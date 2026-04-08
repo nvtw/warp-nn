@@ -1,0 +1,11 @@
+Soft-plus
+=========
+
+API
+^^^
+
+.. autoclass:: warp_nn.modules.activations.SoftPlus
+    :members:
+    :show-inheritance:
+    :special-members: __call__
+    :undoc-members:

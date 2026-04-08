@@ -1,0 +1,16 @@
+html{
+    --pst-sidebar-secondary:17rem;
+}
+
+.bd-main .bd-content .bd-article-container {
+    max-width: 100%;
+}
+
+.bd-page-width {
+    max-width: 88rem;
+}
+
+div.math mjx-container  {
+    overflow: hidden;
+    overflow-x: auto;
+}

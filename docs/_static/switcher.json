@@ -1,0 +1,8 @@
+[
+    {
+        "name": "main",
+        "version": "main",
+        "url": "https://nvidia.github.io/warp-nn/",
+        "preferred": true
+    }
+]

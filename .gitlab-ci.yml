@@ -1,0 +1,154 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+include:
+  - project: "omniverse/devplat/gitlab/templates/common/compliance"
+    file: "modules/omniverse-repo-compliance.gitlab-ci.yml"
+    ref: v1_latest
+
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+
+# Define stages
+stages:
+  - build
+  - test
+  - deploy
+
+# Define variables
+variables:
+  PYTHON_VERSION: "3.10"
+  DOCS_DIR: "docs"
+  BUILD_DIR: "docs/_build/html"
+
+# ========================================================================================
+# Build stage
+# ========================================================================================
+
+# Build documentation
+build-docs:
+  stage: build
+  interruptible: true
+  image: python:${PYTHON_VERSION}
+  tags:
+    - os/linux
+  before_script:
+    - pip install --upgrade pip
+    - pip install -e .[docs]
+  script:
+    - cd ${DOCS_DIR}
+    - sphinx-build -b html -W --keep-going . _build/html
+    - cd ..
+  artifacts:
+    paths:
+      - ${BUILD_DIR}
+    expire_in: 1 hour
+  only:
+    - main
+    - master
+    - develop
+    - tags
+    - merge_requests
+
+# ========================================================================================
+# Test stage
+# ========================================================================================
+
+# Unit tests
+test-pytest:
+  stage: test
+  needs: []
+  interruptible: true
+  image: python:${PYTHON_VERSION}
+  tags:
+    - os/linux
+  before_script:
+    - pip install --upgrade pip
+    - python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+    - pip install -e .[tests]
+  script:
+    - pytest tests/
+  only:
+    - main
+    - master
+    - develop
+    - tags
+    - merge_requests
+
+# Test documentation build
+test-docs:
+  stage: test
+  needs: []
+  interruptible: true
+  image: python:${PYTHON_VERSION}
+  tags:
+    - os/linux
+  before_script:
+    - pip install --upgrade pip
+    - pip install -e .[docs]
+  script:
+    - cd ${DOCS_DIR}
+    - sphinx-build -b html -W . _build/html  # build with warnings as errors to catch issues
+    - echo "Documentation build test passed!"
+  only:
+    - merge_requests
+
+# ========================================================================================
+# Deploy stage
+# ========================================================================================
+
+# Publish Python wheel to package repository
+python-publish-wheel:
+  stage: deploy
+  needs: []
+  image: python:${PYTHON_VERSION}
+  tags:
+    - os/linux
+  before_script:
+    - pip install --quiet --upgrade pip build twine
+  script:
+    - python -m build --wheel
+    - twine upload --repository-url ${PYTHON_REPOSITORY_URL}
+        --username ${PYTHON_REPOSITORY_USERNAME}
+        --password ${PYTHON_REPOSITORY_PASSWORD}
+        dist/*.whl
+  when: manual
+  only:
+    - main
+
+# Deploy documentation to GitLab Pages
+pages:
+  stage: deploy
+  image: alpine:latest
+  tags:
+    - os/linux
+  needs:
+    - build-docs
+  script:
+    # GitLab Pages requires the output to be in a directory named 'public'
+    - rm -rf public
+    - mv ${BUILD_DIR} public
+    # Create a .nojekyll file to ensure all files are served correctly
+    - touch public/.nojekyll
+    # Display deployment info
+    - echo "Documentation has been built and will be deployed to GitLab Pages"
+    - echo "Total files:" $(find public -type f | wc -l)
+  artifacts:
+    paths:
+      - public
+  only:
+    - main
+    - master

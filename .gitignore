@@ -1,0 +1,23 @@
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.[v]env
+*.egg-info/
+
+# Build artifacts
+dist/
+build/
+_build/
+
+# IDE and editor files
+.vscode/
+.history
+
+# 3rd-party references
+3rd-party/
+
+# Test artifacts
+.hypothesis/

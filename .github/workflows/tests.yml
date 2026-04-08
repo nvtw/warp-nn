@@ -1,0 +1,134 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: tests
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+    - 'warp_nn/**'
+    - 'tests/**'
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [ main, develop ]
+    paths:
+    - 'warp_nn/**'
+    - 'tests/**'
+  schedule:
+    - cron: "9 9 * * 6"  # every Saturday at 9:09 UTC
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+
+  ############################################################
+  # Minimum requirements
+  ############################################################
+
+  test-minimum-requirements:
+    name: Minimum requirements
+    runs-on: ubuntu-22.04
+    if: github.event.pull_request.draft == false && github.event_name != 'workflow_dispatch'
+    steps:
+    # setup
+    - uses: actions/checkout@v4
+    - name: Delete Python cache
+      if: env.DELETE_HOSTED_TOOL_PYTHON_CACHE == '1'
+      run: |
+        rm -rf /opt/hostedtoolcache/Python
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+        check-latest: true
+    # install dependencies
+    - name: Install dependencies
+      run: |
+        python -m pip install --quiet --upgrade pip
+        python -m pip install --quiet "numpy<2.0"
+        python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+        python -m pip install --quiet warp-lang==1.12.0
+        python -m pip install --quiet -e .[tests]
+        python -m pip list
+    # run tests
+    - name: Run tests
+      run: |
+        pytest \
+          --cov=warp_nn \
+          --cov-report term:skip-covered \
+          --cov-report html:test-minimum-requirements-coverage.html \
+          tests
+    # report
+    - name: Save reports
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-minimum-requirements
+        path: test-minimum-requirements-*.html
+        retention-days: 3
+
+  ############################################################
+  # Latest requirements
+  ############################################################
+
+  test-latest-requirements:
+    name: Latest requirements
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu-latest", "windows-latest"]
+    runs-on: ${{ matrix.os }}
+    if: github.event.pull_request.draft == false
+    steps:
+    # setup
+    - uses: actions/checkout@v4
+    - name: Delete Python cache
+      if: env.DELETE_HOSTED_TOOL_PYTHON_CACHE == '1'
+      run: |
+        rm -rf /opt/hostedtoolcache/Python
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: 3.14
+        check-latest: true
+    # install dependencies
+    - name: Install dependencies
+      run: |
+        python -m pip install --quiet --upgrade pip
+        python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+        python -m pip install --quiet -e .[tests]
+        python -m pip list
+    # run tests
+    - name: Run tests
+      run: |
+        pytest \
+          --cov=warp_nn \
+          --cov-report term:skip-covered \
+          --cov-report html:test-latest-requirements-coverage.html \
+          tests
+    # report
+    - name: Save reports
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-latest-requirements_${{ matrix.os }}
+        path: test-latest-requirements-*.html
+        retention-days: 3
