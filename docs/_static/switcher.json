@@ -1,8 +1,13 @@
 [
     {
-        "name": "main",
+        "name": "latest",
         "version": "main",
-        "url": "https://nvidia.github.io/warp-nn/",
+        "url": "https://nvidia.github.io/warp-nn/latest/",
         "preferred": true
+    },
+    {
+        "name": "develop",
+        "version": "develop",
+        "url": "https://nvidia.github.io/warp-nn/develop/"
     }
 ]
