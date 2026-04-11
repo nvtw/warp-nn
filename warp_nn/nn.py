@@ -14,6 +14,6 @@
 # limitations under the License.
 
 from warp_nn.modules.activations import ELU, SELU, LeakyReLU, ReLU, Sigmoid, SoftPlus, SoftSign, Tanh
-from warp_nn.modules.layers import Conv1D, Conv2D, GRUCell, LazyLinear, Linear, LSTMCell, RNNCell, Sequential
+from warp_nn.modules.layers import Conv1D, Conv2D, Flatten, GRUCell, LazyLinear, Linear, LSTMCell, RNNCell, Sequential
 from warp_nn.modules.module import Module
 from warp_nn.modules.parameter import Parameter
