@@ -1,6 +1,6 @@
 # Warp-NN: CUDA Graphable Neural Networks for NVIDIA Warp
 
-**[Documentation](https://nvidia.github.io/warp-nn/)** | [Changelog](https://github.com/NVIDIA/warp-nn/blob/main/CHANGELOG.md)
+**[Documentation](https://nvidia.github.io/warp-nn/latest)** | [Changelog](https://github.com/NVIDIA/warp-nn/blob/main/CHANGELOG.md)
 
 Warp-NN is a Python library for building and training neural networks using [NVIDIA Warp](https://nvidia.github.io/warp).
 It enables end-to-end GPU-accelerated neural network implementation for Warp-based applications,

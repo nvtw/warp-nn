@@ -177,7 +177,7 @@ html_theme_options = {
     "navbar_align": "content",
     "navbar_start": [
         "navbar-logo",
-        "version-switcher",
+        # "version-switcher",
     ],
     "switcher": {
         "json_url": "https://nvidia.github.io/warp-nn/switcher.json",

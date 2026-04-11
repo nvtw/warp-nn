@@ -14,3 +14,7 @@ div.math mjx-container  {
     overflow: hidden;
     overflow-x: auto;
 }
+
+.navbar-brand {
+    margin-right: 0.5rem;
+}

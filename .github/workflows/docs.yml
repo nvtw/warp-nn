@@ -50,35 +50,35 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: 3.12
-    # build main docs
-    - name: Install main dependencies
+    # build docs (main)
+    - name: Install dependencies (main)
       working-directory: checkout-main
       run: |
         python -m pip install --quiet --upgrade pip
         python -m pip install --quiet -e .[docs]
         python -m pip list
-    - name: Build main docs (Sphinx)
+    - name: Build docs (main)
       working-directory: checkout-main
       run: sphinx-build -b html docs/ ../site/latest/
       env:
         GITHUB_REF_NAME: main
-    # build develop docs
-    - name: Install develop dependencies
+    # build docs (develop)
+    - name: Install dependencies (develop)
       working-directory: checkout-develop
       run: |
         python -m pip install --quiet --upgrade pip
         python -m pip install --quiet -e .[docs]
         python -m pip list
-    - name: Build develop docs (Sphinx)
+    - name: Build docs (develop)
       working-directory: checkout-develop
       run: sphinx-build -b html docs/ ../site/develop/
       env:
         GITHUB_REF_NAME: develop
     # create root redirect and place switcher.json at a stable root URL
-    - name: Create root files
+    - name: Build root
       run: |
         cp checkout-develop/docs/_static/switcher.json site/switcher.json
-        printf '<html><head><meta http-equiv="refresh" content="0; url=latest/"></head><body>Redirecting to <a href="latest/">latest</a>.</body></html>\n' > site/index.html
+        cp checkout-develop/docs/_static/index.html site/index.html
     # setup pages and upload artifact
     - name: Setup Pages
       uses: actions/configure-pages@v5
