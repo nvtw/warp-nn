@@ -12,6 +12,12 @@ and calling the optimizer to update the model parameters.
 Defining a neural network
 -------------------------
 
+Import the necessary modules.
+
+.. literalinclude:: ../snippets/basics.py
+   :start-after: [basics-imports-start]
+   :end-before: [basics-imports-end]
+
 Subclass :py:class:`~warp_nn.modules.module.Module` and assign built-in layers as attributes.
 Implement the :py:meth:`~warp_nn.modules.module.Module.__call__` method to define the forward pass of the model.
 

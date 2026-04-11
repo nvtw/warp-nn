@@ -13,9 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# fmt: off
+# [basics-imports-start]
 import warp as wp
 from warp_nn import nn
 from warp_nn import optimizers
+# [basics-imports-end]
+# fmt: on
 
 
 epochs = 10
