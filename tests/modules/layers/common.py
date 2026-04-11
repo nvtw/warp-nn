@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
+
 import torch
 
 import warp as wp
@@ -21,27 +23,27 @@ from ... import utilities
 
 
 @wp.kernel
-def _loss_1d(a: wp.array1d(dtype=float), loss: wp.array1d(dtype=float)):
+def _loss_1d(a: wp.array1d[Any], loss: wp.array1d[wp.float32]):
     i = wp.tid()
-    wp.atomic_add(loss, 0, a[i])
+    wp.atomic_add(loss, 0, loss.dtype(a[i]))
 
 
 @wp.kernel
-def _loss_2d(a: wp.array2d(dtype=float), loss: wp.array1d(dtype=float)):
+def _loss_2d(a: wp.array2d[Any], loss: wp.array1d[wp.float32]):
     i, j = wp.tid()
-    wp.atomic_add(loss, 0, a[i, j])
+    wp.atomic_add(loss, 0, loss.dtype(a[i, j]))
 
 
 @wp.kernel
-def _loss_3d(a: wp.array3d(dtype=float), loss: wp.array1d(dtype=float)):
+def _loss_3d(a: wp.array3d[Any], loss: wp.array1d[wp.float32]):
     i, j, k = wp.tid()
-    wp.atomic_add(loss, 0, a[i, j, k])
+    wp.atomic_add(loss, 0, loss.dtype(a[i, j, k]))
 
 
 @wp.kernel
-def _loss_4d(a: wp.array4d(dtype=float), loss: wp.array1d(dtype=float)):
+def _loss_4d(a: wp.array4d[Any], loss: wp.array1d[wp.float32]):
     i, j, k, l = wp.tid()
-    wp.atomic_add(loss, 0, a[i, j, k, l])
+    wp.atomic_add(loss, 0, loss.dtype(a[i, j, k, l]))
 
 
 def check_forward(*, warp_module, torch_module, device, dtype, shape, rtol: float = 1e-02, atol: float = 1e-03):
