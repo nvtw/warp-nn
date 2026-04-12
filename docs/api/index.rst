@@ -60,6 +60,7 @@ Layers
 
     Conv1D
     Conv2D
+    Flatten
     GRUCell
     Linear
     LSTMCell
