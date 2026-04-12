@@ -27,10 +27,16 @@ print("[DOCS] warp-nn path: {}".format(sys.path[0]))
 import warp_nn
 
 # Determine the Git version/tag from CI environment variables.
-# 1. Check for GitHub Actions' variable.
-# 2. Check for GitLab CI's variable.
-# 3. Fallback to 'main' for local builds.
-github_version = os.environ.get("GITHUB_REF_NAME") or os.environ.get("CI_COMMIT_REF_NAME") or "main"
+# 1. Check for custom variable.
+# 2. Check for GitHub Actions' variable (GITHUB_* variables are set by GitHub and cannot be overwritten).
+# 3. Check for GitLab CI's variable.
+# 4. Fallback to 'main' for local builds.
+git_reference = (
+    os.environ.get("GIT_REF_NAME")
+    or os.environ.get("GITHUB_REF_NAME")
+    or os.environ.get("CI_COMMIT_REF_NAME")
+    or "main"
+)
 
 # --------------------------------------------------------------------
 # Project information
@@ -138,7 +144,7 @@ def linkcode_resolve(domain, info):
     # build URL
     filename = os.path.relpath(filename, start=os.path.dirname(warp_nn.__file__))
     lines = f"#L{linenum}-L{linenum + len(source)}" if linenum else ""
-    return f"https://github.com/NVIDIA/warp-nn/blob/{github_version}/warp_nn/{filename}{lines}"
+    return f"https://github.com/NVIDIA/warp-nn/blob/{git_reference}/warp_nn/{filename}{lines}"
 
 
 # --------------------------------------------------------------------
@@ -157,7 +163,7 @@ html_css_files = [
 html_context = {
     "github_user": "NVIDIA",
     "github_repo": "warp-nn",
-    "github_version": github_version,
+    "github_version": git_reference,
     "doc_path": "docs",
 }
 html_theme_options = {
@@ -181,7 +187,7 @@ html_theme_options = {
     ],
     "switcher": {
         "json_url": "https://nvidia.github.io/warp-nn/switcher.json",
-        "version_match": "latest" if github_version == "main" else github_version,
+        "version_match": git_reference,
     },
     "show_nav_level": 2,
 }

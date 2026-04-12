@@ -61,7 +61,7 @@ jobs:
       working-directory: checkout-main
       run: sphinx-build -b html docs/ ../site/latest/
       env:
-        GITHUB_REF_NAME: main
+        GIT_REF_NAME: main
     # build docs (develop)
     - name: Install dependencies (develop)
       working-directory: checkout-develop
@@ -73,7 +73,7 @@ jobs:
       working-directory: checkout-develop
       run: sphinx-build -b html docs/ ../site/develop/
       env:
-        GITHUB_REF_NAME: develop
+        GIT_REF_NAME: develop
     # create root redirect and place switcher.json at a stable root URL
     - name: Build root
       run: |
