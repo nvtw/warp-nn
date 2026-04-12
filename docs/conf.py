@@ -181,7 +181,7 @@ html_theme_options = {
     ],
     "switcher": {
         "json_url": "https://nvidia.github.io/warp-nn/switcher.json",
-        "version_match": github_version,
+        "version_match": "latest" if github_version == "main" else github_version,
     },
     "show_nav_level": 2,
 }
