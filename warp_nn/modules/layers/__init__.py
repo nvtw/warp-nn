@@ -15,6 +15,7 @@
 
 from warp_nn.modules.layers.conv_1d import Conv1D
 from warp_nn.modules.layers.conv_2d import Conv2D
+from warp_nn.modules.layers.flatten import Flatten
 from warp_nn.modules.layers.gru_cell import GRUCell
 from warp_nn.modules.layers.linear import LazyLinear, Linear
 from warp_nn.modules.layers.lstm_cell import LSTMCell

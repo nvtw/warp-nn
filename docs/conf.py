@@ -67,7 +67,7 @@ extensions = [
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3/", None),
     "numpy": ("https://numpy.org/doc/stable/", None),
-    "warp": ("https://nvidia.github.io/warp/", None),
+    "warp": ("https://nvidia.github.io/warp/stable", None),
 }
 
 pygments_style = "tango"

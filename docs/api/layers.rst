@@ -19,6 +19,7 @@ Layers
 
     Conv1D <layers/conv_1d>
     Conv2D <layers/conv_2d>
+    Flatten <layers/flatten>
     GRUCell <layers/gru_cell>
     Linear <layers/linear>
     LSTMCell <layers/lstm_cell>
@@ -37,6 +38,7 @@ The following table lists the available layers:
 
     Conv1D
     Conv2D
+    Flatten
     GRUCell
     Linear
     LSTMCell

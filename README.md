@@ -1,10 +1,19 @@
+[![PyPI version](https://badge.fury.io/py/warp-nn.svg)](https://badge.fury.io/py/warp-nn)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
 # Warp-NN: CUDA Graphable Neural Networks for NVIDIA Warp
 
 **[Documentation](https://nvidia.github.io/warp-nn/latest)** | [Changelog](https://github.com/NVIDIA/warp-nn/blob/main/CHANGELOG.md)
 
-Warp-NN is a Python library for building and training neural networks using [NVIDIA Warp](https://nvidia.github.io/warp).
-It enables end-to-end GPU-accelerated neural network implementation for Warp-based applications,
-without the need for third-party libraries such as PyTorch or JAX.
+Warp-NN is a Warp-native Python library for building and training neural networks for Physical AI workflows.
+It is designed for compact neural network components that run directly within Warp-based simulation,
+robotics, control, and differentiable computing pipelines.
+It is not intended to be a general-purpose replacement for PyTorch, JAX, or other ML frameworks.
+
+> **Disclaimer:**
+> Warp-NN is not part of the `warp-lang` package, and it is not maintained by the [NVIDIA Warp](https://nvidia.github.io/warp) core team.
+> It is a Warp ecosystem library maintained by [@Toni-SM](https://github.com/Toni-SM) / [NVIDIA Isaac Sim](https://github.com/isaac-sim).
+> Issues, releases, roadmap, and support are managed by the maintainers of this repository.
 
 ## Installation
 
