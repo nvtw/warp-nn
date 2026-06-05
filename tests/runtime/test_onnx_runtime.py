@@ -13,17 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 import tempfile
 from pathlib import Path
 
-import pytest
 
 pytest.importorskip("onnx")
 
-import numpy as np
 import onnx
-import warp as wp
 from onnx import TensorProto, helper, numpy_helper
+
+import numpy as np
+import warp as wp
 
 from tests.utilities import check_arrays, is_device_available
 from warp_nn.runtime import OnnxRuntime
@@ -82,15 +84,15 @@ def _build_mlp_policy_model(
         W = (rng.standard_normal((out_dim, in_dim)) * 0.3).astype(np.float32)
         b = (rng.standard_normal((out_dim,)) * 0.05).astype(np.float32)
         w_name, b_name = f"W{i}", f"b{i}"
-        initializers.extend([
-            numpy_helper.from_array(W, name=w_name),
-            numpy_helper.from_array(b, name=b_name),
-        ])
+        initializers.extend(
+            [
+                numpy_helper.from_array(W, name=w_name),
+                numpy_helper.from_array(b, name=b_name),
+            ]
+        )
         is_last = i == len(layer_sizes) - 2
         hidden = "action" if is_last else f"hidden{i}"
-        nodes.append(
-            helper.make_node("Gemm", [prev, w_name, b_name], [hidden], alpha=1.0, beta=1.0, transB=1)
-        )
+        nodes.append(helper.make_node("Gemm", [prev, w_name, b_name], [hidden], alpha=1.0, beta=1.0, transB=1))
         if not is_last:
             activated = f"activated{i}"
             nodes.append(helper.make_node("Elu", [hidden], [activated], alpha=1.0))
@@ -155,7 +157,9 @@ def _build_lstm_step_model(batch: int, input_size: int, hidden_size: int, seed: 
         helper.make_node("Squeeze", ["Y", "squeeze_axes"], ["Y_2d"]),
         helper.make_node("Gemm", ["Y_2d", "Wd", "bd"], ["output"], alpha=1.0, beta=1.0, transB=1),
     ]
-    graph = helper.make_graph(nodes, "lstm_step", [x_in, h_in, c_in], [y_out, h_out_v, c_out_v], initializer=initializers)
+    graph = helper.make_graph(
+        nodes, "lstm_step", [x_in, h_in, c_in], [y_out, h_out_v, c_out_v], initializer=initializers
+    )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
     model.ir_version = 8
     return model
@@ -273,11 +277,13 @@ def test_lstm_single_step(device):
     try:
         onnx.save(model, str(path))
         rt = OnnxRuntime(str(path), device=device, batch_size=batch)
-        out = rt({
-            "input": wp.array(x_np, dtype=wp.float32, device=device),
-            "h_in": wp.array(h_np, dtype=wp.float32, device=device),
-            "c_in": wp.array(c_np, dtype=wp.float32, device=device),
-        })
+        out = rt(
+            {
+                "input": wp.array(x_np, dtype=wp.float32, device=device),
+                "h_in": wp.array(h_np, dtype=wp.float32, device=device),
+                "c_in": wp.array(c_np, dtype=wp.float32, device=device),
+            }
+        )
         check_arrays(out["output"], wp.array(expected_out, dtype=wp.float32, device=device), rtol=1e-3, atol=1e-4)
         check_arrays(
             out["h_out"],
