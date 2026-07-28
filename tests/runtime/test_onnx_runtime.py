@@ -66,6 +66,42 @@ def _run_numpy_mlp(model: onnx.ModelProto, feeds: dict[str, np.ndarray]) -> dict
     return {out.name: values[out.name] for out in model.graph.output}
 
 
+def _finite_difference_gradient(fwd, x: np.ndarray, eps: float = 1e-3) -> np.ndarray:
+    grad = np.zeros_like(x, dtype=np.float32)
+    x_flat = x.reshape(-1)
+    grad_flat = grad.reshape(-1)
+    for i in range(x_flat.size):
+        xp = x_flat.copy()
+        xm = x_flat.copy()
+        xp[i] += eps
+        xm[i] -= eps
+        grad_flat[i] = (fwd(xp.reshape(x.shape)) - fwd(xm.reshape(x.shape))) / (2.0 * eps)
+    return grad
+
+
+def _runtime_input_gradient(
+    rt: OnnxRuntime,
+    feeds: dict[str, np.ndarray],
+    *,
+    input_name: str,
+    output_name: str,
+    seed: np.ndarray,
+    device: str,
+) -> np.ndarray:
+    inputs = {
+        name: wp.array(arr, dtype=wp.float32, device=device, requires_grad=name == input_name)
+        for name, arr in feeds.items()
+    }
+    seed_wp = wp.array(seed, dtype=wp.float32, device=device)
+
+    tape = wp.Tape()
+    with tape:
+        out = rt(inputs)[output_name]
+    tape.backward(grads={out: seed_wp})
+
+    return inputs[input_name].grad.numpy().copy()
+
+
 def _build_mlp_policy_model(
     layer_sizes: tuple[int, ...],
     *,
@@ -188,6 +224,45 @@ def test_mlp_policy(device):
 
 
 @pytest.mark.parametrize("device", ["cuda"])
+def test_mlp_policy_input_gradients(device):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    model = _build_mlp_policy_model((3, 4, 1), batch=1, seed=20260716)
+    rng = np.random.default_rng(20260716)
+    obs = rng.standard_normal((1, 3)).astype(np.float32)
+    seed = np.ones((1, 1), dtype=np.float32)
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        rt = OnnxRuntime(str(path), device=device, batch_size=1, requires_grad=True)
+        actual = _runtime_input_gradient(
+            rt,
+            {"observation": obs},
+            input_name="observation",
+            output_name="action",
+            seed=seed,
+            device=device,
+        )
+
+        def fwd(x):
+            out = _run_numpy_mlp(model, {"observation": x})["action"]
+            return float(np.sum(out * seed))
+
+        expected = _finite_difference_gradient(fwd, obs)
+        check_arrays(
+            wp.array(actual, dtype=wp.float32, device=device),
+            wp.array(expected, dtype=wp.float32, device=device),
+            rtol=1e-2,
+            atol=1e-3,
+        )
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("device", ["cuda"])
 def test_graph_capture_replay(device):
     if not is_device_available(device):
         pytest.skip(f"Device '{device}' is not available")
@@ -296,6 +371,57 @@ def test_lstm_single_step(device):
             wp.array(c_ref.reshape(1, batch, hidden_size), dtype=wp.float32, device=device),
             rtol=1e-3,
             atol=1e-4,
+        )
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("device", ["cuda"])
+def test_lstm_input_gradients(device):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    batch, input_size, hidden_size = 1, 3, 4
+    model = _build_lstm_step_model(batch, input_size, hidden_size, seed=20260716)
+
+    W = numpy_helper.to_array(model.graph.initializer[0])[0]
+    R = numpy_helper.to_array(model.graph.initializer[1])[0]
+    B_full = numpy_helper.to_array(model.graph.initializer[2])[0]
+    Wd = numpy_helper.to_array(model.graph.initializer[3])[0]
+    bd = numpy_helper.to_array(model.graph.initializer[4])
+    Bx, Bh = B_full[: 4 * hidden_size], B_full[4 * hidden_size :]
+
+    rng = np.random.default_rng(16)
+    x_np = rng.standard_normal((1, batch, input_size)).astype(np.float32)
+    h_np = rng.standard_normal((1, batch, hidden_size)).astype(np.float32) * 0.1
+    c_np = rng.standard_normal((1, batch, hidden_size)).astype(np.float32) * 0.1
+    seed = np.ones((batch, 1), dtype=np.float32)
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        rt = OnnxRuntime(str(path), device=device, batch_size=batch, requires_grad=True)
+        actual = _runtime_input_gradient(
+            rt,
+            {"input": x_np, "h_in": h_np, "c_in": c_np},
+            input_name="input",
+            output_name="output",
+            seed=seed,
+            device=device,
+        )
+
+        def fwd(x):
+            h_ref, _ = _lstm_step_reference(x[0], h_np[0], c_np[0], W, R, Bx, Bh)
+            out = (h_ref @ Wd.T + bd).reshape(batch, 1).astype(np.float32)
+            return float(np.sum(out * seed))
+
+        expected = _finite_difference_gradient(fwd, x_np)
+        check_arrays(
+            wp.array(actual, dtype=wp.float32, device=device),
+            wp.array(expected, dtype=wp.float32, device=device),
+            rtol=1e-2,
+            atol=1e-3,
         )
     finally:
         path.unlink(missing_ok=True)

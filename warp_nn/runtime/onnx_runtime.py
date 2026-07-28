@@ -192,9 +192,9 @@ def _decode_attrs(node) -> tuple[dict[str, Any], set[str]]:
     return out, all_names
 
 
-def _np_to_warp(arr_np: np.ndarray, device: wp.context.Device) -> wp.array:
+def _np_to_warp(arr_np: np.ndarray, device: wp.context.Device, requires_grad: bool = False) -> wp.array:
     arr_np = np.ascontiguousarray(arr_np, dtype=np.float32)
-    return wp.array(arr_np, dtype=wp.float32, device=device)
+    return wp.array(arr_np, dtype=wp.float32, device=device, requires_grad=requires_grad)
 
 
 class OnnxRuntime:
@@ -211,6 +211,10 @@ class OnnxRuntime:
             dictionary is provided, it maps graph input names to their batch
             axis.  The selected axes are replaced with ``batch_size`` even
             when the ONNX model exported them as fixed dimensions.
+        requires_grad: Whether runtime-owned tensors, including initializers
+            and intermediate buffers, should allocate gradient storage.  Keep
+            this disabled for inference/replay and enable it when computing
+            gradients through ONNX runtime outputs.
     """
 
     def __init__(
@@ -219,8 +223,10 @@ class OnnxRuntime:
         device: str | wp.Device | None = None,
         batch_size: int = 1,
         input_batch_axes: int | dict[str, int] | None = None,
+        requires_grad: bool = False,
     ):
         self._device = parse_device(device)
+        self._requires_grad = requires_grad
 
         onnx, numpy_helper = _require_onnx()
         model = onnx.load(path)
@@ -231,7 +237,7 @@ class OnnxRuntime:
 
         for init in graph.initializer:
             arr_np = numpy_helper.to_array(init).astype(np.float32)
-            self._tensors[init.name] = _np_to_warp(arr_np, self._device)
+            self._tensors[init.name] = _np_to_warp(arr_np, self._device, requires_grad=self._requires_grad)
             self._shapes[init.name] = tuple(arr_np.shape)
 
         initializer_names = {init.name for init in graph.initializer}
@@ -295,7 +301,7 @@ class OnnxRuntime:
                 raise NotImplementedError(
                     f"OnnxRuntime: unsupported op '{op.op_type}'.  Supported ops: {sorted(_OP_DISPATCH.keys())}"
                 )
-            handler(op, self._shapes, self._tensors, self._device)
+            handler(op, self._shapes, self._tensors, self._device, self._requires_grad)
 
     def __call__(self, inputs: dict[str, wp.array]) -> dict[str, wp.array]:
         """Run forward inference.
@@ -332,7 +338,7 @@ class OnnxRuntime:
         return {name: tensors[name] for name in self.output_names}
 
 
-def _shape_gemm(op, shapes, tensors, device):
+def _shape_gemm(op, shapes, tensors, device, requires_grad=False):
     A_shape = shapes[op.inputs[0]]
     B_shape = shapes[op.inputs[1]]
     transA = int(op.attrs.get("transA", 0))
@@ -356,21 +362,21 @@ def _shape_gemm(op, shapes, tensors, device):
     out_shape = (M, N)
     out_name = op.outputs[0]
     if out_name not in tensors:
-        tensors[out_name] = wp.zeros(out_shape, dtype=wp.float32, device=device)
+        tensors[out_name] = wp.zeros(out_shape, dtype=wp.float32, device=device, requires_grad=requires_grad)
     shapes[out_name] = out_shape
 
 
-def _shape_elementwise_unary(op, shapes, tensors, device):
+def _shape_elementwise_unary(op, shapes, tensors, device, requires_grad=False):
     in_shape = shapes[op.inputs[0]]
     if len(in_shape) != 2:
         raise NotImplementedError("OnnxRuntime Elu: only 2-D tensors are supported")
     out_name = op.outputs[0]
     if out_name not in tensors:
-        tensors[out_name] = wp.zeros(in_shape, dtype=wp.float32, device=device)
+        tensors[out_name] = wp.zeros(in_shape, dtype=wp.float32, device=device, requires_grad=requires_grad)
     shapes[out_name] = in_shape
 
 
-def _shape_squeeze(op, shapes, tensors, device):
+def _shape_squeeze(op, shapes, tensors, device, requires_grad=False):
     in_shape = shapes[op.inputs[0]]
     axes = None
     if len(op.inputs) > 1 and op.inputs[1] in tensors:
@@ -391,7 +397,7 @@ def _shape_squeeze(op, shapes, tensors, device):
     op.attrs["_out_shape"] = out_shape
 
 
-def _shape_lstm(op, shapes, tensors, device):
+def _shape_lstm(op, shapes, tensors, device, requires_grad=False):
     for unsupported in ("activations", "activation_alpha", "activation_beta"):
         if unsupported in op.attr_names:
             raise NotImplementedError(
@@ -457,18 +463,18 @@ def _shape_lstm(op, shapes, tensors, device):
         cache["Bx"] = B_2d[: 4 * hidden_size]
         cache["Bh"] = B_2d[4 * hidden_size :]
     else:
-        cache["Bx"] = wp.zeros(4 * hidden_size, dtype=wp.float32, device=device)
-        cache["Bh"] = wp.zeros(4 * hidden_size, dtype=wp.float32, device=device)
+        cache["Bx"] = wp.zeros(4 * hidden_size, dtype=wp.float32, device=device, requires_grad=requires_grad)
+        cache["Bh"] = wp.zeros(4 * hidden_size, dtype=wp.float32, device=device, requires_grad=requires_grad)
 
-    cache["gates"] = wp.zeros((batch, 4 * hidden_size), dtype=wp.float32, device=device)
+    cache["gates"] = wp.zeros((batch, 4 * hidden_size), dtype=wp.float32, device=device, requires_grad=requires_grad)
     cache["input_size"] = input_size
     cache["hidden_size"] = hidden_size
     cache["batch"] = batch
     cache["layout"] = layout
     op.attrs["_cache"] = cache
 
-    h_buf = wp.zeros((batch, hidden_size), dtype=wp.float32, device=device)
-    c_buf = wp.zeros((batch, hidden_size), dtype=wp.float32, device=device)
+    h_buf = wp.zeros((batch, hidden_size), dtype=wp.float32, device=device, requires_grad=requires_grad)
+    c_buf = wp.zeros((batch, hidden_size), dtype=wp.float32, device=device, requires_grad=requires_grad)
     cache["h_out"] = h_buf
     cache["c_out"] = c_buf
 
