@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.3.1] - 2026-07-28
+### Changed
+- Update the ONNX inference runtime to include opt-in support for gradient propagation
+
 ## [0.3.0] - 2026-07-03
 ### Added
 - Add graph-capturable ONNX inference runtime
