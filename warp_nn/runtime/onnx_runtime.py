@@ -444,6 +444,10 @@ class OnnxRuntime:
 
         onnx, numpy_helper = _require_onnx()
         model = onnx.load(path)
+        try:
+            onnx.checker.check_model(model)
+        except onnx.checker.ValidationError as exc:
+            raise ValueError(f"OnnxRuntime: invalid ONNX model: {exc}") from exc
         graph = model.graph
 
         self._tensors: dict[str, wp.array] = {}

@@ -254,6 +254,28 @@ def _build_lstm_step_model(batch: int, input_size: int, hidden_size: int, seed: 
     return model
 
 
+@pytest.mark.parametrize(
+    "node",
+    [
+        helper.make_node("Gemm", [], ["out"], transB=1),
+        helper.make_node("Gemm", ["missing", "B", "bias"], ["out"], transB=1),
+    ],
+    ids=["missing-inputs", "undefined-input"],
+)
+def test_rejects_invalid_model(node):
+    output = helper.make_tensor_value_info("out", TensorProto.FLOAT, [1, 1])
+    model = helper.make_model(helper.make_graph([node], "invalid", [], [output]))
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        with pytest.raises(ValueError, match="OnnxRuntime: invalid ONNX model"):
+            OnnxRuntime(str(path), device="cpu")
+    finally:
+        path.unlink(missing_ok=True)
+
+
 @pytest.mark.parametrize("device", ["cuda"])
 def test_mlp_policy(device):
     if not is_device_available(device):
