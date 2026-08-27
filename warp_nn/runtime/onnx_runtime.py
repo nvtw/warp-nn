@@ -620,6 +620,18 @@ def _causal_conv_state_kernel(
         present[batch, channel, state_index] = x[batch, channel, source_index - past.shape[2]]
 
 
+@wp.kernel(enable_backward=False)
+def _causal_conv_state_inplace_kernel(x: wp.array3d[Any], state: wp.array3d[Any]):
+    batch, channel = wp.tid()
+    sequence_length = x.shape[2]
+    for state_index in range(state.shape[2]):
+        source_index = sequence_length + state_index
+        if source_index < state.shape[2]:
+            state[batch, channel, state_index] = state[batch, channel, source_index]
+        else:
+            state[batch, channel, state_index] = x[batch, channel, source_index - state.shape[2]]
+
+
 _dequantize_nbits_kernel_cache = {}
 
 
@@ -1415,7 +1427,7 @@ class OnnxRuntime:
             self._dtypes[name] = self._input_dtypes[name]
         for op in self._ops:
             op.attrs = {name: value for name, value in op.attrs.items() if not name.startswith("_") or name == "_value"}
-            if op.op_type == "GroupQueryAttention":
+            if op.op_type in ("CausalConvWithState", "GroupQueryAttention", "LinearAttention"):
                 op.attrs["_share_cache"] = share_kv_cache
         self._preallocate_buffers()
 
@@ -2079,6 +2091,7 @@ def _shape_causal_conv_with_state(op, shapes, dtypes, tensors, device, requires_
 
     bias = tensors[op.inputs[2]] if has_bias else wp.zeros(1, dtype=dtype, device=device)
     past = wp.zeros(state_shape, dtype=dtype, device=device) if not has_past else None
+    share_state = bool(op.attrs.get("_share_cache", False)) and has_past
     tensors[op.outputs[0]] = wp.zeros(x_shape, dtype=dtype, device=device)
     tensors[op.outputs[1]] = wp.zeros(state_shape, dtype=dtype, device=device)
     shapes[op.outputs[0]] = x_shape
@@ -2091,10 +2104,12 @@ def _shape_causal_conv_with_state(op, shapes, dtypes, tensors, device, requires_
     op.attrs["_has_past"] = has_past
     op.attrs["_has_bias"] = has_bias
     op.attrs["_silu"] = activation != "none"
+    op.attrs["_share_state"] = share_state
     op.attrs["_kernel"] = _kernel_for_dtype(
         _causal_conv_1d_kernel, dtype, (3,), (3,), (1,), (3,), (3,), int, bool, bool
     )
     op.attrs["_state_kernel"] = _kernel_for_dtype(_causal_conv_state_kernel, dtype, (3,), (3,), (3,))
+    op.attrs["_inplace_state_kernel"] = _kernel_for_dtype(_causal_conv_state_inplace_kernel, dtype, (3,), (3,))
 
 
 def _shape_linear_attention(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -2163,6 +2178,7 @@ def _shape_linear_attention(op, shapes, dtypes, tensors, device, requires_grad=F
     output_heads = max(query_heads, value_heads)
     output_shape = (batch, sequence_length, output_heads * value_size)
     tensors[op.outputs[0]] = wp.zeros(output_shape, dtype=dtype, device=device)
+    share_state = bool(op.attrs.get("_share_cache", False)) and has_past
     tensors[op.outputs[1]] = wp.zeros(state_shape, dtype=dtype, device=device)
     shapes[op.outputs[0]] = output_shape
     shapes[op.outputs[1]] = state_shape
@@ -2180,6 +2196,7 @@ def _shape_linear_attention(op, shapes, dtypes, tensors, device, requires_grad=F
     op.attrs["_value_size"] = value_size
     op.attrs["_value_blocks"] = value_size // min(64, value_size & -value_size)
     op.attrs["_has_past"] = has_past
+    op.attrs["_share_state"] = share_state
     op.attrs["_past"] = None if has_past else wp.zeros(state_shape, dtype=dtype, device=device)
     op.attrs["_decay"] = None if has_decay else wp.zeros((1, 1), dtype=dtype, device=device)
     op.attrs["_beta"] = None if has_beta else wp.zeros((1, 1), dtype=dtype, device=device)
@@ -2935,6 +2952,8 @@ def _exec_matmul_nbits(op, tensors, shapes, device):
 def _exec_causal_conv_with_state(op, tensors, shapes, device):
     x = tensors[op.inputs[0]]
     past = tensors[op.inputs[3]] if op.attrs["_has_past"] else op.attrs["_past"]
+    if op.attrs["_share_state"]:
+        tensors[op.outputs[1]] = past
     wp.launch(
         op.attrs["_kernel"],
         dim=x.shape,
@@ -2951,12 +2970,20 @@ def _exec_causal_conv_with_state(op, tensors, shapes, device):
         device=device,
     )
     if op.attrs["_kernel_size"] > 1:
-        wp.launch(
-            op.attrs["_state_kernel"],
-            dim=tensors[op.outputs[1]].shape,
-            inputs=[x, past, tensors[op.outputs[1]]],
-            device=device,
-        )
+        if op.attrs["_share_state"]:
+            wp.launch(
+                op.attrs["_inplace_state_kernel"],
+                dim=(x.shape[0], x.shape[1]),
+                inputs=[x, past],
+                device=device,
+            )
+        else:
+            wp.launch(
+                op.attrs["_state_kernel"],
+                dim=tensors[op.outputs[1]].shape,
+                inputs=[x, past, tensors[op.outputs[1]]],
+                device=device,
+            )
 
 
 def _exec_linear_attention(op, tensors, shapes, device):
@@ -2968,6 +2995,8 @@ def _exec_linear_attention(op, tensors, shapes, device):
     key_size = op.attrs["_key_size"]
     value_size = op.attrs["_value_size"]
     past = tensors[op.inputs[3]] if op.attrs["_has_past"] else op.attrs["_past"]
+    if op.attrs["_share_state"]:
+        tensors[op.outputs[1]] = past
     decay = tensors[op.inputs[4]] if op.attrs["_needs_decay"] else op.attrs["_decay"]
     beta = tensors[op.inputs[5]] if op.attrs["_needs_beta"] else op.attrs["_beta"]
     wp.launch_tiled(

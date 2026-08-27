@@ -1228,6 +1228,13 @@ def test_causal_conv_with_state(device, data_type, np_dtype, wp_dtype, sequence,
             raise
         wp.capture_launch(graph)
         np.testing.assert_allclose(outputs["output"].numpy(), expected, rtol=1.0e-2, atol=1.0e-2)
+
+        shared_runtime = runtime._fork({"x": x.shape, "past": past.shape}, share_kv_cache=True)
+        shared_past = wp.array(past, dtype=wp_dtype, device=device)
+        shared_outputs = shared_runtime({"x": inputs["x"], "past": shared_past})
+        assert shared_outputs["present"].ptr == shared_past.ptr
+        np.testing.assert_allclose(shared_outputs["output"].numpy(), expected, rtol=1.0e-2, atol=1.0e-2)
+        np.testing.assert_array_equal(shared_past.numpy(), expected_state)
     finally:
         path.unlink(missing_ok=True)
 
@@ -1358,6 +1365,13 @@ def test_linear_attention(device, query_heads, value_heads, key_heads, key_size,
             raise
         wp.capture_launch(graph)
         np.testing.assert_allclose(outputs["output"].numpy(), expected, rtol=5.0e-2, atol=5.0e-2)
+
+        shared_runtime = runtime._fork({name: value.shape for name, value in feeds.items()}, share_kv_cache=True)
+        shared_feeds = {name: wp.array(value, dtype=wp.float16, device=device) for name, value in feeds.items()}
+        shared_outputs = shared_runtime(shared_feeds)
+        assert shared_outputs["present"].ptr == shared_feeds["past"].ptr
+        np.testing.assert_allclose(shared_outputs["output"].numpy(), expected, rtol=5.0e-2, atol=5.0e-2)
+        np.testing.assert_allclose(shared_feeds["past"].numpy(), expected_state, rtol=5.0e-2, atol=5.0e-2)
     finally:
         path.unlink(missing_ok=True)
 
