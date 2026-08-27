@@ -39,6 +39,10 @@ Supported ONNX operators (all graph-capturable after one warmup call):
 * **LSTM** -- forward, single-direction, single-layer, ``seq_length=1``. The
   full step (gate GEMM + cell update) executes in two on-device kernels.
 
+Floating-point operators preserve matching FP16, BF16, FP32, or FP64 model
+dtypes. Non-floating initializers such as shape and axis tensors retain their
+declared dtype as well.
+
 Example::
 
     from warp_nn.runtime import OnnxRuntime
@@ -76,6 +80,45 @@ def _require_onnx():
     return onnx, numpy_helper
 
 
+_FLOAT_DTYPES = (wp.float16, wp.bfloat16, wp.float32, wp.float64)
+
+
+def _warp_dtype_from_onnx(onnx, elem_type: int):
+    """Map an ONNX tensor element type to a Warp scalar type."""
+    mapping = {
+        onnx.TensorProto.FLOAT16: wp.float16,
+        onnx.TensorProto.BFLOAT16: wp.bfloat16,
+        onnx.TensorProto.FLOAT: wp.float32,
+        onnx.TensorProto.DOUBLE: wp.float64,
+        onnx.TensorProto.INT8: wp.int8,
+        onnx.TensorProto.INT16: wp.int16,
+        onnx.TensorProto.INT32: wp.int32,
+        onnx.TensorProto.INT64: wp.int64,
+        onnx.TensorProto.UINT8: wp.uint8,
+        onnx.TensorProto.UINT16: wp.uint16,
+        onnx.TensorProto.UINT32: wp.uint32,
+        onnx.TensorProto.UINT64: wp.uint64,
+        onnx.TensorProto.BOOL: wp.bool,
+    }
+    try:
+        return mapping[elem_type]
+    except KeyError as exc:
+        type_name = onnx.TensorProto.DataType.Name(elem_type)
+        raise NotImplementedError(f"OnnxRuntime: unsupported tensor dtype '{type_name}'") from exc
+
+
+def _require_matching_float_dtypes(op, dtypes: dict[str, type], names: list[str]) -> type:
+    """Validate homogeneous floating-point inputs and return their dtype."""
+    dtype = dtypes[names[0]]
+    if dtype not in _FLOAT_DTYPES:
+        raise NotImplementedError(f"OnnxRuntime {op.op_type}: dtype '{dtype.__name__}' is not supported")
+    mismatched = {name: dtypes[name].__name__ for name in names if dtypes[name] != dtype}
+    if mismatched:
+        actual = {name: dtypes[name].__name__ for name in names}
+        raise ValueError(f"OnnxRuntime {op.op_type}: input dtypes must match, got {actual}")
+    return dtype
+
+
 # ---------------------------------------------------------------------------
 # Inference kernels
 # ---------------------------------------------------------------------------
@@ -87,10 +130,10 @@ def _require_onnx():
 
 @wp.kernel
 def _gemm_transb_kernel(
-    A: wp.array2d[float],  # (M, K)
-    B: wp.array2d[float],  # (N, K) — stored transposed
-    bias: wp.array[float],  # (N,)
-    C: wp.array2d[float],  # (M, N)
+    A: wp.array2d[Any],  # (M, K)
+    B: wp.array2d[Any],  # (N, K) — stored transposed
+    bias: wp.array1d[Any],  # (N,)
+    C: wp.array2d[Any],  # (M, N)
     K: int,
     alpha: float,
     beta: float,
@@ -98,11 +141,11 @@ def _gemm_transb_kernel(
     """``C = alpha * A @ B.T + beta * bias`` with ``transB=1``."""
     i, j = wp.tid()
 
-    s = float(0.0)
+    s = A.dtype(0.0)
     for k in range(K):
         s += A[i, k] * B[j, k]
 
-    C[i, j] = alpha * s + beta * bias[j]
+    C[i, j] = A.dtype(alpha) * s + A.dtype(beta) * bias[j]
 
 
 def _create_gemm_transb_tiled_kernel(config):
@@ -133,21 +176,21 @@ _GEMM_TRANSB_TILED_KERNEL = _create_gemm_transb_tiled_kernel(_GEMM_CONFIG)
 
 @wp.kernel
 def _elu_kernel(
-    x: wp.array2d[float],
-    y: wp.array2d[float],
+    x: wp.array2d[Any],
+    y: wp.array2d[Any],
     alpha: float,
 ):
     i, j = wp.tid()
     v = x[i, j]
-    y[i, j] = wp.where(v >= 0.0, v, alpha * (wp.exp(v) - 1.0))
+    y[i, j] = wp.where(v >= x.dtype(0.0), v, x.dtype(alpha) * (wp.exp(v) - x.dtype(1.0)))
 
 
 @wp.kernel
-def _unary_kernel(x: wp.array2d[float], operation: int, y: wp.array2d[float]):
+def _unary_kernel(x: wp.array2d[Any], operation: int, y: wp.array2d[Any]):
     i, j = wp.tid()
     value = x[i, j]
     if operation == 0:
-        y[i, j] = wp.max(value, 0.0)
+        y[i, j] = wp.max(value, x.dtype(0.0))
     elif operation == 1:
         y[i, j] = wp.tanh(value)
     else:
@@ -156,10 +199,10 @@ def _unary_kernel(x: wp.array2d[float], operation: int, y: wp.array2d[float]):
 
 @wp.kernel
 def _binary_broadcast_kernel(
-    lhs: wp.array2d[float],
-    rhs: wp.array2d[float],
+    lhs: wp.array2d[Any],
+    rhs: wp.array2d[Any],
     operation: int,
-    out: wp.array2d[float],
+    out: wp.array2d[Any],
 ):
     i, j = wp.tid()
     left = lhs[i % lhs.shape[0], j % lhs.shape[1]]
@@ -175,34 +218,34 @@ def _binary_broadcast_kernel(
 
 
 @wp.kernel
-def _reduce_mean_rows_kernel(x: wp.array2d[float], out: wp.array2d[float]):
+def _reduce_mean_rows_kernel(x: wp.array2d[Any], out: wp.array2d[Any]):
     row = wp.tid()
-    total = float(0.0)
+    total = x.dtype(0.0)
     for column in range(x.shape[1]):
         total += x[row, column]
-    out[row, 0] = total / float(x.shape[1])
+    out[row, 0] = total / x.dtype(x.shape[1])
 
 
 @wp.kernel
 def _batch_normalization_kernel(
-    x: wp.array2d[float],
-    scale: wp.array[float],
-    bias: wp.array[float],
-    mean: wp.array[float],
-    variance: wp.array[float],
+    x: wp.array2d[Any],
+    scale: wp.array1d[Any],
+    bias: wp.array1d[Any],
+    mean: wp.array1d[Any],
+    variance: wp.array1d[Any],
     epsilon: float,
     relu: bool,
-    y: wp.array2d[float],
+    y: wp.array2d[Any],
 ):
     row, column = wp.tid()
-    unit = (x[row, column] - mean[column]) / wp.sqrt(variance[column] + epsilon)
+    unit = (x[row, column] - mean[column]) / wp.sqrt(variance[column] + x.dtype(epsilon))
     value = unit * scale[column] + bias[column]
-    y[row, column] = wp.where(relu, wp.max(value, 0.0), value)
+    y[row, column] = wp.where(relu, wp.max(value, x.dtype(0.0)), value)
 
 
 @wp.func
-def _inverse_sqrt(value: float):
-    return 1.0 / wp.sqrt(value)
+def _inverse_sqrt(value: Any):
+    return value.dtype(1.0) / wp.sqrt(value)
 
 
 def _create_rms_normalization_kernel(width: int):
@@ -210,16 +253,16 @@ def _create_rms_normalization_kernel(width: int):
 
     @wp.kernel
     def kernel(
-        x: wp.array2d[float],
-        epsilon: wp.array[float],
-        scale: wp.array[float],
-        output: wp.array2d[float],
+        x: wp.array2d[Any],
+        epsilon: wp.array1d[Any],
+        scale: wp.array1d[Any],
+        output: wp.array2d[Any],
     ):
         row = wp.tid()
         values = wp.tile_load(x, shape=(1, wp.static(width)), offset=(row, 0))
         sum_squares = wp.tile_sum(values * values)
         epsilon_tile = wp.tile_load(epsilon, shape=(1,), offset=(0,))
-        inverse_rms = wp.tile_map(_inverse_sqrt, sum_squares / float(wp.static(width)) + epsilon_tile)
+        inverse_rms = wp.tile_map(_inverse_sqrt, sum_squares / x.dtype(wp.static(width)) + epsilon_tile)
         inverse_rms = wp.tile_broadcast(inverse_rms, shape=(1, wp.static(width)))
         scales = wp.tile_broadcast(
             wp.tile_load(scale, shape=(wp.static(width),), offset=(0,)),
@@ -232,18 +275,18 @@ def _create_rms_normalization_kernel(width: int):
 
 @wp.kernel
 def _lstm_gates_kernel(
-    x: wp.array2d[float],  # (batch, input_size)
-    h_prev: wp.array2d[float],  # (batch, hidden_size)
-    W: wp.array2d[float],  # (4*hidden_size, input_size)
-    R: wp.array2d[float],  # (4*hidden_size, hidden_size)
-    gates: wp.array2d[float],  # (batch, 4*hidden_size) output
+    x: wp.array2d[Any],  # (batch, input_size)
+    h_prev: wp.array2d[Any],  # (batch, hidden_size)
+    W: wp.array2d[Any],  # (4*hidden_size, input_size)
+    R: wp.array2d[Any],  # (4*hidden_size, hidden_size)
+    gates: wp.array2d[Any],  # (batch, 4*hidden_size) output
     input_size: int,
     hidden_size: int,
 ):
     """``gates = x @ W.T + h_prev @ R.T`` (one thread per (batch, gate))."""
     b, j = wp.tid()
 
-    s = float(0.0)
+    s = x.dtype(0.0)
     for k in range(input_size):
         s += x[b, k] * W[j, k]
     for k in range(hidden_size):
@@ -254,12 +297,12 @@ def _lstm_gates_kernel(
 
 @wp.kernel
 def _lstm_cell_update_kernel(
-    gates: wp.array2d[float],  # (batch, 4*hidden_size); already x@W.T + h_prev@R.T
-    c_prev: wp.array2d[float],  # (batch, hidden_size)
-    Bx: wp.array[float],  # (4*hidden_size,)
-    Bh: wp.array[float],  # (4*hidden_size,)
-    h_out: wp.array2d[float],  # (batch, hidden_size)
-    c_out: wp.array2d[float],  # (batch, hidden_size)
+    gates: wp.array2d[Any],  # (batch, 4*hidden_size); already x@W.T + h_prev@R.T
+    c_prev: wp.array2d[Any],  # (batch, hidden_size)
+    Bx: wp.array1d[Any],  # (4*hidden_size,)
+    Bh: wp.array1d[Any],  # (4*hidden_size,)
+    h_out: wp.array2d[Any],  # (batch, hidden_size)
+    c_out: wp.array2d[Any],  # (batch, hidden_size)
     hidden_size: int,
 ):
     b, h = wp.tid()
@@ -269,14 +312,31 @@ def _lstm_cell_update_kernel(
     s_f = gates[b, 2 * hidden_size + h] + Bx[2 * hidden_size + h] + Bh[2 * hidden_size + h]
     s_c = gates[b, 3 * hidden_size + h] + Bx[3 * hidden_size + h] + Bh[3 * hidden_size + h]
 
-    g_i = 1.0 / (1.0 + wp.exp(-s_i))
-    g_o = 1.0 / (1.0 + wp.exp(-s_o))
-    g_f = 1.0 / (1.0 + wp.exp(-s_f))
+    one = gates.dtype(1.0)
+    g_i = one / (one + wp.exp(-s_i))
+    g_o = one / (one + wp.exp(-s_o))
+    g_f = one / (one + wp.exp(-s_f))
     g_c = wp.tanh(s_c)
 
     c_new = g_f * c_prev[b, h] + g_i * g_c
     c_out[b, h] = c_new
     h_out[b, h] = g_o * wp.tanh(c_new)
+
+
+def _array_type(dtype: type, ndim: int):
+    return wp.array(dtype=dtype, ndim=ndim)
+
+
+_KERNEL_OVERLOADS: dict[tuple[Any, ...], Any] = {}
+
+
+def _kernel_for_dtype(kernel, dtype: type, *parameter_types: type | tuple[int]):
+    """Return one cached specialization of a generic same-dtype kernel."""
+    key = (kernel, dtype, parameter_types)
+    if key not in _KERNEL_OVERLOADS:
+        signature = [_array_type(dtype, item[0]) if isinstance(item, tuple) else item for item in parameter_types]
+        _KERNEL_OVERLOADS[key] = wp.overload(kernel, signature)
+    return _KERNEL_OVERLOADS[key]
 
 
 # ---------------------------------------------------------------------------
@@ -407,8 +467,14 @@ def _fuse_inference_ops(ops: list[_Op], graph_outputs: set[str], initializer_nam
 
 
 def _np_to_warp(arr_np: np.ndarray, device: wp.context.Device, requires_grad: bool = False) -> wp.array:
-    arr_np = np.ascontiguousarray(arr_np, dtype=np.float32)
-    return wp.array(arr_np, dtype=wp.float32, device=device, requires_grad=requires_grad)
+    arr_np = np.ascontiguousarray(arr_np)
+    dtype = wp.dtype_from_numpy(arr_np.dtype)
+    return wp.array(
+        arr_np,
+        dtype=dtype,
+        device=device,
+        requires_grad=requires_grad and dtype in _FLOAT_DTYPES,
+    )
 
 
 class OnnxRuntime:
@@ -452,11 +518,13 @@ class OnnxRuntime:
 
         self._tensors: dict[str, wp.array] = {}
         self._shapes: dict[str, tuple[int, ...]] = {}
+        self._dtypes: dict[str, type] = {}
 
         for init in graph.initializer:
-            arr_np = numpy_helper.to_array(init).astype(np.float32)
+            arr_np = numpy_helper.to_array(init)
             self._tensors[init.name] = _np_to_warp(arr_np, self._device, requires_grad=self._requires_grad)
             self._shapes[init.name] = tuple(arr_np.shape)
+            self._dtypes[init.name] = self._tensors[init.name].dtype
 
         initializer_names = {init.name for init in graph.initializer}
         self.input_names: list[str] = [inp.name for inp in graph.input if inp.name not in initializer_names]
@@ -496,6 +564,7 @@ class OnnxRuntime:
                 else:
                     shape.append(batch_size)
             self._shapes[inp.name] = tuple(shape)
+            self._dtypes[inp.name] = _warp_dtype_from_onnx(onnx, inp.type.tensor_type.elem_type)
 
         self._ops: list[_Op] = []
         for node in graph.node:
@@ -520,7 +589,7 @@ class OnnxRuntime:
             if handler is None:
                 supported = sorted(name for name in _OP_DISPATCH if not name.startswith("_"))
                 raise NotImplementedError(f"OnnxRuntime: unsupported op '{op.op_type}'.  Supported ops: {supported}")
-            handler(op, self._shapes, self._tensors, self._device, self._requires_grad)
+            handler(op, self._shapes, self._dtypes, self._tensors, self._device, self._requires_grad)
 
     def __call__(self, inputs: dict[str, wp.array]) -> dict[str, wp.array]:
         """Run forward inference.
@@ -546,6 +615,12 @@ class OnnxRuntime:
             expected_shape = self._shapes[name]
             if tuple(arr.shape) != expected_shape:
                 raise ValueError(f"OnnxRuntime: input '{name}' has shape {tuple(arr.shape)}, expected {expected_shape}")
+            expected_dtype = self._dtypes[name]
+            if arr.dtype != expected_dtype:
+                raise TypeError(
+                    f"OnnxRuntime: input '{name}' has dtype '{arr.dtype.__name__}', "
+                    f"expected '{expected_dtype.__name__}'"
+                )
             tensors[name] = arr
 
         for op in self._ops:
@@ -557,7 +632,7 @@ class OnnxRuntime:
         return {name: tensors[name] for name in self.output_names}
 
 
-def _shape_gemm(op, shapes, tensors, device, requires_grad=False):
+def _shape_gemm(op, shapes, dtypes, tensors, device, requires_grad=False):
     A_shape = shapes[op.inputs[0]]
     B_shape = shapes[op.inputs[1]]
     transA = int(op.attrs.get("transA", 0))
@@ -578,26 +653,30 @@ def _shape_gemm(op, shapes, tensors, device, requires_grad=False):
     bias_shape = shapes[op.inputs[2]]
     if bias_shape != (N,):
         raise ValueError(f"OnnxRuntime Gemm: bias '{op.inputs[2]}' has shape {bias_shape}, expected {(N,)}")
+    dtype = _require_matching_float_dtypes(op, dtypes, op.inputs[:3])
     out_shape = (M, N)
     out_name = op.outputs[0]
     if out_name not in tensors:
-        tensors[out_name] = wp.zeros(out_shape, dtype=wp.float32, device=device, requires_grad=requires_grad)
+        tensors[out_name] = wp.zeros(out_shape, dtype=dtype, device=device, requires_grad=requires_grad)
     shapes[out_name] = out_shape
+    dtypes[out_name] = dtype
     op.attrs["_bias_2d"] = tensors[op.inputs[2]].reshape((N, 1))
     op.attrs["_requires_grad"] = requires_grad
 
 
-def _shape_elementwise_unary(op, shapes, tensors, device, requires_grad=False):
+def _shape_elementwise_unary(op, shapes, dtypes, tensors, device, requires_grad=False):
     in_shape = shapes[op.inputs[0]]
     if len(in_shape) != 2:
         raise NotImplementedError("OnnxRuntime Elu: only 2-D tensors are supported")
+    dtype = _require_matching_float_dtypes(op, dtypes, [op.inputs[0]])
     out_name = op.outputs[0]
     if out_name not in tensors:
-        tensors[out_name] = wp.zeros(in_shape, dtype=wp.float32, device=device, requires_grad=requires_grad)
+        tensors[out_name] = wp.zeros(in_shape, dtype=dtype, device=device, requires_grad=requires_grad)
     shapes[out_name] = in_shape
+    dtypes[out_name] = dtype
 
 
-def _shape_elementwise_binary(op, shapes, tensors, device, requires_grad=False):
+def _shape_elementwise_binary(op, shapes, dtypes, tensors, device, requires_grad=False):
     lhs_shape = shapes[op.inputs[0]]
     rhs_shape = shapes[op.inputs[1]]
     if len(lhs_shape) not in (1, 2) or len(rhs_shape) not in (1, 2):
@@ -612,10 +691,12 @@ def _shape_elementwise_binary(op, shapes, tensors, device, requires_grad=False):
     out_shape = tuple(max(lhs_size, rhs_size) for lhs_size, rhs_size in zip(lhs_2d, rhs_2d))
     if requires_grad and (lhs_2d != out_shape or rhs_2d != out_shape):
         raise NotImplementedError(f"OnnxRuntime {op.op_type}: broadcast gradients are not supported deterministically")
+    dtype = _require_matching_float_dtypes(op, dtypes, op.inputs[:2])
     out_name = op.outputs[0]
     if out_name not in tensors:
-        tensors[out_name] = wp.zeros(out_shape, dtype=wp.float32, device=device, requires_grad=requires_grad)
+        tensors[out_name] = wp.zeros(out_shape, dtype=dtype, device=device, requires_grad=requires_grad)
     shapes[out_name] = out_shape
+    dtypes[out_name] = dtype
     op.attrs["_lhs_shape_2d"] = lhs_2d
     op.attrs["_rhs_shape_2d"] = rhs_2d
     if op.inputs[0] in tensors and len(lhs_shape) == 1:
@@ -624,20 +705,22 @@ def _shape_elementwise_binary(op, shapes, tensors, device, requires_grad=False):
         op.attrs["_rhs_view"] = tensors[op.inputs[1]].reshape(rhs_2d)
 
 
-def _shape_reduce_mean(op, shapes, tensors, device, requires_grad=False):
+def _shape_reduce_mean(op, shapes, dtypes, tensors, device, requires_grad=False):
     in_shape = shapes[op.inputs[0]]
     axes = tuple(int(axis) for axis in op.attrs.get("axes", []))
     keepdims = int(op.attrs.get("keepdims", 1))
     if len(in_shape) != 2 or axes not in ((1,), (-1,)) or keepdims != 1:
         raise NotImplementedError("OnnxRuntime ReduceMean: only 2-D row reductions with keepdims=1 are supported")
+    dtype = _require_matching_float_dtypes(op, dtypes, [op.inputs[0]])
     out_shape = (in_shape[0], 1)
     out_name = op.outputs[0]
     if out_name not in tensors:
-        tensors[out_name] = wp.zeros(out_shape, dtype=wp.float32, device=device, requires_grad=requires_grad)
+        tensors[out_name] = wp.zeros(out_shape, dtype=dtype, device=device, requires_grad=requires_grad)
     shapes[out_name] = out_shape
+    dtypes[out_name] = dtype
 
 
-def _shape_batch_normalization(op, shapes, tensors, device, requires_grad=False):
+def _shape_batch_normalization(op, shapes, dtypes, tensors, device, requires_grad=False):
     if requires_grad:
         raise NotImplementedError("OnnxRuntime BatchNormalization: deterministic gradients are not supported")
     if len(op.inputs) != 5:
@@ -653,13 +736,15 @@ def _shape_batch_normalization(op, shapes, tensors, device, requires_grad=False)
             )
     if int(op.attrs.get("training_mode", 0)) != 0:
         raise NotImplementedError("OnnxRuntime BatchNormalization: training mode is not supported")
+    dtype = _require_matching_float_dtypes(op, dtypes, op.inputs)
     out_name = op.outputs[0]
     if out_name not in tensors:
-        tensors[out_name] = wp.zeros(in_shape, dtype=wp.float32, device=device, requires_grad=requires_grad)
+        tensors[out_name] = wp.zeros(in_shape, dtype=dtype, device=device, requires_grad=requires_grad)
     shapes[out_name] = in_shape
+    dtypes[out_name] = dtype
 
 
-def _shape_rms_normalization(op, shapes, tensors, device, requires_grad=False):
+def _shape_rms_normalization(op, shapes, dtypes, tensors, device, requires_grad=False):
     if requires_grad:
         raise RuntimeError("internal inference fusion cannot require gradients")
     shape = shapes[op.inputs[0]]
@@ -668,18 +753,22 @@ def _shape_rms_normalization(op, shapes, tensors, device, requires_grad=False):
     if shapes[op.inputs[1]] != (1,):
         raise ValueError("OnnxRuntime fused RMS normalization epsilon must have shape (1,)")
     width = shape[1]
+    dtype_names = [name for name in op.inputs if name]
+    dtype = _require_matching_float_dtypes(op, dtypes, dtype_names)
     if op.inputs[2]:
         if shapes[op.inputs[2]] != (width,):
             raise ValueError("OnnxRuntime fused RMS normalization scale has invalid shape")
         op.attrs["_scale"] = tensors[op.inputs[2]]
     else:
-        op.attrs["_scale"] = wp.ones(width, dtype=wp.float32, device=device)
-    op.attrs["_kernel"] = _create_rms_normalization_kernel(width)
-    tensors[op.outputs[0]] = wp.zeros(shape, dtype=wp.float32, device=device)
+        op.attrs["_scale"] = wp.ones(width, dtype=dtype, device=device)
+    kernel = _create_rms_normalization_kernel(width)
+    op.attrs["_kernel"] = _kernel_for_dtype(kernel, dtype, (2,), (1,), (1,), (2,))
+    tensors[op.outputs[0]] = wp.zeros(shape, dtype=dtype, device=device)
     shapes[op.outputs[0]] = shape
+    dtypes[op.outputs[0]] = dtype
 
 
-def _shape_squeeze(op, shapes, tensors, device, requires_grad=False):
+def _shape_squeeze(op, shapes, dtypes, tensors, device, requires_grad=False):
     in_shape = shapes[op.inputs[0]]
     axes = None
     if len(op.inputs) > 1 and op.inputs[1] in tensors:
@@ -697,10 +786,11 @@ def _shape_squeeze(op, shapes, tensors, device, requires_grad=False):
             f"OnnxRuntime Squeeze: only squeezes that produce a 2-D tensor are supported (got {out_shape})"
         )
     shapes[op.outputs[0]] = out_shape
+    dtypes[op.outputs[0]] = dtypes[op.inputs[0]]
     op.attrs["_out_shape"] = out_shape
 
 
-def _shape_lstm(op, shapes, tensors, device, requires_grad=False):
+def _shape_lstm(op, shapes, dtypes, tensors, device, requires_grad=False):
     for unsupported in ("activations", "activation_alpha", "activation_beta"):
         if unsupported in op.attr_names:
             raise NotImplementedError(
@@ -751,6 +841,12 @@ def _shape_lstm(op, shapes, tensors, device, requires_grad=False):
     if R_shape != (1, 4 * hidden_size, hidden_size):
         raise ValueError(f"OnnxRuntime LSTM: R has shape {R_shape}, expected {(1, 4 * hidden_size, hidden_size)}")
 
+    dtype_inputs = [name for name in (op.inputs[0], op.inputs[1], op.inputs[2]) if name]
+    for index in (3, 5, 6):
+        if len(op.inputs) > index and op.inputs[index]:
+            dtype_inputs.append(op.inputs[index])
+    dtype = _require_matching_float_dtypes(op, dtypes, dtype_inputs)
+
     W_full = tensors[op.inputs[1]]
     R_full = tensors[op.inputs[2]]
     cache: dict[str, wp.array] = {}
@@ -768,20 +864,20 @@ def _shape_lstm(op, shapes, tensors, device, requires_grad=False):
     else:
         cache["Bx"] = wp.zeros(
             4 * hidden_size,
-            dtype=wp.float32,
+            dtype=dtype,
             device=device,
             requires_grad=requires_grad,
         )
         cache["Bh"] = wp.zeros(
             4 * hidden_size,
-            dtype=wp.float32,
+            dtype=dtype,
             device=device,
             requires_grad=requires_grad,
         )
 
     cache["gates"] = wp.zeros(
         (batch, 4 * hidden_size),
-        dtype=wp.float32,
+        dtype=dtype,
         device=device,
         requires_grad=requires_grad,
     )
@@ -789,17 +885,18 @@ def _shape_lstm(op, shapes, tensors, device, requires_grad=False):
     cache["hidden_size"] = hidden_size
     cache["batch"] = batch
     cache["layout"] = layout
+    cache["dtype"] = dtype
     op.attrs["_cache"] = cache
 
     h_buf = wp.zeros(
         (batch, hidden_size),
-        dtype=wp.float32,
+        dtype=dtype,
         device=device,
         requires_grad=requires_grad,
     )
     c_buf = wp.zeros(
         (batch, hidden_size),
-        dtype=wp.float32,
+        dtype=dtype,
         device=device,
         requires_grad=requires_grad,
     )
@@ -815,12 +912,15 @@ def _shape_lstm(op, shapes, tensors, device, requires_grad=False):
     if len(op.outputs) > 0 and op.outputs[0]:
         tensors[op.outputs[0]] = h_buf.reshape(Y_shape)
         shapes[op.outputs[0]] = Y_shape
+        dtypes[op.outputs[0]] = dtype
     if len(op.outputs) > 1 and op.outputs[1]:
         tensors[op.outputs[1]] = h_buf.reshape(Yh_shape)
         shapes[op.outputs[1]] = Yh_shape
+        dtypes[op.outputs[1]] = dtype
     if len(op.outputs) > 2 and op.outputs[2]:
         tensors[op.outputs[2]] = c_buf.reshape(Yh_shape)
         shapes[op.outputs[2]] = Yh_shape
+        dtypes[op.outputs[2]] = dtype
 
 
 def _exec_gemm(op, tensors, shapes, device):
@@ -833,9 +933,9 @@ def _exec_gemm(op, tensors, shapes, device):
     M = shapes[op.inputs[0]][0]
     N, K = shapes[op.inputs[1]]
 
-    if op.attrs["_requires_grad"]:
+    if op.attrs["_requires_grad"] or A.dtype != wp.float32:
         wp.launch(
-            _gemm_transb_kernel,
+            _kernel_for_dtype(_gemm_transb_kernel, A.dtype, (2,), (2,), (1,), (2,), int, float, float),
             dim=(M, N),
             inputs=[A, B, bias, out, K, alpha, beta],
             device=device,
@@ -856,13 +956,14 @@ def _exec_elu(op, tensors, shapes, device):
     alpha = float(op.attrs.get("alpha", 1.0))
     out = tensors[op.outputs[0]]
     shape = shapes[op.inputs[0]]
-    wp.launch(_elu_kernel, dim=shape, inputs=[x, out, alpha], device=device)
+    kernel = _kernel_for_dtype(_elu_kernel, x.dtype, (2,), (2,), float)
+    wp.launch(kernel, dim=shape, inputs=[x, out, alpha], device=device)
 
 
 def _exec_unary(op, tensors, shapes, device):
     operation = {"Relu": 0, "Tanh": 1, "Sqrt": 2}[op.op_type]
     wp.launch(
-        _unary_kernel,
+        _kernel_for_dtype(_unary_kernel, tensors[op.inputs[0]].dtype, (2,), int, (2,)),
         dim=shapes[op.inputs[0]],
         inputs=[tensors[op.inputs[0]], operation],
         outputs=[tensors[op.outputs[0]]],
@@ -879,7 +980,7 @@ def _exec_binary(op, tensors, shapes, device):
         rhs = rhs.reshape(op.attrs["_rhs_shape_2d"])
     operation = {"Add": 0, "Sub": 1, "Mul": 2, "Div": 3}[op.op_type]
     wp.launch(
-        _binary_broadcast_kernel,
+        _kernel_for_dtype(_binary_broadcast_kernel, lhs.dtype, (2,), (2,), int, (2,)),
         dim=shapes[op.outputs[0]],
         inputs=[lhs, rhs, operation],
         outputs=[tensors[op.outputs[0]]],
@@ -889,7 +990,7 @@ def _exec_binary(op, tensors, shapes, device):
 
 def _exec_reduce_mean(op, tensors, shapes, device):
     wp.launch(
-        _reduce_mean_rows_kernel,
+        _kernel_for_dtype(_reduce_mean_rows_kernel, tensors[op.inputs[0]].dtype, (2,), (2,)),
         dim=shapes[op.inputs[0]][0],
         inputs=[tensors[op.inputs[0]]],
         outputs=[tensors[op.outputs[0]]],
@@ -899,7 +1000,18 @@ def _exec_reduce_mean(op, tensors, shapes, device):
 
 def _exec_batch_normalization(op, tensors, shapes, device):
     wp.launch(
-        _batch_normalization_kernel,
+        _kernel_for_dtype(
+            _batch_normalization_kernel,
+            tensors[op.inputs[0]].dtype,
+            (2,),
+            (1,),
+            (1,),
+            (1,),
+            (1,),
+            float,
+            bool,
+            (2,),
+        ),
         dim=shapes[op.inputs[0]],
         inputs=[
             tensors[op.inputs[0]],
@@ -950,13 +1062,13 @@ def _exec_lstm(op, tensors, shapes, device):
         h_prev = tensors[op.inputs[5]].reshape((batch, hidden_size))
     else:
         if "h_prev_zero" not in cache:
-            cache["h_prev_zero"] = wp.zeros((batch, hidden_size), dtype=wp.float32, device=device)
+            cache["h_prev_zero"] = wp.zeros((batch, hidden_size), dtype=cache["dtype"], device=device)
         h_prev = cache["h_prev_zero"]
     if len(op.inputs) > 6 and op.inputs[6] and op.inputs[6] in tensors:
         c_prev = tensors[op.inputs[6]].reshape((batch, hidden_size))
     else:
         if "c_prev_zero" not in cache:
-            cache["c_prev_zero"] = wp.zeros((batch, hidden_size), dtype=wp.float32, device=device)
+            cache["c_prev_zero"] = wp.zeros((batch, hidden_size), dtype=cache["dtype"], device=device)
         c_prev = cache["c_prev_zero"]
 
     gates = cache["gates"]
@@ -964,13 +1076,13 @@ def _exec_lstm(op, tensors, shapes, device):
     c_out = cache["c_out"]
 
     wp.launch(
-        _lstm_gates_kernel,
+        _kernel_for_dtype(_lstm_gates_kernel, cache["dtype"], (2,), (2,), (2,), (2,), (2,), int, int),
         dim=(batch, 4 * hidden_size),
         inputs=[x_t, h_prev, cache["W"], cache["R"], gates, input_size, hidden_size],
         device=device,
     )
     wp.launch(
-        _lstm_cell_update_kernel,
+        _kernel_for_dtype(_lstm_cell_update_kernel, cache["dtype"], (2,), (2,), (1,), (1,), (2,), (2,), int),
         dim=(batch, hidden_size),
         inputs=[gates, c_prev, cache["Bx"], cache["Bh"], h_out, c_out, hidden_size],
         device=device,

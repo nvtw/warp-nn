@@ -16,6 +16,7 @@
 import pytest
 
 import tempfile
+from copy import deepcopy
 from pathlib import Path
 
 
@@ -29,6 +30,20 @@ import warp as wp
 
 from tests.utilities import check_arrays, is_device_available
 from warp_nn.runtime import OnnxRuntime
+
+
+def _convert_float_model_dtype(model: onnx.ModelProto, np_dtype, tensor_type: int) -> onnx.ModelProto:
+    model = deepcopy(model)
+    for index, initializer in enumerate(model.graph.initializer):
+        if initializer.data_type == TensorProto.FLOAT:
+            model.graph.initializer[index].CopyFrom(
+                numpy_helper.from_array(numpy_helper.to_array(initializer).astype(np_dtype), name=initializer.name)
+            )
+    for value_info in (*model.graph.input, *model.graph.output, *model.graph.value_info):
+        if value_info.type.tensor_type.elem_type == TensorProto.FLOAT:
+            value_info.type.tensor_type.elem_type = tensor_type
+    onnx.checker.check_model(model)
+    return model
 
 
 def _node_attrs(node) -> dict[str, float | int]:
@@ -303,6 +318,40 @@ def test_mlp_policy(device):
         path.unlink(missing_ok=True)
 
 
+@pytest.mark.parametrize(
+    "np_dtype,tensor_type,warp_dtype,rtol,atol",
+    [
+        (np.float16, TensorProto.FLOAT16, wp.float16, 2.0e-2, 2.0e-2),
+        (np.float64, TensorProto.DOUBLE, wp.float64, 1.0e-6, 1.0e-6),
+    ],
+)
+@pytest.mark.parametrize("device", ["cuda"])
+def test_preserves_floating_point_dtypes(device, np_dtype, tensor_type, warp_dtype, rtol, atol):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    model = _convert_float_model_dtype(_build_mlp_policy_model((8, 6, 4), seed=17), np_dtype, tensor_type)
+    rng = np.random.default_rng(17)
+    observation = rng.standard_normal((1, 8)).astype(np_dtype)
+    expected = _run_numpy_mlp(model, {"observation": observation})["action"]
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        rt = OnnxRuntime(str(path), device=device)
+        assert {tensor.dtype for tensor in rt._tensors.values()} == {warp_dtype}
+
+        with pytest.raises(TypeError, match="expected"):
+            rt({"observation": wp.array(observation.astype(np.float32), dtype=wp.float32, device=device)})
+
+        output = rt({"observation": wp.array(observation, dtype=warp_dtype, device=device)})["action"]
+        assert output.dtype == warp_dtype
+        np.testing.assert_allclose(output.numpy(), expected, rtol=rtol, atol=atol)
+    finally:
+        path.unlink(missing_ok=True)
+
+
 @pytest.mark.parametrize("device", ["cuda"])
 def test_mlp_policy_input_gradients(device):
     if not is_device_available(device):
@@ -498,6 +547,36 @@ def test_general_ops_graph_capture_is_deterministic(device):
 
 
 @pytest.mark.parametrize("device", ["cuda"])
+def test_general_ops_float16(device):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    batch, input_size, output_size = 3, 8, 5
+    model = _convert_float_model_dtype(
+        _build_general_ops_model(batch, input_size, output_size, seed=11), np.float16, TensorProto.FLOAT16
+    )
+    values = {item.name: numpy_helper.to_array(item).astype(np.float32) for item in model.graph.initializer}
+    input_np = np.random.default_rng(11).standard_normal((batch, input_size)).astype(np.float16)
+    linear = input_np.astype(np.float32) @ values["weight"].T + values["bias"]
+    normalized = (linear - values["mean"]) / np.sqrt(values["variance"] + 1.0e-5)
+    activated = np.maximum(normalized * values["scale"] + values["bn_bias"], 0.0)
+    unit = activated / np.sqrt(np.mean(activated * activated, axis=1, keepdims=True) + values["epsilon"])
+    expected = np.tanh(unit * values["rms_scale"] - values["zero"])
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        output = OnnxRuntime(str(path), device=device, batch_size=batch)(
+            {"input": wp.array(input_np, dtype=wp.float16, device=device)}
+        )["output"]
+        assert output.dtype == wp.float16
+        np.testing.assert_allclose(output.numpy(), expected, rtol=2.0e-2, atol=2.0e-2)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("device", ["cuda"])
 def test_rejects_unsupported_ops(device):
     if not is_device_available(device):
         pytest.skip(f"Device '{device}' is not available")
@@ -619,6 +698,31 @@ def test_lstm_single_step(device):
             rtol=1e-3,
             atol=1e-4,
         )
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("device", ["cuda"])
+def test_lstm_float16_preserves_integer_axes(device):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    batch, input_size, hidden_size = 2, 3, 4
+    model = _convert_float_model_dtype(
+        _build_lstm_step_model(batch, input_size, hidden_size, seed=13), np.float16, TensorProto.FLOAT16
+    )
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        rt = OnnxRuntime(str(path), device=device, batch_size=batch)
+        assert rt._tensors["squeeze_axes"].dtype == wp.int64
+        zeros = {
+            "input": wp.zeros((1, batch, input_size), dtype=wp.float16, device=device),
+            "h_in": wp.zeros((1, batch, hidden_size), dtype=wp.float16, device=device),
+            "c_in": wp.zeros((1, batch, hidden_size), dtype=wp.float16, device=device),
+        }
+        assert {output.dtype for output in rt(zeros).values()} == {wp.float16}
     finally:
         path.unlink(missing_ok=True)
 
