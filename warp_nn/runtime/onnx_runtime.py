@@ -490,10 +490,17 @@ def _gather_single_index_kernel(
 def _subgroup_sum(value: float, width: int) -> float: ...
 
 
+def _nbits_reduction_width(bits: int, packed_block_size: int, warp_reduction: bool) -> int:
+    if not warp_reduction:
+        return 1
+    width = 1 << (packed_block_size - 1).bit_length()
+    return min(32, width // 2 if bits == 8 and width > 1 else width)
+
+
 def _create_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_reduction: bool):
     values_per_byte = 8 // bits
     packed_block_size = block_size // values_per_byte
-    reduction_width = min(32, 1 << (packed_block_size - 1).bit_length()) if warp_reduction else 1
+    reduction_width = _nbits_reduction_width(bits, packed_block_size, warp_reduction)
     load_stride = reduction_width
     loads_per_lane = (packed_block_size + load_stride - 1) // load_stride
 
@@ -542,7 +549,7 @@ def _create_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_re
 @lru_cache(maxsize=None)
 def _get_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_reduction: bool):
     packed_block_size = block_size * bits // 8
-    reduction_width = min(32, 1 << (packed_block_size - 1).bit_length()) if warp_reduction else 1
+    reduction_width = _nbits_reduction_width(bits, packed_block_size, warp_reduction)
     return reduction_width, _create_matmul_nbits_kernel(bits, block_size, dtype, warp_reduction)
 
 
