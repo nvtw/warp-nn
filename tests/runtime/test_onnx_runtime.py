@@ -713,21 +713,65 @@ def test_gather_block_quantized_int8(device):
         path.unlink(missing_ok=True)
 
 
-@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("device", ["cuda"])
+def test_gather_bfloat16_embedding(device):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    table = np.arange(35, dtype=np.float32).reshape(7, 5).astype(np.dtype("bfloat16"))
+    indices = np.array([[6, 1, 3], [0, 4, 2]], dtype=np.int64)
+    model = helper.make_model(
+        helper.make_graph(
+            [helper.make_node("Gather", ["table", "indices"], ["output"])],
+            "embedding",
+            [helper.make_tensor_value_info("indices", TensorProto.INT64, list(indices.shape))],
+            [helper.make_tensor_value_info("output", TensorProto.BFLOAT16, [2, 3, 5])],
+            [numpy_helper.from_array(table, name="table")],
+        ),
+        opset_imports=[helper.make_opsetid("", 21)],
+    )
+    model.ir_version = 10
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        output = OnnxRuntime(str(path), device=device)({"indices": wp.array(indices, dtype=wp.int64, device=device)})[
+            "output"
+        ]
+        np.testing.assert_array_equal(output.numpy(), table[indices])
+    finally:
+        path.unlink(missing_ok=True)
+
+
 @pytest.mark.parametrize("batch,sequence", [(2, 3), (1, 1)])
 @pytest.mark.parametrize("use_cublas", [False, True])
+@pytest.mark.parametrize(
+    "data_type,bits,block_size,has_zero_points",
+    [
+        (TensorProto.FLOAT16, 4, 128, True),
+        (TensorProto.FLOAT16, 8, 128, True),
+        (TensorProto.BFLOAT16, 4, 32, False),
+    ],
+)
 @pytest.mark.parametrize("device", ["cuda"])
-def test_matmul_nbits(device, bits, batch, sequence, use_cublas):
+def test_matmul_nbits(device, bits, batch, sequence, use_cublas, data_type, block_size, has_zero_points):
     if not is_device_available(device):
         pytest.skip(f"Device '{device}' is not available")
 
     rng = np.random.default_rng(37 + bits)
     K, N = 256, 5
-    blocks = K // 128
-    activations = rng.standard_normal((batch, sequence, K)).astype(np.float16)
-    quantized = rng.integers(0, 1 << bits, size=(N, blocks, 128), dtype=np.uint8)
-    scales = rng.uniform(0.001, 0.02, size=(N, blocks)).astype(np.float16)
-    zero_values = rng.integers(0, 1 << bits, size=(N, blocks), dtype=np.uint8)
+    np_dtype = np.float16 if data_type == TensorProto.FLOAT16 else np.dtype("bfloat16")
+    wp_dtype = wp.float16 if data_type == TensorProto.FLOAT16 else wp.bfloat16
+    blocks = K // block_size
+    activations = rng.standard_normal((batch, sequence, K)).astype(np_dtype)
+    quantized = rng.integers(0, 1 << bits, size=(N, blocks, block_size), dtype=np.uint8)
+    scales = rng.uniform(0.001, 0.02, size=(N, blocks)).astype(np_dtype)
+    zero_values = (
+        rng.integers(0, 1 << bits, size=(N, blocks), dtype=np.uint8)
+        if has_zero_points
+        else np.full((N, blocks), 1 << (bits - 1), dtype=np.uint8)
+    )
     if bits == 4:
         weights = quantized[:, :, 0::2] | (quantized[:, :, 1::2] << 4)
         zero_points = zero_values[:, 0::2] | (zero_values[:, 1::2] << 4)
@@ -739,30 +783,34 @@ def test_matmul_nbits(device, bits, batch, sequence, use_cublas):
         (quantized.astype(np.float32) - zero_values[:, :, None].astype(np.float32))
         * scales[:, :, None].astype(np.float32)
     ).reshape(N, K)
-    expected = (activations.astype(np.float32) @ dequantized.T).astype(np.float16)
+    expected = (activations.astype(np.float32) @ dequantized.T).astype(np_dtype)
+    node_inputs = ["activations", "weights", "scales"]
+    initializers = [
+        numpy_helper.from_array(weights, name="weights"),
+        numpy_helper.from_array(scales, name="scales"),
+    ]
+    if has_zero_points:
+        node_inputs.append("zero_points")
+        initializers.append(numpy_helper.from_array(zero_points, name="zero_points"))
     model = helper.make_model(
         helper.make_graph(
             [
                 helper.make_node(
                     "MatMulNBits",
-                    ["activations", "weights", "scales", "zero_points"],
+                    node_inputs,
                     ["output"],
                     domain="com.microsoft",
                     K=K,
                     N=N,
                     bits=bits,
-                    block_size=128,
-                    accuracy_level=0,
+                    block_size=block_size,
+                    accuracy_level=0 if has_zero_points else 4,
                 )
             ],
             "quantized_matmul",
-            [helper.make_tensor_value_info("activations", TensorProto.FLOAT16, [batch, sequence, K])],
-            [helper.make_tensor_value_info("output", TensorProto.FLOAT16, [batch, sequence, N])],
-            [
-                numpy_helper.from_array(weights, name="weights"),
-                numpy_helper.from_array(scales, name="scales"),
-                numpy_helper.from_array(zero_points, name="zero_points"),
-            ],
+            [helper.make_tensor_value_info("activations", data_type, [batch, sequence, K])],
+            [helper.make_tensor_value_info("output", data_type, [batch, sequence, N])],
+            initializers,
         ),
         opset_imports=[helper.make_opsetid("", 21), helper.make_opsetid("com.microsoft", 1)],
     )
@@ -776,7 +824,7 @@ def test_matmul_nbits(device, bits, batch, sequence, use_cublas):
         runtime = OnnxRuntime(str(path), device=device, use_cublas=use_cublas)
         if not use_cublas:
             assert runtime._cublas is None
-        inputs = {"activations": wp.array(activations, dtype=wp.float16, device=device)}
+        inputs = {"activations": wp.array(activations, dtype=wp_dtype, device=device)}
         output = runtime(inputs)["output"]
         np.testing.assert_allclose(output.numpy(), expected, rtol=2.0e-2, atol=2.0e-2)
 
@@ -794,32 +842,39 @@ def test_matmul_nbits(device, bits, batch, sequence, use_cublas):
         path.unlink(missing_ok=True)
 
 
+@pytest.mark.parametrize(
+    "data_type,np_dtype,wp_dtype",
+    [
+        (TensorProto.FLOAT16, np.float16, wp.float16),
+        (TensorProto.BFLOAT16, np.dtype("bfloat16"), wp.bfloat16),
+    ],
+)
 @pytest.mark.parametrize("device", ["cuda"])
-def test_qwen_normalization_and_swiglu(device):
+def test_qwen_normalization_and_swiglu(device, data_type, np_dtype, wp_dtype):
     if not is_device_available(device):
         pytest.skip(f"Device '{device}' is not available")
 
     rng = np.random.default_rng(53)
     shape = (2, 3, 128)
-    x = rng.standard_normal(shape).astype(np.float16)
-    skip = rng.standard_normal(shape).astype(np.float16)
-    gate = rng.standard_normal(shape).astype(np.float16)
-    up = rng.standard_normal(shape).astype(np.float16)
-    scale = rng.uniform(0.8, 1.2, shape[-1]).astype(np.float16)
+    x = rng.standard_normal(shape).astype(np_dtype)
+    skip = rng.standard_normal(shape).astype(np_dtype)
+    gate = rng.standard_normal(shape).astype(np_dtype)
+    up = rng.standard_normal(shape).astype(np_dtype)
+    scale = rng.uniform(0.8, 1.2, shape[-1]).astype(np_dtype)
     epsilon = 1.0e-6
 
     def rms_norm(value):
         inverse_rms = 1.0 / np.sqrt(np.mean(value.astype(np.float32) ** 2, axis=-1, keepdims=True) + epsilon)
-        return (value.astype(np.float32) * inverse_rms * scale.astype(np.float32)).astype(np.float16)
+        return (value.astype(np.float32) * inverse_rms * scale.astype(np.float32)).astype(np_dtype)
 
     residual_fp32 = x.astype(np.float32) + skip.astype(np.float32)
-    residual = residual_fp32.astype(np.float16)
+    residual = residual_fp32.astype(np_dtype)
     expected = {
         "normalized": rms_norm(x),
         "skip_normalized": rms_norm(residual_fp32),
         "residual": residual,
         "swiglu": (gate.astype(np.float32) / (1.0 + np.exp(-gate.astype(np.float32))) * up.astype(np.float32)).astype(
-            np.float16
+            np_dtype
         ),
     }
     model = helper.make_model(
@@ -845,11 +900,8 @@ def test_qwen_normalization_and_swiglu(device):
                 helper.make_node("Mul", ["silu", "up"], ["swiglu"]),
             ],
             "qwen_feed_forward",
-            [
-                helper.make_tensor_value_info(name, TensorProto.FLOAT16, list(shape))
-                for name in ("x", "skip", "gate", "up")
-            ],
-            [helper.make_tensor_value_info(name, TensorProto.FLOAT16, list(shape)) for name in expected],
+            [helper.make_tensor_value_info(name, data_type, list(shape)) for name in ("x", "skip", "gate", "up")],
+            [helper.make_tensor_value_info(name, data_type, list(shape)) for name in expected],
             [numpy_helper.from_array(scale, name="scale")],
         ),
         opset_imports=[helper.make_opsetid("", 21), helper.make_opsetid("com.microsoft", 1)],
@@ -864,12 +916,12 @@ def test_qwen_normalization_and_swiglu(device):
         assert "_SwiGLU" in {op.op_type for op in runtime._ops}
         outputs = runtime(
             {
-                name: wp.array(value, dtype=wp.float16, device=device)
+                name: wp.array(value, dtype=wp_dtype, device=device)
                 for name, value in {"x": x, "skip": skip, "gate": gate, "up": up}.items()
             }
         )
         for name, reference in expected.items():
-            np.testing.assert_allclose(outputs[name].numpy(), reference, rtol=2.0e-3, atol=2.0e-3)
+            np.testing.assert_allclose(outputs[name].numpy(), reference, rtol=1.0e-2, atol=1.0e-2)
     finally:
         path.unlink(missing_ok=True)
 

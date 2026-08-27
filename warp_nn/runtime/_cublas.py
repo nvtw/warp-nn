@@ -33,7 +33,7 @@ def _load_library():
 
 
 class Cublas:
-    """The small subset of cuBLAS needed for row-major FP16 GEMM."""
+    """The small subset of cuBLAS needed for row-major 16-bit GEMM."""
 
     def __init__(self):
         self._lib = _load_library()
@@ -73,7 +73,7 @@ class Cublas:
         if status:
             raise RuntimeError(f"{operation} failed with cuBLAS status {status}")
 
-    def gemm_fp16(self, activations, weights, output, rows, columns, inner, stream):
+    def gemm(self, activations, weights, output, rows, columns, inner, stream, data_type):
         """Compute row-major ``activations @ weights.T``."""
         self._check(
             self._lib.cublasSetStream_v2(self._handle, ctypes.c_void_p(stream)),
@@ -89,14 +89,14 @@ class Cublas:
                 inner,
                 ctypes.byref(self._alpha),
                 ctypes.c_void_p(weights),
-                2,
+                data_type,
                 inner,
                 ctypes.c_void_p(activations),
-                2,
+                data_type,
                 inner,
                 ctypes.byref(self._beta),
                 ctypes.c_void_p(output),
-                2,
+                data_type,
                 columns,
                 68,
                 99,

@@ -368,31 +368,9 @@ def _gather_block_quantized_int8_kernel(
 
 
 @wp.kernel
-def _matmul_nbits_kernel(
-    activations: wp.array2d[wp.float16],
-    weights: wp.array3d[wp.uint8],
-    scales: wp.array2d[wp.float16],
-    zero_points: wp.array2d[wp.uint8],
-    output: wp.array2d[wp.float16],
-    K: int,
-    bits: int,
-):
-    row, column = wp.tid()
-    total = wp.float32(0.0)
-    for k in range(K):
-        block = k / 128
-        offset = k - block * 128
-        if bits == 4:
-            packed = wp.int32(weights[column, block, offset / 2])
-            quantized = wp.where(offset % 2 == 0, packed & 15, (packed >> 4) & 15)
-            packed_zero = wp.int32(zero_points[column, block / 2])
-            zero = wp.where(block % 2 == 0, packed_zero & 15, (packed_zero >> 4) & 15)
-        else:
-            quantized = wp.int32(weights[column, block, offset])
-            zero = wp.int32(zero_points[column, block])
-        dequantized = wp.float32(quantized - zero) * wp.float32(scales[column, block])
-        total += wp.float32(activations[row, k]) * dequantized
-    output[row, column] = wp.float16(total)
+def _gather_rows_kernel(data: wp.array2d[Any], indices: wp.array2d[wp.int64], output: wp.array3d[Any]):
+    batch, sequence, column = wp.tid()
+    output[batch, sequence, column] = data[indices[batch, sequence], column]
 
 
 @wp.func_native(
@@ -407,157 +385,183 @@ def _matmul_nbits_kernel(
 def _warp_sum(value: float) -> float: ...
 
 
-def _create_matmul_nbits_gemv_kernel(bits: int):
+def _create_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_reduction: bool):
     values_per_byte = 8 // bits
-    loads_per_lane = 128 // values_per_byte // 32
+    packed_block_size = block_size // values_per_byte
+    load_stride = 32 if warp_reduction else 1
+    loads_per_lane = (packed_block_size + load_stride - 1) // load_stride
 
     @wp.kernel(enable_backward=False)
     def kernel(
-        activations: wp.array2d[wp.float16],
+        activations: wp.array2d(dtype=dtype),
         weights: wp.array3d[wp.uint8],
-        scales: wp.array2d[wp.float16],
+        scales: wp.array2d(dtype=dtype),
         zero_points: wp.array2d[wp.uint8],
-        output: wp.array2d[wp.float16],
+        output: wp.array2d(dtype=dtype),
+        has_zero_points: bool,
     ):
         thread = wp.tid()
-        lane = thread & 31
-        warp = thread / 32
-        row = warp / weights.shape[0]
-        column = warp % weights.shape[0]
+        lane = thread & 31 if warp_reduction else 0
+        item = thread / 32 if warp_reduction else thread
+        row = item / weights.shape[0]
+        column = item % weights.shape[0]
         total = wp.float32(0.0)
 
         for block in range(weights.shape[1]):
-            packed_zero = wp.int32(zero_points[column, block / values_per_byte])
-            zero = (packed_zero >> ((block % values_per_byte) * bits)) & ((1 << bits) - 1)
+            zero = 1 << (bits - 1)
+            if has_zero_points:
+                packed_zero = wp.int32(zero_points[column, block / values_per_byte])
+                zero = (packed_zero >> ((block % values_per_byte) * bits)) & ((1 << bits) - 1)
             scale = wp.float32(scales[column, block])
             for group in range(loads_per_lane):
-                packed_offset = lane + group * 32
-                packed = wp.int32(weights[column, block, packed_offset])
-                activation_offset = block * 128 + packed_offset * values_per_byte
-                for value_index in range(values_per_byte):
-                    quantized = (packed >> (value_index * bits)) & ((1 << bits) - 1)
-                    total += (
-                        wp.float32(activations[row, activation_offset + value_index])
-                        * wp.float32(quantized - zero)
-                        * scale
-                    )
+                packed_offset = lane + group * load_stride
+                if packed_offset < packed_block_size:
+                    packed = wp.int32(weights[column, block, packed_offset])
+                    activation_offset = block * block_size + packed_offset * values_per_byte
+                    for value_index in range(values_per_byte):
+                        quantized = (packed >> (value_index * bits)) & ((1 << bits) - 1)
+                        total += (
+                            wp.float32(activations[row, activation_offset + value_index])
+                            * wp.float32(quantized - zero)
+                            * scale
+                        )
 
-        total = _warp_sum(total)
+        if warp_reduction:
+            total = _warp_sum(total)
         if lane == 0:
-            output[row, column] = wp.float16(total)
+            output[row, column] = dtype(total)
 
     return kernel
 
 
-_matmul_nbits_gemv_kernels = {bits: _create_matmul_nbits_gemv_kernel(bits) for bits in (4, 8)}
+_matmul_nbits_kernel_cache = {}
 
 
-def _create_dequantize_nbits_kernel(bits: int):
+def _get_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_reduction: bool):
+    key = (bits, block_size, dtype, warp_reduction)
+    if key not in _matmul_nbits_kernel_cache:
+        _matmul_nbits_kernel_cache[key] = _create_matmul_nbits_kernel(*key)
+    return _matmul_nbits_kernel_cache[key]
+
+
+def _create_dequantize_nbits_kernel(bits: int, block_size: int, dtype: type):
     values_per_byte = 8 // bits
-    packed_block_size = 128 // values_per_byte
+    packed_block_size = block_size // values_per_byte
 
     @wp.kernel(enable_backward=False)
     def kernel(
         weights: wp.array3d[wp.uint8],
-        scales: wp.array2d[wp.float16],
+        scales: wp.array2d(dtype=dtype),
         zero_points: wp.array2d[wp.uint8],
-        output: wp.array2d[wp.float16],
+        output: wp.array2d(dtype=dtype),
+        has_zero_points: bool,
     ):
         column, packed_index = wp.tid()
         block = packed_index / packed_block_size
         packed_offset = packed_index - block * packed_block_size
         packed = wp.int32(weights[column, block, packed_offset])
-        packed_zero = wp.int32(zero_points[column, block / values_per_byte])
-        zero = (packed_zero >> ((block % values_per_byte) * bits)) & ((1 << bits) - 1)
+        zero = 1 << (bits - 1)
+        if has_zero_points:
+            packed_zero = wp.int32(zero_points[column, block / values_per_byte])
+            zero = (packed_zero >> ((block % values_per_byte) * bits)) & ((1 << bits) - 1)
         scale = wp.float32(scales[column, block])
-        output_offset = block * 128 + packed_offset * values_per_byte
+        output_offset = block * block_size + packed_offset * values_per_byte
         for value_index in range(values_per_byte):
             quantized = (packed >> (value_index * bits)) & ((1 << bits) - 1)
-            output[column, output_offset + value_index] = wp.float16(wp.float32(quantized - zero) * scale)
+            output[column, output_offset + value_index] = dtype(wp.float32(quantized - zero) * scale)
 
     return kernel
 
 
-_dequantize_nbits_kernels = {bits: _create_dequantize_nbits_kernel(bits) for bits in (4, 8)}
+_dequantize_nbits_kernel_cache = {}
 
 
-@wp.func
-def _square_fp16(value: wp.float16):
-    value_fp32 = wp.float32(value)
-    return value_fp32 * value_fp32
+def _get_dequantize_nbits_kernel(bits: int, block_size: int, dtype: type):
+    key = (bits, block_size, dtype)
+    if key not in _dequantize_nbits_kernel_cache:
+        _dequantize_nbits_kernel_cache[key] = _create_dequantize_nbits_kernel(*key)
+    return _dequantize_nbits_kernel_cache[key]
 
 
-@wp.func
-def _skip_square_fp16(value: wp.float16, skip: wp.float16):
-    value_fp32 = wp.float32(value) + wp.float32(skip)
-    return value_fp32 * value_fp32
-
-
-@wp.func
-def _add_fp16(value: wp.float16, skip: wp.float16):
-    return wp.float16(wp.float32(value) + wp.float32(skip))
-
-
-@wp.func
-def _normalize_fp16(value: wp.float16, scale: wp.float16, inverse_rms: float):
-    return wp.float16(wp.float32(value) * wp.float32(scale) * inverse_rms)
-
-
-@wp.func
-def _skip_normalize_fp16(value: wp.float16, skip: wp.float16, scale: wp.float16, inverse_rms: float):
-    return wp.float16((wp.float32(value) + wp.float32(skip)) * wp.float32(scale) * inverse_rms)
-
-
-def _create_rms_norm_kernels(tile_width: int):
+def _create_rms_norm_kernels(tile_width: int, dtype: type):
     TILE_WIDTH = tile_width
+    DTYPE = dtype
+
+    @wp.func
+    def square(value: dtype):
+        value_fp32 = wp.float32(dtype(value))
+        return value_fp32 * value_fp32
+
+    @wp.func
+    def skip_square(value: dtype, skip: dtype):
+        value_fp32 = wp.float32(dtype(value)) + wp.float32(skip)
+        return value_fp32 * value_fp32
+
+    @wp.func
+    def add(value: dtype, skip: dtype):
+        return dtype(wp.float32(value) + wp.float32(skip))
+
+    @wp.func
+    def normalize(value: dtype, scale: dtype, inverse_rms: float):
+        return dtype(wp.float32(value) * wp.float32(scale) * inverse_rms)
+
+    @wp.func
+    def skip_normalize(value: dtype, skip: dtype, scale: dtype, inverse_rms: float):
+        return dtype((wp.float32(value) + wp.float32(skip)) * wp.float32(scale) * inverse_rms)
 
     @wp.kernel(enable_backward=False)
     def rms_norm(
-        x: wp.array2d[wp.float16],
-        scale: wp.array1d[wp.float16],
-        output: wp.array2d[wp.float16],
+        x: wp.array2d(dtype=DTYPE),
+        scale: wp.array1d(dtype=DTYPE),
+        output: wp.array2d(dtype=DTYPE),
         epsilon: float,
     ):
         row = wp.tid()
+        typed_zero = DTYPE(0.0)
         partials = wp.tile_zeros(shape=(TILE_WIDTH,), dtype=wp.float32)
         for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
             values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(tile_index * TILE_WIDTH,))
-            partials += wp.tile_map(_square_fp16, values)
+            partials += wp.tile_map(square, values)
         inverse_rms = wp.float32(1.0) / wp.sqrt(
-            wp.tile_extract(wp.tile_sum(partials), 0) / wp.float32(x.shape[1]) + wp.float32(epsilon)
+            wp.tile_extract(wp.tile_sum(partials), 0) / wp.float32(x.shape[1])
+            + wp.float32(epsilon)
+            + wp.float32(typed_zero)
         )
         for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
             offset = tile_index * TILE_WIDTH
             values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
             scales = wp.tile_load(scale, shape=(TILE_WIDTH,), offset=(offset,))
-            wp.tile_store(output[row], wp.tile_map(_normalize_fp16, values, scales, inverse_rms), offset=(offset,))
+            wp.tile_store(output[row], wp.tile_map(normalize, values, scales, inverse_rms), offset=(offset,))
 
     @wp.kernel(enable_backward=False)
     def skip_rms_norm(
-        x: wp.array2d[wp.float16],
-        skip: wp.array2d[wp.float16],
-        scale: wp.array1d[wp.float16],
-        output: wp.array2d[wp.float16],
-        residual: wp.array2d[wp.float16],
+        x: wp.array2d(dtype=DTYPE),
+        skip: wp.array2d(dtype=DTYPE),
+        scale: wp.array1d(dtype=DTYPE),
+        output: wp.array2d(dtype=DTYPE),
+        residual: wp.array2d(dtype=DTYPE),
         epsilon: float,
     ):
         row = wp.tid()
+        typed_zero = DTYPE(0.0)
         partials = wp.tile_zeros(shape=(TILE_WIDTH,), dtype=wp.float32)
         for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
             offset = tile_index * TILE_WIDTH
             values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
             skips = wp.tile_load(skip[row], shape=(TILE_WIDTH,), offset=(offset,))
-            partials += wp.tile_map(_skip_square_fp16, values, skips)
-            wp.tile_store(residual[row], wp.tile_map(_add_fp16, values, skips), offset=(offset,))
+            partials += wp.tile_map(skip_square, values, skips)
+            wp.tile_store(residual[row], wp.tile_map(add, values, skips), offset=(offset,))
         inverse_rms = wp.float32(1.0) / wp.sqrt(
-            wp.tile_extract(wp.tile_sum(partials), 0) / wp.float32(x.shape[1]) + wp.float32(epsilon)
+            wp.tile_extract(wp.tile_sum(partials), 0) / wp.float32(x.shape[1])
+            + wp.float32(epsilon)
+            + wp.float32(typed_zero)
         )
         for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
             offset = tile_index * TILE_WIDTH
             values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
             skips = wp.tile_load(skip[row], shape=(TILE_WIDTH,), offset=(offset,))
             scales = wp.tile_load(scale, shape=(TILE_WIDTH,), offset=(offset,))
-            normalized = wp.tile_map(_skip_normalize_fp16, values, skips, scales, inverse_rms)
+            normalized = wp.tile_map(skip_normalize, values, skips, scales, inverse_rms)
             wp.tile_store(output[row], normalized, offset=(offset,))
 
     return rms_norm, skip_rms_norm
@@ -566,23 +570,30 @@ def _create_rms_norm_kernels(tile_width: int):
 _rms_norm_kernel_cache = {}
 
 
-def _get_rms_norm_kernels(width: int):
+def _get_rms_norm_kernels(width: int, dtype: type):
     tile_width = min(512, max(32, 1 << (width - 1).bit_length()))
-    if tile_width not in _rms_norm_kernel_cache:
-        _rms_norm_kernel_cache[tile_width] = _create_rms_norm_kernels(tile_width)
-    return tile_width, _rms_norm_kernel_cache[tile_width]
+    key = (tile_width, dtype)
+    if key not in _rms_norm_kernel_cache:
+        _rms_norm_kernel_cache[key] = _create_rms_norm_kernels(*key)
+    return tile_width, _rms_norm_kernel_cache[key]
 
 
-@wp.kernel
-def _swiglu_fp16_kernel(
-    gate: wp.array2d[wp.float16],
-    up: wp.array2d[wp.float16],
-    output: wp.array2d[wp.float16],
-):
-    row, column = wp.tid()
-    value = wp.float32(gate[row, column])
-    silu = value / (wp.float32(1.0) + wp.exp(-value))
-    output[row, column] = wp.float16(silu * wp.float32(up[row, column]))
+def _create_swiglu_kernel(dtype: type):
+    @wp.kernel(enable_backward=False)
+    def kernel(
+        gate: wp.array2d(dtype=dtype),
+        up: wp.array2d(dtype=dtype),
+        output: wp.array2d(dtype=dtype),
+    ):
+        row, column = wp.tid()
+        value = wp.float32(gate[row, column])
+        silu = value / (wp.float32(1.0) + wp.exp(-value))
+        output[row, column] = dtype(silu * wp.float32(up[row, column]))
+
+    return kernel
+
+
+_swiglu_kernel_cache = {}
 
 
 @wp.kernel
@@ -1038,7 +1049,7 @@ class OnnxRuntime:
             self._ops = _fuse_inference_ops(self._ops, set(self.output_names), initializer_names)
 
         self._cublas = try_create_cublas() if use_cublas and self._device.is_cuda else None
-        self._matmul_scratch = None
+        self._matmul_scratch = {}
         self._preallocate_buffers()
 
     def resize_inputs(self, input_shapes: dict[str, tuple[int, ...]], share_kv_cache: bool = False) -> None:
@@ -1077,7 +1088,7 @@ class OnnxRuntime:
         runtime._input_dims = dict(self._input_dims)
         runtime._input_dtypes = dict(self._input_dtypes)
         runtime._cublas = self._cublas
-        runtime._matmul_scratch = None
+        runtime._matmul_scratch = {}
         runtime._tensors = {name: self._tensors[name] for name in self._initializer_names}
         runtime._shapes = {name: tuple(tensor.shape) for name, tensor in runtime._tensors.items()}
         runtime._dtypes = {name: tensor.dtype for name, tensor in runtime._tensors.items()}
@@ -1103,15 +1114,21 @@ class OnnxRuntime:
             handler(op, self._shapes, self._dtypes, self._tensors, self._device, self._requires_grad)
 
         matmuls = [op for op in self._ops if op.op_type == "MatMulNBits" and op.attrs["_rows"] > 1]
-        if self._cublas is not None and matmuls:
-            scratch_elements = max(int(op.attrs["K"]) * int(op.attrs["N"]) for op in matmuls)
-            if self._matmul_scratch is None or self._matmul_scratch.size < scratch_elements:
-                self._matmul_scratch = wp.empty(scratch_elements, dtype=wp.float16, device=self._device)
-            for op in matmuls:
-                K = int(op.attrs["K"])
-                N = int(op.attrs["N"])
-                op.attrs["_cublas"] = self._cublas
-                op.attrs["_dequantized_weights"] = self._matmul_scratch[: K * N].reshape((N, K))
+        if self._cublas is not None:
+            for dtype in (wp.float16, wp.bfloat16):
+                typed_matmuls = [op for op in matmuls if op.attrs["_dtype"] == dtype]
+                if not typed_matmuls:
+                    continue
+                scratch_elements = max(int(op.attrs["K"]) * int(op.attrs["N"]) for op in typed_matmuls)
+                scratch = self._matmul_scratch.get(dtype)
+                if scratch is None or scratch.size < scratch_elements:
+                    scratch = wp.empty(scratch_elements, dtype=dtype, device=self._device)
+                    self._matmul_scratch[dtype] = scratch
+                for op in typed_matmuls:
+                    K = int(op.attrs["K"])
+                    N = int(op.attrs["N"])
+                    op.attrs["_cublas"] = self._cublas
+                    op.attrs["_dequantized_weights"] = scratch[: K * N].reshape((N, K))
 
     def __call__(self, inputs: dict[str, wp.array]) -> dict[str, wp.array]:
         """Run forward inference.
@@ -1278,8 +1295,23 @@ def _shape_shape(op, shapes, dtypes, tensors, device, requires_grad=False):
 
 
 def _shape_gather(op, shapes, dtypes, tensors, device, requires_grad=False):
-    if op.inputs[0] not in tensors or op.inputs[1] not in tensors or int(op.attrs.get("axis", 0)) != 0:
+    if int(op.attrs.get("axis", 0)) != 0:
         raise NotImplementedError("OnnxRuntime Gather: only constant axis-0 gathers are supported")
+    if (
+        op.inputs[0] in tensors
+        and len(shapes[op.inputs[0]]) == 2
+        and len(shapes[op.inputs[1]]) == 2
+        and dtypes[op.inputs[0]] in _FLOAT_DTYPES
+        and dtypes[op.inputs[1]] == wp.int64
+    ):
+        out_shape = (*shapes[op.inputs[1]], shapes[op.inputs[0]][1])
+        tensors[op.outputs[0]] = wp.zeros(out_shape, dtype=dtypes[op.inputs[0]], device=device)
+        shapes[op.outputs[0]] = out_shape
+        dtypes[op.outputs[0]] = dtypes[op.inputs[0]]
+        op.attrs["_dynamic"] = True
+        return
+    if op.inputs[0] not in tensors or op.inputs[1] not in tensors:
+        raise NotImplementedError("OnnxRuntime Gather: unsupported dynamic gather")
     value = np.take(tensors[op.inputs[0]].numpy(), tensors[op.inputs[1]].numpy().astype(np.int64), axis=0)
     tensors[op.outputs[0]] = _np_to_warp(value, device)
     shapes[op.outputs[0]] = tuple(tensors[op.outputs[0]].shape)
@@ -1429,12 +1461,12 @@ def _shape_matmul_nbits(op, shapes, dtypes, tensors, device, requires_grad=False
         raise NotImplementedError("OnnxRuntime MatMulNBits: gradients are not supported")
     bits = int(op.attrs.get("bits", 4))
     block_size = int(op.attrs.get("block_size", 128))
-    if bits not in (4, 8) or block_size != 128 or int(op.attrs.get("accuracy_level", 0)) != 0:
+    if bits not in (4, 8) or block_size < 16 or block_size & (block_size - 1):
         raise NotImplementedError(
-            "OnnxRuntime MatMulNBits: only 4/8-bit blocks of 128 at accuracy level 0 are supported"
+            "OnnxRuntime MatMulNBits: only 4/8-bit power-of-two blocks of at least 16 are supported"
         )
-    if len(op.inputs) != 4:
-        raise NotImplementedError("OnnxRuntime MatMulNBits: zero points are required")
+    if int(op.attrs.get("accuracy_level", 0)) not in (0, 4) or len(op.inputs) not in (3, 4):
+        raise NotImplementedError("OnnxRuntime MatMulNBits: unsupported accuracy level or input count")
 
     activation_shape = shapes[op.inputs[0]]
     if len(activation_shape) not in (2, 3):
@@ -1444,33 +1476,47 @@ def _shape_matmul_nbits(op, shapes, dtypes, tensors, device, requires_grad=False
     if activation_shape[-1] != K:
         raise ValueError(f"OnnxRuntime MatMulNBits: activation width is {activation_shape[-1]}, expected {K}")
 
-    blocks = (K + 127) // 128
-    packed_block = 128 * bits // 8
+    if K % block_size:
+        raise NotImplementedError("OnnxRuntime MatMulNBits: partial quantization blocks are not supported")
+    blocks = K // block_size
+    packed_block = block_size * bits // 8
     expected_weight_shape = (N, blocks, packed_block)
     expected_scale_shape = (N, blocks)
-    expected_zero_shape = (N, blocks if bits == 8 else (blocks + 1) // 2)
+    expected_zero_shape = (N, (blocks * bits + 7) // 8)
     if shapes[op.inputs[1]] != expected_weight_shape:
         raise ValueError(f"OnnxRuntime MatMulNBits: weights must have shape {expected_weight_shape}")
-    if shapes[op.inputs[2]] != expected_scale_shape or shapes[op.inputs[3]] != expected_zero_shape:
+    has_zero_points = len(op.inputs) == 4 and bool(op.inputs[3])
+    if shapes[op.inputs[2]] != expected_scale_shape or (
+        has_zero_points and shapes[op.inputs[3]] != expected_zero_shape
+    ):
         raise ValueError(
             f"OnnxRuntime MatMulNBits: scales and zero points must have shapes "
             f"{expected_scale_shape} and {expected_zero_shape}"
         )
-    actual_dtypes = tuple(dtypes[name] for name in op.inputs)
-    if actual_dtypes != (wp.float16, wp.uint8, wp.float16, wp.uint8):
+    dtype = dtypes[op.inputs[0]]
+    actual_dtypes = tuple(dtypes[name] for name in op.inputs if name)
+    expected_dtypes = (dtype, wp.uint8, dtype, wp.uint8) if has_zero_points else (dtype, wp.uint8, dtype)
+    if dtype not in (wp.float16, wp.bfloat16) or actual_dtypes != expected_dtypes:
         raise TypeError(
-            "OnnxRuntime MatMulNBits: expected float16, uint8, float16, uint8 inputs, "
+            "OnnxRuntime MatMulNBits: expected matching FP16/BF16 activations and scales with uint8 weights, "
             f"got {tuple(dtype.__name__ for dtype in actual_dtypes)}"
         )
 
     rows = int(np.prod(activation_shape[:-1]))
     out_shape = (*activation_shape[:-1], N)
-    tensors[op.outputs[0]] = wp.zeros(out_shape, dtype=wp.float16, device=device)
+    tensors[op.outputs[0]] = wp.zeros(out_shape, dtype=dtype, device=device)
     shapes[op.outputs[0]] = out_shape
-    dtypes[op.outputs[0]] = wp.float16
+    dtypes[op.outputs[0]] = dtype
+    zero_name = "__onnx_runtime_default_nbits_zero"
+    if not has_zero_points and zero_name not in tensors:
+        tensors[zero_name] = wp.zeros((1, 1), dtype=wp.uint8, device=device)
     op.attrs["_rows"] = rows
     op.attrs["K"] = K
     op.attrs["N"] = N
+    op.attrs["_block_size"] = block_size
+    op.attrs["_dtype"] = dtype
+    op.attrs["_has_zero_points"] = has_zero_points
+    op.attrs["_zero_points"] = tensors[op.inputs[3]] if has_zero_points else tensors[zero_name]
     op.attrs["_output_2d"] = tensors[op.outputs[0]].reshape((rows, N))
 
 
@@ -1483,19 +1529,17 @@ def _shape_simplified_layer_normalization(op, shapes, dtypes, tensors, device, r
             "OnnxRuntime SimplifiedLayerNormalization: only the last axis of 2/3-D inputs is supported"
         )
     width = shape[-1]
-    if shapes[op.inputs[1]] != (width,) or tuple(dtypes[name] for name in op.inputs) != (
-        wp.float16,
-        wp.float16,
-    ):
-        raise ValueError("OnnxRuntime SimplifiedLayerNormalization: expected matching FP16 input and scale")
+    dtype = _require_matching_float_dtypes(op, dtypes, op.inputs)
+    if dtype not in (wp.float16, wp.bfloat16) or shapes[op.inputs[1]] != (width,):
+        raise ValueError("OnnxRuntime SimplifiedLayerNormalization: expected matching FP16/BF16 input and scale")
     rows = int(np.prod(shape[:-1]))
-    tensors[op.outputs[0]] = wp.zeros(shape, dtype=wp.float16, device=device)
+    tensors[op.outputs[0]] = wp.zeros(shape, dtype=dtype, device=device)
     shapes[op.outputs[0]] = shape
-    dtypes[op.outputs[0]] = wp.float16
+    dtypes[op.outputs[0]] = dtype
     op.attrs["_rows"] = rows
     op.attrs["_width"] = width
     op.attrs["_output_2d"] = tensors[op.outputs[0]].reshape((rows, width))
-    op.attrs["_tile_width"], op.attrs["_rms_norm_kernels"] = _get_rms_norm_kernels(width)
+    op.attrs["_tile_width"], op.attrs["_rms_norm_kernels"] = _get_rms_norm_kernels(width, dtype)
 
 
 def _shape_skip_simplified_layer_normalization(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -1505,40 +1549,45 @@ def _shape_skip_simplified_layer_normalization(op, shapes, dtypes, tensors, devi
     if len(shape) not in (2, 3) or shapes[op.inputs[1]] != shape:
         raise NotImplementedError("OnnxRuntime SkipSimplifiedLayerNormalization: matching 2/3-D inputs are required")
     width = shape[-1]
-    if shapes[op.inputs[2]] != (width,) or any(dtypes[name] != wp.float16 for name in op.inputs):
-        raise ValueError("OnnxRuntime SkipSimplifiedLayerNormalization: expected FP16 inputs and scale")
+    dtype = _require_matching_float_dtypes(op, dtypes, op.inputs)
+    if dtype not in (wp.float16, wp.bfloat16) or shapes[op.inputs[2]] != (width,):
+        raise ValueError("OnnxRuntime SkipSimplifiedLayerNormalization: expected FP16/BF16 inputs and scale")
     if any(output for output in op.outputs[1:3]):
         raise NotImplementedError("OnnxRuntime SkipSimplifiedLayerNormalization: statistics outputs are not supported")
 
     rows = int(np.prod(shape[:-1]))
-    tensors[op.outputs[0]] = wp.zeros(shape, dtype=wp.float16, device=device)
+    tensors[op.outputs[0]] = wp.zeros(shape, dtype=dtype, device=device)
     shapes[op.outputs[0]] = shape
-    dtypes[op.outputs[0]] = wp.float16
+    dtypes[op.outputs[0]] = dtype
     if len(op.outputs) > 3 and op.outputs[3]:
-        residual = wp.zeros(shape, dtype=wp.float16, device=device)
+        residual = wp.zeros(shape, dtype=dtype, device=device)
         tensors[op.outputs[3]] = residual
         shapes[op.outputs[3]] = shape
-        dtypes[op.outputs[3]] = wp.float16
+        dtypes[op.outputs[3]] = dtype
     else:
-        residual = wp.zeros(shape, dtype=wp.float16, device=device)
+        residual = wp.zeros(shape, dtype=dtype, device=device)
     op.attrs["_rows"] = rows
     op.attrs["_width"] = width
     op.attrs["_output_2d"] = tensors[op.outputs[0]].reshape((rows, width))
     op.attrs["_residual_2d"] = residual.reshape((rows, width))
-    op.attrs["_tile_width"], op.attrs["_rms_norm_kernels"] = _get_rms_norm_kernels(width)
+    op.attrs["_tile_width"], op.attrs["_rms_norm_kernels"] = _get_rms_norm_kernels(width, dtype)
 
 
 def _shape_swiglu(op, shapes, dtypes, tensors, device, requires_grad=False):
     shape = shapes[op.inputs[0]]
     if len(shape) not in (2, 3) or shapes[op.inputs[1]] != shape:
         raise NotImplementedError("OnnxRuntime fused SwiGLU requires matching 2/3-D inputs")
-    if any(dtypes[name] != wp.float16 for name in op.inputs):
-        raise TypeError("OnnxRuntime fused SwiGLU requires FP16 inputs")
-    tensors[op.outputs[0]] = wp.zeros(shape, dtype=wp.float16, device=device)
+    dtype = _require_matching_float_dtypes(op, dtypes, op.inputs)
+    if dtype not in (wp.float16, wp.bfloat16):
+        raise TypeError("OnnxRuntime fused SwiGLU requires FP16/BF16 inputs")
+    tensors[op.outputs[0]] = wp.zeros(shape, dtype=dtype, device=device)
     shapes[op.outputs[0]] = shape
-    dtypes[op.outputs[0]] = wp.float16
+    dtypes[op.outputs[0]] = dtype
     op.attrs["_shape_2d"] = (int(np.prod(shape[:-1])), shape[-1])
     op.attrs["_output_2d"] = tensors[op.outputs[0]].reshape(op.attrs["_shape_2d"])
+    if dtype not in _swiglu_kernel_cache:
+        _swiglu_kernel_cache[dtype] = _create_swiglu_kernel(dtype)
+    op.attrs["_kernel"] = _swiglu_kernel_cache[dtype]
 
 
 def _shape_group_query_attention(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -1848,6 +1897,24 @@ def _exec_static(op, tensors, shapes, device):
     pass
 
 
+def _exec_gather(op, tensors, shapes, device):
+    if not op.attrs.get("_dynamic"):
+        return
+    data = tensors[op.inputs[0]]
+    wp.launch(
+        _kernel_for_dtype(
+            _gather_rows_kernel,
+            data.dtype,
+            (2,),
+            _array_type(wp.int64, 2),
+            (3,),
+        ),
+        dim=shapes[op.outputs[0]],
+        inputs=[data, tensors[op.inputs[1]], tensors[op.outputs[0]]],
+        device=device,
+    )
+
+
 def _exec_cast(op, tensors, shapes, device):
     wp.launch(
         _cast_int64_to_int32_kernel,
@@ -1925,16 +1992,20 @@ def _exec_matmul_nbits(op, tensors, shapes, device):
     K = int(op.attrs["K"])
     N = int(op.attrs["N"])
     bits = int(op.attrs["bits"])
+    block_size = op.attrs["_block_size"]
+    dtype = op.attrs["_dtype"]
+    zero_points = op.attrs["_zero_points"]
+    has_zero_points = op.attrs["_has_zero_points"]
     if "_cublas" in op.attrs:
         weights = tensors[op.inputs[1]]
         dequantized = op.attrs["_dequantized_weights"]
         wp.launch(
-            _dequantize_nbits_kernels[bits],
+            _get_dequantize_nbits_kernel(bits, block_size, dtype),
             dim=(N, weights.shape[1] * weights.shape[2]),
-            inputs=[weights, tensors[op.inputs[2]], tensors[op.inputs[3]], dequantized],
+            inputs=[weights, tensors[op.inputs[2]], zero_points, dequantized, has_zero_points],
             device=device,
         )
-        op.attrs["_cublas"].gemm_fp16(
+        op.attrs["_cublas"].gemm(
             tensors[op.inputs[0]].ptr,
             dequantized.ptr,
             op.attrs["_output_2d"].ptr,
@@ -1942,34 +2013,35 @@ def _exec_matmul_nbits(op, tensors, shapes, device):
             N,
             K,
             wp.get_stream(device).cuda_stream,
+            2 if dtype == wp.float16 else 14,
         )
         return
     if device.is_cuda:
         wp.launch(
-            _matmul_nbits_gemv_kernels[bits],
+            _get_matmul_nbits_kernel(bits, block_size, dtype, True),
             dim=op.attrs["_rows"] * N * 32,
             inputs=[
                 tensors[op.inputs[0]].reshape((op.attrs["_rows"], K)),
                 tensors[op.inputs[1]],
                 tensors[op.inputs[2]],
-                tensors[op.inputs[3]],
+                zero_points,
                 op.attrs["_output_2d"],
+                has_zero_points,
             ],
             block_dim=128,
             device=device,
         )
         return
     wp.launch(
-        _matmul_nbits_kernel,
+        _get_matmul_nbits_kernel(bits, block_size, dtype, False),
         dim=(op.attrs["_rows"], N),
         inputs=[
             tensors[op.inputs[0]].reshape((op.attrs["_rows"], K)),
             tensors[op.inputs[1]],
             tensors[op.inputs[2]],
-            tensors[op.inputs[3]],
+            zero_points,
             op.attrs["_output_2d"],
-            K,
-            bits,
+            has_zero_points,
         ],
         device=device,
     )
@@ -2010,7 +2082,7 @@ def _exec_skip_simplified_layer_normalization(op, tensors, shapes, device):
 
 def _exec_swiglu(op, tensors, shapes, device):
     wp.launch(
-        _swiglu_fp16_kernel,
+        op.attrs["_kernel"],
         dim=op.attrs["_shape_2d"],
         inputs=[
             tensors[op.inputs[0]].reshape(op.attrs["_shape_2d"]),
@@ -2149,7 +2221,7 @@ _OP_DISPATCH: dict[str, Any] = {
     "Div": _exec_binary,
     "Elu": _exec_elu,
     "Gemm": _exec_gemm,
-    "Gather": _exec_static,
+    "Gather": _exec_gather,
     "GatherBlockQuantized": _exec_gather_block_quantized,
     "GroupQueryAttention": _exec_group_query_attention,
     "LSTM": _exec_lstm,
