@@ -32,6 +32,7 @@ def main():
     messages = [] if args.system is None else [{"role": "system", "content": args.system}]
 
     print("Enter /clear to forget the conversation or /exit to quit.")
+    print("The first response may spend a few minutes compiling Warp kernels with no GPU activity.")
     while True:
         try:
             prompt = input("You: ").strip()
