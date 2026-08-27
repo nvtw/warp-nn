@@ -504,7 +504,7 @@ def _create_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_re
     load_stride = reduction_width
     loads_per_lane = (packed_block_size + load_stride - 1) // load_stride
 
-    @wp.kernel(enable_backward=False, module="unique")
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
     def kernel(
         activations: wp.array2d(dtype=dtype),
         weights: wp.array3d[wp.uint8],
