@@ -656,6 +656,64 @@ def test_constant_reshape_is_a_view(device):
 
 
 @pytest.mark.parametrize("device", ["cuda"])
+def test_gather_block_quantized_int8(device):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    rng = np.random.default_rng(29)
+    data = rng.integers(0, 256, size=(4, 256), dtype=np.uint8)
+    scales = rng.uniform(0.001, 0.02, size=(4, 2)).astype(np.float16)
+    zero_points = rng.integers(96, 160, size=(4, 2), dtype=np.uint8)
+    indices = np.asarray([[0, 3], [2, 1]], dtype=np.int64)
+    expected = np.empty((2, 2, 256), dtype=np.float16)
+    for batch in range(2):
+        for sequence in range(2):
+            row = indices[batch, sequence]
+            for column in range(256):
+                block = column // 128
+                expected[batch, sequence, column] = (
+                    np.float32(data[row, column]) - np.float32(zero_points[row, block])
+                ) * np.float32(scales[row, block])
+
+    model = helper.make_model(
+        helper.make_graph(
+            [
+                helper.make_node(
+                    "GatherBlockQuantized",
+                    ["data", "input_ids", "scales", "zero_points"],
+                    ["output"],
+                    domain="com.microsoft",
+                    bits=8,
+                    block_size=128,
+                )
+            ],
+            "quantized_embedding",
+            [helper.make_tensor_value_info("input_ids", TensorProto.INT64, [2, 2])],
+            [helper.make_tensor_value_info("output", TensorProto.FLOAT16, [2, 2, 256])],
+            [
+                numpy_helper.from_array(data, name="data"),
+                numpy_helper.from_array(scales, name="scales"),
+                numpy_helper.from_array(zero_points, name="zero_points"),
+            ],
+        ),
+        opset_imports=[helper.make_opsetid("", 21), helper.make_opsetid("com.microsoft", 1)],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        output = OnnxRuntime(str(path), device=device)({"input_ids": wp.array(indices, dtype=wp.int64, device=device)})[
+            "output"
+        ]
+        np.testing.assert_array_equal(output.numpy(), expected)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("device", ["cuda"])
 def test_rejects_unsupported_ops(device):
     if not is_device_available(device):
         pytest.skip(f"Device '{device}' is not available")

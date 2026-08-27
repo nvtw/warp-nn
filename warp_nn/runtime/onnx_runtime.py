@@ -36,6 +36,7 @@ Supported ONNX operators (all graph-capturable after one warmup call):
 * **ReduceMean** -- 2-D row reduction with ``keepdims=1``
 * **Constant** -- tensor-valued constants resolved during construction
 * **Reshape** -- view-only reshape with a construction-time shape tensor
+* **GatherBlockQuantized** -- Qwen-style INT8 block-quantized embedding lookup
 * **Squeeze** -- alias passthrough (the output array shares memory with the
   input). Only used to drop unit dims, no copy is performed.
 * **LSTM** -- forward, single-direction, single-layer, ``seq_length=1``. The
@@ -324,6 +325,23 @@ def _lstm_cell_update_kernel(
     c_new = g_f * c_prev[b, h] + g_i * g_c
     c_out[b, h] = c_new
     h_out[b, h] = g_o * wp.tanh(c_new)
+
+
+@wp.kernel
+def _gather_block_quantized_int8_kernel(
+    data: wp.array2d[wp.uint8],
+    indices: wp.array2d[wp.int64],
+    scales: wp.array2d[wp.float16],
+    zero_points: wp.array2d[wp.uint8],
+    output: wp.array3d[wp.float16],
+    block_size: int,
+):
+    batch, sequence, column = wp.tid()
+    row = indices[batch, sequence]
+    block = column / block_size
+    output[batch, sequence, column] = wp.float16(
+        (wp.float32(data[row, column]) - wp.float32(zero_points[row, block])) * wp.float32(scales[row, block])
+    )
 
 
 def _array_type(dtype: type, ndim: int):
@@ -833,6 +851,39 @@ def _shape_reshape(op, shapes, dtypes, tensors, device, requires_grad=False):
     dtypes[op.outputs[0]] = dtypes[op.inputs[0]]
 
 
+def _shape_gather_block_quantized(op, shapes, dtypes, tensors, device, requires_grad=False):
+    if requires_grad:
+        raise NotImplementedError("OnnxRuntime GatherBlockQuantized: gradients are not supported")
+    if int(op.attrs.get("bits", 4)) != 8 or int(op.attrs.get("block_size", 128)) != 128:
+        raise NotImplementedError("OnnxRuntime GatherBlockQuantized: only 8-bit blocks of 128 are supported")
+    if len(op.inputs) != 4:
+        raise NotImplementedError("OnnxRuntime GatherBlockQuantized: zero points are required")
+
+    data_shape = shapes[op.inputs[0]]
+    indices_shape = shapes[op.inputs[1]]
+    scales_shape = shapes[op.inputs[2]]
+    zero_points_shape = shapes[op.inputs[3]]
+    if len(data_shape) != 2 or len(indices_shape) != 2:
+        raise NotImplementedError("OnnxRuntime GatherBlockQuantized: only 2-D data and indices are supported")
+    expected_quant_shape = (data_shape[0], (data_shape[1] + 127) // 128)
+    if scales_shape != expected_quant_shape or zero_points_shape != expected_quant_shape:
+        raise ValueError(
+            "OnnxRuntime GatherBlockQuantized: scales and zero points must have shape " f"{expected_quant_shape}"
+        )
+    expected_dtypes = (wp.uint8, wp.int64, wp.float16, wp.uint8)
+    actual_dtypes = tuple(dtypes[name] for name in op.inputs)
+    if actual_dtypes != expected_dtypes:
+        raise TypeError(
+            "OnnxRuntime GatherBlockQuantized: expected uint8, int64, float16, uint8 inputs, "
+            f"got {tuple(dtype.__name__ for dtype in actual_dtypes)}"
+        )
+
+    out_shape = (*indices_shape, data_shape[1])
+    tensors[op.outputs[0]] = wp.zeros(out_shape, dtype=wp.float16, device=device)
+    shapes[op.outputs[0]] = out_shape
+    dtypes[op.outputs[0]] = wp.float16
+
+
 def _shape_squeeze(op, shapes, dtypes, tensors, device, requires_grad=False):
     in_shape = shapes[op.inputs[0]]
     axes = None
@@ -1111,6 +1162,22 @@ def _exec_reshape(op, tensors, shapes, device):
     tensors[op.outputs[0]] = tensors[op.inputs[0]].reshape(op.attrs["_out_shape"])
 
 
+def _exec_gather_block_quantized(op, tensors, shapes, device):
+    wp.launch(
+        _gather_block_quantized_int8_kernel,
+        dim=shapes[op.outputs[0]],
+        inputs=[
+            tensors[op.inputs[0]],
+            tensors[op.inputs[1]],
+            tensors[op.inputs[2]],
+            tensors[op.inputs[3]],
+            tensors[op.outputs[0]],
+            128,
+        ],
+        device=device,
+    )
+
+
 def _exec_squeeze(op, tensors, shapes, device):
     src = tensors[op.inputs[0]]
     out_shape = op.attrs["_out_shape"]
@@ -1171,6 +1238,7 @@ _OP_DISPATCH: dict[str, Any] = {
     "Div": _exec_binary,
     "Elu": _exec_elu,
     "Gemm": _exec_gemm,
+    "GatherBlockQuantized": _exec_gather_block_quantized,
     "LSTM": _exec_lstm,
     "Mul": _exec_binary,
     "ReduceMean": _exec_reduce_mean,
@@ -1191,6 +1259,7 @@ _SHAPE_DISPATCH: dict[str, Any] = {
     "Div": _shape_elementwise_binary,
     "Elu": _shape_elementwise_unary,
     "Gemm": _shape_gemm,
+    "GatherBlockQuantized": _shape_gather_block_quantized,
     "LSTM": _shape_lstm,
     "Mul": _shape_elementwise_binary,
     "ReduceMean": _shape_reduce_mean,
