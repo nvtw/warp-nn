@@ -1487,6 +1487,9 @@ class OnnxRuntime:
                     N = int(op.attrs["N"])
                     op.attrs["_cublas"] = self._cublas
                     op.attrs["_dequantized_weights"] = scratch[: K * N].reshape((N, K))
+                    op.attrs["_dequantize_kernel"] = _get_dequantize_nbits_kernel(
+                        int(op.attrs["bits"]), int(op.attrs["_block_size"]), dtype
+                    )
 
     def __call__(self, inputs: dict[str, wp.array]) -> dict[str, wp.array]:
         """Run forward inference.
@@ -1559,6 +1562,7 @@ def _shape_gemm(op, shapes, dtypes, tensors, device, requires_grad=False):
     dtypes[out_name] = dtype
     op.attrs["_bias_2d"] = tensors[op.inputs[2]].reshape((N, 1))
     op.attrs["_requires_grad"] = requires_grad
+    op.attrs["_kernel"] = _kernel_for_dtype(_gemm_transb_kernel, dtype, (2,), (2,), (1,), (2,), int, float, float)
 
 
 def _shape_elementwise_unary(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -1571,6 +1575,9 @@ def _shape_elementwise_unary(op, shapes, dtypes, tensors, device, requires_grad=
     dtypes[out_name] = dtype
     width = in_shape[-1] if in_shape else 1
     op.attrs["_shape_2d"] = (int(np.prod(in_shape)) // width, width)
+    kernel = _elu_kernel if op.op_type == "Elu" else _unary_kernel
+    parameter_types = ((2,), (2,), float) if op.op_type == "Elu" else ((2,), int, (2,))
+    op.attrs["_kernel"] = _kernel_for_dtype(kernel, dtype, *parameter_types)
 
 
 def _shape_elementwise_binary(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -1626,6 +1633,7 @@ def _shape_elementwise_binary(op, shapes, dtypes, tensors, device, requires_grad
     op.attrs["_out_shape_2d"] = out_2d
     op.attrs["_lhs_shape_2d"] = lhs_2d
     op.attrs["_rhs_shape_2d"] = rhs_2d
+    op.attrs["_kernel"] = _kernel_for_dtype(_binary_broadcast_kernel, dtype, (2,), (2,), int, (2,))
 
 
 def _shape_reduce_mean(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -1641,6 +1649,7 @@ def _shape_reduce_mean(op, shapes, dtypes, tensors, device, requires_grad=False)
         tensors[out_name] = wp.zeros(out_shape, dtype=dtype, device=device, requires_grad=requires_grad)
     shapes[out_name] = out_shape
     dtypes[out_name] = dtype
+    op.attrs["_kernel"] = _kernel_for_dtype(_reduce_mean_rows_kernel, dtype, (2,), (2,))
 
 
 def _shape_lp_normalization(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -1673,6 +1682,7 @@ def _shape_reduce_sum(op, shapes, dtypes, tensors, device, requires_grad=False):
     tensors[op.outputs[0]] = wp.zeros(out_shape, dtype=dtype, device=device)
     shapes[op.outputs[0]] = out_shape
     dtypes[op.outputs[0]] = dtype
+    op.attrs["_kernel"] = _kernel_for_dtype(_reduce_sum_rows_kernel, dtype, (2,), (1,))
 
 
 def _shape_reduce_max(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -1724,6 +1734,13 @@ def _shape_gather(op, shapes, dtypes, tensors, device, requires_grad=False):
         shapes[op.outputs[0]] = out_shape
         dtypes[op.outputs[0]] = dtypes[op.inputs[0]]
         op.attrs["_dynamic"] = True
+        op.attrs["_kernel"] = _kernel_for_dtype(
+            _gather_rows_kernel,
+            dtypes[op.inputs[0]],
+            (2,),
+            _array_type(wp.int64, 2),
+            (3,),
+        )
         return
     if indices_static and tensors[op.inputs[1]].size == 1:
         if requires_grad:
@@ -1741,6 +1758,9 @@ def _shape_gather(op, shapes, dtypes, tensors, device, requires_grad=False):
         op.attrs["_single_index"] = index
         op.attrs["_axis_size"] = data_shape[axis]
         op.attrs["_stride"] = int(np.prod(data_shape[axis + 1 :]))
+        op.attrs["_kernel"] = _kernel_for_dtype(
+            _gather_single_index_kernel, dtypes[op.inputs[0]], (1,), (1,), int, int, int
+        )
         return
     raise NotImplementedError("OnnxRuntime Gather: unsupported dynamic gather")
 
@@ -1790,6 +1810,9 @@ def _shape_batch_normalization(op, shapes, dtypes, tensors, device, requires_gra
         tensors[out_name] = wp.zeros(in_shape, dtype=dtype, device=device, requires_grad=requires_grad)
     shapes[out_name] = in_shape
     dtypes[out_name] = dtype
+    op.attrs["_kernel"] = _kernel_for_dtype(
+        _batch_normalization_kernel, dtype, (2,), (1,), (1,), (1,), (1,), float, bool, (2,)
+    )
 
 
 def _shape_rms_normalization(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -2052,6 +2075,7 @@ def _shape_matmul_nbits(op, shapes, dtypes, tensors, device, requires_grad=False
     op.attrs["_has_zero_points"] = has_zero_points
     op.attrs["_zero_points"] = tensors[op.inputs[3]] if has_zero_points else tensors[zero_name]
     op.attrs["_output_2d"] = tensors[op.outputs[0]].reshape((rows, N))
+    op.attrs["_matmul_kernel"] = _get_matmul_nbits_kernel(bits, block_size, dtype, device.is_cuda)
 
 
 def _shape_causal_conv_with_state(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -2565,6 +2589,8 @@ def _shape_lstm(op, shapes, dtypes, tensors, device, requires_grad=False):
     cache["batch"] = batch
     cache["layout"] = layout
     cache["dtype"] = dtype
+    cache["gates_kernel"] = _kernel_for_dtype(_lstm_gates_kernel, dtype, (2,), (2,), (2,), (2,), (2,), int, int)
+    cache["cell_kernel"] = _kernel_for_dtype(_lstm_cell_update_kernel, dtype, (2,), (2,), (1,), (1,), (2,), (2,), int)
     op.attrs["_cache"] = cache
 
     h_buf = wp.zeros(
@@ -2614,7 +2640,7 @@ def _exec_gemm(op, tensors, shapes, device):
 
     if op.attrs["_requires_grad"] or A.dtype != wp.float32:
         wp.launch(
-            _kernel_for_dtype(_gemm_transb_kernel, A.dtype, (2,), (2,), (1,), (2,), int, float, float),
+            op.attrs["_kernel"],
             dim=(M, N),
             inputs=[A, B, bias, out, K, alpha, beta],
             device=device,
@@ -2635,15 +2661,14 @@ def _exec_elu(op, tensors, shapes, device):
     alpha = float(op.attrs.get("alpha", 1.0))
     out = tensors[op.outputs[0]]
     shape = op.attrs["_shape_2d"]
-    kernel = _kernel_for_dtype(_elu_kernel, x.dtype, (2,), (2,), float)
-    wp.launch(kernel, dim=shape, inputs=[x.reshape(shape), out.reshape(shape), alpha], device=device)
+    wp.launch(op.attrs["_kernel"], dim=shape, inputs=[x.reshape(shape), out.reshape(shape), alpha], device=device)
 
 
 def _exec_unary(op, tensors, shapes, device):
     operation = {"Relu": 0, "Tanh": 1, "Sqrt": 2, "Sigmoid": 3, "Softplus": 4}[op.op_type]
     shape_2d = op.attrs["_shape_2d"]
     wp.launch(
-        _kernel_for_dtype(_unary_kernel, tensors[op.inputs[0]].dtype, (2,), int, (2,)),
+        op.attrs["_kernel"],
         dim=shape_2d,
         inputs=[tensors[op.inputs[0]].reshape(shape_2d), operation],
         outputs=[tensors[op.outputs[0]].reshape(shape_2d)],
@@ -2658,7 +2683,7 @@ def _exec_binary(op, tensors, shapes, device):
     rhs = tensors[op.inputs[1]].reshape(op.attrs["_rhs_shape_2d"])
     operation = {"Add": 0, "Sub": 1, "Mul": 2, "Div": 3}[op.op_type]
     wp.launch(
-        _kernel_for_dtype(_binary_broadcast_kernel, lhs.dtype, (2,), (2,), int, (2,)),
+        op.attrs["_kernel"],
         dim=op.attrs["_out_shape_2d"],
         inputs=[lhs, rhs, operation],
         outputs=[tensors[op.outputs[0]].reshape(op.attrs["_out_shape_2d"])],
@@ -2668,7 +2693,7 @@ def _exec_binary(op, tensors, shapes, device):
 
 def _exec_reduce_mean(op, tensors, shapes, device):
     wp.launch(
-        _kernel_for_dtype(_reduce_mean_rows_kernel, tensors[op.inputs[0]].dtype, (2,), (2,)),
+        op.attrs["_kernel"],
         dim=shapes[op.inputs[0]][0],
         inputs=[tensors[op.inputs[0]]],
         outputs=[tensors[op.outputs[0]]],
@@ -2678,7 +2703,7 @@ def _exec_reduce_mean(op, tensors, shapes, device):
 
 def _exec_reduce_sum(op, tensors, shapes, device):
     wp.launch(
-        _kernel_for_dtype(_reduce_sum_rows_kernel, tensors[op.inputs[0]].dtype, (2,), (1,)),
+        op.attrs["_kernel"],
         dim=shapes[op.inputs[0]][0],
         inputs=[tensors[op.inputs[0]], tensors[op.outputs[0]]],
         device=device,
@@ -2696,7 +2721,7 @@ def _exec_gather(op, tensors, shapes, device):
         data = tensors[op.inputs[0]]
         output = tensors[op.outputs[0]]
         wp.launch(
-            _kernel_for_dtype(_gather_single_index_kernel, data.dtype, (1,), (1,), int, int, int),
+            op.attrs["_kernel"],
             dim=output.size,
             inputs=[
                 data.flatten(),
@@ -2712,13 +2737,7 @@ def _exec_gather(op, tensors, shapes, device):
         return
     data = tensors[op.inputs[0]]
     wp.launch(
-        _kernel_for_dtype(
-            _gather_rows_kernel,
-            data.dtype,
-            (2,),
-            _array_type(wp.int64, 2),
-            (3,),
-        ),
+        op.attrs["_kernel"],
         dim=shapes[op.outputs[0]],
         inputs=[data, tensors[op.inputs[1]], tensors[op.outputs[0]]],
         device=device,
@@ -2763,18 +2782,7 @@ def _exec_reduce_max(op, tensors, shapes, device):
 
 def _exec_batch_normalization(op, tensors, shapes, device):
     wp.launch(
-        _kernel_for_dtype(
-            _batch_normalization_kernel,
-            tensors[op.inputs[0]].dtype,
-            (2,),
-            (1,),
-            (1,),
-            (1,),
-            (1,),
-            float,
-            bool,
-            (2,),
-        ),
+        op.attrs["_kernel"],
         dim=shapes[op.inputs[0]],
         inputs=[
             tensors[op.inputs[0]],
@@ -2902,7 +2910,7 @@ def _exec_matmul_nbits(op, tensors, shapes, device):
         weights = tensors[op.inputs[1]]
         dequantized = op.attrs["_dequantized_weights"]
         wp.launch(
-            _get_dequantize_nbits_kernel(bits, block_size, dtype),
+            op.attrs["_dequantize_kernel"],
             dim=(N, weights.shape[1] * weights.shape[2]),
             inputs=[weights, tensors[op.inputs[2]], zero_points, dequantized, has_zero_points],
             device=device,
@@ -2920,7 +2928,7 @@ def _exec_matmul_nbits(op, tensors, shapes, device):
         return
     if device.is_cuda:
         wp.launch(
-            _get_matmul_nbits_kernel(bits, block_size, dtype, True),
+            op.attrs["_matmul_kernel"],
             dim=op.attrs["_rows"] * N * 32,
             inputs=[
                 tensors[op.inputs[0]].reshape((op.attrs["_rows"], K)),
@@ -2935,7 +2943,7 @@ def _exec_matmul_nbits(op, tensors, shapes, device):
         )
         return
     wp.launch(
-        _get_matmul_nbits_kernel(bits, block_size, dtype, False),
+        op.attrs["_matmul_kernel"],
         dim=(op.attrs["_rows"], N),
         inputs=[
             tensors[op.inputs[0]].reshape((op.attrs["_rows"], K)),
@@ -3177,13 +3185,13 @@ def _exec_lstm(op, tensors, shapes, device):
     c_out = cache["c_out"]
 
     wp.launch(
-        _kernel_for_dtype(_lstm_gates_kernel, cache["dtype"], (2,), (2,), (2,), (2,), (2,), int, int),
+        cache["gates_kernel"],
         dim=(batch, 4 * hidden_size),
         inputs=[x_t, h_prev, cache["W"], cache["R"], gates, input_size, hidden_size],
         device=device,
     )
     wp.launch(
-        _kernel_for_dtype(_lstm_cell_update_kernel, cache["dtype"], (2,), (2,), (1,), (1,), (2,), (2,), int),
+        cache["cell_kernel"],
         dim=(batch, hidden_size),
         inputs=[gates, c_prev, cache["Bx"], cache["Bh"], h_out, c_out, hidden_size],
         device=device,
