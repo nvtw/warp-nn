@@ -666,7 +666,7 @@ def _create_rms_norm_kernels(tile_width: int, dtype: type):
     def skip_normalize(value: dtype, skip: dtype, scale: dtype, inverse_rms: float):
         return dtype((wp.float32(value) + wp.float32(skip)) * wp.float32(scale) * inverse_rms)
 
-    @wp.kernel(enable_backward=False)
+    @wp.kernel(enable_backward=False, module="unique")
     def rms_norm(
         x: wp.array2d(dtype=DTYPE),
         scale: wp.array1d(dtype=DTYPE),
@@ -690,7 +690,7 @@ def _create_rms_norm_kernels(tile_width: int, dtype: type):
             scales = wp.tile_load(scale, shape=(TILE_WIDTH,), offset=(offset,))
             wp.tile_store(output[row], wp.tile_map(normalize, values, scales, inverse_rms), offset=(offset,))
 
-    @wp.kernel(enable_backward=False)
+    @wp.kernel(enable_backward=False, module="unique")
     def skip_rms_norm(
         x: wp.array2d(dtype=DTYPE),
         skip: wp.array2d(dtype=DTYPE),
@@ -748,7 +748,7 @@ def _create_lp_normalization_kernel(tile_width: int, dtype: type):
     def normalize(value: dtype, inverse_norm: float):
         return dtype(wp.float32(value) * inverse_norm)
 
-    @wp.kernel(enable_backward=False)
+    @wp.kernel(enable_backward=False, module="unique")
     def kernel(x: wp.array2d(dtype=DTYPE), output: wp.array2d(dtype=DTYPE)):
         row = wp.tid()
         typed_zero = DTYPE(0.0)
@@ -788,7 +788,7 @@ def _create_linear_attention_kernel(key_size: int, value_size: int, dtype: type)
     def exp_value(value: dtype):
         return dtype(wp.exp(wp.float32(value)))
 
-    @wp.kernel(enable_backward=False)
+    @wp.kernel(enable_backward=False, module="unique")
     def kernel(
         query: wp.array2d(dtype=DTYPE),
         key: wp.array2d(dtype=DTYPE),
@@ -978,7 +978,7 @@ def _gqa_normalize_fp16(total: wp.float32, denominator: wp.float32):
 
 
 def _create_gqa_attention_kernel(head_size: int):
-    @wp.kernel(enable_backward=False)
+    @wp.kernel(enable_backward=False, module="unique")
     def kernel(
         query: wp.array2d[wp.float16],
         key: wp.array2d[wp.float16],
