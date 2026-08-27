@@ -619,6 +619,43 @@ def test_general_ops_float16(device):
 
 
 @pytest.mark.parametrize("device", ["cuda"])
+def test_constant_reshape_is_a_view(device):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    shape = numpy_helper.from_array(np.asarray([0, -1, 2], dtype=np.int64), name="shape_value")
+    model = helper.make_model(
+        helper.make_graph(
+            [
+                helper.make_node("Constant", [], ["shape"], value=shape),
+                helper.make_node("Reshape", ["input", "shape"], ["output"]),
+            ],
+            "reshape_view",
+            [helper.make_tensor_value_info("input", TensorProto.FLOAT16, [2, 3, 4])],
+            [helper.make_tensor_value_info("output", TensorProto.FLOAT16, [2, 6, 2])],
+        ),
+        opset_imports=[helper.make_opsetid("", 17)],
+    )
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    input_np = np.arange(24, dtype=np.float16).reshape(2, 3, 4)
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        runtime = OnnxRuntime(str(path), device=device)
+        input_wp = wp.array(input_np, dtype=wp.float16, device=device)
+        output = runtime({"input": input_wp})["output"]
+        assert output.shape == (2, 6, 2)
+        assert output.dtype == wp.float16
+        assert output.ptr == input_wp.ptr
+        np.testing.assert_array_equal(output.numpy(), input_np.reshape(2, 6, 2))
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("device", ["cuda"])
 def test_rejects_unsupported_ops(device):
     if not is_device_available(device):
         pytest.skip(f"Device '{device}' is not available")

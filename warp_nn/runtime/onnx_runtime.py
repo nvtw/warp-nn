@@ -34,6 +34,8 @@ Supported ONNX operators (all graph-capturable after one warmup call):
 * **Gemm** -- ``C = alpha * A @ B.T + beta * bias`` with ``transB=1``
 * **Elu**, **Relu**, **Sqrt**, **Tanh** -- elementwise activation/math
 * **ReduceMean** -- 2-D row reduction with ``keepdims=1``
+* **Constant** -- tensor-valued constants resolved during construction
+* **Reshape** -- view-only reshape with a construction-time shape tensor
 * **Squeeze** -- alias passthrough (the output array shares memory with the
   input). Only used to drop unit dims, no copy is performed.
 * **LSTM** -- forward, single-direction, single-layer, ``seq_length=1``. The
@@ -349,6 +351,7 @@ _ATTR_DECODERS = {
     1: lambda a: a.f,  # FLOAT
     2: lambda a: a.i,  # INT
     3: lambda a: a.s.decode("utf-8") if isinstance(a.s, (bytes, bytearray)) else a.s,  # STRING
+    4: lambda a: a.t,  # TENSOR
     7: lambda a: list(a.ints),  # INTS
 }
 
@@ -577,6 +580,12 @@ class OnnxRuntime:
         self._ops: list[_Op] = []
         for node in graph.node:
             decoded, all_names = _decode_attrs(node)
+            if node.op_type == "Constant" and "value" in decoded:
+                decoded["_value"] = _np_to_warp(
+                    numpy_helper.to_array(decoded["value"]),
+                    self._device,
+                    requires_grad=self._requires_grad,
+                )
             self._ops.append(
                 _Op(
                     op_type=node.op_type,
@@ -774,6 +783,54 @@ def _shape_rms_normalization(op, shapes, dtypes, tensors, device, requires_grad=
     tensors[op.outputs[0]] = wp.zeros(shape, dtype=dtype, device=device)
     shapes[op.outputs[0]] = shape
     dtypes[op.outputs[0]] = dtype
+
+
+def _shape_constant(op, shapes, dtypes, tensors, device, requires_grad=False):
+    if set(op.attr_names) != {"value"}:
+        raise NotImplementedError("OnnxRuntime Constant: only the tensor-valued 'value' attribute is supported")
+    value = op.attrs["_value"]
+    tensors[op.outputs[0]] = value
+    shapes[op.outputs[0]] = tuple(value.shape)
+    dtypes[op.outputs[0]] = value.dtype
+
+
+def _shape_reshape(op, shapes, dtypes, tensors, device, requires_grad=False):
+    if len(op.inputs) != 2 or op.inputs[1] not in tensors:
+        raise NotImplementedError("OnnxRuntime Reshape: the shape input must be constant")
+
+    in_shape = shapes[op.inputs[0]]
+    requested = [int(value) for value in tensors[op.inputs[1]].numpy().reshape(-1)]
+    allowzero = int(op.attrs.get("allowzero", 0))
+    out_shape = []
+    inferred_axis = None
+    for axis, dimension in enumerate(requested):
+        if dimension == 0 and not allowzero:
+            if axis >= len(in_shape):
+                raise ValueError("OnnxRuntime Reshape: a copied dimension is outside the input rank")
+            dimension = in_shape[axis]
+        elif dimension == -1:
+            if inferred_axis is not None:
+                raise ValueError("OnnxRuntime Reshape: at most one dimension may be inferred")
+            inferred_axis = axis
+            dimension = 1
+        elif dimension < 0:
+            raise ValueError(f"OnnxRuntime Reshape: invalid dimension {dimension}")
+        out_shape.append(dimension)
+
+    input_size = int(np.prod(in_shape))
+    known_size = int(np.prod(out_shape))
+    if inferred_axis is not None:
+        if 0 in out_shape:
+            raise ValueError("OnnxRuntime Reshape: zero dimensions cannot be combined with an inferred dimension")
+        if known_size == 0 or input_size % known_size:
+            raise ValueError("OnnxRuntime Reshape: input size is not divisible by the requested shape")
+        out_shape[inferred_axis] = input_size // known_size
+    elif known_size != input_size:
+        raise ValueError("OnnxRuntime Reshape: input and output shapes must have the same number of elements")
+
+    op.attrs["_out_shape"] = tuple(out_shape)
+    shapes[op.outputs[0]] = tuple(out_shape)
+    dtypes[op.outputs[0]] = dtypes[op.inputs[0]]
 
 
 def _shape_squeeze(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -1046,6 +1103,14 @@ def _exec_rms_normalization(op, tensors, shapes, device):
     )
 
 
+def _exec_constant(op, tensors, shapes, device):
+    pass
+
+
+def _exec_reshape(op, tensors, shapes, device):
+    tensors[op.outputs[0]] = tensors[op.inputs[0]].reshape(op.attrs["_out_shape"])
+
+
 def _exec_squeeze(op, tensors, shapes, device):
     src = tensors[op.inputs[0]]
     out_shape = op.attrs["_out_shape"]
@@ -1102,6 +1167,7 @@ _OP_DISPATCH: dict[str, Any] = {
     "_RmsNormalization": _exec_rms_normalization,
     "Add": _exec_binary,
     "BatchNormalization": _exec_batch_normalization,
+    "Constant": _exec_constant,
     "Div": _exec_binary,
     "Elu": _exec_elu,
     "Gemm": _exec_gemm,
@@ -1109,6 +1175,7 @@ _OP_DISPATCH: dict[str, Any] = {
     "Mul": _exec_binary,
     "ReduceMean": _exec_reduce_mean,
     "Relu": _exec_unary,
+    "Reshape": _exec_reshape,
     "Sqrt": _exec_unary,
     "Squeeze": _exec_squeeze,
     "Sub": _exec_binary,
@@ -1120,6 +1187,7 @@ _SHAPE_DISPATCH: dict[str, Any] = {
     "_RmsNormalization": _shape_rms_normalization,
     "Add": _shape_elementwise_binary,
     "BatchNormalization": _shape_batch_normalization,
+    "Constant": _shape_constant,
     "Div": _shape_elementwise_binary,
     "Elu": _shape_elementwise_unary,
     "Gemm": _shape_gemm,
@@ -1127,6 +1195,7 @@ _SHAPE_DISPATCH: dict[str, Any] = {
     "Mul": _shape_elementwise_binary,
     "ReduceMean": _shape_reduce_mean,
     "Relu": _shape_elementwise_unary,
+    "Reshape": _shape_reshape,
     "Sqrt": _shape_elementwise_unary,
     "Squeeze": _shape_squeeze,
     "Sub": _shape_elementwise_binary,
