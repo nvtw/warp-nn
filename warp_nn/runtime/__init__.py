@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from warp_nn.runtime.onnx_runtime import OnnxRuntime
-from warp_nn.runtime.qwen3 import Qwen3OnnxRunner
+from warp_nn.runtime.qwen3 import Qwen3OnnxRunner, Qwen3Tokenizer, sample_token
 
 
-__all__ = ["OnnxRuntime", "Qwen3OnnxRunner"]
+__all__ = ["OnnxRuntime", "Qwen3OnnxRunner", "Qwen3Tokenizer", "sample_token"]
