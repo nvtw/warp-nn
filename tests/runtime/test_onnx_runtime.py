@@ -843,6 +843,88 @@ def test_matmul_nbits(device, bits, batch, sequence, use_cublas, data_type, bloc
 
 
 @pytest.mark.parametrize(
+    "data_type,np_dtype,wp_dtype,sequence,activation",
+    [
+        (TensorProto.FLOAT16, np.float16, wp.float16, 5, "silu"),
+        (TensorProto.BFLOAT16, np.dtype("bfloat16"), wp.bfloat16, 1, "none"),
+    ],
+)
+@pytest.mark.parametrize("device", ["cuda"])
+def test_causal_conv_with_state(device, data_type, np_dtype, wp_dtype, sequence, activation):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    rng = np.random.default_rng(71)
+    batch, channels, kernel_size = 2, 3, 4
+    x = rng.standard_normal((batch, channels, sequence)).astype(np_dtype)
+    weight = rng.standard_normal((channels, 1, kernel_size)).astype(np_dtype)
+    bias = rng.standard_normal(channels).astype(np_dtype)
+    past = rng.standard_normal((batch, channels, kernel_size - 1)).astype(np_dtype)
+
+    history = np.concatenate((past.astype(np.float32), x.astype(np.float32)), axis=2)
+    expected = np.empty_like(x)
+    for position in range(sequence):
+        window = history[:, :, position : position + kernel_size]
+        value = np.sum(window * weight[:, 0, :].astype(np.float32)[None, :, :], axis=2)
+        value += bias.astype(np.float32)[None, :]
+        if activation == "silu":
+            value /= 1.0 + np.exp(-value)
+        expected[:, :, position] = value.astype(np_dtype)
+    expected_state = history[:, :, -(kernel_size - 1) :].astype(np_dtype)
+
+    model = helper.make_model(
+        helper.make_graph(
+            [
+                helper.make_node(
+                    "CausalConvWithState",
+                    ["x", "weight", "bias", "past"],
+                    ["output", "present"],
+                    domain="com.microsoft",
+                    ndim=1,
+                    activation=activation,
+                )
+            ],
+            "causal_conv",
+            [
+                helper.make_tensor_value_info("x", data_type, list(x.shape)),
+                helper.make_tensor_value_info("past", data_type, list(past.shape)),
+            ],
+            [
+                helper.make_tensor_value_info("output", data_type, list(x.shape)),
+                helper.make_tensor_value_info("present", data_type, list(past.shape)),
+            ],
+            [numpy_helper.from_array(weight, name="weight"), numpy_helper.from_array(bias, name="bias")],
+        ),
+        opset_imports=[helper.make_opsetid("", 21), helper.make_opsetid("com.microsoft", 1)],
+    )
+    model.ir_version = 10
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        runtime = OnnxRuntime(str(path), device=device)
+        inputs = {
+            "x": wp.array(x, dtype=wp_dtype, device=device),
+            "past": wp.array(past, dtype=wp_dtype, device=device),
+        }
+        outputs = runtime(inputs)
+        np.testing.assert_allclose(outputs["output"].numpy(), expected, rtol=1.0e-2, atol=1.0e-2)
+        np.testing.assert_array_equal(outputs["present"].numpy(), expected_state)
+        wp.capture_begin(device=device)
+        try:
+            runtime(inputs)
+            graph = wp.capture_end(device=device)
+        except Exception:
+            wp.capture_end(device=device)
+            raise
+        wp.capture_launch(graph)
+        np.testing.assert_allclose(outputs["output"].numpy(), expected, rtol=1.0e-2, atol=1.0e-2)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize(
     "data_type,np_dtype,wp_dtype",
     [
         (TensorProto.FLOAT16, np.float16, wp.float16),

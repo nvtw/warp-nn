@@ -38,6 +38,7 @@ Supported ONNX operators (all graph-capturable after one warmup call):
 * **Reshape** -- view-only reshape with a construction-time shape tensor
 * **GatherBlockQuantized** -- Qwen-style INT8 block-quantized embedding lookup
 * **MatMulNBits** -- Qwen-style INT4/INT8 block-quantized matrix multiplication
+* **CausalConvWithState** -- stateful causal depthwise 1-D convolution
 * **SimplifiedLayerNormalization**, **SkipSimplifiedLayerNormalization** --
   Qwen FP16 last-axis RMS normalization, with optional residual addition
 * **GroupQueryAttention** -- causal FP16 grouped-query attention with
@@ -471,6 +472,49 @@ def _create_dequantize_nbits_kernel(bits: int, block_size: int, dtype: type):
             output[column, output_offset + value_index] = dtype(wp.float32(quantized - zero) * scale)
 
     return kernel
+
+
+@wp.kernel(enable_backward=False)
+def _causal_conv_1d_kernel(
+    x: wp.array3d[Any],
+    weight: wp.array3d[Any],
+    bias: wp.array1d[Any],
+    past: wp.array3d[Any],
+    output: wp.array3d[Any],
+    kernel_size: int,
+    has_bias: bool,
+    silu: bool,
+):
+    batch, channel, position = wp.tid()
+    value = wp.float32(0.0)
+    if has_bias:
+        value = wp.float32(bias[channel])
+    for kernel_index in range(kernel_size):
+        input_index = position + kernel_index - (kernel_size - 1)
+        input_value = wp.float32(0.0)
+        if input_index < 0:
+            input_value = wp.float32(past[batch, channel, input_index + kernel_size - 1])
+        else:
+            input_value = wp.float32(x[batch, channel, input_index])
+        value += input_value * wp.float32(weight[channel, 0, kernel_index])
+    if silu:
+        value = value / (wp.float32(1.0) + wp.exp(-value))
+    output[batch, channel, position] = x.dtype(value)
+
+
+@wp.kernel(enable_backward=False)
+def _causal_conv_state_kernel(
+    x: wp.array3d[Any],
+    past: wp.array3d[Any],
+    present: wp.array3d[Any],
+):
+    batch, channel, state_index = wp.tid()
+    sequence_length = x.shape[2]
+    source_index = sequence_length + state_index
+    if source_index < past.shape[2]:
+        present[batch, channel, state_index] = past[batch, channel, source_index]
+    else:
+        present[batch, channel, state_index] = x[batch, channel, source_index - past.shape[2]]
 
 
 _dequantize_nbits_kernel_cache = {}
@@ -1520,6 +1564,61 @@ def _shape_matmul_nbits(op, shapes, dtypes, tensors, device, requires_grad=False
     op.attrs["_output_2d"] = tensors[op.outputs[0]].reshape((rows, N))
 
 
+def _shape_causal_conv_with_state(op, shapes, dtypes, tensors, device, requires_grad=False):
+    if requires_grad:
+        raise NotImplementedError("OnnxRuntime CausalConvWithState: gradients are not supported")
+    if int(op.attrs.get("ndim", 1)) != 1:
+        raise NotImplementedError("OnnxRuntime CausalConvWithState: only 1-D convolution is supported")
+    activation = op.attrs.get("activation", "none").lower()
+    if activation not in ("none", "silu", "swish"):
+        raise NotImplementedError(f"OnnxRuntime CausalConvWithState: unsupported activation '{activation}'")
+
+    x_shape = shapes[op.inputs[0]]
+    weight_shape = shapes[op.inputs[1]]
+    if len(x_shape) != 3 or len(weight_shape) != 3 or weight_shape[:2] != (x_shape[1], 1):
+        raise ValueError(
+            "OnnxRuntime CausalConvWithState: expected input [batch, channels, sequence] and "
+            "weights [channels, 1, kernel]"
+        )
+    batch, channels, sequence_length = x_shape
+    kernel_size = weight_shape[2]
+    if sequence_length < 1 or kernel_size < 1:
+        raise ValueError("OnnxRuntime CausalConvWithState: sequence and kernel sizes must be positive")
+
+    has_bias = len(op.inputs) > 2 and bool(op.inputs[2])
+    has_past = len(op.inputs) > 3 and bool(op.inputs[3])
+    dtype_names = [op.inputs[0], op.inputs[1]]
+    if has_bias:
+        if shapes[op.inputs[2]] != (channels,):
+            raise ValueError(f"OnnxRuntime CausalConvWithState: bias must have shape {(channels,)}")
+        dtype_names.append(op.inputs[2])
+    state_shape = (batch, channels, kernel_size - 1)
+    if has_past:
+        if shapes[op.inputs[3]] != state_shape:
+            raise ValueError(f"OnnxRuntime CausalConvWithState: past state must have shape {state_shape}")
+        dtype_names.append(op.inputs[3])
+    dtype = _require_matching_float_dtypes(op, dtypes, dtype_names)
+
+    bias = tensors[op.inputs[2]] if has_bias else wp.zeros(1, dtype=dtype, device=device)
+    past = wp.zeros(state_shape, dtype=dtype, device=device) if not has_past else None
+    tensors[op.outputs[0]] = wp.zeros(x_shape, dtype=dtype, device=device)
+    tensors[op.outputs[1]] = wp.zeros(state_shape, dtype=dtype, device=device)
+    shapes[op.outputs[0]] = x_shape
+    shapes[op.outputs[1]] = state_shape
+    dtypes[op.outputs[0]] = dtype
+    dtypes[op.outputs[1]] = dtype
+    op.attrs["_kernel_size"] = kernel_size
+    op.attrs["_bias"] = bias
+    op.attrs["_past"] = past
+    op.attrs["_has_past"] = has_past
+    op.attrs["_has_bias"] = has_bias
+    op.attrs["_silu"] = activation != "none"
+    op.attrs["_kernel"] = _kernel_for_dtype(
+        _causal_conv_1d_kernel, dtype, (3,), (3,), (1,), (3,), (3,), int, bool, bool
+    )
+    op.attrs["_state_kernel"] = _kernel_for_dtype(_causal_conv_state_kernel, dtype, (3,), (3,), (3,))
+
+
 def _shape_simplified_layer_normalization(op, shapes, dtypes, tensors, device, requires_grad=False):
     if requires_grad:
         raise NotImplementedError("OnnxRuntime SimplifiedLayerNormalization: gradients are not supported")
@@ -2047,6 +2146,33 @@ def _exec_matmul_nbits(op, tensors, shapes, device):
     )
 
 
+def _exec_causal_conv_with_state(op, tensors, shapes, device):
+    x = tensors[op.inputs[0]]
+    past = tensors[op.inputs[3]] if op.attrs["_has_past"] else op.attrs["_past"]
+    wp.launch(
+        op.attrs["_kernel"],
+        dim=x.shape,
+        inputs=[
+            x,
+            tensors[op.inputs[1]],
+            op.attrs["_bias"],
+            past,
+            tensors[op.outputs[0]],
+            op.attrs["_kernel_size"],
+            op.attrs["_has_bias"],
+            op.attrs["_silu"],
+        ],
+        device=device,
+    )
+    if op.attrs["_kernel_size"] > 1:
+        wp.launch(
+            op.attrs["_state_kernel"],
+            dim=tensors[op.outputs[1]].shape,
+            inputs=[x, past, tensors[op.outputs[1]]],
+            device=device,
+        )
+
+
 def _exec_simplified_layer_normalization(op, tensors, shapes, device):
     wp.launch_tiled(
         op.attrs["_rms_norm_kernels"][0],
@@ -2217,6 +2343,7 @@ _OP_DISPATCH: dict[str, Any] = {
     "Add": _exec_binary,
     "BatchNormalization": _exec_batch_normalization,
     "Cast": _exec_cast,
+    "CausalConvWithState": _exec_causal_conv_with_state,
     "Constant": _exec_constant,
     "Div": _exec_binary,
     "Elu": _exec_elu,
@@ -2247,6 +2374,7 @@ _SHAPE_DISPATCH: dict[str, Any] = {
     "Add": _shape_elementwise_binary,
     "BatchNormalization": _shape_batch_normalization,
     "Cast": _shape_cast,
+    "CausalConvWithState": _shape_causal_conv_with_state,
     "Constant": _shape_constant,
     "Div": _shape_elementwise_binary,
     "Elu": _shape_elementwise_unary,
