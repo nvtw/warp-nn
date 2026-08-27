@@ -68,6 +68,7 @@ Example::
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any
 
 from dataclasses import dataclass, field
@@ -495,7 +496,7 @@ def _create_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_re
     load_stride = 32 if warp_reduction else 1
     loads_per_lane = (packed_block_size + load_stride - 1) // load_stride
 
-    @wp.kernel(enable_backward=False)
+    @wp.kernel(enable_backward=False, module="unique")
     def kernel(
         activations: wp.array2d(dtype=dtype),
         weights: wp.array3d[wp.uint8],
@@ -516,7 +517,7 @@ def _create_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_re
             if has_zero_points:
                 packed_zero = wp.int32(zero_points[column, block / values_per_byte])
                 zero = (packed_zero >> ((block % values_per_byte) * bits)) & ((1 << bits) - 1)
-            scale = wp.float32(scales[column, block])
+            block_total = wp.float32(0.0)
             for group in range(loads_per_lane):
                 packed_offset = lane + group * load_stride
                 if packed_offset < packed_block_size:
@@ -524,11 +525,10 @@ def _create_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_re
                     activation_offset = block * block_size + packed_offset * values_per_byte
                     for value_index in range(values_per_byte):
                         quantized = (packed >> (value_index * bits)) & ((1 << bits) - 1)
-                        total += (
-                            wp.float32(activations[row, activation_offset + value_index])
-                            * wp.float32(quantized - zero)
-                            * scale
+                        block_total += wp.float32(activations[row, activation_offset + value_index]) * wp.float32(
+                            quantized - zero
                         )
+            total += block_total * wp.float32(scales[column, block])
 
         if warp_reduction:
             total = _warp_sum(total)
@@ -538,14 +538,9 @@ def _create_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_re
     return kernel
 
 
-_matmul_nbits_kernel_cache = {}
-
-
+@lru_cache(maxsize=None)
 def _get_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_reduction: bool):
-    key = (bits, block_size, dtype, warp_reduction)
-    if key not in _matmul_nbits_kernel_cache:
-        _matmul_nbits_kernel_cache[key] = _create_matmul_nbits_kernel(*key)
-    return _matmul_nbits_kernel_cache[key]
+    return _create_matmul_nbits_kernel(bits, block_size, dtype, warp_reduction)
 
 
 def _create_dequantize_nbits_kernel(bits: int, block_size: int, dtype: type):
