@@ -1341,6 +1341,29 @@ def _np_to_warp(arr_np: np.ndarray, device: wp.context.Device, requires_grad: bo
     )
 
 
+def _external_initializer_view(onnx, initializer, base_dir: Path, mappings: dict[Path, np.memmap]):
+    metadata = {entry.key: entry.value for entry in initializer.external_data}
+    location = metadata.get("location")
+    if location is None:
+        return None
+    try:
+        dtype = np.dtype(onnx.helper.tensor_dtype_to_np_dtype(initializer.data_type))
+    except TypeError:
+        return None
+    path = base_dir / location
+    mapping = mappings.get(path)
+    if mapping is None:
+        mapping = np.memmap(path, mode="r", dtype=np.uint8)
+        mappings[path] = mapping
+    offset = int(metadata.get("offset", 0))
+    shape = tuple(initializer.dims)
+    elements = int(np.prod(shape, dtype=np.int64))
+    length = int(metadata.get("length", elements * dtype.itemsize))
+    if elements * dtype.itemsize > length:
+        raise ValueError(f"ONNX external initializer '{initializer.name}' is shorter than its declared shape")
+    return np.ndarray(shape, dtype=dtype, buffer=mapping, offset=offset)
+
+
 class OnnxRuntime:
     """Lightweight ONNX inference engine for graph-capturable MLP policies.
 
@@ -1395,10 +1418,17 @@ class OnnxRuntime:
         self._shapes: dict[str, tuple[int, ...]] = {}
         self._dtypes: dict[str, type] = {}
 
+        external_mappings = {}
         for init in graph.initializer:
             external = onnx.external_data_helper.uses_external_data(init)
             try:
-                arr_np = numpy_helper.to_array(init, base_dir=str(model_path.parent))
+                arr_np = (
+                    _external_initializer_view(onnx, init, model_path.parent, external_mappings)
+                    if external
+                    else None
+                )
+                if arr_np is None:
+                    arr_np = numpy_helper.to_array(init, base_dir=str(model_path.parent))
                 tensor = _np_to_warp(arr_np, self._device, requires_grad=self._requires_grad)
             finally:
                 if external:
@@ -1406,6 +1436,8 @@ class OnnxRuntime:
             self._tensors[init.name] = tensor
             self._shapes[init.name] = tuple(arr_np.shape)
             self._dtypes[init.name] = tensor.dtype
+        arr_np = None
+        external_mappings.clear()
 
         initializer_names = {init.name for init in graph.initializer}
         self._initializer_names = initializer_names

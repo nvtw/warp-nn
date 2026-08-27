@@ -319,7 +319,7 @@ def test_mlp_policy(device):
 
 
 @pytest.mark.parametrize("device", ["cuda"])
-def test_streams_external_initializers(device, monkeypatch):
+def test_maps_external_initializers_once(device, monkeypatch):
     if not is_device_available(device):
         pytest.skip(f"Device '{device}' is not available")
 
@@ -342,18 +342,16 @@ def test_streams_external_initializers(device, monkeypatch):
         assert data_path.is_file()
         assert all(onnx.external_data_helper.uses_external_data(item) for item in unloaded.graph.initializer)
 
-        loaded_tensors = []
-        load_external_data_for_tensor = onnx.external_data_helper.load_external_data_for_tensor
+        mapped_paths = []
+        memmap = np.memmap
 
-        def track_external_load(tensor, base_dir):
-            assert all(not previous.HasField("raw_data") for previous in loaded_tensors)
-            load_external_data_for_tensor(tensor, base_dir)
-            loaded_tensors.append(tensor)
+        def track_memmap(filename, *args, **kwargs):
+            mapped_paths.append(Path(filename))
+            return memmap(filename, *args, **kwargs)
 
-        monkeypatch.setattr(onnx.external_data_helper, "load_external_data_for_tensor", track_external_load)
+        monkeypatch.setattr(np, "memmap", track_memmap)
         runtime = OnnxRuntime(str(path), device=device)
-        assert len(loaded_tensors) == len(model.graph.initializer)
-        assert all(not tensor.HasField("raw_data") for tensor in loaded_tensors)
+        assert mapped_paths == [data_path]
         assert {tensor.dtype for tensor in runtime._tensors.values()} == {wp.float16}
 
         output = runtime({"observation": wp.array(observation, dtype=wp.float16, device=device)})["action"]
