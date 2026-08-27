@@ -756,6 +756,7 @@ def test_transformer_cast_and_int32_metadata(device):
             [
                 helper.make_node("Cast", ["mask"], ["mask_i32"], to=TensorProto.INT32),
                 helper.make_node("ReduceSum", ["mask_i32", "axis"], ["lengths"], keepdims=0),
+                helper.make_node("ReduceMax", ["lengths"], ["max_length"], keepdims=0),
                 helper.make_node("Sub", ["lengths", "one"], ["last_indices"]),
                 helper.make_node("Cast", ["values"], ["values_f32"], to=TensorProto.FLOAT),
                 helper.make_node("Cast", ["values_f32"], ["restored"], to=TensorProto.FLOAT16),
@@ -767,6 +768,7 @@ def test_transformer_cast_and_int32_metadata(device):
             ],
             [
                 helper.make_tensor_value_info("last_indices", TensorProto.INT32, [2]),
+                helper.make_tensor_value_info("max_length", TensorProto.INT32, []),
                 helper.make_tensor_value_info("restored", TensorProto.FLOAT16, list(values.shape)),
             ],
             [
@@ -789,7 +791,58 @@ def test_transformer_cast_and_int32_metadata(device):
             }
         )
         np.testing.assert_array_equal(outputs["last_indices"].numpy(), mask.sum(axis=1).astype(np.int32) - 1)
+        assert outputs["max_length"].numpy()[0] == 3
         np.testing.assert_array_equal(outputs["restored"].numpy(), values)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("device", ["cuda"])
+def test_transformer_layout_ops(device):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    x = np.arange(24, dtype=np.float16).reshape(2, 3, 4)
+    model = helper.make_model(
+        helper.make_graph(
+            [
+                helper.make_node("Unsqueeze", ["x", "axis"], ["expanded"]),
+                helper.make_node("Squeeze", ["expanded", "axis"], ["restored"]),
+                helper.make_node("Transpose", ["x"], ["transposed3"], perm=[0, 2, 1]),
+                helper.make_node("Transpose", ["expanded"], ["transposed4"], perm=[0, 2, 1, 3]),
+                helper.make_node("Split", ["transposed3", "split"], ["left", "right"], axis=-1),
+                helper.make_node("Tile", ["x", "repeats"], ["tiled"]),
+            ],
+            "transformer_layout",
+            [helper.make_tensor_value_info("x", TensorProto.FLOAT16, list(x.shape))],
+            [
+                helper.make_tensor_value_info("restored", TensorProto.FLOAT16, list(x.shape)),
+                helper.make_tensor_value_info("transposed4", TensorProto.FLOAT16, [1, 3, 2, 4]),
+                helper.make_tensor_value_info("left", TensorProto.FLOAT16, [2, 4, 1]),
+                helper.make_tensor_value_info("right", TensorProto.FLOAT16, [2, 4, 2]),
+                helper.make_tensor_value_info("tiled", TensorProto.FLOAT16, [4, 3, 4]),
+            ],
+            [
+                numpy_helper.from_array(np.array([0], dtype=np.int64), name="axis"),
+                numpy_helper.from_array(np.array([1, 2], dtype=np.int64), name="split"),
+                numpy_helper.from_array(np.array([2, 1, 1], dtype=np.int64), name="repeats"),
+            ],
+        ),
+        opset_imports=[helper.make_opsetid("", 21)],
+    )
+    model.ir_version = 10
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        outputs = OnnxRuntime(str(path), device=device)({"x": wp.array(x, dtype=wp.float16, device=device)})
+        transposed = x.transpose(0, 2, 1)
+        np.testing.assert_array_equal(outputs["restored"].numpy(), x)
+        np.testing.assert_array_equal(outputs["transposed4"].numpy(), x[None].transpose(0, 2, 1, 3))
+        np.testing.assert_array_equal(outputs["left"].numpy(), transposed[..., :1])
+        np.testing.assert_array_equal(outputs["right"].numpy(), transposed[..., 1:])
+        np.testing.assert_array_equal(outputs["tiled"].numpy(), np.tile(x, (2, 1, 1)))
     finally:
         path.unlink(missing_ok=True)
 

@@ -250,9 +250,45 @@ def _reduce_sum_rows_kernel(x: wp.array2d[Any], out: wp.array1d[Any]):
 
 
 @wp.kernel(enable_backward=False)
+def _reduce_max_1d_kernel(x: wp.array1d[Any], out: wp.array1d[Any]):
+    value = x[0]
+    for index in range(1, x.shape[0]):
+        value = wp.max(value, x[index])
+    out[0] = value
+
+
+@wp.kernel(enable_backward=False)
 def _cast_kernel(x: wp.array1d[Any], out: wp.array1d[Any]):
     index = wp.tid()
     out[index] = out.dtype(x[index])
+
+
+@wp.kernel(enable_backward=False)
+def _transpose_021_kernel(x: wp.array3d[Any], output: wp.array3d[Any]):
+    i, j, k = wp.tid()
+    output[i, j, k] = x[i, k, j]
+
+
+@wp.kernel(enable_backward=False)
+def _transpose_0213_kernel(x: wp.array4d[Any], output: wp.array4d[Any]):
+    i, j, k, l = wp.tid()
+    output[i, j, k, l] = x[i, k, j, l]
+
+
+@wp.kernel(enable_backward=False)
+def _split_last_axis_kernel(
+    x: wp.array2d[Any],
+    output: wp.array2d[Any],
+    input_offset: int,
+):
+    row, column = wp.tid()
+    output[row, column] = x[row, input_offset + column]
+
+
+@wp.kernel(enable_backward=False)
+def _tile_3d_kernel(x: wp.array3d[Any], output: wp.array3d[Any]):
+    i, j, k = wp.tid()
+    output[i, j, k] = x[i % x.shape[0], j % x.shape[1], k % x.shape[2]]
 
 
 @wp.kernel
@@ -1446,6 +1482,17 @@ def _shape_reduce_sum(op, shapes, dtypes, tensors, device, requires_grad=False):
     dtypes[op.outputs[0]] = dtype
 
 
+def _shape_reduce_max(op, shapes, dtypes, tensors, device, requires_grad=False):
+    in_shape = shapes[op.inputs[0]]
+    if len(in_shape) != 1 or int(op.attrs.get("keepdims", 1)) != 0:
+        raise NotImplementedError("OnnxRuntime ReduceMax: only full 1-D reductions are supported")
+    dtype = dtypes[op.inputs[0]]
+    tensors[op.outputs[0]] = wp.zeros(1, dtype=dtype, device=device)
+    shapes[op.outputs[0]] = ()
+    dtypes[op.outputs[0]] = dtype
+    op.attrs["_kernel"] = _kernel_for_dtype(_reduce_max_1d_kernel, dtype, (1,), (1,))
+
+
 def _shape_shape(op, shapes, dtypes, tensors, device, requires_grad=False):
     if op.attr_names:
         raise NotImplementedError("OnnxRuntime Shape: start/end attributes are not supported")
@@ -1984,13 +2031,93 @@ def _shape_squeeze(op, shapes, dtypes, tensors, device, requires_grad=False):
         rank = len(in_shape)
         axes_norm = {a if a >= 0 else a + rank for a in axes}
         out_shape = tuple(d for i, d in enumerate(in_shape) if i not in axes_norm)
-    if len(out_shape) != 2:
-        raise NotImplementedError(
-            f"OnnxRuntime Squeeze: only squeezes that produce a 2-D tensor are supported (got {out_shape})"
-        )
+    if axes is not None and any(in_shape[axis] != 1 for axis in axes_norm):
+        raise ValueError("OnnxRuntime Squeeze: selected axes must have size one")
     shapes[op.outputs[0]] = out_shape
     dtypes[op.outputs[0]] = dtypes[op.inputs[0]]
     op.attrs["_out_shape"] = out_shape
+
+
+def _shape_unsqueeze(op, shapes, dtypes, tensors, device, requires_grad=False):
+    if len(op.inputs) != 2 or op.inputs[1] not in tensors:
+        raise NotImplementedError("OnnxRuntime Unsqueeze: the axes input must be constant")
+    in_shape = shapes[op.inputs[0]]
+    axes = [int(value) for value in tensors[op.inputs[1]].numpy().reshape(-1)]
+    out_rank = len(in_shape) + len(axes)
+    axes_norm = {axis if axis >= 0 else axis + out_rank for axis in axes}
+    if len(axes_norm) != len(axes) or any(axis < 0 or axis >= out_rank for axis in axes_norm):
+        raise ValueError("OnnxRuntime Unsqueeze: invalid or duplicate axes")
+    source = iter(in_shape)
+    out_shape = tuple(1 if axis in axes_norm else next(source) for axis in range(out_rank))
+    shapes[op.outputs[0]] = out_shape
+    dtypes[op.outputs[0]] = dtypes[op.inputs[0]]
+    op.attrs["_out_shape"] = out_shape
+
+
+def _shape_transpose(op, shapes, dtypes, tensors, device, requires_grad=False):
+    in_shape = shapes[op.inputs[0]]
+    perm = tuple(int(axis) for axis in op.attrs.get("perm", reversed(range(len(in_shape)))))
+    if sorted(perm) != list(range(len(in_shape))):
+        raise ValueError("OnnxRuntime Transpose: invalid permutation")
+    if perm == (0, 2, 1):
+        kernel = _transpose_021_kernel
+    elif perm == (0, 2, 1, 3):
+        kernel = _transpose_0213_kernel
+    else:
+        raise NotImplementedError(f"OnnxRuntime Transpose: permutation {perm} is not supported")
+    out_shape = tuple(in_shape[axis] for axis in perm)
+    dtype = dtypes[op.inputs[0]]
+    tensors[op.outputs[0]] = wp.zeros(out_shape, dtype=dtype, device=device)
+    shapes[op.outputs[0]] = out_shape
+    dtypes[op.outputs[0]] = dtype
+    op.attrs["_kernel"] = _kernel_for_dtype(kernel, dtype, (len(in_shape),), (len(in_shape),))
+
+
+def _shape_split(op, shapes, dtypes, tensors, device, requires_grad=False):
+    in_shape = shapes[op.inputs[0]]
+    axis = int(op.attrs.get("axis", 0))
+    if axis < 0:
+        axis += len(in_shape)
+    if axis != len(in_shape) - 1:
+        raise NotImplementedError("OnnxRuntime Split: only the last axis is supported")
+    if len(op.inputs) > 1 and op.inputs[1]:
+        if op.inputs[1] not in tensors:
+            raise NotImplementedError("OnnxRuntime Split: split sizes must be constant")
+        split_sizes = [int(value) for value in tensors[op.inputs[1]].numpy().reshape(-1)]
+    elif "split" in op.attrs:
+        split_sizes = [int(value) for value in op.attrs["split"]]
+    else:
+        if in_shape[-1] % len(op.outputs):
+            raise ValueError("OnnxRuntime Split: axis size is not evenly divisible")
+        split_sizes = [in_shape[-1] // len(op.outputs)] * len(op.outputs)
+    if len(split_sizes) != len(op.outputs) or sum(split_sizes) != in_shape[-1]:
+        raise ValueError("OnnxRuntime Split: invalid split sizes")
+
+    dtype = dtypes[op.inputs[0]]
+    rows = int(np.prod(in_shape[:-1]))
+    for name, width in zip(op.outputs, split_sizes):
+        out_shape = (*in_shape[:-1], width)
+        tensors[name] = wp.zeros(out_shape, dtype=dtype, device=device)
+        shapes[name] = out_shape
+        dtypes[name] = dtype
+    op.attrs["_rows"] = rows
+    op.attrs["_split_sizes"] = split_sizes
+    op.attrs["_kernel"] = _kernel_for_dtype(_split_last_axis_kernel, dtype, (2,), (2,), int)
+
+
+def _shape_tile(op, shapes, dtypes, tensors, device, requires_grad=False):
+    if len(op.inputs) != 2 or op.inputs[1] not in tensors or len(shapes[op.inputs[0]]) != 3:
+        raise NotImplementedError("OnnxRuntime Tile: only rank-3 tensors with constant repeats are supported")
+    repeats = tuple(int(value) for value in tensors[op.inputs[1]].numpy().reshape(-1))
+    in_shape = shapes[op.inputs[0]]
+    if len(repeats) != 3 or any(repeat < 0 for repeat in repeats):
+        raise ValueError("OnnxRuntime Tile: invalid repeats")
+    out_shape = tuple(size * repeat for size, repeat in zip(in_shape, repeats))
+    dtype = dtypes[op.inputs[0]]
+    tensors[op.outputs[0]] = wp.zeros(out_shape, dtype=dtype, device=device)
+    shapes[op.outputs[0]] = out_shape
+    dtypes[op.outputs[0]] = dtype
+    op.attrs["_kernel"] = _kernel_for_dtype(_tile_3d_kernel, dtype, (3,), (3,))
 
 
 def _shape_lstm(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -2242,6 +2369,15 @@ def _exec_cast(op, tensors, shapes, device):
     )
 
 
+def _exec_reduce_max(op, tensors, shapes, device):
+    wp.launch(
+        op.attrs["_kernel"],
+        dim=1,
+        inputs=[tensors[op.inputs[0]], tensors[op.outputs[0]]],
+        device=device,
+    )
+
+
 def _exec_batch_normalization(op, tensors, shapes, device):
     wp.launch(
         _kernel_for_dtype(
@@ -2288,6 +2424,38 @@ def _exec_constant(op, tensors, shapes, device):
 
 def _exec_reshape(op, tensors, shapes, device):
     tensors[op.outputs[0]] = tensors[op.inputs[0]].reshape(op.attrs["_out_shape"])
+
+
+def _exec_transpose(op, tensors, shapes, device):
+    wp.launch(
+        op.attrs["_kernel"],
+        dim=shapes[op.outputs[0]],
+        inputs=[tensors[op.inputs[0]], tensors[op.outputs[0]]],
+        device=device,
+    )
+
+
+def _exec_split(op, tensors, shapes, device):
+    rows = op.attrs["_rows"]
+    source = tensors[op.inputs[0]].reshape((rows, shapes[op.inputs[0]][-1]))
+    offset = 0
+    for name, width in zip(op.outputs, op.attrs["_split_sizes"]):
+        wp.launch(
+            op.attrs["_kernel"],
+            dim=(rows, width),
+            inputs=[source, tensors[name].reshape((rows, width)), offset],
+            device=device,
+        )
+        offset += width
+
+
+def _exec_tile(op, tensors, shapes, device):
+    wp.launch(
+        op.attrs["_kernel"],
+        dim=shapes[op.outputs[0]],
+        inputs=[tensors[op.inputs[0]], tensors[op.outputs[0]]],
+        device=device,
+    )
 
 
 def _exec_gather_block_quantized(op, tensors, shapes, device):
@@ -2613,6 +2781,7 @@ _OP_DISPATCH: dict[str, Any] = {
     "MatMulNBits": _exec_matmul_nbits,
     "Mul": _exec_binary,
     "ReduceMean": _exec_reduce_mean,
+    "ReduceMax": _exec_reduce_max,
     "ReduceSum": _exec_reduce_sum,
     "Relu": _exec_unary,
     "Reshape": _exec_reshape,
@@ -2622,7 +2791,11 @@ _OP_DISPATCH: dict[str, Any] = {
     "Squeeze": _exec_squeeze,
     "Sub": _exec_binary,
     "SkipSimplifiedLayerNormalization": _exec_skip_simplified_layer_normalization,
+    "Split": _exec_split,
     "Tanh": _exec_unary,
+    "Tile": _exec_tile,
+    "Transpose": _exec_transpose,
+    "Unsqueeze": _exec_squeeze,
 }
 
 _SHAPE_DISPATCH: dict[str, Any] = {
@@ -2645,6 +2818,7 @@ _SHAPE_DISPATCH: dict[str, Any] = {
     "MatMulNBits": _shape_matmul_nbits,
     "Mul": _shape_elementwise_binary,
     "ReduceMean": _shape_reduce_mean,
+    "ReduceMax": _shape_reduce_max,
     "ReduceSum": _shape_reduce_sum,
     "Relu": _shape_elementwise_unary,
     "Reshape": _shape_reshape,
@@ -2654,5 +2828,9 @@ _SHAPE_DISPATCH: dict[str, Any] = {
     "Squeeze": _shape_squeeze,
     "Sub": _shape_elementwise_binary,
     "SkipSimplifiedLayerNormalization": _shape_skip_simplified_layer_normalization,
+    "Split": _shape_split,
     "Tanh": _shape_elementwise_unary,
+    "Tile": _shape_tile,
+    "Transpose": _shape_transpose,
+    "Unsqueeze": _shape_unsqueeze,
 }
