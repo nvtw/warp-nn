@@ -874,13 +874,14 @@ def test_qwen_normalization_and_swiglu(device):
         path.unlink(missing_ok=True)
 
 
+@pytest.mark.parametrize("sequence_length,past_length", [(2, 2), (7, 5)])
 @pytest.mark.parametrize("device", ["cuda"])
-def test_qwen_group_query_attention(device):
+def test_qwen_group_query_attention(device, sequence_length, past_length):
     if not is_device_available(device):
         pytest.skip(f"Device '{device}' is not available")
 
     rng = np.random.default_rng(59)
-    batch, sequence_length, past_length = 1, 2, 2
+    batch = 1
     query_heads, kv_heads, head_size = 4, 2, 16
     total_length = sequence_length + past_length
     query = rng.normal(0.0, 0.2, (batch, sequence_length, query_heads * head_size)).astype(np.float16)
@@ -1012,6 +1013,7 @@ def test_qwen_group_query_attention(device):
         runtime = OnnxRuntime(
             str(path), device=device, input_shapes={name: value.shape for name, value in inputs.items()}
         )
+        assert all("_scores" not in op.attrs for op in runtime._ops)
         outputs = runtime(
             {
                 name: wp.array(value, dtype=wp.dtype_from_numpy(value.dtype), device=device)

@@ -638,67 +638,72 @@ def _gqa_prepare_fp16_kernel(
         present_value[batch, head, cache_token, column] = value[batch, token, offset + column]
 
 
-@wp.kernel
-def _gqa_scores_fp16_kernel(
-    query: wp.array4d[wp.float16],
-    key: wp.array4d[wp.float16],
-    sequence_lengths_minus_one: wp.array1d[wp.int32],
-    scores: wp.array4d[wp.float32],
-    kv_group_size: int,
-    sequence_length: int,
-    head_size: int,
-    scale: float,
-):
-    batch, head, query_token, key_token = wp.tid()
-    past_length = wp.int32(sequence_lengths_minus_one[batch]) - sequence_length + 1
-    if key_token <= past_length + query_token:
-        total = wp.float32(0.0)
-        kv_head = head // kv_group_size
-        for column in range(head_size):
-            total += wp.float32(query[batch, head, query_token, column]) * wp.float32(
-                key[batch, kv_head, key_token, column]
-            )
-        scores[batch, head, query_token, key_token] = total * wp.float32(scale)
+@wp.func
+def _gqa_dot_fp16(left: wp.float16, right: wp.float16):
+    return wp.float32(left) * wp.float32(right)
 
 
-@wp.kernel
-def _gqa_softmax_fp32_kernel(
-    scores: wp.array4d[wp.float32],
-    sequence_lengths_minus_one: wp.array1d[wp.int32],
-    sequence_length: int,
-):
-    batch, head, query_token = wp.tid()
-    past_length = wp.int32(sequence_lengths_minus_one[batch]) - sequence_length + 1
-    valid_keys = past_length + query_token + 1
-    maximum = wp.float32(-3.402823466e38)
-    for key_token in range(valid_keys):
-        maximum = wp.max(maximum, scores[batch, head, query_token, key_token])
-    total = wp.float32(0.0)
-    for key_token in range(valid_keys):
-        value = wp.exp(scores[batch, head, query_token, key_token] - maximum)
-        scores[batch, head, query_token, key_token] = value
-        total += value
-    for key_token in range(valid_keys):
-        scores[batch, head, query_token, key_token] /= total
+@wp.func
+def _gqa_accumulate_fp16(total: wp.float32, value: wp.float16, old_scale: wp.float32, weight: wp.float32):
+    return total * old_scale + wp.float32(value) * weight
 
 
-@wp.kernel
-def _gqa_output_fp16_kernel(
-    scores: wp.array4d[wp.float32],
-    value: wp.array4d[wp.float16],
-    sequence_lengths_minus_one: wp.array1d[wp.int32],
-    output: wp.array3d[wp.float16],
-    kv_group_size: int,
-    sequence_length: int,
-    head_size: int,
-):
-    batch, query_token, head, column = wp.tid()
-    total = wp.float32(0.0)
-    kv_head = head // kv_group_size
-    past_length = wp.int32(sequence_lengths_minus_one[batch]) - sequence_length + 1
-    for key_token in range(past_length + query_token + 1):
-        total += scores[batch, head, query_token, key_token] * wp.float32(value[batch, kv_head, key_token, column])
-    output[batch, query_token, head * head_size + column] = wp.float16(total)
+@wp.func
+def _gqa_normalize_fp16(total: wp.float32, denominator: wp.float32):
+    return wp.float16(total / denominator)
+
+
+def _create_gqa_attention_kernel(head_size: int):
+    @wp.kernel(enable_backward=False)
+    def kernel(
+        query: wp.array2d[wp.float16],
+        key: wp.array2d[wp.float16],
+        value: wp.array2d[wp.float16],
+        sequence_lengths_minus_one: wp.array1d[wp.int32],
+        output: wp.array2d[wp.float16],
+        query_heads: int,
+        kv_heads: int,
+        sequence_length: int,
+        total_length: int,
+        scale: float,
+    ):
+        index = wp.tid()
+        query_token = index % sequence_length
+        head = (index // sequence_length) % query_heads
+        batch = index // (sequence_length * query_heads)
+        kv_head = head // (query_heads // kv_heads)
+        valid_keys = wp.int32(sequence_lengths_minus_one[batch]) - sequence_length + query_token + 2
+        query_row = (batch * query_heads + head) * sequence_length + query_token
+        query_values = wp.tile_load(query[query_row], shape=(head_size,))
+        accumulator = wp.tile_zeros(shape=(head_size,), dtype=wp.float32)
+        maximum = wp.float32(-3.402823466e38)
+        denominator = wp.float32(0.0)
+        for key_token in range(valid_keys):
+            cache_row = (batch * kv_heads + kv_head) * total_length + key_token
+            key_values = wp.tile_load(key[cache_row], shape=(head_size,))
+            score = wp.tile_extract(wp.tile_sum(wp.tile_map(_gqa_dot_fp16, query_values, key_values)), 0)
+            score *= wp.float32(scale)
+            new_maximum = wp.max(maximum, score)
+            old_scale = wp.exp(maximum - new_maximum)
+            weight = wp.exp(score - new_maximum)
+            denominator = denominator * old_scale + weight
+            value_values = wp.tile_load(value[cache_row], shape=(head_size,))
+            accumulator = wp.tile_map(_gqa_accumulate_fp16, accumulator, value_values, old_scale, weight)
+            maximum = new_maximum
+        normalized = wp.tile_map(_gqa_normalize_fp16, accumulator, denominator)
+        wp.tile_store(output[batch * sequence_length + query_token], normalized, offset=(head * head_size,))
+
+    return kernel
+
+
+_gqa_attention_kernel_cache = {}
+
+
+def _get_gqa_attention_kernel(head_size: int):
+    if head_size not in _gqa_attention_kernel_cache:
+        _gqa_attention_kernel_cache[head_size] = _create_gqa_attention_kernel(head_size)
+    block_dim = min(1024, max(32, 1 << (head_size - 1).bit_length()))
+    return block_dim, _gqa_attention_kernel_cache[head_size]
 
 
 def _array_type(dtype: type, ndim: int):
@@ -1582,13 +1587,10 @@ def _shape_group_query_attention(op, shapes, dtypes, tensors, device, requires_g
     shapes[op.outputs[0]], shapes[op.outputs[1]], shapes[op.outputs[2]] = output_shape, present_shape, present_shape
     dtypes[op.outputs[0]] = dtypes[op.outputs[1]] = dtypes[op.outputs[2]] = wp.float16
     rotated_shape = (batch, query_heads, sequence_length, head_size)
-    scores_shape = (batch, query_heads, sequence_length, total_length)
     rotated_name = f"__onnx_runtime_gqa_query_{rotated_shape}"
-    scores_name = f"__onnx_runtime_gqa_scores_{scores_shape}"
     if rotated_name not in tensors:
         tensors[rotated_name] = wp.zeros(rotated_shape, dtype=wp.float16, device=device)
-    if scores_name not in tensors:
-        tensors[scores_name] = wp.zeros(scores_shape, dtype=wp.float32, device=device)
+    attention_block_dim, attention_kernel = _get_gqa_attention_kernel(head_size)
     op.attrs.update(
         {
             "_batch": batch,
@@ -1597,7 +1599,8 @@ def _shape_group_query_attention(op, shapes, dtypes, tensors, device, requires_g
             "_total_length": total_length,
             "_head_size": head_size,
             "_rotated_query": tensors[rotated_name],
-            "_scores": tensors[scores_name],
+            "_attention_block_dim": attention_block_dim,
+            "_attention_kernel": attention_kernel,
         }
     )
 
@@ -2064,39 +2067,22 @@ def _exec_group_query_attention(op, tensors, shapes, device):
         ],
         device=device,
     )
-    wp.launch(
-        _gqa_scores_fp16_kernel,
-        dim=(batch, query_heads, sequence_length, total_length),
+    wp.launch_tiled(
+        op.attrs["_attention_kernel"],
+        dim=batch * query_heads * sequence_length,
         inputs=[
-            op.attrs["_rotated_query"],
-            present_key,
+            op.attrs["_rotated_query"].reshape((batch * query_heads * sequence_length, head_size)),
+            present_key.reshape((batch * kv_heads * total_length, head_size)),
+            present_value.reshape((batch * kv_heads * total_length, head_size)),
             tensors[op.inputs[5]],
-            op.attrs["_scores"],
-            query_heads // kv_heads,
+            tensors[op.outputs[0]].reshape((batch * sequence_length, query_heads * head_size)),
+            query_heads,
+            kv_heads,
             sequence_length,
-            head_size,
+            total_length,
             float(op.attrs.get("scale", head_size**-0.5)),
         ],
-        device=device,
-    )
-    wp.launch(
-        _gqa_softmax_fp32_kernel,
-        dim=(batch, query_heads, sequence_length),
-        inputs=[op.attrs["_scores"], tensors[op.inputs[5]], sequence_length],
-        device=device,
-    )
-    wp.launch(
-        _gqa_output_fp16_kernel,
-        dim=(batch, sequence_length, query_heads, head_size),
-        inputs=[
-            op.attrs["_scores"],
-            present_value,
-            tensors[op.inputs[5]],
-            tensors[op.outputs[0]],
-            query_heads // kv_heads,
-            sequence_length,
-            head_size,
-        ],
+        block_dim=op.attrs["_attention_block_dim"],
         device=device,
     )
 
