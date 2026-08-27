@@ -305,8 +305,14 @@ def sample_token(
 class Qwen3OnnxRunner:
     """Run prefill and token-by-token decode while keeping weights on device."""
 
-    def __init__(self, path: str, device: str | wp.Device | None = None, cache_capacity: int | None = None):
-        self.runtime = OnnxRuntime(path, device=device)
+    def __init__(
+        self,
+        path: str,
+        device: str | wp.Device | None = None,
+        cache_capacity: int | None = None,
+        use_cublas: bool = True,
+    ):
+        self.runtime = OnnxRuntime(path, device=device, use_cublas=use_cublas)
         self._past_names = [name for name in self.runtime.input_names if name.startswith("past_key_values.")]
         self._present_for_past = {
             name: f"present.{name.split('.')[1]}.{name.split('.')[2]}" for name in self._past_names

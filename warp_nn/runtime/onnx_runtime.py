@@ -73,6 +73,7 @@ import numpy as np
 import warp as wp
 
 from warp_nn.modules.layers._common import tile_transposed_gemm_2d
+from warp_nn.runtime._cublas import try_create_cublas
 from warp_nn.utils.config import get_kernel_config
 from warp_nn.utils.device import parse_device
 from warp_nn.utils.ops import resolve_dim
@@ -449,6 +450,35 @@ def _create_matmul_nbits_gemv_kernel(bits: int):
 
 
 _matmul_nbits_gemv_kernels = {bits: _create_matmul_nbits_gemv_kernel(bits) for bits in (4, 8)}
+
+
+def _create_dequantize_nbits_kernel(bits: int):
+    values_per_byte = 8 // bits
+    packed_block_size = 128 // values_per_byte
+
+    @wp.kernel(enable_backward=False)
+    def kernel(
+        weights: wp.array3d[wp.uint8],
+        scales: wp.array2d[wp.float16],
+        zero_points: wp.array2d[wp.uint8],
+        output: wp.array2d[wp.float16],
+    ):
+        column, packed_index = wp.tid()
+        block = packed_index / packed_block_size
+        packed_offset = packed_index - block * packed_block_size
+        packed = wp.int32(weights[column, block, packed_offset])
+        packed_zero = wp.int32(zero_points[column, block / values_per_byte])
+        zero = (packed_zero >> ((block % values_per_byte) * bits)) & ((1 << bits) - 1)
+        scale = wp.float32(scales[column, block])
+        output_offset = block * 128 + packed_offset * values_per_byte
+        for value_index in range(values_per_byte):
+            quantized = (packed >> (value_index * bits)) & ((1 << bits) - 1)
+            output[column, output_offset + value_index] = wp.float16(wp.float32(quantized - zero) * scale)
+
+    return kernel
+
+
+_dequantize_nbits_kernels = {bits: _create_dequantize_nbits_kernel(bits) for bits in (4, 8)}
 
 
 @wp.func
@@ -868,6 +898,9 @@ class OnnxRuntime:
             and intermediate buffers, should allocate gradient storage.  Keep
             this disabled for inference/replay and enable it when computing
             gradients through ONNX runtime outputs.
+        use_cublas: Use an available system cuBLAS library for multi-row
+            quantized matrix multiplication.  Falls back to Warp when cuBLAS
+            is unavailable.
     """
 
     def __init__(
@@ -878,6 +911,7 @@ class OnnxRuntime:
         input_batch_axes: int | dict[str, int] | None = None,
         input_shapes: dict[str, tuple[int, ...]] | None = None,
         requires_grad: bool = False,
+        use_cublas: bool = True,
     ):
         self._device = parse_device(device)
         self._requires_grad = requires_grad
@@ -998,6 +1032,8 @@ class OnnxRuntime:
         if not self._requires_grad:
             self._ops = _fuse_inference_ops(self._ops, set(self.output_names), initializer_names)
 
+        self._cublas = try_create_cublas() if use_cublas and self._device.is_cuda else None
+        self._matmul_scratch = None
         self._preallocate_buffers()
 
     def resize_inputs(self, input_shapes: dict[str, tuple[int, ...]], share_kv_cache: bool = False) -> None:
@@ -1035,6 +1071,8 @@ class OnnxRuntime:
         runtime.output_names = list(self.output_names)
         runtime._input_dims = dict(self._input_dims)
         runtime._input_dtypes = dict(self._input_dtypes)
+        runtime._cublas = self._cublas
+        runtime._matmul_scratch = None
         runtime._tensors = {name: self._tensors[name] for name in self._initializer_names}
         runtime._shapes = {name: tuple(tensor.shape) for name, tensor in runtime._tensors.items()}
         runtime._dtypes = {name: tensor.dtype for name, tensor in runtime._tensors.items()}
@@ -1058,6 +1096,17 @@ class OnnxRuntime:
                 supported = sorted(name for name in _OP_DISPATCH if not name.startswith("_"))
                 raise NotImplementedError(f"OnnxRuntime: unsupported op '{op.op_type}'.  Supported ops: {supported}")
             handler(op, self._shapes, self._dtypes, self._tensors, self._device, self._requires_grad)
+
+        matmuls = [op for op in self._ops if op.op_type == "MatMulNBits" and op.attrs["_rows"] > 1]
+        if self._cublas is not None and matmuls:
+            scratch_elements = max(int(op.attrs["K"]) * int(op.attrs["N"]) for op in matmuls)
+            if self._matmul_scratch is None or self._matmul_scratch.size < scratch_elements:
+                self._matmul_scratch = wp.empty(scratch_elements, dtype=wp.float16, device=self._device)
+            for op in matmuls:
+                K = int(op.attrs["K"])
+                N = int(op.attrs["N"])
+                op.attrs["_cublas"] = self._cublas
+                op.attrs["_dequantized_weights"] = self._matmul_scratch[: K * N].reshape((N, K))
 
     def __call__(self, inputs: dict[str, wp.array]) -> dict[str, wp.array]:
         """Run forward inference.
@@ -1415,6 +1464,8 @@ def _shape_matmul_nbits(op, shapes, dtypes, tensors, device, requires_grad=False
     shapes[op.outputs[0]] = out_shape
     dtypes[op.outputs[0]] = wp.float16
     op.attrs["_rows"] = rows
+    op.attrs["K"] = K
+    op.attrs["N"] = N
     op.attrs["_output_2d"] = tensors[op.outputs[0]].reshape((rows, N))
 
 
@@ -1871,6 +1922,25 @@ def _exec_matmul_nbits(op, tensors, shapes, device):
     K = int(op.attrs["K"])
     N = int(op.attrs["N"])
     bits = int(op.attrs["bits"])
+    if "_cublas" in op.attrs:
+        weights = tensors[op.inputs[1]]
+        dequantized = op.attrs["_dequantized_weights"]
+        wp.launch(
+            _dequantize_nbits_kernels[bits],
+            dim=(N, weights.shape[1] * weights.shape[2]),
+            inputs=[weights, tensors[op.inputs[2]], tensors[op.inputs[3]], dequantized],
+            device=device,
+        )
+        op.attrs["_cublas"].gemm_fp16(
+            tensors[op.inputs[0]].ptr,
+            dequantized.ptr,
+            op.attrs["_output_2d"].ptr,
+            op.attrs["_rows"],
+            N,
+            K,
+            wp.get_stream(device).cuda_stream,
+        )
+        return
     if device.is_cuda:
         wp.launch(
             _matmul_nbits_gemv_kernels[bits],

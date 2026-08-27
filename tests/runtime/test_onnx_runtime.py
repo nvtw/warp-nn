@@ -715,8 +715,9 @@ def test_gather_block_quantized_int8(device):
 
 @pytest.mark.parametrize("bits", [4, 8])
 @pytest.mark.parametrize("batch,sequence", [(2, 3), (1, 1)])
+@pytest.mark.parametrize("use_cublas", [False, True])
 @pytest.mark.parametrize("device", ["cuda"])
-def test_matmul_nbits(device, bits, batch, sequence):
+def test_matmul_nbits(device, bits, batch, sequence, use_cublas):
     if not is_device_available(device):
         pytest.skip(f"Device '{device}' is not available")
 
@@ -772,10 +773,23 @@ def test_matmul_nbits(device, bits, batch, sequence):
         path = Path(tmp.name)
     try:
         onnx.save(model, str(path))
-        output = OnnxRuntime(str(path), device=device)(
-            {"activations": wp.array(activations, dtype=wp.float16, device=device)}
-        )["output"]
+        runtime = OnnxRuntime(str(path), device=device, use_cublas=use_cublas)
+        if not use_cublas:
+            assert runtime._cublas is None
+        inputs = {"activations": wp.array(activations, dtype=wp.float16, device=device)}
+        output = runtime(inputs)["output"]
         np.testing.assert_allclose(output.numpy(), expected, rtol=2.0e-2, atol=2.0e-2)
+
+        if use_cublas and batch * sequence > 1 and runtime._cublas is not None:
+            wp.capture_begin(device=device)
+            try:
+                runtime(inputs)
+                graph = wp.capture_end(device=device)
+            except Exception:
+                wp.capture_end(device=device)
+                raise
+            wp.capture_launch(graph)
+            np.testing.assert_allclose(output.numpy(), expected, rtol=2.0e-2, atol=2.0e-2)
     finally:
         path.unlink(missing_ok=True)
 
@@ -1127,7 +1141,7 @@ def test_qwen_stateful_prefill_and_decode(device):
         decoded = runner.decode(2).numpy()
         assert runner.sequence_length == 3
         full = runner.prefill([0, 1, 2]).numpy()
-        np.testing.assert_array_equal(decoded, full[:, -1:, :])
+        np.testing.assert_allclose(decoded, full[:, -1:, :], rtol=1.0e-3, atol=1.0e-3)
 
         logits = runner.prefill([0, 1])
         expected = []
