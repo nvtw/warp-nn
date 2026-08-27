@@ -449,44 +449,96 @@ def _create_matmul_nbits_gemv_kernel(bits: int):
 _matmul_nbits_gemv_kernels = {bits: _create_matmul_nbits_gemv_kernel(bits) for bits in (4, 8)}
 
 
-@wp.kernel
-def _simplified_layer_normalization_fp16_kernel(
-    x: wp.array2d[wp.float16],
-    scale: wp.array1d[wp.float16],
-    output: wp.array2d[wp.float16],
-    width: int,
-    epsilon: float,
-):
-    row = wp.tid()
-    sum_squares = wp.float32(0.0)
-    for column in range(width):
-        value = wp.float32(x[row, column])
-        sum_squares += value * value
-    inverse_rms = wp.float32(1.0) / wp.sqrt(sum_squares / wp.float32(width) + wp.float32(epsilon))
-    for column in range(width):
-        output[row, column] = wp.float16(wp.float32(x[row, column]) * inverse_rms * wp.float32(scale[column]))
+@wp.func
+def _square_fp16(value: wp.float16):
+    value_fp32 = wp.float32(value)
+    return value_fp32 * value_fp32
 
 
-@wp.kernel
-def _skip_simplified_layer_normalization_fp16_kernel(
-    x: wp.array2d[wp.float16],
-    skip: wp.array2d[wp.float16],
-    scale: wp.array1d[wp.float16],
-    output: wp.array2d[wp.float16],
-    residual: wp.array2d[wp.float16],
-    width: int,
-    epsilon: float,
-):
-    row = wp.tid()
-    sum_squares = wp.float32(0.0)
-    for column in range(width):
-        value = wp.float32(x[row, column]) + wp.float32(skip[row, column])
-        residual[row, column] = wp.float16(value)
-        sum_squares += value * value
-    inverse_rms = wp.float32(1.0) / wp.sqrt(sum_squares / wp.float32(width) + wp.float32(epsilon))
-    for column in range(width):
-        value = wp.float32(x[row, column]) + wp.float32(skip[row, column])
-        output[row, column] = wp.float16(value * inverse_rms * wp.float32(scale[column]))
+@wp.func
+def _skip_square_fp16(value: wp.float16, skip: wp.float16):
+    value_fp32 = wp.float32(value) + wp.float32(skip)
+    return value_fp32 * value_fp32
+
+
+@wp.func
+def _add_fp16(value: wp.float16, skip: wp.float16):
+    return wp.float16(wp.float32(value) + wp.float32(skip))
+
+
+@wp.func
+def _normalize_fp16(value: wp.float16, scale: wp.float16, inverse_rms: float):
+    return wp.float16(wp.float32(value) * wp.float32(scale) * inverse_rms)
+
+
+@wp.func
+def _skip_normalize_fp16(value: wp.float16, skip: wp.float16, scale: wp.float16, inverse_rms: float):
+    return wp.float16((wp.float32(value) + wp.float32(skip)) * wp.float32(scale) * inverse_rms)
+
+
+def _create_rms_norm_kernels(tile_width: int):
+    TILE_WIDTH = tile_width
+
+    @wp.kernel(enable_backward=False)
+    def rms_norm(
+        x: wp.array2d[wp.float16],
+        scale: wp.array1d[wp.float16],
+        output: wp.array2d[wp.float16],
+        epsilon: float,
+    ):
+        row = wp.tid()
+        partials = wp.tile_zeros(shape=(TILE_WIDTH,), dtype=wp.float32)
+        for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
+            values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(tile_index * TILE_WIDTH,))
+            partials += wp.tile_map(_square_fp16, values)
+        inverse_rms = wp.float32(1.0) / wp.sqrt(
+            wp.tile_extract(wp.tile_sum(partials), 0) / wp.float32(x.shape[1]) + wp.float32(epsilon)
+        )
+        for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
+            offset = tile_index * TILE_WIDTH
+            values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
+            scales = wp.tile_load(scale, shape=(TILE_WIDTH,), offset=(offset,))
+            wp.tile_store(output[row], wp.tile_map(_normalize_fp16, values, scales, inverse_rms), offset=(offset,))
+
+    @wp.kernel(enable_backward=False)
+    def skip_rms_norm(
+        x: wp.array2d[wp.float16],
+        skip: wp.array2d[wp.float16],
+        scale: wp.array1d[wp.float16],
+        output: wp.array2d[wp.float16],
+        residual: wp.array2d[wp.float16],
+        epsilon: float,
+    ):
+        row = wp.tid()
+        partials = wp.tile_zeros(shape=(TILE_WIDTH,), dtype=wp.float32)
+        for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
+            offset = tile_index * TILE_WIDTH
+            values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
+            skips = wp.tile_load(skip[row], shape=(TILE_WIDTH,), offset=(offset,))
+            partials += wp.tile_map(_skip_square_fp16, values, skips)
+            wp.tile_store(residual[row], wp.tile_map(_add_fp16, values, skips), offset=(offset,))
+        inverse_rms = wp.float32(1.0) / wp.sqrt(
+            wp.tile_extract(wp.tile_sum(partials), 0) / wp.float32(x.shape[1]) + wp.float32(epsilon)
+        )
+        for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
+            offset = tile_index * TILE_WIDTH
+            values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
+            skips = wp.tile_load(skip[row], shape=(TILE_WIDTH,), offset=(offset,))
+            scales = wp.tile_load(scale, shape=(TILE_WIDTH,), offset=(offset,))
+            normalized = wp.tile_map(_skip_normalize_fp16, values, skips, scales, inverse_rms)
+            wp.tile_store(output[row], normalized, offset=(offset,))
+
+    return rms_norm, skip_rms_norm
+
+
+_rms_norm_kernel_cache = {}
+
+
+def _get_rms_norm_kernels(width: int):
+    tile_width = min(512, max(32, 1 << (width - 1).bit_length()))
+    if tile_width not in _rms_norm_kernel_cache:
+        _rms_norm_kernel_cache[tile_width] = _create_rms_norm_kernels(tile_width)
+    return tile_width, _rms_norm_kernel_cache[tile_width]
 
 
 @wp.kernel
@@ -1385,6 +1437,7 @@ def _shape_simplified_layer_normalization(op, shapes, dtypes, tensors, device, r
     op.attrs["_rows"] = rows
     op.attrs["_width"] = width
     op.attrs["_output_2d"] = tensors[op.outputs[0]].reshape((rows, width))
+    op.attrs["_tile_width"], op.attrs["_rms_norm_kernels"] = _get_rms_norm_kernels(width)
 
 
 def _shape_skip_simplified_layer_normalization(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -1414,6 +1467,7 @@ def _shape_skip_simplified_layer_normalization(op, shapes, dtypes, tensors, devi
     op.attrs["_width"] = width
     op.attrs["_output_2d"] = tensors[op.outputs[0]].reshape((rows, width))
     op.attrs["_residual_2d"] = residual.reshape((rows, width))
+    op.attrs["_tile_width"], op.attrs["_rms_norm_kernels"] = _get_rms_norm_kernels(width)
 
 
 def _shape_swiglu(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -1847,24 +1901,24 @@ def _exec_matmul_nbits(op, tensors, shapes, device):
 
 
 def _exec_simplified_layer_normalization(op, tensors, shapes, device):
-    wp.launch(
-        _simplified_layer_normalization_fp16_kernel,
+    wp.launch_tiled(
+        op.attrs["_rms_norm_kernels"][0],
         dim=op.attrs["_rows"],
         inputs=[
             tensors[op.inputs[0]].reshape((op.attrs["_rows"], op.attrs["_width"])),
             tensors[op.inputs[1]],
             op.attrs["_output_2d"],
-            op.attrs["_width"],
             float(op.attrs.get("epsilon", 1.0e-5)),
         ],
+        block_dim=op.attrs["_tile_width"],
         device=device,
     )
 
 
 def _exec_skip_simplified_layer_normalization(op, tensors, shapes, device):
     shape_2d = (op.attrs["_rows"], op.attrs["_width"])
-    wp.launch(
-        _skip_simplified_layer_normalization_fp16_kernel,
+    wp.launch_tiled(
+        op.attrs["_rms_norm_kernels"][1],
         dim=op.attrs["_rows"],
         inputs=[
             tensors[op.inputs[0]].reshape(shape_2d),
@@ -1872,9 +1926,9 @@ def _exec_skip_simplified_layer_normalization(op, tensors, shapes, device):
             tensors[op.inputs[2]],
             op.attrs["_output_2d"],
             op.attrs["_residual_2d"],
-            op.attrs["_width"],
             float(op.attrs.get("epsilon", 1.0e-5)),
         ],
+        block_dim=op.attrs["_tile_width"],
         device=device,
     )
 
