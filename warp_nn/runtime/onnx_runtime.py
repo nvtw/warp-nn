@@ -474,12 +474,14 @@ def _gqa_prepare_fp16_kernel(
     sequence_length: int,
     past_length: int,
     head_size: int,
+    share_cache: bool,
 ):
     batch, head, token, column = wp.tid()
     cache_column = column % (head_size // 2)
     paired_column = column + head_size // 2 if column < head_size // 2 else column - head_size // 2
     sign = wp.float32(-1.0) if column < head_size // 2 else wp.float32(1.0)
     position = wp.int32(sequence_lengths_minus_one[batch]) - sequence_length + 1 + token
+    cache_token = position if share_cache else past_length + token
     cosine = wp.float32(cos_cache[position, cache_column])
     sine = wp.float32(sin_cache[position, cache_column])
 
@@ -493,21 +495,23 @@ def _gqa_prepare_fp16_kernel(
         offset = head * head_size
         current = wp.float32(key[batch, token, offset + column])
         paired = wp.float32(key[batch, token, offset + paired_column])
-        present_key[batch, head, past_length + token, column] = wp.float16(current * cosine + sign * paired * sine)
-        present_value[batch, head, past_length + token, column] = value[batch, token, offset + column]
+        present_key[batch, head, cache_token, column] = wp.float16(current * cosine + sign * paired * sine)
+        present_value[batch, head, cache_token, column] = value[batch, token, offset + column]
 
 
 @wp.kernel
 def _gqa_scores_fp16_kernel(
     query: wp.array4d[wp.float16],
     key: wp.array4d[wp.float16],
+    sequence_lengths_minus_one: wp.array1d[wp.int32],
     scores: wp.array4d[wp.float32],
     kv_group_size: int,
-    past_length: int,
+    sequence_length: int,
     head_size: int,
     scale: float,
 ):
     batch, head, query_token, key_token = wp.tid()
+    past_length = wp.int32(sequence_lengths_minus_one[batch]) - sequence_length + 1
     if key_token <= past_length + query_token:
         total = wp.float32(0.0)
         kv_head = head // kv_group_size
@@ -516,14 +520,17 @@ def _gqa_scores_fp16_kernel(
                 key[batch, kv_head, key_token, column]
             )
         scores[batch, head, query_token, key_token] = total * wp.float32(scale)
-    else:
-        scores[batch, head, query_token, key_token] = wp.float32(-3.402823466e38)
 
 
 @wp.kernel
-def _gqa_softmax_fp32_kernel(scores: wp.array4d[wp.float32], valid_key_offset: int):
+def _gqa_softmax_fp32_kernel(
+    scores: wp.array4d[wp.float32],
+    sequence_lengths_minus_one: wp.array1d[wp.int32],
+    sequence_length: int,
+):
     batch, head, query_token = wp.tid()
-    valid_keys = valid_key_offset + query_token + 1
+    past_length = wp.int32(sequence_lengths_minus_one[batch]) - sequence_length + 1
+    valid_keys = past_length + query_token + 1
     maximum = wp.float32(-3.402823466e38)
     for key_token in range(valid_keys):
         maximum = wp.max(maximum, scores[batch, head, query_token, key_token])
@@ -540,14 +547,16 @@ def _gqa_softmax_fp32_kernel(scores: wp.array4d[wp.float32], valid_key_offset: i
 def _gqa_output_fp16_kernel(
     scores: wp.array4d[wp.float32],
     value: wp.array4d[wp.float16],
+    sequence_lengths_minus_one: wp.array1d[wp.int32],
     output: wp.array3d[wp.float16],
     kv_group_size: int,
-    past_length: int,
+    sequence_length: int,
     head_size: int,
 ):
     batch, query_token, head, column = wp.tid()
     total = wp.float32(0.0)
     kv_head = head // kv_group_size
+    past_length = wp.int32(sequence_lengths_minus_one[batch]) - sequence_length + 1
     for key_token in range(past_length + query_token + 1):
         total += scores[batch, head, query_token, key_token] * wp.float32(value[batch, kv_head, key_token, column])
     output[batch, query_token, head * head_size + column] = wp.float16(total)
@@ -882,7 +891,7 @@ class OnnxRuntime:
 
         self._preallocate_buffers()
 
-    def resize_inputs(self, input_shapes: dict[str, tuple[int, ...]]) -> None:
+    def resize_inputs(self, input_shapes: dict[str, tuple[int, ...]], share_kv_cache: bool = False) -> None:
         """Rebuild shape-dependent buffers while retaining loaded initializers."""
         if set(input_shapes) != set(self.input_names):
             missing = sorted(set(self.input_names) - set(input_shapes))
@@ -903,7 +912,35 @@ class OnnxRuntime:
             self._dtypes[name] = self._input_dtypes[name]
         for op in self._ops:
             op.attrs = {name: value for name, value in op.attrs.items() if not name.startswith("_") or name == "_value"}
+            if op.op_type == "GroupQueryAttention":
+                op.attrs["_share_cache"] = share_kv_cache
         self._preallocate_buffers()
+
+    def _fork(self, input_shapes: dict[str, tuple[int, ...]], share_kv_cache: bool = False) -> OnnxRuntime:
+        """Create another execution plan sharing this runtime's initializers."""
+        runtime = object.__new__(OnnxRuntime)
+        runtime._device = self._device
+        runtime._requires_grad = self._requires_grad
+        runtime._initializer_names = self._initializer_names
+        runtime.input_names = list(self.input_names)
+        runtime.output_names = list(self.output_names)
+        runtime._input_dims = dict(self._input_dims)
+        runtime._input_dtypes = dict(self._input_dtypes)
+        runtime._tensors = {name: self._tensors[name] for name in self._initializer_names}
+        runtime._shapes = {name: tuple(tensor.shape) for name, tensor in runtime._tensors.items()}
+        runtime._dtypes = {name: tensor.dtype for name, tensor in runtime._tensors.items()}
+        runtime._ops = [
+            _Op(
+                op_type=op.op_type,
+                inputs=list(op.inputs),
+                outputs=list(op.outputs),
+                attrs={name: value for name, value in op.attrs.items() if not name.startswith("_") or name == "_value"},
+                attr_names=set(op.attr_names),
+            )
+            for op in self._ops
+        ]
+        runtime.resize_inputs(input_shapes, share_kv_cache=share_kv_cache)
+        return runtime
 
     def _preallocate_buffers(self) -> None:
         for op in self._ops:
@@ -1372,12 +1409,14 @@ def _shape_group_query_attention(op, shapes, dtypes, tensors, device, requires_g
         raise NotImplementedError("OnnxRuntime GroupQueryAttention: only causal non-interleaved RoPE is supported")
 
     past_length = past_shape[2]
-    total_length = past_length + sequence_length
+    share_cache = bool(op.attrs.get("_share_cache", False))
+    total_length = past_length if share_cache else past_length + sequence_length
     output_shape = query_shape
     present_shape = (batch, kv_heads, total_length, head_size)
     tensors[op.outputs[0]] = wp.zeros(output_shape, dtype=wp.float16, device=device)
-    tensors[op.outputs[1]] = wp.zeros(present_shape, dtype=wp.float16, device=device)
-    tensors[op.outputs[2]] = wp.zeros(present_shape, dtype=wp.float16, device=device)
+    if not share_cache:
+        tensors[op.outputs[1]] = wp.zeros(present_shape, dtype=wp.float16, device=device)
+        tensors[op.outputs[2]] = wp.zeros(present_shape, dtype=wp.float16, device=device)
     shapes[op.outputs[0]], shapes[op.outputs[1]], shapes[op.outputs[2]] = output_shape, present_shape, present_shape
     dtypes[op.outputs[0]] = dtypes[op.outputs[1]] = dtypes[op.outputs[2]] = wp.float16
     rotated_shape = (batch, query_heads, sequence_length, head_size)
@@ -1790,9 +1829,16 @@ def _exec_group_query_attention(op, tensors, shapes, device):
     head_size = op.attrs["_head_size"]
     query_heads = int(op.attrs["num_heads"])
     kv_heads = int(op.attrs["kv_num_heads"])
-    present_key = tensors[op.outputs[1]]
-    present_value = tensors[op.outputs[2]]
-    if past_length:
+    share_cache = bool(op.attrs.get("_share_cache", False))
+    if share_cache:
+        present_key = tensors[op.inputs[3]]
+        present_value = tensors[op.inputs[4]]
+        tensors[op.outputs[1]] = present_key
+        tensors[op.outputs[2]] = present_value
+    else:
+        present_key = tensors[op.outputs[1]]
+        present_value = tensors[op.outputs[2]]
+    if past_length and not share_cache:
         wp.launch(
             _gqa_copy_past_fp16_kernel,
             dim=(batch, kv_heads, past_length, head_size),
@@ -1817,6 +1863,7 @@ def _exec_group_query_attention(op, tensors, shapes, device):
             sequence_length,
             past_length,
             head_size,
+            share_cache,
         ],
         device=device,
     )
@@ -1826,9 +1873,10 @@ def _exec_group_query_attention(op, tensors, shapes, device):
         inputs=[
             op.attrs["_rotated_query"],
             present_key,
+            tensors[op.inputs[5]],
             op.attrs["_scores"],
             query_heads // kv_heads,
-            past_length,
+            sequence_length,
             head_size,
             float(op.attrs.get("scale", head_size**-0.5)),
         ],
@@ -1837,7 +1885,7 @@ def _exec_group_query_attention(op, tensors, shapes, device):
     wp.launch(
         _gqa_softmax_fp32_kernel,
         dim=(batch, query_heads, sequence_length),
-        inputs=[op.attrs["_scores"], past_length],
+        inputs=[op.attrs["_scores"], tensors[op.inputs[5]], sequence_length],
         device=device,
     )
     wp.launch(
@@ -1846,9 +1894,10 @@ def _exec_group_query_attention(op, tensors, shapes, device):
         inputs=[
             op.attrs["_scores"],
             present_value,
+            tensors[op.inputs[5]],
             tensors[op.outputs[0]],
             query_heads // kv_heads,
-            past_length,
+            sequence_length,
             head_size,
         ],
         device=device,

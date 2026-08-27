@@ -1019,6 +1019,9 @@ def test_qwen_stateful_prefill_and_decode(device):
     embedding = rng.integers(96, 160, size=(vocabulary, head_size), dtype=np.uint8)
     scales = rng.uniform(0.005, 0.02, size=(vocabulary, 1)).astype(np.float16)
     zero_points = np.full((vocabulary, 1), 128, dtype=np.uint8)
+    lm_weight = rng.integers(96, 160, size=(vocabulary, 1, head_size), dtype=np.uint8)
+    lm_scales = rng.uniform(0.005, 0.02, size=(vocabulary, 1)).astype(np.float16)
+    lm_zero_points = np.full((vocabulary, 1), 128, dtype=np.uint8)
     positions = np.arange(cache_length, dtype=np.float32)[:, None]
     frequencies = 1.0 / (10000.0 ** (np.arange(head_size // 2, dtype=np.float32) * 2.0 / head_size))
     cos_cache = np.cos(positions * frequencies).astype(np.float16)
@@ -1055,7 +1058,7 @@ def test_qwen_stateful_prefill_and_decode(device):
                 "",
                 "",
             ],
-            ["logits", "present.0.key", "present.0.value"],
+            ["attention", "present.0.key", "present.0.value"],
             domain="com.microsoft",
             num_heads=1,
             kv_num_heads=1,
@@ -1063,6 +1066,17 @@ def test_qwen_stateful_prefill_and_decode(device):
             softcap=0.0,
             do_rotary=1,
             rotary_interleaved=0,
+        ),
+        helper.make_node(
+            "MatMulNBits",
+            ["attention", "lm_weight", "lm_scales", "lm_zero_points"],
+            ["logits"],
+            domain="com.microsoft",
+            bits=8,
+            block_size=128,
+            accuracy_level=0,
+            K=head_size,
+            N=vocabulary,
         ),
     ]
     model = helper.make_model(
@@ -1080,7 +1094,7 @@ def test_qwen_stateful_prefill_and_decode(device):
                 ),
             ],
             [
-                helper.make_tensor_value_info("logits", TensorProto.FLOAT16, ["batch", "sequence", head_size]),
+                helper.make_tensor_value_info("logits", TensorProto.FLOAT16, ["batch", "sequence", vocabulary]),
                 helper.make_tensor_value_info("present.0.key", TensorProto.FLOAT16, ["batch", 1, "total", head_size]),
                 helper.make_tensor_value_info("present.0.value", TensorProto.FLOAT16, ["batch", 1, "total", head_size]),
             ],
@@ -1090,6 +1104,9 @@ def test_qwen_stateful_prefill_and_decode(device):
                 numpy_helper.from_array(embedding, name="embedding"),
                 numpy_helper.from_array(scales, name="scales"),
                 numpy_helper.from_array(zero_points, name="zero_points"),
+                numpy_helper.from_array(lm_weight, name="lm_weight"),
+                numpy_helper.from_array(lm_scales, name="lm_scales"),
+                numpy_helper.from_array(lm_zero_points, name="lm_zero_points"),
                 numpy_helper.from_array(cos_cache, name="cos_cache"),
                 numpy_helper.from_array(sin_cache, name="sin_cache"),
             ],
@@ -1105,11 +1122,19 @@ def test_qwen_stateful_prefill_and_decode(device):
         onnx.save(model, str(path))
         runner = Qwen3OnnxRunner(str(path), device=device)
         prompt_logits = runner.prefill([0, 1])
-        assert prompt_logits.shape == (1, 2, head_size)
+        assert prompt_logits.shape == (1, 2, vocabulary)
         decoded = runner.decode(2).numpy()
         assert runner.sequence_length == 3
         full = runner.prefill([0, 1, 2]).numpy()
         np.testing.assert_array_equal(decoded, full[:, -1:, :])
+
+        logits = runner.prefill([0, 1])
+        expected = []
+        for _ in range(3):
+            token_id = int(np.argmax(logits.numpy()[0, -1]))
+            expected.append(token_id)
+            logits = runner.decode(token_id)
+        assert runner.generate_greedy([0, 1], max_new_tokens=3, eos_token_id=-1) == expected
     finally:
         path.unlink(missing_ok=True)
 

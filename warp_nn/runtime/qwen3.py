@@ -18,6 +18,70 @@ import warp as wp
 from warp_nn.runtime.onnx_runtime import OnnxRuntime
 
 
+@wp.kernel
+def _copy_cache_prefix(source: wp.array4d[wp.float16], destination: wp.array4d[wp.float16]):
+    batch, head, token, column = wp.tid()
+    destination[batch, head, token, column] = source[batch, head, token, column]
+
+
+@wp.kernel
+def _initialize_attention_mask(mask: wp.array2d[wp.int64], length: int):
+    index = wp.tid()
+    mask[0, index] = wp.int64(1) if index < length else wp.int64(0)
+
+
+@wp.kernel
+def _set_decode_token(
+    input_ids: wp.array2d[wp.int64], attention_mask: wp.array2d[wp.int64], token_id: int, position: int
+):
+    input_ids[0, 0] = wp.int64(token_id)
+    attention_mask[0, position] = wp.int64(1)
+
+
+@wp.kernel
+def _initialize_generation_state(
+    position: wp.array1d[wp.int32],
+    generated_count: wp.array1d[wp.int32],
+    finished: wp.array1d[wp.int32],
+    prompt_length: int,
+):
+    position[0] = wp.int32(prompt_length)
+    generated_count[0] = wp.int32(0)
+    finished[0] = wp.int32(0)
+
+
+@wp.kernel
+def _greedy_sample_next(
+    logits: wp.array3d[wp.float16],
+    input_ids: wp.array2d[wp.int64],
+    attention_mask: wp.array2d[wp.int64],
+    position: wp.array1d[wp.int32],
+    generated_count: wp.array1d[wp.int32],
+    generated_ids: wp.array1d[wp.int64],
+    finished: wp.array1d[wp.int32],
+    eos_token_id: int,
+):
+    if finished[0] != 0:
+        return
+    sequence = logits.shape[1] - 1
+    best_token = wp.int32(0)
+    best_logit = wp.float32(logits[0, sequence, 0])
+    for token in range(1, logits.shape[2]):
+        value = wp.float32(logits[0, sequence, token])
+        if value > best_logit:
+            best_logit = value
+            best_token = token
+    count = generated_count[0]
+    generated_ids[count] = wp.int64(best_token)
+    generated_count[0] = count + 1
+    input_ids[0, 0] = wp.int64(best_token)
+    token_position = position[0]
+    attention_mask[0, token_position] = wp.int64(1)
+    position[0] = token_position + 1
+    if best_token == eos_token_id:
+        finished[0] = wp.int32(1)
+
+
 def _byte_alphabet() -> tuple[dict[int, str], dict[str, int]]:
     values = list(range(ord("!"), ord("~") + 1))
     values += list(range(ord("¡"), ord("¬") + 1))
@@ -241,7 +305,7 @@ def sample_token(
 class Qwen3OnnxRunner:
     """Run prefill and token-by-token decode while keeping weights on device."""
 
-    def __init__(self, path: str, device: str | wp.Device | None = None):
+    def __init__(self, path: str, device: str | wp.Device | None = None, cache_capacity: int | None = None):
         self.runtime = OnnxRuntime(path, device=device)
         self._past_names = [name for name in self.runtime.input_names if name.startswith("past_key_values.")]
         self._present_for_past = {
@@ -258,6 +322,31 @@ class Qwen3OnnxRunner:
         if not rotary_lengths:
             raise ValueError("Qwen3OnnxRunner: model does not contain rotary embedding caches")
         self.max_sequence_length = min(rotary_lengths)
+        self.cache_capacity = cache_capacity or self.max_sequence_length
+        if not 0 < self.cache_capacity <= self.max_sequence_length:
+            raise ValueError("Qwen3OnnxRunner: cache_capacity must be within the model's rotary cache")
+        self._cache = {
+            name: wp.zeros(
+                (1, shape[1], self.cache_capacity, shape[3]),
+                dtype=self.runtime._input_dtypes[name],
+                device=self.runtime._device,
+            )
+            for name, shape in self._cache_shapes.items()
+        }
+        self._decode_input_ids = wp.zeros((1, 1), dtype=wp.int64, device=self.runtime._device)
+        self._decode_attention_mask = wp.zeros((1, self.cache_capacity), dtype=wp.int64, device=self.runtime._device)
+        decode_shapes = {"input_ids": (1, 1), "attention_mask": (1, self.cache_capacity)}
+        decode_shapes.update({name: tuple(cache.shape) for name, cache in self._cache.items()})
+        self._decode_runtime = self.runtime._fork(decode_shapes, share_kv_cache=True)
+        self._decode_inputs = {
+            "input_ids": self._decode_input_ids,
+            "attention_mask": self._decode_attention_mask,
+            **self._cache,
+        }
+        self._decode_position = wp.zeros(1, dtype=wp.int32, device=self.runtime._device)
+        self._generated_count = wp.zeros(1, dtype=wp.int32, device=self.runtime._device)
+        self._generated_ids = wp.zeros(self.cache_capacity, dtype=wp.int64, device=self.runtime._device)
+        self._generation_finished = wp.zeros(1, dtype=wp.int32, device=self.runtime._device)
         self._past: dict[str, wp.array] = {}
         self.sequence_length = 0
 
@@ -269,46 +358,109 @@ class Qwen3OnnxRunner:
     def prefill(self, token_ids: Sequence[int]) -> wp.array:
         """Reset state, process a prompt, and return its logits."""
         self.reset()
-        return self._forward(token_ids)
+        current_length = len(token_ids)
+        if current_length == 0:
+            raise ValueError("Qwen3OnnxRunner: token_ids must not be empty")
+        if current_length >= self.cache_capacity:
+            raise ValueError("Qwen3OnnxRunner: prompt must leave room for at least one decoded token")
+        shapes = {"input_ids": (1, current_length), "attention_mask": (1, current_length)}
+        for name, base_shape in self._cache_shapes.items():
+            shapes[name] = (1, base_shape[1], 0, base_shape[3])
+        self.runtime.resize_inputs(shapes)
+        inputs = {
+            "input_ids": wp.array(
+                np.asarray(token_ids, dtype=np.int64)[None, :], dtype=wp.int64, device=self.runtime._device
+            ),
+            "attention_mask": wp.ones((1, current_length), dtype=wp.int64, device=self.runtime._device),
+        }
+        for name, shape in shapes.items():
+            if name not in inputs:
+                inputs[name] = wp.zeros(shape, dtype=self.runtime._input_dtypes[name], device=self.runtime._device)
+        outputs = self.runtime(inputs)
+        for name, destination in self._cache.items():
+            wp.launch(
+                _copy_cache_prefix,
+                dim=outputs[self._present_for_past[name]].shape,
+                inputs=[outputs[self._present_for_past[name]], destination],
+                device=self.runtime._device,
+            )
+        self.sequence_length = current_length
+        self._prepare_decode()
+        return outputs["logits"]
 
     def decode(self, token_id: int) -> wp.array:
         """Append one token and return its logits."""
         if self.sequence_length == 0:
             raise RuntimeError("Qwen3OnnxRunner.decode requires a preceding prefill call")
-        return self._forward([token_id])
-
-    def _forward(self, token_ids: Sequence[int]) -> wp.array:
-        current_length = len(token_ids)
-        if current_length == 0:
-            raise ValueError("Qwen3OnnxRunner: token_ids must not be empty")
-        total_length = self.sequence_length + current_length
-        if total_length > self.max_sequence_length:
-            raise ValueError(
-                f"Qwen3OnnxRunner: sequence length {total_length} exceeds model limit {self.max_sequence_length}"
-            )
-
-        shapes = {
-            "input_ids": (1, current_length),
-            "attention_mask": (1, total_length),
-        }
-        for name, base_shape in self._cache_shapes.items():
-            shapes[name] = (1, base_shape[1], self.sequence_length, base_shape[3])
-        self.runtime.resize_inputs(shapes)
-
-        device = self.runtime._device
-        inputs = {
-            "input_ids": wp.array(np.asarray(token_ids, dtype=np.int64)[None, :], dtype=wp.int64, device=device),
-            "attention_mask": wp.ones((1, total_length), dtype=wp.int64, device=device),
-        }
-        for name, shape in shapes.items():
-            if name in ("input_ids", "attention_mask"):
-                continue
-            if name in self._past:
-                inputs[name] = self._past[name]
-            else:
-                inputs[name] = wp.zeros(shape, dtype=self.runtime._input_dtypes[name], device=device)
-
-        outputs = self.runtime(inputs)
-        self._past = {name: outputs[present] for name, present in self._present_for_past.items()}
-        self.sequence_length = total_length
+        if self.sequence_length >= self.cache_capacity:
+            raise ValueError("Qwen3OnnxRunner: KV cache is full")
+        self._stage_decode_token(token_id)
+        outputs = self._decode_runtime(self._decode_inputs)
+        self.sequence_length += 1
         return outputs["logits"]
+
+    def generate_greedy(self, token_ids: Sequence[int], max_new_tokens: int, eos_token_id: int) -> list[int]:
+        """Generate with an allocation-free captured CUDA graph and device-side argmax."""
+        if max_new_tokens <= 0:
+            return []
+        if len(token_ids) + max_new_tokens > self.cache_capacity:
+            raise ValueError("Qwen3OnnxRunner: requested generation exceeds KV-cache capacity")
+        prompt_logits = self.prefill(token_ids)
+        wp.launch(
+            _initialize_generation_state,
+            dim=1,
+            inputs=[
+                self._decode_position,
+                self._generated_count,
+                self._generation_finished,
+                self.sequence_length,
+            ],
+            device=self.runtime._device,
+        )
+        sample_inputs = [
+            self._decode_input_ids,
+            self._decode_attention_mask,
+            self._decode_position,
+            self._generated_count,
+            self._generated_ids,
+            self._generation_finished,
+            eos_token_id,
+        ]
+        wp.launch(_greedy_sample_next, dim=1, inputs=[prompt_logits, *sample_inputs], device=self.runtime._device)
+        wp.capture_begin(device=self.runtime._device)
+        try:
+            outputs = self._decode_runtime(self._decode_inputs)
+            wp.launch(
+                _greedy_sample_next,
+                dim=1,
+                inputs=[outputs["logits"], *sample_inputs],
+                device=self.runtime._device,
+            )
+            graph = wp.capture_end(device=self.runtime._device)
+        except Exception:
+            wp.capture_end(device=self.runtime._device)
+            raise
+        for _ in range(max_new_tokens - 1):
+            wp.capture_launch(graph)
+        generated = self._generated_ids.numpy()[:max_new_tokens].tolist()
+        if eos_token_id in generated:
+            generated = generated[: generated.index(eos_token_id) + 1]
+        self.sequence_length += len(generated)
+        return generated
+
+    def _stage_decode_token(self, token_id: int) -> None:
+        wp.launch(
+            _set_decode_token,
+            dim=1,
+            inputs=[self._decode_input_ids, self._decode_attention_mask, token_id, self.sequence_length],
+            device=self.runtime._device,
+        )
+
+    def _prepare_decode(self) -> None:
+        wp.launch(
+            _initialize_attention_mask,
+            dim=self.cache_capacity,
+            inputs=[self._decode_attention_mask, self.sequence_length],
+            device=self.runtime._device,
+        )
+        self._past = dict(self._cache)
