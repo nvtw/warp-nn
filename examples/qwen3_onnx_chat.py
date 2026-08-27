@@ -14,7 +14,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("model_dir", type=Path, help="Directory containing model.onnx and tokenizer.json")
     parser.add_argument("--system", help="Optional system message")
-    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--cache-capacity", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--thinking", action="store_true", help="Enable Qwen3 thinking mode")
@@ -56,7 +56,8 @@ def main():
         logits = runner.prefill(token_ids)
         generated = []
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
-        for _ in range(min(args.max_new_tokens, args.cache_capacity - len(token_ids))):
+        generation_limit = min(args.max_new_tokens, args.cache_capacity - len(token_ids))
+        for _ in range(generation_limit):
             token_id = sample_token(logits, temperature=args.temperature)
             generated.append(token_id)
             if token_id == tokenizer.eos_token_id:
@@ -65,6 +66,8 @@ def main():
             logits = runner.decode(token_id)
 
         print(decoder.decode(b"", final=True))
+        if not generated or generated[-1] != tokenizer.eos_token_id:
+            print(f"[Stopped at the {generation_limit}-token limit; use --max-new-tokens or /clear.]")
         response = tokenizer.decode(generated, skip_special_tokens=True)
         messages.append({"role": "assistant", "content": response})
 
