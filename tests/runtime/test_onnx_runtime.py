@@ -744,6 +744,56 @@ def test_gather_bfloat16_embedding(device):
         path.unlink(missing_ok=True)
 
 
+@pytest.mark.parametrize("device", ["cuda"])
+def test_transformer_cast_and_int32_metadata(device):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    mask = np.array([[1, 1, 0], [1, 1, 1]], dtype=np.int64)
+    values = np.arange(12, dtype=np.float16).reshape(2, 2, 3)
+    model = helper.make_model(
+        helper.make_graph(
+            [
+                helper.make_node("Cast", ["mask"], ["mask_i32"], to=TensorProto.INT32),
+                helper.make_node("ReduceSum", ["mask_i32", "axis"], ["lengths"], keepdims=0),
+                helper.make_node("Sub", ["lengths", "one"], ["last_indices"]),
+                helper.make_node("Cast", ["values"], ["values_f32"], to=TensorProto.FLOAT),
+                helper.make_node("Cast", ["values_f32"], ["restored"], to=TensorProto.FLOAT16),
+            ],
+            "transformer_metadata",
+            [
+                helper.make_tensor_value_info("mask", TensorProto.INT64, list(mask.shape)),
+                helper.make_tensor_value_info("values", TensorProto.FLOAT16, list(values.shape)),
+            ],
+            [
+                helper.make_tensor_value_info("last_indices", TensorProto.INT32, [2]),
+                helper.make_tensor_value_info("restored", TensorProto.FLOAT16, list(values.shape)),
+            ],
+            [
+                numpy_helper.from_array(np.array([1], dtype=np.int64), name="axis"),
+                numpy_helper.from_array(np.array([1], dtype=np.int32), name="one"),
+            ],
+        ),
+        opset_imports=[helper.make_opsetid("", 21)],
+    )
+    model.ir_version = 10
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        outputs = OnnxRuntime(str(path), device=device)(
+            {
+                "mask": wp.array(mask, dtype=wp.int64, device=device),
+                "values": wp.array(values, dtype=wp.float16, device=device),
+            }
+        )
+        np.testing.assert_array_equal(outputs["last_indices"].numpy(), mask.sum(axis=1).astype(np.int32) - 1)
+        np.testing.assert_array_equal(outputs["restored"].numpy(), values)
+    finally:
+        path.unlink(missing_ok=True)
+
+
 @pytest.mark.parametrize("batch,sequence", [(2, 3), (1, 1)])
 @pytest.mark.parametrize("use_cublas", [False, True])
 @pytest.mark.parametrize(

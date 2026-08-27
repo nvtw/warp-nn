@@ -240,19 +240,19 @@ def _reduce_mean_rows_kernel(x: wp.array2d[Any], out: wp.array2d[Any]):
     out[row, 0] = total / x.dtype(x.shape[1])
 
 
-@wp.kernel
-def _reduce_sum_rows_int64_kernel(x: wp.array2d[wp.int64], out: wp.array1d[wp.int64]):
+@wp.kernel(enable_backward=False)
+def _reduce_sum_rows_kernel(x: wp.array2d[Any], out: wp.array1d[Any]):
     row = wp.tid()
-    total = wp.int64(0)
+    total = x.dtype(0)
     for column in range(x.shape[1]):
         total += x[row, column]
     out[row] = total
 
 
-@wp.kernel
-def _cast_int64_to_int32_kernel(x: wp.array1d[wp.int64], out: wp.array1d[wp.int32]):
+@wp.kernel(enable_backward=False)
+def _cast_kernel(x: wp.array1d[Any], out: wp.array1d[Any]):
     index = wp.tid()
-    out[index] = wp.int32(x[index])
+    out[index] = out.dtype(x[index])
 
 
 @wp.kernel
@@ -882,6 +882,16 @@ def _kernel_for_dtype(kernel, dtype: type, *parameter_types: type | tuple[int]):
     return _KERNEL_OVERLOADS[key]
 
 
+def _cast_kernel_for_dtypes(source_dtype: type, target_dtype: type):
+    key = (_cast_kernel, source_dtype, target_dtype)
+    if key not in _KERNEL_OVERLOADS:
+        _KERNEL_OVERLOADS[key] = wp.overload(
+            _cast_kernel,
+            [wp.array1d(dtype=source_dtype), wp.array1d(dtype=target_dtype)],
+        )
+    return _KERNEL_OVERLOADS[key]
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -1370,14 +1380,15 @@ def _shape_elementwise_binary(op, shapes, dtypes, tensors, device, requires_grad
     if len(lhs_shape) not in (1, 2) or len(rhs_shape) not in (1, 2):
         raise NotImplementedError(f"OnnxRuntime {op.op_type}: only 1-D and 2-D tensors are supported")
     if len(lhs_shape) == 1 and len(rhs_shape) == 1:
-        if op.op_type != "Sub" or dtypes[op.inputs[0]] != wp.int64 or dtypes[op.inputs[1]] != wp.int64:
+        dtype = dtypes[op.inputs[0]]
+        if op.op_type != "Sub" or dtype not in (wp.int32, wp.int64) or dtypes[op.inputs[1]] != dtype:
             raise NotImplementedError(f"OnnxRuntime {op.op_type}: at least one input must be 2-D")
         if lhs_shape != rhs_shape and lhs_shape != (1,) and rhs_shape != (1,):
             raise ValueError(f"OnnxRuntime Sub: shapes {lhs_shape} and {rhs_shape} do not broadcast")
         out_shape = (max(lhs_shape[0], rhs_shape[0]),)
-        tensors[op.outputs[0]] = wp.zeros(out_shape, dtype=wp.int64, device=device)
+        tensors[op.outputs[0]] = wp.zeros(out_shape, dtype=dtype, device=device)
         shapes[op.outputs[0]] = out_shape
-        dtypes[op.outputs[0]] = wp.int64
+        dtypes[op.outputs[0]] = dtype
         op.attrs["_lhs_shape_2d"] = (1, lhs_shape[0])
         op.attrs["_rhs_shape_2d"] = (1, rhs_shape[0])
         op.attrs["_out_shape_2d"] = (1, out_shape[0])
@@ -1426,12 +1437,13 @@ def _shape_reduce_sum(op, shapes, dtypes, tensors, device, requires_grad=False):
     in_shape = shapes[op.inputs[0]]
     if len(in_shape) != 2 or axes != (1,) or int(op.attrs.get("keepdims", 1)) != 0:
         raise NotImplementedError("OnnxRuntime ReduceSum: only Qwen's 2-D integer row reduction is supported")
-    if dtypes[op.inputs[0]] != wp.int64:
-        raise TypeError("OnnxRuntime ReduceSum: expected an INT64 input")
+    dtype = dtypes[op.inputs[0]]
+    if dtype not in (wp.int32, wp.int64):
+        raise TypeError("OnnxRuntime ReduceSum: expected an INT32 or INT64 input")
     out_shape = (in_shape[0],)
-    tensors[op.outputs[0]] = wp.zeros(out_shape, dtype=wp.int64, device=device)
+    tensors[op.outputs[0]] = wp.zeros(out_shape, dtype=dtype, device=device)
     shapes[op.outputs[0]] = out_shape
-    dtypes[op.outputs[0]] = wp.int64
+    dtypes[op.outputs[0]] = dtype
 
 
 def _shape_shape(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -1468,12 +1480,19 @@ def _shape_gather(op, shapes, dtypes, tensors, device, requires_grad=False):
 
 
 def _shape_cast(op, shapes, dtypes, tensors, device, requires_grad=False):
-    if dtypes[op.inputs[0]] != wp.int64 or int(op.attrs.get("to", 0)) != 6 or len(shapes[op.inputs[0]]) != 1:
-        raise NotImplementedError("OnnxRuntime Cast: only 1-D INT64 to INT32 casts are supported")
+    target_dtype = {
+        1: wp.float32,
+        6: wp.int32,
+        10: wp.float16,
+        16: wp.bfloat16,
+    }.get(int(op.attrs.get("to", 0)))
+    if target_dtype is None:
+        raise NotImplementedError("OnnxRuntime Cast: unsupported target dtype")
     shape = shapes[op.inputs[0]]
-    tensors[op.outputs[0]] = wp.zeros(shape, dtype=wp.int32, device=device)
+    tensors[op.outputs[0]] = wp.zeros(shape, dtype=target_dtype, device=device)
     shapes[op.outputs[0]] = shape
-    dtypes[op.outputs[0]] = wp.int32
+    dtypes[op.outputs[0]] = target_dtype
+    op.attrs["_kernel"] = _cast_kernel_for_dtypes(dtypes[op.inputs[0]], target_dtype)
 
 
 def _shape_batch_normalization(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -2184,7 +2203,7 @@ def _exec_reduce_mean(op, tensors, shapes, device):
 
 def _exec_reduce_sum(op, tensors, shapes, device):
     wp.launch(
-        _reduce_sum_rows_int64_kernel,
+        _kernel_for_dtype(_reduce_sum_rows_kernel, tensors[op.inputs[0]].dtype, (2,), (1,)),
         dim=shapes[op.inputs[0]][0],
         inputs=[tensors[op.inputs[0]], tensors[op.outputs[0]]],
         device=device,
@@ -2214,10 +2233,11 @@ def _exec_gather(op, tensors, shapes, device):
 
 
 def _exec_cast(op, tensors, shapes, device):
+    size = int(np.prod(shapes[op.inputs[0]]))
     wp.launch(
-        _cast_int64_to_int32_kernel,
-        dim=shapes[op.inputs[0]][0],
-        inputs=[tensors[op.inputs[0]], tensors[op.outputs[0]]],
+        op.attrs["_kernel"],
+        dim=size,
+        inputs=[tensors[op.inputs[0]].reshape((size,)), tensors[op.outputs[0]].reshape((size,))],
         device=device,
     )
 
