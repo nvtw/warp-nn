@@ -57,6 +57,7 @@ from __future__ import annotations
 from typing import Any
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import warp as wp
@@ -509,9 +510,10 @@ class OnnxRuntime:
         self._requires_grad = requires_grad
 
         onnx, numpy_helper = _require_onnx()
-        model = onnx.load(path)
+        model_path = Path(path)
+        model = onnx.load(model_path, load_external_data=False)
         try:
-            onnx.checker.check_model(model)
+            onnx.checker.check_model(model_path)
         except onnx.checker.ValidationError as exc:
             raise ValueError(f"OnnxRuntime: invalid ONNX model: {exc}") from exc
         graph = model.graph
@@ -521,10 +523,16 @@ class OnnxRuntime:
         self._dtypes: dict[str, type] = {}
 
         for init in graph.initializer:
-            arr_np = numpy_helper.to_array(init)
-            self._tensors[init.name] = _np_to_warp(arr_np, self._device, requires_grad=self._requires_grad)
-            self._shapes[init.name] = tuple(arr_np.shape)
-            self._dtypes[init.name] = self._tensors[init.name].dtype
+            external = onnx.external_data_helper.uses_external_data(init)
+            try:
+                arr_np = numpy_helper.to_array(init, base_dir=str(model_path.parent))
+                tensor = _np_to_warp(arr_np, self._device, requires_grad=self._requires_grad)
+            finally:
+                if external:
+                    init.ClearField("raw_data")
+            self._tensors[init.name] = tensor
+            self._shapes[init.name] = tuple(tensor.shape)
+            self._dtypes[init.name] = tensor.dtype
 
         initializer_names = {init.name for init in graph.initializer}
         self.input_names: list[str] = [inp.name for inp in graph.input if inp.name not in initializer_names]

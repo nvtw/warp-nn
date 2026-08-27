@@ -318,6 +318,48 @@ def test_mlp_policy(device):
         path.unlink(missing_ok=True)
 
 
+@pytest.mark.parametrize("device", ["cuda"])
+def test_streams_external_initializers(device, monkeypatch):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    model = _convert_float_model_dtype(_build_mlp_policy_model((8, 6, 4), seed=23), np.float16, TensorProto.FLOAT16)
+    observation = np.random.default_rng(23).standard_normal((1, 8)).astype(np.float16)
+    expected = _run_numpy_mlp(model, {"observation": observation})["action"]
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "model.onnx"
+        data_path = Path(directory) / "weights.bin"
+        onnx.save_model(
+            model,
+            path,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=data_path.name,
+            size_threshold=0,
+        )
+        unloaded = onnx.load(path, load_external_data=False)
+        assert data_path.is_file()
+        assert all(onnx.external_data_helper.uses_external_data(item) for item in unloaded.graph.initializer)
+
+        loaded_tensors = []
+        load_external_data_for_tensor = onnx.external_data_helper.load_external_data_for_tensor
+
+        def track_external_load(tensor, base_dir):
+            assert all(not previous.HasField("raw_data") for previous in loaded_tensors)
+            load_external_data_for_tensor(tensor, base_dir)
+            loaded_tensors.append(tensor)
+
+        monkeypatch.setattr(onnx.external_data_helper, "load_external_data_for_tensor", track_external_load)
+        runtime = OnnxRuntime(str(path), device=device)
+        assert len(loaded_tensors) == len(model.graph.initializer)
+        assert all(not tensor.HasField("raw_data") for tensor in loaded_tensors)
+        assert {tensor.dtype for tensor in runtime._tensors.values()} == {wp.float16}
+
+        output = runtime({"observation": wp.array(observation, dtype=wp.float16, device=device)})["action"]
+        np.testing.assert_allclose(output.numpy(), expected, rtol=2.0e-2, atol=2.0e-2)
+
+
 @pytest.mark.parametrize(
     "np_dtype,tensor_type,warp_dtype,rtol,atol",
     [
