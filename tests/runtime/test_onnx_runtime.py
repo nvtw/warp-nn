@@ -847,6 +847,119 @@ def test_transformer_layout_ops(device):
         path.unlink(missing_ok=True)
 
 
+@pytest.mark.parametrize("device", ["cuda"])
+def test_transformer_activations_and_normalization(device):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    rng = np.random.default_rng(83)
+    x = rng.standard_normal((2, 3, 4)).astype(np.float16)
+    q = rng.standard_normal((1, 2, 3, 4)).astype(np.float16)
+    bias = rng.standard_normal(4).astype(np.float16)
+    scale = np.array([0.25], dtype=np.float16)
+    model = helper.make_model(
+        helper.make_graph(
+            [
+                helper.make_node("Sigmoid", ["x"], ["sigmoid"]),
+                helper.make_node("Softplus", ["x"], ["softplus"]),
+                helper.make_node("Add", ["x", "bias"], ["biased"]),
+                helper.make_node("Mul", ["x", "scale"], ["scaled"]),
+                helper.make_node("LpNormalization", ["q"], ["normalized"], axis=-1, p=2),
+            ],
+            "transformer_activations",
+            [
+                helper.make_tensor_value_info("x", TensorProto.FLOAT16, list(x.shape)),
+                helper.make_tensor_value_info("q", TensorProto.FLOAT16, list(q.shape)),
+            ],
+            [
+                helper.make_tensor_value_info(name, TensorProto.FLOAT16, list(x.shape))
+                for name in ("sigmoid", "softplus", "biased", "scaled")
+            ]
+            + [helper.make_tensor_value_info("normalized", TensorProto.FLOAT16, list(q.shape))],
+            [numpy_helper.from_array(bias, name="bias"), numpy_helper.from_array(scale, name="scale")],
+        ),
+        opset_imports=[helper.make_opsetid("", 21)],
+    )
+    model.ir_version = 10
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        outputs = OnnxRuntime(str(path), device=device)(
+            {
+                "x": wp.array(x, dtype=wp.float16, device=device),
+                "q": wp.array(q, dtype=wp.float16, device=device),
+            }
+        )
+        x_fp32 = x.astype(np.float32)
+        np.testing.assert_allclose(outputs["sigmoid"].numpy(), 1.0 / (1.0 + np.exp(-x_fp32)), atol=1e-3)
+        np.testing.assert_allclose(outputs["softplus"].numpy(), np.logaddexp(0.0, x_fp32), atol=1e-3)
+        np.testing.assert_array_equal(outputs["biased"].numpy(), (x + bias).astype(np.float16))
+        np.testing.assert_array_equal(outputs["scaled"].numpy(), (x * scale[0]).astype(np.float16))
+        expected_norm = q.astype(np.float32) / np.linalg.norm(q.astype(np.float32), axis=-1, keepdims=True)
+        np.testing.assert_allclose(outputs["normalized"].numpy(), expected_norm, rtol=2e-3, atol=2e-3)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("device", ["cuda"])
+def test_transformer_selection_ops(device):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    condition = np.array([True, False, True, False])
+    x = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+    y = -x
+    model = helper.make_model(
+        helper.make_graph(
+            [
+                helper.make_node("Range", ["start", "limit", "delta"], ["range"]),
+                helper.make_node("Slice", ["source", "starts", "ends", "axes"], ["slice"]),
+                helper.make_node("Where", ["condition", "x", "y"], ["selected"]),
+            ],
+            "transformer_selection",
+            [
+                helper.make_tensor_value_info("x", TensorProto.FLOAT, list(x.shape)),
+                helper.make_tensor_value_info("y", TensorProto.FLOAT, list(y.shape)),
+            ],
+            [
+                helper.make_tensor_value_info("range", TensorProto.INT64, [4]),
+                helper.make_tensor_value_info("slice", TensorProto.INT64, [2]),
+                helper.make_tensor_value_info("selected", TensorProto.FLOAT, list(x.shape)),
+            ],
+            [
+                numpy_helper.from_array(np.array(0, dtype=np.int64), name="start"),
+                numpy_helper.from_array(np.array(4, dtype=np.int64), name="limit"),
+                numpy_helper.from_array(np.array(1, dtype=np.int64), name="delta"),
+                numpy_helper.from_array(np.array([4, 5, 6], dtype=np.int64), name="source"),
+                numpy_helper.from_array(np.array([1], dtype=np.int64), name="starts"),
+                numpy_helper.from_array(np.array([3], dtype=np.int64), name="ends"),
+                numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+                numpy_helper.from_array(condition, name="condition"),
+            ],
+        ),
+        opset_imports=[helper.make_opsetid("", 21)],
+    )
+    model.ir_version = 10
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        outputs = OnnxRuntime(str(path), device=device)(
+            {
+                "x": wp.array(x, dtype=wp.float32, device=device),
+                "y": wp.array(y, dtype=wp.float32, device=device),
+            }
+        )
+        np.testing.assert_array_equal(outputs["range"].numpy(), np.arange(4, dtype=np.int64))
+        np.testing.assert_array_equal(outputs["slice"].numpy(), np.array([5, 6], dtype=np.int64))
+        np.testing.assert_array_equal(outputs["selected"].numpy(), np.where(condition, x, y))
+    finally:
+        path.unlink(missing_ok=True)
+
+
 @pytest.mark.parametrize("batch,sequence", [(2, 3), (1, 1)])
 @pytest.mark.parametrize("use_cublas", [False, True])
 @pytest.mark.parametrize(
@@ -1170,7 +1283,7 @@ def test_qwen_normalization_and_swiglu(device, data_type, np_dtype, wp_dtype):
         pytest.skip(f"Device '{device}' is not available")
 
     rng = np.random.default_rng(53)
-    shape = (2, 3, 128)
+    shape = (2, 1, 3, 128)
     x = rng.standard_normal(shape).astype(np_dtype)
     skip = rng.standard_normal(shape).astype(np_dtype)
     gate = rng.standard_normal(shape).astype(np_dtype)
