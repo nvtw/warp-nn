@@ -1765,7 +1765,7 @@ def test_rejects_unsupported_ops(device):
 
     model = helper.make_model(
         helper.make_graph(
-            nodes=[helper.make_node("Sigmoid", ["A"], ["Y"])],
+            nodes=[helper.make_node("Acos", ["A"], ["Y"])],
             name="reject",
             inputs=[helper.make_tensor_value_info("A", TensorProto.FLOAT, [1, 4])],
             outputs=[helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
@@ -1778,7 +1778,7 @@ def test_rejects_unsupported_ops(device):
         path = Path(tmp.name)
     try:
         onnx.save(model, str(path))
-        with pytest.raises(NotImplementedError, match="unsupported op 'Sigmoid'"):
+        with pytest.raises(NotImplementedError, match="unsupported op 'Acos'"):
             OnnxRuntime(str(path), device=device)
     finally:
         path.unlink(missing_ok=True)
@@ -1809,19 +1809,19 @@ def test_rejects_unsupported_op_variants(device):
         model = helper.make_model(
             helper.make_graph(
                 nodes=[helper.make_node("Add", ["A", "B"], ["Y"])],
-                name="reject_1d_binary",
+                name="reject_binary_broadcast",
                 inputs=[
-                    helper.make_tensor_value_info("A", TensorProto.FLOAT, [4]),
-                    helper.make_tensor_value_info("B", TensorProto.FLOAT, [4]),
+                    helper.make_tensor_value_info("A", TensorProto.FLOAT, [2, 3, 4]),
+                    helper.make_tensor_value_info("B", TensorProto.FLOAT, [2, 1, 4]),
                 ],
-                outputs=[helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4])],
+                outputs=[helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 3, 4])],
             ),
             opset_imports=[helper.make_opsetid("", 17)],
         )
         model.ir_version = 8
         onnx.checker.check_model(model)
         onnx.save(model, str(path))
-        with pytest.raises(NotImplementedError, match="at least one input must be 2-D"):
+        with pytest.raises(NotImplementedError, match="broadcast pattern"):
             OnnxRuntime(str(path), device=device)
     finally:
         path.unlink(missing_ok=True)
