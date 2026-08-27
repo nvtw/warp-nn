@@ -1431,8 +1431,9 @@ def test_qwen_normalization_and_swiglu(device, data_type, np_dtype, wp_dtype):
 
 
 @pytest.mark.parametrize("sequence_length,past_length", [(2, 2), (7, 5)])
+@pytest.mark.parametrize("do_rotary", [False, True])
 @pytest.mark.parametrize("device", ["cuda"])
-def test_qwen_group_query_attention(device, sequence_length, past_length):
+def test_qwen_group_query_attention(device, do_rotary, sequence_length, past_length):
     if not is_device_available(device):
         pytest.skip(f"Device '{device}' is not available")
 
@@ -1460,8 +1461,16 @@ def test_qwen_group_query_attention(device, sequence_length, past_length):
             np.float16
         )
 
-    rotated_query = rotate(query, query_heads)
-    rotated_key = rotate(key, kv_heads)
+    rotated_query = (
+        rotate(query, query_heads)
+        if do_rotary
+        else query.reshape(batch, sequence_length, query_heads, head_size).transpose(0, 2, 1, 3)
+    )
+    rotated_key = (
+        rotate(key, kv_heads)
+        if do_rotary
+        else key.reshape(batch, sequence_length, kv_heads, head_size).transpose(0, 2, 1, 3)
+    )
     present_key = np.concatenate((past_key, rotated_key), axis=2)
     present_value = np.concatenate(
         (past_value, value.reshape(batch, sequence_length, kv_heads, head_size).transpose(0, 2, 1, 3)), axis=2
@@ -1501,8 +1510,8 @@ def test_qwen_group_query_attention(device, sequence_length, past_length):
                         "past_value",
                         "sequence_lengths",
                         "total_length",
-                        "cos_cache",
-                        "sin_cache",
+                        "cos_cache" if do_rotary else "",
+                        "sin_cache" if do_rotary else "",
                         "",
                         "",
                     ],
@@ -1512,7 +1521,7 @@ def test_qwen_group_query_attention(device, sequence_length, past_length):
                     kv_num_heads=kv_heads,
                     scale=head_size**-0.5,
                     softcap=0.0,
-                    do_rotary=1,
+                    do_rotary=int(do_rotary),
                     rotary_interleaved=0,
                 ),
             ],

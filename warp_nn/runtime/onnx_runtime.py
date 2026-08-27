@@ -908,27 +908,37 @@ def _gqa_prepare_fp16_kernel(
     past_length: int,
     head_size: int,
     share_cache: bool,
+    do_rotary: bool,
 ):
     batch, head, token, column = wp.tid()
-    cache_column = column % (head_size // 2)
-    paired_column = column + head_size // 2 if column < head_size // 2 else column - head_size // 2
-    sign = wp.float32(-1.0) if column < head_size // 2 else wp.float32(1.0)
     position = wp.int32(sequence_lengths_minus_one[batch]) - sequence_length + 1 + token
     cache_token = position if share_cache else past_length + token
-    cosine = wp.float32(cos_cache[position, cache_column])
-    sine = wp.float32(sin_cache[position, cache_column])
 
     if head < query_heads:
         offset = head * head_size
         current = wp.float32(query[batch, token, offset + column])
-        paired = wp.float32(query[batch, token, offset + paired_column])
-        rotated_query[batch, head, token, column] = wp.float16(current * cosine + sign * paired * sine)
+        if do_rotary:
+            cache_column = column % (head_size // 2)
+            paired_column = column + head_size // 2 if column < head_size // 2 else column - head_size // 2
+            sign = wp.float32(-1.0) if column < head_size // 2 else wp.float32(1.0)
+            paired = wp.float32(query[batch, token, offset + paired_column])
+            current = current * wp.float32(cos_cache[position, cache_column]) + sign * paired * wp.float32(
+                sin_cache[position, cache_column]
+            )
+        rotated_query[batch, head, token, column] = wp.float16(current)
 
     if head < kv_heads:
         offset = head * head_size
         current = wp.float32(key[batch, token, offset + column])
-        paired = wp.float32(key[batch, token, offset + paired_column])
-        present_key[batch, head, cache_token, column] = wp.float16(current * cosine + sign * paired * sine)
+        if do_rotary:
+            cache_column = column % (head_size // 2)
+            paired_column = column + head_size // 2 if column < head_size // 2 else column - head_size // 2
+            sign = wp.float32(-1.0) if column < head_size // 2 else wp.float32(1.0)
+            paired = wp.float32(key[batch, token, offset + paired_column])
+            current = current * wp.float32(cos_cache[position, cache_column]) + sign * paired * wp.float32(
+                sin_cache[position, cache_column]
+            )
+        present_key[batch, head, cache_token, column] = wp.float16(current)
         present_value[batch, head, cache_token, column] = value[batch, token, offset + column]
 
 
@@ -2207,20 +2217,36 @@ def _shape_group_query_attention(op, shapes, dtypes, tensors, device, requires_g
         raise ValueError("OnnxRuntime GroupQueryAttention: invalid past KV-cache shape")
     if shapes[op.inputs[5]] != (batch,) or dtypes[op.inputs[5]] != wp.int32:
         raise ValueError("OnnxRuntime GroupQueryAttention: sequence lengths must be an INT32 batch vector")
-    if shapes[op.inputs[6]] != (1,) or dtypes[op.inputs[6]] != wp.int32:
+    if shapes[op.inputs[6]] not in ((), (1,)) or dtypes[op.inputs[6]] != wp.int32:
         raise ValueError("OnnxRuntime GroupQueryAttention: total sequence length must be an INT32 scalar")
-    if shapes[op.inputs[7]] != shapes[op.inputs[8]] or shapes[op.inputs[7]][1] != head_size // 2:
-        raise ValueError("OnnxRuntime GroupQueryAttention: invalid rotary cache shape")
-    if any(dtypes[name] != wp.float16 for name in op.inputs[:5] + op.inputs[7:9]):
-        raise TypeError("OnnxRuntime GroupQueryAttention: Q/K/V, caches, and rotary tables must be FP16")
+    do_rotary = bool(op.attrs.get("do_rotary", 0))
+    if any(dtypes[name] != wp.float16 for name in op.inputs[:5]):
+        raise TypeError("OnnxRuntime GroupQueryAttention: Q/K/V and caches must be FP16")
+    if do_rotary:
+        if (
+            len(op.inputs) < 9
+            or not op.inputs[7]
+            or not op.inputs[8]
+            or shapes[op.inputs[7]] != shapes[op.inputs[8]]
+            or len(shapes[op.inputs[7]]) != 2
+            or shapes[op.inputs[7]][1] != head_size // 2
+        ):
+            raise ValueError("OnnxRuntime GroupQueryAttention: invalid rotary cache shape")
+        if dtypes[op.inputs[7]] != wp.float16 or dtypes[op.inputs[8]] != wp.float16:
+            raise TypeError("OnnxRuntime GroupQueryAttention: rotary tables must be FP16")
+        cos_cache, sin_cache = tensors[op.inputs[7]], tensors[op.inputs[8]]
+    else:
+        dummy_name = "__onnx_runtime_gqa_dummy_fp16"
+        if dummy_name not in tensors:
+            tensors[dummy_name] = wp.zeros((1, 1), dtype=wp.float16, device=device)
+        cos_cache = sin_cache = tensors[dummy_name]
     if (
-        len(op.inputs) != 11
+        len(op.inputs) < 7
         or any(op.inputs[9:])
-        or int(op.attrs.get("do_rotary", 0)) != 1
         or int(op.attrs.get("rotary_interleaved", 0)) != 0
         or float(op.attrs.get("softcap", 0.0)) != 0.0
     ):
-        raise NotImplementedError("OnnxRuntime GroupQueryAttention: only causal non-interleaved RoPE is supported")
+        raise NotImplementedError("OnnxRuntime GroupQueryAttention: unsupported optional inputs or attributes")
 
     past_length = past_shape[2]
     share_cache = bool(op.attrs.get("_share_cache", False))
@@ -2245,6 +2271,9 @@ def _shape_group_query_attention(op, shapes, dtypes, tensors, device, requires_g
             "_past_length": past_length,
             "_total_length": total_length,
             "_head_size": head_size,
+            "_cos_cache": cos_cache,
+            "_sin_cache": sin_cache,
+            "_do_rotary": do_rotary,
             "_rotated_query": tensors[rotated_name],
             "_attention_block_dim": attention_block_dim,
             "_attention_kernel": attention_kernel,
@@ -2955,8 +2984,8 @@ def _exec_group_query_attention(op, tensors, shapes, device):
             tensors[op.inputs[1]],
             tensors[op.inputs[2]],
             tensors[op.inputs[5]],
-            tensors[op.inputs[7]],
-            tensors[op.inputs[8]],
+            op.attrs["_cos_cache"],
+            op.attrs["_sin_cache"],
             op.attrs["_rotated_query"],
             present_key,
             present_value,
@@ -2966,6 +2995,7 @@ def _exec_group_query_attention(op, tensors, shapes, device):
             past_length,
             head_size,
             share_cache,
+            op.attrs["_do_rotary"],
         ],
         device=device,
     )
