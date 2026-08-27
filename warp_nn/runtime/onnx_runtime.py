@@ -578,6 +578,31 @@ def _matmul_int4_q8_kernel(
         output[row, column] = wp.float16(total)
 
 
+@wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+def _matmul_int8_q8_kernel(
+    activations: wp.array3d[wp.uint32],
+    activation_scales: wp.array2d[wp.float32],
+    weights: wp.array3d[wp.uint32],
+    weight_scales: wp.array2d[wp.float16],
+    output: wp.array2d[wp.float16],
+):
+    thread = wp.tid()
+    lane = thread % 8
+    item = thread / 8
+    row = item / weights.shape[0]
+    column = item % weights.shape[0]
+    total = wp.float32(0.0)
+    for block in range(weights.shape[1]):
+        packed_activation = wp.int32(activations[row, block, lane])
+        signed_weights = wp.int32(weights[column, block, lane] ^ wp.uint32(0x80808080))
+        block_total = _dp4a(signed_weights, packed_activation, 0)
+        reduced = _subgroup_sum(wp.float32(block_total), 8)
+        if lane == 0:
+            total += reduced * activation_scales[row, block] * wp.float32(weight_scales[column, block])
+    if lane == 0:
+        output[row, column] = wp.float16(total)
+
+
 def _nbits_reduction_width(bits: int, packed_block_size: int, warp_reduction: bool) -> int:
     if not warp_reduction:
         return 1
@@ -2203,7 +2228,14 @@ def _shape_matmul_nbits(op, shapes, dtypes, tensors, device, requires_grad=False
     op.attrs["_reduction_width"], op.attrs["_matmul_kernel"] = _get_matmul_nbits_kernel(
         bits, block_size, dtype, device.is_cuda
     )
-    if device.is_cuda and rows == 1 and bits == 4 and block_size == 32 and dtype == wp.float16 and not has_zero_points:
+    if (
+        device.is_cuda
+        and rows == 1
+        and bits in (4, 8)
+        and block_size == 32
+        and dtype == wp.float16
+        and not has_zero_points
+    ):
         weights = tensors[op.inputs[1]]
         quantized = wp.empty((rows, K), dtype=wp.int8, device=device)
         op.attrs["_q8_activations"] = quantized
@@ -2215,13 +2247,15 @@ def _shape_matmul_nbits(op, shapes, dtypes, tensors, device, requires_grad=False
             device=device,
         )
         op.attrs["_q8_scales"] = wp.empty((rows, blocks), dtype=wp.float32, device=device)
-        op.attrs["_int4_weight_words"] = wp.array(
+        op.attrs["_q8_weight_words"] = wp.array(
             ptr=weights.ptr,
             capacity=weights.capacity,
             dtype=wp.uint32,
-            shape=(N, blocks, 4),
+            shape=(N, blocks, bits),
             device=device,
         )
+        op.attrs["_q8_kernel"] = _matmul_int4_q8_kernel if bits == 4 else _matmul_int8_q8_kernel
+        op.attrs["_q8_width"] = bits
 
 
 def _shape_causal_conv_with_state(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -3062,12 +3096,12 @@ def _exec_matmul_nbits(op, tensors, shapes, device):
             device=device,
         )
         wp.launch(
-            _matmul_int4_q8_kernel,
-            dim=op.attrs["_rows"] * N * 4,
+            op.attrs["_q8_kernel"],
+            dim=op.attrs["_rows"] * N * op.attrs["_q8_width"],
             inputs=[
                 op.attrs["_q8_activation_words"],
                 op.attrs["_q8_scales"],
-                op.attrs["_int4_weight_words"],
+                op.attrs["_q8_weight_words"],
                 tensors[op.inputs[2]],
                 op.attrs["_output_2d"],
             ],
