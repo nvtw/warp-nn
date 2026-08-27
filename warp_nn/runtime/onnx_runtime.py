@@ -481,19 +481,20 @@ def _gather_single_index_kernel(
 @wp.func_native(
     """
 #if defined(__CUDA_ARCH__)
-    for (int offset = 16; offset > 0; offset >>= 1)
-        value += __shfl_down_sync(0xffffffff, value, offset);
+    for (int offset = width / 2; offset > 0; offset >>= 1)
+        value += __shfl_down_sync(__activemask(), value, offset, width);
 #endif
     return value;
     """
 )
-def _warp_sum(value: float) -> float: ...
+def _subgroup_sum(value: float, width: int) -> float: ...
 
 
 def _create_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_reduction: bool):
     values_per_byte = 8 // bits
     packed_block_size = block_size // values_per_byte
-    load_stride = 32 if warp_reduction else 1
+    reduction_width = min(32, 1 << (packed_block_size - 1).bit_length()) if warp_reduction else 1
+    load_stride = reduction_width
     loads_per_lane = (packed_block_size + load_stride - 1) // load_stride
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -506,8 +507,8 @@ def _create_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_re
         has_zero_points: bool,
     ):
         thread = wp.tid()
-        lane = thread & 31 if warp_reduction else 0
-        item = thread / 32 if warp_reduction else thread
+        lane = thread % reduction_width if warp_reduction else 0
+        item = thread / reduction_width if warp_reduction else thread
         row = item / weights.shape[0]
         column = item % weights.shape[0]
         total = wp.float32(0.0)
@@ -531,7 +532,7 @@ def _create_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_re
             total += block_total * wp.float32(scales[column, block])
 
         if warp_reduction:
-            total = _warp_sum(total)
+            total = _subgroup_sum(total, reduction_width)
         if lane == 0:
             output[row, column] = dtype(total)
 
@@ -540,7 +541,9 @@ def _create_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_re
 
 @lru_cache(maxsize=None)
 def _get_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_reduction: bool):
-    return _create_matmul_nbits_kernel(bits, block_size, dtype, warp_reduction)
+    packed_block_size = block_size * bits // 8
+    reduction_width = min(32, 1 << (packed_block_size - 1).bit_length()) if warp_reduction else 1
+    return reduction_width, _create_matmul_nbits_kernel(bits, block_size, dtype, warp_reduction)
 
 
 def _create_dequantize_nbits_kernel(bits: int, block_size: int, dtype: type):
@@ -2070,7 +2073,9 @@ def _shape_matmul_nbits(op, shapes, dtypes, tensors, device, requires_grad=False
     op.attrs["_has_zero_points"] = has_zero_points
     op.attrs["_zero_points"] = tensors[op.inputs[3]] if has_zero_points else tensors[zero_name]
     op.attrs["_output_2d"] = tensors[op.outputs[0]].reshape((rows, N))
-    op.attrs["_matmul_kernel"] = _get_matmul_nbits_kernel(bits, block_size, dtype, device.is_cuda)
+    op.attrs["_reduction_width"], op.attrs["_matmul_kernel"] = _get_matmul_nbits_kernel(
+        bits, block_size, dtype, device.is_cuda
+    )
 
 
 def _shape_causal_conv_with_state(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -2924,7 +2929,7 @@ def _exec_matmul_nbits(op, tensors, shapes, device):
     if device.is_cuda:
         wp.launch(
             op.attrs["_matmul_kernel"],
-            dim=op.attrs["_rows"] * N * 32,
+            dim=op.attrs["_rows"] * N * op.attrs["_reduction_width"],
             inputs=[
                 tensors[op.inputs[0]].reshape((op.attrs["_rows"], K)),
                 tensors[op.inputs[1]],
