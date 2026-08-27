@@ -911,27 +911,40 @@ def test_transformer_selection_ops(device):
     condition = np.array([True, False, True, False])
     x = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
     y = -x
+    positions = np.arange(24, dtype=np.int64).reshape(3, 2, 4)
     model = helper.make_model(
         helper.make_graph(
             [
+                helper.make_node("Shape", ["x"], ["x_shape"]),
+                helper.make_node("Gather", ["x_shape", "zero"], ["batch_size"], axis=0),
+                helper.make_node("Gather", ["x_shape", "one"], ["sequence_size"], axis=0),
+                helper.make_node("Mul", ["batch_size", "sequence_size"], ["limit"]),
                 helper.make_node("Range", ["start", "limit", "delta"], ["range"]),
                 helper.make_node("Slice", ["source", "starts", "ends", "axes"], ["slice"]),
                 helper.make_node("Where", ["condition", "x", "y"], ["selected"]),
+                helper.make_node("Gather", ["positions", "one_vector"], ["position_plane"], axis=0),
+                helper.make_node("Gather", ["x", "last"], ["last_token"], axis=1),
             ],
             "transformer_selection",
             [
                 helper.make_tensor_value_info("x", TensorProto.FLOAT, list(x.shape)),
                 helper.make_tensor_value_info("y", TensorProto.FLOAT, list(y.shape)),
+                helper.make_tensor_value_info("positions", TensorProto.INT64, list(positions.shape)),
             ],
             [
-                helper.make_tensor_value_info("range", TensorProto.INT64, [4]),
+                helper.make_tensor_value_info("range", TensorProto.INT64, [6]),
                 helper.make_tensor_value_info("slice", TensorProto.INT64, [2]),
                 helper.make_tensor_value_info("selected", TensorProto.FLOAT, list(x.shape)),
+                helper.make_tensor_value_info("position_plane", TensorProto.INT64, [1, 2, 4]),
+                helper.make_tensor_value_info("last_token", TensorProto.FLOAT, [2, 4]),
             ],
             [
                 numpy_helper.from_array(np.array(0, dtype=np.int64), name="start"),
-                numpy_helper.from_array(np.array(4, dtype=np.int64), name="limit"),
                 numpy_helper.from_array(np.array(1, dtype=np.int64), name="delta"),
+                numpy_helper.from_array(np.array(0, dtype=np.int64), name="zero"),
+                numpy_helper.from_array(np.array(1, dtype=np.int64), name="one"),
+                numpy_helper.from_array(np.array([1], dtype=np.int64), name="one_vector"),
+                numpy_helper.from_array(np.array(-1, dtype=np.int64), name="last"),
                 numpy_helper.from_array(np.array([4, 5, 6], dtype=np.int64), name="source"),
                 numpy_helper.from_array(np.array([1], dtype=np.int64), name="starts"),
                 numpy_helper.from_array(np.array([3], dtype=np.int64), name="ends"),
@@ -951,11 +964,14 @@ def test_transformer_selection_ops(device):
             {
                 "x": wp.array(x, dtype=wp.float32, device=device),
                 "y": wp.array(y, dtype=wp.float32, device=device),
+                "positions": wp.array(positions, dtype=wp.int64, device=device),
             }
         )
-        np.testing.assert_array_equal(outputs["range"].numpy(), np.arange(4, dtype=np.int64))
+        np.testing.assert_array_equal(outputs["range"].numpy(), np.arange(6, dtype=np.int64))
         np.testing.assert_array_equal(outputs["slice"].numpy(), np.array([5, 6], dtype=np.int64))
         np.testing.assert_array_equal(outputs["selected"].numpy(), np.where(condition, x, y))
+        np.testing.assert_array_equal(outputs["position_plane"].numpy(), positions[1:2])
+        np.testing.assert_array_equal(outputs["last_token"].numpy(), x[:, -1])
     finally:
         path.unlink(missing_ok=True)
 
