@@ -1058,6 +1058,7 @@ def test_rotary_embedding(device):
     "data_type,bits,block_size,has_zero_points",
     [
         (TensorProto.FLOAT16, 4, 128, True),
+        (TensorProto.FLOAT16, 4, 32, False),
         (TensorProto.FLOAT16, 8, 128, True),
         (TensorProto.BFLOAT16, 4, 32, False),
     ],
