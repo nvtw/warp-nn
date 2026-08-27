@@ -895,7 +895,6 @@ class OnnxRuntime:
             ):
                 raise ValueError(f"OnnxRuntime: input '{name}' shape {shape} conflicts with declared shape {declared}")
 
-        wp.synchronize_device(self._device)
         self._tensors = {name: self._tensors[name] for name in self._initializer_names}
         self._shapes = {name: tuple(tensor.shape) for name, tensor in self._tensors.items()}
         self._dtypes = {name: tensor.dtype for name, tensor in self._tensors.items()}
