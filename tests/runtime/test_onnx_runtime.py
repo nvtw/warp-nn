@@ -780,6 +780,86 @@ def test_matmul_nbits(device, bits):
 
 
 @pytest.mark.parametrize("device", ["cuda"])
+def test_qwen_normalization_and_swiglu(device):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    rng = np.random.default_rng(53)
+    shape = (2, 3, 128)
+    x = rng.standard_normal(shape).astype(np.float16)
+    skip = rng.standard_normal(shape).astype(np.float16)
+    gate = rng.standard_normal(shape).astype(np.float16)
+    up = rng.standard_normal(shape).astype(np.float16)
+    scale = rng.uniform(0.8, 1.2, shape[-1]).astype(np.float16)
+    epsilon = 1.0e-6
+
+    def rms_norm(value):
+        inverse_rms = 1.0 / np.sqrt(np.mean(value.astype(np.float32) ** 2, axis=-1, keepdims=True) + epsilon)
+        return (value.astype(np.float32) * inverse_rms * scale.astype(np.float32)).astype(np.float16)
+
+    residual_fp32 = x.astype(np.float32) + skip.astype(np.float32)
+    residual = residual_fp32.astype(np.float16)
+    expected = {
+        "normalized": rms_norm(x),
+        "skip_normalized": rms_norm(residual_fp32),
+        "residual": residual,
+        "swiglu": (gate.astype(np.float32) / (1.0 + np.exp(-gate.astype(np.float32))) * up.astype(np.float32)).astype(
+            np.float16
+        ),
+    }
+    model = helper.make_model(
+        helper.make_graph(
+            [
+                helper.make_node(
+                    "SimplifiedLayerNormalization",
+                    ["x", "scale"],
+                    ["normalized"],
+                    epsilon=epsilon,
+                    axis=-1,
+                    stash_type=1,
+                ),
+                helper.make_node(
+                    "SkipSimplifiedLayerNormalization",
+                    ["x", "skip", "scale"],
+                    ["skip_normalized", "", "", "residual"],
+                    domain="com.microsoft",
+                    epsilon=epsilon,
+                ),
+                helper.make_node("Sigmoid", ["gate"], ["sigmoid"]),
+                helper.make_node("Mul", ["gate", "sigmoid"], ["silu"]),
+                helper.make_node("Mul", ["silu", "up"], ["swiglu"]),
+            ],
+            "qwen_feed_forward",
+            [
+                helper.make_tensor_value_info(name, TensorProto.FLOAT16, list(shape))
+                for name in ("x", "skip", "gate", "up")
+            ],
+            [helper.make_tensor_value_info(name, TensorProto.FLOAT16, list(shape)) for name in expected],
+            [numpy_helper.from_array(scale, name="scale")],
+        ),
+        opset_imports=[helper.make_opsetid("", 21), helper.make_opsetid("com.microsoft", 1)],
+    )
+    model.ir_version = 10
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        runtime = OnnxRuntime(str(path), device=device)
+        assert "_SwiGLU" in {op.op_type for op in runtime._ops}
+        outputs = runtime(
+            {
+                name: wp.array(value, dtype=wp.float16, device=device)
+                for name, value in {"x": x, "skip": skip, "gate": gate, "up": up}.items()
+            }
+        )
+        for name, reference in expected.items():
+            np.testing.assert_allclose(outputs[name].numpy(), reference, rtol=2.0e-3, atol=2.0e-3)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("device", ["cuda"])
 def test_rejects_unsupported_ops(device):
     if not is_device_available(device):
         pytest.skip(f"Device '{device}' is not available")

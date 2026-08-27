@@ -38,6 +38,8 @@ Supported ONNX operators (all graph-capturable after one warmup call):
 * **Reshape** -- view-only reshape with a construction-time shape tensor
 * **GatherBlockQuantized** -- Qwen-style INT8 block-quantized embedding lookup
 * **MatMulNBits** -- Qwen-style INT4/INT8 block-quantized matrix multiplication
+* **SimplifiedLayerNormalization**, **SkipSimplifiedLayerNormalization** --
+  Qwen FP16 last-axis RMS normalization, with optional residual addition
 * **Squeeze** -- alias passthrough (the output array shares memory with the
   input). Only used to drop unit dims, no copy is performed.
 * **LSTM** -- forward, single-direction, single-layer, ``seq_length=1``. The
@@ -373,6 +375,58 @@ def _matmul_nbits_kernel(
     output[row, column] = wp.float16(total)
 
 
+@wp.kernel
+def _simplified_layer_normalization_fp16_kernel(
+    x: wp.array2d[wp.float16],
+    scale: wp.array1d[wp.float16],
+    output: wp.array2d[wp.float16],
+    width: int,
+    epsilon: float,
+):
+    row = wp.tid()
+    sum_squares = wp.float32(0.0)
+    for column in range(width):
+        value = wp.float32(x[row, column])
+        sum_squares += value * value
+    inverse_rms = wp.float32(1.0) / wp.sqrt(sum_squares / wp.float32(width) + wp.float32(epsilon))
+    for column in range(width):
+        output[row, column] = wp.float16(wp.float32(x[row, column]) * inverse_rms * wp.float32(scale[column]))
+
+
+@wp.kernel
+def _skip_simplified_layer_normalization_fp16_kernel(
+    x: wp.array2d[wp.float16],
+    skip: wp.array2d[wp.float16],
+    scale: wp.array1d[wp.float16],
+    output: wp.array2d[wp.float16],
+    residual: wp.array2d[wp.float16],
+    width: int,
+    epsilon: float,
+):
+    row = wp.tid()
+    sum_squares = wp.float32(0.0)
+    for column in range(width):
+        value = wp.float32(x[row, column]) + wp.float32(skip[row, column])
+        residual[row, column] = wp.float16(value)
+        sum_squares += value * value
+    inverse_rms = wp.float32(1.0) / wp.sqrt(sum_squares / wp.float32(width) + wp.float32(epsilon))
+    for column in range(width):
+        value = wp.float32(x[row, column]) + wp.float32(skip[row, column])
+        output[row, column] = wp.float16(value * inverse_rms * wp.float32(scale[column]))
+
+
+@wp.kernel
+def _swiglu_fp16_kernel(
+    gate: wp.array2d[wp.float16],
+    up: wp.array2d[wp.float16],
+    output: wp.array2d[wp.float16],
+):
+    row, column = wp.tid()
+    value = wp.float32(gate[row, column])
+    silu = value / (wp.float32(1.0) + wp.exp(-value))
+    output[row, column] = wp.float16(silu * wp.float32(up[row, column]))
+
+
 def _array_type(dtype: type, ndim: int):
     return wp.array(dtype=dtype, ndim=ndim)
 
@@ -432,6 +486,28 @@ def _fuse_inference_ops(ops: list[_Op], graph_outputs: set[str], initializer_nam
     fused: list[_Op] = []
     index = 0
     while index < len(ops):
+        if index + 2 < len(ops):
+            sigmoid, silu_mul, output_mul = ops[index : index + 3]
+            gate = sigmoid.inputs[0] if len(sigmoid.inputs) == 1 else ""
+            sigmoid_out = sigmoid.outputs[0]
+            silu_out = silu_mul.outputs[0]
+            silu_inputs = set(silu_mul.inputs)
+            matches = (
+                sigmoid.op_type == "Sigmoid"
+                and silu_mul.op_type == "Mul"
+                and silu_inputs == {gate, sigmoid_out}
+                and output_mul.op_type == "Mul"
+                and silu_out in output_mul.inputs
+                and consumers.get(sigmoid_out) == 1
+                and consumers.get(silu_out) == 1
+                and sigmoid_out not in graph_outputs
+                and silu_out not in graph_outputs
+            )
+            if matches:
+                up = output_mul.inputs[1] if output_mul.inputs[0] == silu_out else output_mul.inputs[0]
+                fused.append(_Op(op_type="_SwiGLU", inputs=[gate, up], outputs=list(output_mul.outputs)))
+                index += 3
+                continue
         if index + 1 < len(ops):
             norm, relu = ops[index : index + 2]
             norm_out = norm.outputs[0]
@@ -565,7 +641,10 @@ class OnnxRuntime:
         try:
             onnx.checker.check_model(model_path)
         except onnx.checker.ValidationError as exc:
-            raise ValueError(f"OnnxRuntime: invalid ONNX model: {exc}") from exc
+            # Qwen's optimized graph places this ORT operator in the default
+            # domain, where the ONNX checker cannot resolve its schema.
+            if "No Op registered for SimplifiedLayerNormalization" not in str(exc):
+                raise ValueError(f"OnnxRuntime: invalid ONNX model: {exc}") from exc
         graph = model.graph
 
         self._tensors: dict[str, wp.array] = {}
@@ -961,6 +1040,71 @@ def _shape_matmul_nbits(op, shapes, dtypes, tensors, device, requires_grad=False
     op.attrs["_output_2d"] = tensors[op.outputs[0]].reshape((rows, N))
 
 
+def _shape_simplified_layer_normalization(op, shapes, dtypes, tensors, device, requires_grad=False):
+    if requires_grad:
+        raise NotImplementedError("OnnxRuntime SimplifiedLayerNormalization: gradients are not supported")
+    shape = shapes[op.inputs[0]]
+    if len(shape) not in (2, 3) or int(op.attrs.get("axis", -1)) != -1:
+        raise NotImplementedError(
+            "OnnxRuntime SimplifiedLayerNormalization: only the last axis of 2/3-D inputs is supported"
+        )
+    width = shape[-1]
+    if shapes[op.inputs[1]] != (width,) or tuple(dtypes[name] for name in op.inputs) != (
+        wp.float16,
+        wp.float16,
+    ):
+        raise ValueError("OnnxRuntime SimplifiedLayerNormalization: expected matching FP16 input and scale")
+    rows = int(np.prod(shape[:-1]))
+    tensors[op.outputs[0]] = wp.zeros(shape, dtype=wp.float16, device=device)
+    shapes[op.outputs[0]] = shape
+    dtypes[op.outputs[0]] = wp.float16
+    op.attrs["_rows"] = rows
+    op.attrs["_width"] = width
+    op.attrs["_output_2d"] = tensors[op.outputs[0]].reshape((rows, width))
+
+
+def _shape_skip_simplified_layer_normalization(op, shapes, dtypes, tensors, device, requires_grad=False):
+    if requires_grad:
+        raise NotImplementedError("OnnxRuntime SkipSimplifiedLayerNormalization: gradients are not supported")
+    shape = shapes[op.inputs[0]]
+    if len(shape) not in (2, 3) or shapes[op.inputs[1]] != shape:
+        raise NotImplementedError("OnnxRuntime SkipSimplifiedLayerNormalization: matching 2/3-D inputs are required")
+    width = shape[-1]
+    if shapes[op.inputs[2]] != (width,) or any(dtypes[name] != wp.float16 for name in op.inputs):
+        raise ValueError("OnnxRuntime SkipSimplifiedLayerNormalization: expected FP16 inputs and scale")
+    if any(output for output in op.outputs[1:3]):
+        raise NotImplementedError("OnnxRuntime SkipSimplifiedLayerNormalization: statistics outputs are not supported")
+
+    rows = int(np.prod(shape[:-1]))
+    tensors[op.outputs[0]] = wp.zeros(shape, dtype=wp.float16, device=device)
+    shapes[op.outputs[0]] = shape
+    dtypes[op.outputs[0]] = wp.float16
+    if len(op.outputs) > 3 and op.outputs[3]:
+        residual = wp.zeros(shape, dtype=wp.float16, device=device)
+        tensors[op.outputs[3]] = residual
+        shapes[op.outputs[3]] = shape
+        dtypes[op.outputs[3]] = wp.float16
+    else:
+        residual = wp.zeros(shape, dtype=wp.float16, device=device)
+    op.attrs["_rows"] = rows
+    op.attrs["_width"] = width
+    op.attrs["_output_2d"] = tensors[op.outputs[0]].reshape((rows, width))
+    op.attrs["_residual_2d"] = residual.reshape((rows, width))
+
+
+def _shape_swiglu(op, shapes, dtypes, tensors, device, requires_grad=False):
+    shape = shapes[op.inputs[0]]
+    if len(shape) not in (2, 3) or shapes[op.inputs[1]] != shape:
+        raise NotImplementedError("OnnxRuntime fused SwiGLU requires matching 2/3-D inputs")
+    if any(dtypes[name] != wp.float16 for name in op.inputs):
+        raise TypeError("OnnxRuntime fused SwiGLU requires FP16 inputs")
+    tensors[op.outputs[0]] = wp.zeros(shape, dtype=wp.float16, device=device)
+    shapes[op.outputs[0]] = shape
+    dtypes[op.outputs[0]] = wp.float16
+    op.attrs["_shape_2d"] = (int(np.prod(shape[:-1])), shape[-1])
+    op.attrs["_output_2d"] = tensors[op.outputs[0]].reshape(op.attrs["_shape_2d"])
+
+
 def _shape_squeeze(op, shapes, dtypes, tensors, device, requires_grad=False):
     in_shape = shapes[op.inputs[0]]
     axes = None
@@ -1274,6 +1418,52 @@ def _exec_matmul_nbits(op, tensors, shapes, device):
     )
 
 
+def _exec_simplified_layer_normalization(op, tensors, shapes, device):
+    wp.launch(
+        _simplified_layer_normalization_fp16_kernel,
+        dim=op.attrs["_rows"],
+        inputs=[
+            tensors[op.inputs[0]].reshape((op.attrs["_rows"], op.attrs["_width"])),
+            tensors[op.inputs[1]],
+            op.attrs["_output_2d"],
+            op.attrs["_width"],
+            float(op.attrs.get("epsilon", 1.0e-5)),
+        ],
+        device=device,
+    )
+
+
+def _exec_skip_simplified_layer_normalization(op, tensors, shapes, device):
+    shape_2d = (op.attrs["_rows"], op.attrs["_width"])
+    wp.launch(
+        _skip_simplified_layer_normalization_fp16_kernel,
+        dim=op.attrs["_rows"],
+        inputs=[
+            tensors[op.inputs[0]].reshape(shape_2d),
+            tensors[op.inputs[1]].reshape(shape_2d),
+            tensors[op.inputs[2]],
+            op.attrs["_output_2d"],
+            op.attrs["_residual_2d"],
+            op.attrs["_width"],
+            float(op.attrs.get("epsilon", 1.0e-5)),
+        ],
+        device=device,
+    )
+
+
+def _exec_swiglu(op, tensors, shapes, device):
+    wp.launch(
+        _swiglu_fp16_kernel,
+        dim=op.attrs["_shape_2d"],
+        inputs=[
+            tensors[op.inputs[0]].reshape(op.attrs["_shape_2d"]),
+            tensors[op.inputs[1]].reshape(op.attrs["_shape_2d"]),
+            op.attrs["_output_2d"],
+        ],
+        device=device,
+    )
+
+
 def _exec_squeeze(op, tensors, shapes, device):
     src = tensors[op.inputs[0]]
     out_shape = op.attrs["_out_shape"]
@@ -1328,6 +1518,7 @@ def _exec_lstm(op, tensors, shapes, device):
 _OP_DISPATCH: dict[str, Any] = {
     "_BatchNormalizationRelu": _exec_batch_normalization,
     "_RmsNormalization": _exec_rms_normalization,
+    "_SwiGLU": _exec_swiglu,
     "Add": _exec_binary,
     "BatchNormalization": _exec_batch_normalization,
     "Constant": _exec_constant,
@@ -1342,14 +1533,17 @@ _OP_DISPATCH: dict[str, Any] = {
     "Relu": _exec_unary,
     "Reshape": _exec_reshape,
     "Sqrt": _exec_unary,
+    "SimplifiedLayerNormalization": _exec_simplified_layer_normalization,
     "Squeeze": _exec_squeeze,
     "Sub": _exec_binary,
+    "SkipSimplifiedLayerNormalization": _exec_skip_simplified_layer_normalization,
     "Tanh": _exec_unary,
 }
 
 _SHAPE_DISPATCH: dict[str, Any] = {
     "_BatchNormalizationRelu": _shape_batch_normalization,
     "_RmsNormalization": _shape_rms_normalization,
+    "_SwiGLU": _shape_swiglu,
     "Add": _shape_elementwise_binary,
     "BatchNormalization": _shape_batch_normalization,
     "Constant": _shape_constant,
@@ -1364,7 +1558,9 @@ _SHAPE_DISPATCH: dict[str, Any] = {
     "Relu": _shape_elementwise_unary,
     "Reshape": _shape_reshape,
     "Sqrt": _shape_elementwise_unary,
+    "SimplifiedLayerNormalization": _shape_simplified_layer_normalization,
     "Squeeze": _shape_squeeze,
     "Sub": _shape_elementwise_binary,
+    "SkipSimplifiedLayerNormalization": _shape_skip_simplified_layer_normalization,
     "Tanh": _shape_elementwise_unary,
 }
