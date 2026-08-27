@@ -960,6 +960,82 @@ def test_transformer_selection_ops(device):
         path.unlink(missing_ok=True)
 
 
+@pytest.mark.parametrize("device", ["cuda"])
+def test_rotary_embedding(device):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    rng = np.random.default_rng(89)
+    x = rng.standard_normal((2, 3, 4, 10)).astype(np.float32)
+    position_ids = np.array([[0, 2, 4, 6], [1, 3, 5, 7]], dtype=np.int64)
+    angles = rng.standard_normal((8, 3)).astype(np.float32)
+    cos_cache = np.cos(angles)
+    sin_cache = np.sin(angles)
+
+    def reference(interleaved):
+        output = x.copy()
+        for batch in range(x.shape[0]):
+            for sequence in range(x.shape[2]):
+                cos = cos_cache[position_ids[batch, sequence]]
+                sin = sin_cache[position_ids[batch, sequence]]
+                values = x[batch, :, sequence, :6]
+                if interleaved:
+                    rotated = np.stack((-values[:, 1::2], values[:, 0::2]), axis=-1).reshape(values.shape)
+                    output[batch, :, sequence, :6] = values * np.repeat(cos, 2) + rotated * np.repeat(sin, 2)
+                else:
+                    rotated = np.concatenate((-values[:, 3:], values[:, :3]), axis=-1)
+                    output[batch, :, sequence, :6] = values * np.tile(cos, 2) + rotated * np.tile(sin, 2)
+        return output
+
+    model = helper.make_model(
+        helper.make_graph(
+            [
+                helper.make_node(
+                    "RotaryEmbedding",
+                    ["x", "position_ids", "cos", "sin"],
+                    ["non_interleaved"],
+                    domain="com.microsoft",
+                    num_heads=3,
+                    rotary_embedding_dim=6,
+                    interleaved=0,
+                ),
+                helper.make_node(
+                    "RotaryEmbedding",
+                    ["x", "position_ids", "cos", "sin"],
+                    ["interleaved"],
+                    domain="com.microsoft",
+                    num_heads=3,
+                    rotary_embedding_dim=6,
+                    interleaved=1,
+                ),
+            ],
+            "rotary_embedding",
+            [helper.make_tensor_value_info("x", TensorProto.FLOAT, list(x.shape))],
+            [
+                helper.make_tensor_value_info("non_interleaved", TensorProto.FLOAT, list(x.shape)),
+                helper.make_tensor_value_info("interleaved", TensorProto.FLOAT, list(x.shape)),
+            ],
+            [
+                numpy_helper.from_array(position_ids, name="position_ids"),
+                numpy_helper.from_array(cos_cache, name="cos"),
+                numpy_helper.from_array(sin_cache, name="sin"),
+            ],
+        ),
+        opset_imports=[helper.make_opsetid("", 21), helper.make_opsetid("com.microsoft", 1)],
+    )
+    model.ir_version = 10
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        outputs = OnnxRuntime(str(path), device=device)({"x": wp.array(x, dtype=wp.float32, device=device)})
+        np.testing.assert_allclose(outputs["non_interleaved"].numpy(), reference(False), rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(outputs["interleaved"].numpy(), reference(True), rtol=1e-6, atol=1e-6)
+    finally:
+        path.unlink(missing_ok=True)
+
+
 @pytest.mark.parametrize("batch,sequence", [(2, 3), (1, 1)])
 @pytest.mark.parametrize("use_cublas", [False, True])
 @pytest.mark.parametrize(

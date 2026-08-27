@@ -44,6 +44,8 @@ Supported ONNX operators (all graph-capturable after one warmup call):
   Qwen FP16 last-axis RMS normalization, with optional residual addition
 * **GroupQueryAttention** -- causal FP16 grouped-query attention with
   non-interleaved rotary embeddings and an external FP16 KV cache
+* **RotaryEmbedding** -- BNSH rotary position embedding with split-half or
+  interleaved pairs
 * **Cast**, **Gather**, **ReduceSum**, **Shape** -- the integer metadata subset
   used by transformer attention-mask subgraphs
 * **Squeeze** -- alias passthrough (the output array shares memory with the
@@ -309,6 +311,39 @@ def _where_broadcast_kernel(
         condition[row % condition.shape[0], column % condition.shape[1]],
         x[row, column],
         y[row, column],
+    )
+
+
+@wp.kernel(enable_backward=False)
+def _rotary_embedding_kernel(
+    x: wp.array4d[Any],
+    position_ids: wp.array2d[wp.int64],
+    cos_cache: wp.array2d[Any],
+    sin_cache: wp.array2d[Any],
+    output: wp.array4d[Any],
+    rotary_dim: int,
+    interleaved: bool,
+    position_offset: bool,
+):
+    batch, head, sequence, column = wp.tid()
+    if column >= rotary_dim:
+        output[batch, head, sequence, column] = x[batch, head, sequence, column]
+        return
+
+    half = rotary_dim / 2
+    if interleaved:
+        cache_column = column / 2
+        partner = column + 1 if column % 2 == 0 else column - 1
+        sign = wp.float32(-1.0) if column % 2 == 0 else wp.float32(1.0)
+    else:
+        cache_column = column % half
+        partner = column + half if column < half else column - half
+        sign = wp.float32(-1.0) if column < half else wp.float32(1.0)
+    position = position_ids[0, 0] + wp.int64(sequence) if position_offset else position_ids[batch, sequence]
+    value = wp.float32(x[batch, head, sequence, column])
+    rotated = sign * wp.float32(x[batch, head, sequence, partner])
+    output[batch, head, sequence, column] = x.dtype(
+        value * wp.float32(cos_cache[position, cache_column]) + rotated * wp.float32(sin_cache[position, cache_column])
     )
 
 
@@ -997,6 +1032,25 @@ def _where_kernel_for_dtype(dtype: type):
         _KERNEL_OVERLOADS[key] = wp.overload(
             _where_broadcast_kernel,
             [wp.array2d(dtype=wp.bool), wp.array2d(dtype=dtype), wp.array2d(dtype=dtype), wp.array2d(dtype=dtype)],
+        )
+    return _KERNEL_OVERLOADS[key]
+
+
+def _rotary_embedding_kernel_for_dtype(dtype: type):
+    key = (_rotary_embedding_kernel, dtype)
+    if key not in _KERNEL_OVERLOADS:
+        _KERNEL_OVERLOADS[key] = wp.overload(
+            _rotary_embedding_kernel,
+            [
+                wp.array4d(dtype=dtype),
+                wp.array2d(dtype=wp.int64),
+                wp.array2d(dtype=dtype),
+                wp.array2d(dtype=dtype),
+                wp.array4d(dtype=dtype),
+                int,
+                bool,
+                bool,
+            ],
         )
     return _KERNEL_OVERLOADS[key]
 
@@ -1743,6 +1797,40 @@ def _shape_where(op, shapes, dtypes, tensors, device, requires_grad=False):
     op.attrs["_shape_2d"] = (rows, width)
     op.attrs["_condition_shape_2d"] = (rows, width) if condition_shape == x_shape else (1, width)
     op.attrs["_kernel"] = _where_kernel_for_dtype(dtype)
+
+
+def _shape_rotary_embedding(op, shapes, dtypes, tensors, device, requires_grad=False):
+    if requires_grad:
+        raise NotImplementedError("OnnxRuntime RotaryEmbedding: gradients are not supported")
+    shape = shapes[op.inputs[0]]
+    if len(shape) != 4:
+        raise NotImplementedError("OnnxRuntime RotaryEmbedding: expected BNSH input layout")
+    batch, heads, sequence, head_size = shape
+    num_heads = int(op.attrs.get("num_heads", 0))
+    rotary_dim = int(op.attrs.get("rotary_embedding_dim", head_size))
+    if num_heads not in (0, heads) or rotary_dim <= 0 or rotary_dim > head_size or rotary_dim % 2:
+        raise ValueError("OnnxRuntime RotaryEmbedding: invalid head count or rotary dimension")
+    position_shape = shapes[op.inputs[1]]
+    if position_shape == (1,):
+        position_shape_2d = (1, 1)
+        position_offset = True
+    elif position_shape == (batch, sequence):
+        position_shape_2d = position_shape
+        position_offset = False
+    else:
+        raise ValueError("OnnxRuntime RotaryEmbedding: position IDs must be a scalar offset or [batch, sequence]")
+    cache_shape = shapes[op.inputs[2]]
+    if cache_shape != shapes[op.inputs[3]] or len(cache_shape) != 2 or cache_shape[1] != rotary_dim // 2:
+        raise ValueError("OnnxRuntime RotaryEmbedding: cosine and sine cache shapes do not match")
+    if dtypes[op.inputs[1]] != wp.int64:
+        raise TypeError("OnnxRuntime RotaryEmbedding: position IDs must be INT64")
+    dtype = _require_matching_float_dtypes(op, dtypes, [op.inputs[0], op.inputs[2], op.inputs[3]])
+    tensors[op.outputs[0]] = wp.zeros(shape, dtype=dtype, device=device)
+    shapes[op.outputs[0]] = shape
+    dtypes[op.outputs[0]] = dtype
+    op.attrs["_position_shape_2d"] = position_shape_2d
+    op.attrs["_position_offset"] = position_offset
+    op.attrs["_kernel"] = _rotary_embedding_kernel_for_dtype(dtype)
 
 
 def _shape_reshape(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -2631,6 +2719,24 @@ def _exec_where(op, tensors, shapes, device):
     )
 
 
+def _exec_rotary_embedding(op, tensors, shapes, device):
+    wp.launch(
+        op.attrs["_kernel"],
+        dim=shapes[op.inputs[0]],
+        inputs=[
+            tensors[op.inputs[0]],
+            tensors[op.inputs[1]].reshape(op.attrs["_position_shape_2d"]),
+            tensors[op.inputs[2]],
+            tensors[op.inputs[3]],
+            tensors[op.outputs[0]],
+            int(op.attrs.get("rotary_embedding_dim", shapes[op.inputs[0]][-1])),
+            bool(op.attrs.get("interleaved", 0)),
+            op.attrs["_position_offset"],
+        ],
+        device=device,
+    )
+
+
 def _exec_gather_block_quantized(op, tensors, shapes, device):
     wp.launch(
         _gather_block_quantized_int8_kernel,
@@ -2960,6 +3066,7 @@ _OP_DISPATCH: dict[str, Any] = {
     "Range": _exec_static,
     "Relu": _exec_unary,
     "Reshape": _exec_reshape,
+    "RotaryEmbedding": _exec_rotary_embedding,
     "Shape": _exec_static,
     "Sigmoid": _exec_unary,
     "Sqrt": _exec_unary,
@@ -3003,6 +3110,7 @@ _SHAPE_DISPATCH: dict[str, Any] = {
     "Range": _shape_range,
     "Relu": _shape_elementwise_unary,
     "Reshape": _shape_reshape,
+    "RotaryEmbedding": _shape_rotary_embedding,
     "Shape": _shape_shape,
     "Sigmoid": _shape_elementwise_unary,
     "Sqrt": _shape_elementwise_unary,
