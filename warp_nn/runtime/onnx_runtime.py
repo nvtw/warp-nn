@@ -39,6 +39,7 @@ Supported ONNX operators (all graph-capturable after one warmup call):
 * **GatherBlockQuantized** -- Qwen-style INT8 block-quantized embedding lookup
 * **MatMulNBits** -- Qwen-style INT4/INT8 block-quantized matrix multiplication
 * **CausalConvWithState** -- stateful causal depthwise 1-D convolution
+* **LinearAttention** -- fused recurrent linear/delta attention with GQA
 * **SimplifiedLayerNormalization**, **SkipSimplifiedLayerNormalization** --
   Qwen FP16 last-axis RMS normalization, with optional residual addition
 * **GroupQueryAttention** -- causal FP16 grouped-query attention with
@@ -620,6 +621,110 @@ def _get_rms_norm_kernels(width: int, dtype: type):
     if key not in _rms_norm_kernel_cache:
         _rms_norm_kernel_cache[key] = _create_rms_norm_kernels(*key)
     return tile_width, _rms_norm_kernel_cache[key]
+
+
+def _create_linear_attention_kernel(key_size: int, value_size: int, dtype: type):
+    KEY_SIZE = key_size
+    VALUE_SIZE = value_size
+    VALUE_TILE = min(64, value_size & -value_size)
+    VALUE_BLOCKS = VALUE_SIZE // VALUE_TILE
+    DTYPE = dtype
+
+    @wp.func
+    def exp_value(value: dtype):
+        return dtype(wp.exp(wp.float32(value)))
+
+    @wp.kernel(enable_backward=False)
+    def kernel(
+        query: wp.array2d(dtype=DTYPE),
+        key: wp.array2d(dtype=DTYPE),
+        value: wp.array2d(dtype=DTYPE),
+        past: wp.array2d(dtype=DTYPE),
+        decay: wp.array2d(dtype=DTYPE),
+        beta: wp.array2d(dtype=DTYPE),
+        output: wp.array2d(dtype=DTYPE),
+        present: wp.array2d(dtype=DTYPE),
+        sequence_length: int,
+        query_heads: int,
+        key_heads: int,
+        value_heads: int,
+        needs_decay: bool,
+        decay_per_key: bool,
+        needs_beta: bool,
+        beta_per_head: bool,
+        scale: float,
+    ):
+        item = wp.tid()
+        value_block = item % VALUE_BLOCKS
+        state_item = item / VALUE_BLOCKS
+        batch = state_item / value_heads
+        value_head = state_item % value_heads
+        key_head = value_head * key_heads / value_heads
+        state_offset = state_item * KEY_SIZE
+        value_offset = value_block * VALUE_TILE
+        state = wp.tile_load(past, shape=(KEY_SIZE, VALUE_TILE), offset=(state_offset, value_offset))
+
+        for token in range(sequence_length):
+            token_row = batch * sequence_length + token
+            if needs_decay:
+                if decay_per_key:
+                    decay_row = wp.tile_load(decay, shape=(1, KEY_SIZE), offset=(token_row, value_head * KEY_SIZE))
+                    decay_column = wp.tile_transpose(wp.tile_map(exp_value, decay_row))
+                    state *= wp.tile_broadcast(decay_column, shape=(KEY_SIZE, VALUE_TILE))
+                else:
+                    state *= DTYPE(wp.exp(wp.float32(decay[token_row, value_head])))
+
+            key_row = wp.tile_load(key, shape=(1, KEY_SIZE), offset=(token_row, key_head * KEY_SIZE))
+            value_row = wp.tile_load(
+                value,
+                shape=(1, VALUE_TILE),
+                offset=(token_row, value_head * VALUE_SIZE + value_offset),
+            )
+            if needs_beta:
+                retrieved = wp.tile_zeros(shape=(1, VALUE_TILE), dtype=DTYPE)
+                wp.tile_matmul(key_row, state, retrieved)
+                beta_value = beta[token_row, value_head] if beta_per_head else beta[token_row, 0]
+                delta = DTYPE(beta_value) * (value_row - retrieved)
+            else:
+                delta = value_row
+            wp.tile_matmul(wp.tile_transpose(key_row), delta, state)
+
+            if query_heads >= value_heads:
+                heads_per_group = query_heads / value_heads
+                for group in range(heads_per_group):
+                    query_head = value_head * heads_per_group + group
+                    query_row = wp.tile_load(query, shape=(1, KEY_SIZE), offset=(token_row, query_head * KEY_SIZE))
+                    result = wp.tile_zeros(shape=(1, VALUE_TILE), dtype=DTYPE)
+                    wp.tile_matmul(query_row, state, result)
+                    wp.tile_store(
+                        output,
+                        DTYPE(scale) * result,
+                        offset=(token_row, query_head * VALUE_SIZE + value_offset),
+                    )
+            else:
+                query_head = value_head * query_heads / value_heads
+                query_row = wp.tile_load(query, shape=(1, KEY_SIZE), offset=(token_row, query_head * KEY_SIZE))
+                result = wp.tile_zeros(shape=(1, VALUE_TILE), dtype=DTYPE)
+                wp.tile_matmul(query_row, state, result)
+                wp.tile_store(
+                    output,
+                    DTYPE(scale) * result,
+                    offset=(token_row, value_head * VALUE_SIZE + value_offset),
+                )
+
+        wp.tile_store(present, state, offset=(state_offset, value_offset))
+
+    return kernel
+
+
+_linear_attention_kernel_cache = {}
+
+
+def _get_linear_attention_kernel(key_size: int, value_size: int, dtype: type):
+    key = (key_size, value_size, dtype)
+    if key not in _linear_attention_kernel_cache:
+        _linear_attention_kernel_cache[key] = _create_linear_attention_kernel(*key)
+    return _linear_attention_kernel_cache[key]
 
 
 def _create_swiglu_kernel(dtype: type):
@@ -1619,6 +1724,100 @@ def _shape_causal_conv_with_state(op, shapes, dtypes, tensors, device, requires_
     op.attrs["_state_kernel"] = _kernel_for_dtype(_causal_conv_state_kernel, dtype, (3,), (3,), (3,))
 
 
+def _shape_linear_attention(op, shapes, dtypes, tensors, device, requires_grad=False):
+    if requires_grad:
+        raise NotImplementedError("OnnxRuntime LinearAttention: gradients are not supported")
+    if len(op.inputs) < 3 or not op.inputs[1] or not op.inputs[2]:
+        raise NotImplementedError("OnnxRuntime LinearAttention: separate key and value inputs are required")
+    query_shape, key_shape, value_shape = (shapes[name] for name in op.inputs[:3])
+    if (
+        any(len(shape) != 3 for shape in (query_shape, key_shape, value_shape))
+        or key_shape[:2] != query_shape[:2]
+        or value_shape[:2] != query_shape[:2]
+    ):
+        raise ValueError("OnnxRuntime LinearAttention: query, key, and value must be matching rank-3 tensors")
+
+    batch, sequence_length, query_hidden = query_shape
+    query_heads = int(op.attrs.get("q_num_heads", 0))
+    value_heads = int(op.attrs.get("kv_num_heads", 0))
+    if query_heads < 1 or value_heads < 1 or query_hidden % query_heads:
+        raise ValueError("OnnxRuntime LinearAttention: invalid q_num_heads or kv_num_heads")
+    key_size = query_hidden // query_heads
+    if key_shape[2] % key_size or value_shape[2] % value_heads:
+        raise ValueError("OnnxRuntime LinearAttention: key or value hidden size is not divisible by its head size")
+    key_heads = key_shape[2] // key_size
+    value_size = value_shape[2] // value_heads
+    if value_heads % key_heads or max(query_heads, value_heads) % min(query_heads, value_heads):
+        raise ValueError("OnnxRuntime LinearAttention: incompatible query, key, and value head counts")
+
+    update_rule = op.attrs.get("update_rule", "gated_delta").lower()
+    if update_rule not in ("linear", "gated", "delta", "gated_delta"):
+        raise NotImplementedError(f"OnnxRuntime LinearAttention: unsupported update rule '{update_rule}'")
+    needs_decay = update_rule in ("gated", "gated_delta")
+    needs_beta = update_rule in ("delta", "gated_delta")
+    has_past = len(op.inputs) > 3 and bool(op.inputs[3])
+    has_decay = len(op.inputs) > 4 and bool(op.inputs[4])
+    has_beta = len(op.inputs) > 5 and bool(op.inputs[5])
+    if needs_decay != has_decay or needs_beta != has_beta:
+        raise ValueError(f"OnnxRuntime LinearAttention: update rule '{update_rule}' has inconsistent gate inputs")
+
+    state_shape = (batch, value_heads, key_size, value_size)
+    dtype_names = list(op.inputs[:3])
+    if has_past:
+        if shapes[op.inputs[3]] != state_shape:
+            raise ValueError(f"OnnxRuntime LinearAttention: past state must have shape {state_shape}")
+        dtype_names.append(op.inputs[3])
+    decay_per_key = False
+    if has_decay:
+        decay_shape = shapes[op.inputs[4]]
+        if decay_shape == (batch, sequence_length, value_heads * key_size):
+            decay_per_key = True
+        elif decay_shape != (batch, sequence_length, value_heads):
+            raise ValueError("OnnxRuntime LinearAttention: invalid decay shape")
+        dtype_names.append(op.inputs[4])
+    beta_per_head = False
+    if has_beta:
+        beta_shape = shapes[op.inputs[5]]
+        if beta_shape == (batch, sequence_length, value_heads):
+            beta_per_head = True
+        elif beta_shape != (batch, sequence_length, 1):
+            raise ValueError("OnnxRuntime LinearAttention: invalid beta shape")
+        dtype_names.append(op.inputs[5])
+    dtype = _require_matching_float_dtypes(op, dtypes, dtype_names)
+    if dtype not in (wp.float16, wp.bfloat16, wp.float32):
+        raise NotImplementedError("OnnxRuntime LinearAttention: only FP16, BF16, and FP32 are supported")
+
+    output_heads = max(query_heads, value_heads)
+    output_shape = (batch, sequence_length, output_heads * value_size)
+    tensors[op.outputs[0]] = wp.zeros(output_shape, dtype=dtype, device=device)
+    tensors[op.outputs[1]] = wp.zeros(state_shape, dtype=dtype, device=device)
+    shapes[op.outputs[0]] = output_shape
+    shapes[op.outputs[1]] = state_shape
+    dtypes[op.outputs[0]] = dtype
+    dtypes[op.outputs[1]] = dtype
+
+    op.attrs["_kernel"] = _get_linear_attention_kernel(key_size, value_size, dtype)
+    op.attrs["_block_dim"] = 256
+    op.attrs["_batch"] = batch
+    op.attrs["_sequence_length"] = sequence_length
+    op.attrs["_query_heads"] = query_heads
+    op.attrs["_key_heads"] = key_heads
+    op.attrs["_value_heads"] = value_heads
+    op.attrs["_key_size"] = key_size
+    op.attrs["_value_size"] = value_size
+    op.attrs["_value_blocks"] = value_size // min(64, value_size & -value_size)
+    op.attrs["_has_past"] = has_past
+    op.attrs["_past"] = None if has_past else wp.zeros(state_shape, dtype=dtype, device=device)
+    op.attrs["_decay"] = None if has_decay else wp.zeros((1, 1), dtype=dtype, device=device)
+    op.attrs["_beta"] = None if has_beta else wp.zeros((1, 1), dtype=dtype, device=device)
+    op.attrs["_needs_decay"] = needs_decay
+    op.attrs["_decay_per_key"] = decay_per_key
+    op.attrs["_needs_beta"] = needs_beta
+    op.attrs["_beta_per_head"] = beta_per_head
+    configured_scale = float(op.attrs.get("scale", 0.0))
+    op.attrs["_scale"] = configured_scale if configured_scale != 0.0 else key_size**-0.5
+
+
 def _shape_simplified_layer_normalization(op, shapes, dtypes, tensors, device, requires_grad=False):
     if requires_grad:
         raise NotImplementedError("OnnxRuntime SimplifiedLayerNormalization: gradients are not supported")
@@ -2173,6 +2372,44 @@ def _exec_causal_conv_with_state(op, tensors, shapes, device):
         )
 
 
+def _exec_linear_attention(op, tensors, shapes, device):
+    batch = op.attrs["_batch"]
+    sequence_length = op.attrs["_sequence_length"]
+    query_heads = op.attrs["_query_heads"]
+    key_heads = op.attrs["_key_heads"]
+    value_heads = op.attrs["_value_heads"]
+    key_size = op.attrs["_key_size"]
+    value_size = op.attrs["_value_size"]
+    past = tensors[op.inputs[3]] if op.attrs["_has_past"] else op.attrs["_past"]
+    decay = tensors[op.inputs[4]] if op.attrs["_needs_decay"] else op.attrs["_decay"]
+    beta = tensors[op.inputs[5]] if op.attrs["_needs_beta"] else op.attrs["_beta"]
+    wp.launch_tiled(
+        op.attrs["_kernel"],
+        dim=batch * value_heads * op.attrs["_value_blocks"],
+        inputs=[
+            tensors[op.inputs[0]].reshape((batch * sequence_length, query_heads * key_size)),
+            tensors[op.inputs[1]].reshape((batch * sequence_length, key_heads * key_size)),
+            tensors[op.inputs[2]].reshape((batch * sequence_length, value_heads * value_size)),
+            past.reshape((batch * value_heads * key_size, value_size)),
+            decay.reshape((int(np.prod(decay.shape[:-1])), decay.shape[-1])),
+            beta.reshape((int(np.prod(beta.shape[:-1])), beta.shape[-1])),
+            tensors[op.outputs[0]].reshape((batch * sequence_length, max(query_heads, value_heads) * value_size)),
+            tensors[op.outputs[1]].reshape((batch * value_heads * key_size, value_size)),
+            sequence_length,
+            query_heads,
+            key_heads,
+            value_heads,
+            op.attrs["_needs_decay"],
+            op.attrs["_decay_per_key"],
+            op.attrs["_needs_beta"],
+            op.attrs["_beta_per_head"],
+            op.attrs["_scale"],
+        ],
+        block_dim=op.attrs["_block_dim"],
+        device=device,
+    )
+
+
 def _exec_simplified_layer_normalization(op, tensors, shapes, device):
     wp.launch_tiled(
         op.attrs["_rms_norm_kernels"][0],
@@ -2352,6 +2589,7 @@ _OP_DISPATCH: dict[str, Any] = {
     "GatherBlockQuantized": _exec_gather_block_quantized,
     "GroupQueryAttention": _exec_group_query_attention,
     "LSTM": _exec_lstm,
+    "LinearAttention": _exec_linear_attention,
     "MatMulNBits": _exec_matmul_nbits,
     "Mul": _exec_binary,
     "ReduceMean": _exec_reduce_mean,
@@ -2383,6 +2621,7 @@ _SHAPE_DISPATCH: dict[str, Any] = {
     "GatherBlockQuantized": _shape_gather_block_quantized,
     "GroupQueryAttention": _shape_group_query_attention,
     "LSTM": _shape_lstm,
+    "LinearAttention": _shape_linear_attention,
     "MatMulNBits": _shape_matmul_nbits,
     "Mul": _shape_elementwise_binary,
     "ReduceMean": _shape_reduce_mean,

@@ -925,6 +925,136 @@ def test_causal_conv_with_state(device, data_type, np_dtype, wp_dtype, sequence,
 
 
 @pytest.mark.parametrize(
+    "query_heads,value_heads,key_heads,key_size,value_size,update_rule",
+    [(16, 32, 16, 128, 128, "gated_delta"), (4, 2, 2, 8, 6, "linear")],
+)
+@pytest.mark.parametrize("device", ["cuda"])
+def test_linear_attention(device, query_heads, value_heads, key_heads, key_size, value_size, update_rule):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    rng = np.random.default_rng(79)
+    batch, sequence = 1, 3
+    q = rng.standard_normal((batch, sequence, query_heads * key_size)).astype(np.float16)
+    k = rng.standard_normal((batch, sequence, key_heads * key_size)).astype(np.float16)
+    q = (
+        (
+            q.reshape(batch, sequence, query_heads, key_size)
+            / np.linalg.norm(
+                q.astype(np.float32).reshape(batch, sequence, query_heads, key_size), axis=-1, keepdims=True
+            )
+        )
+        .reshape(batch, sequence, -1)
+        .astype(np.float16)
+    )
+    k = (
+        (
+            k.reshape(batch, sequence, key_heads, key_size)
+            / np.linalg.norm(k.astype(np.float32).reshape(batch, sequence, key_heads, key_size), axis=-1, keepdims=True)
+        )
+        .reshape(batch, sequence, -1)
+        .astype(np.float16)
+    )
+    v = rng.standard_normal((batch, sequence, value_heads * value_size)).astype(np.float16)
+    past = (0.1 * rng.standard_normal((batch, value_heads, key_size, value_size))).astype(np.float16)
+    decay = rng.uniform(-0.2, -0.01, (batch, sequence, value_heads)).astype(np.float16)
+    beta = rng.uniform(0.1, 0.9, (batch, sequence, value_heads)).astype(np.float16)
+    scale = 0.7
+
+    state = past.astype(np.float32)
+    expected = np.empty((batch, sequence, max(query_heads, value_heads) * value_size), dtype=np.float16)
+    for token in range(sequence):
+        for value_head in range(value_heads):
+            key_head = value_head * key_heads // value_heads
+            query_head = value_head * query_heads // value_heads if query_heads < value_heads else None
+            key_vector = k[0, token, key_head * key_size : (key_head + 1) * key_size].astype(np.float32)
+            value_vector = v[0, token, value_head * value_size : (value_head + 1) * value_size].astype(np.float32)
+            if update_rule == "gated_delta":
+                state[0, value_head] *= np.exp(np.float32(decay[0, token, value_head]))
+                retrieved = key_vector @ state[0, value_head]
+                delta = np.float32(beta[0, token, value_head]) * (value_vector - retrieved)
+            else:
+                delta = value_vector
+            state[0, value_head] += np.outer(key_vector, delta)
+            if query_heads >= value_heads:
+                for group in range(query_heads // value_heads):
+                    query_head = value_head * (query_heads // value_heads) + group
+                    query_vector = q[0, token, query_head * key_size : (query_head + 1) * key_size].astype(np.float32)
+                    expected[0, token, query_head * value_size : (query_head + 1) * value_size] = (
+                        scale * query_vector @ state[0, value_head]
+                    ).astype(np.float16)
+            else:
+                query_vector = q[0, token, query_head * key_size : (query_head + 1) * key_size].astype(np.float32)
+                expected[0, token, value_head * value_size : (value_head + 1) * value_size] = (
+                    scale * query_vector @ state[0, value_head]
+                ).astype(np.float16)
+    expected_state = state.astype(np.float16)
+
+    inputs = ["q", "k", "v", "past", "decay", "beta"]
+    graph_inputs = [
+        helper.make_tensor_value_info(name, TensorProto.FLOAT16, list(value.shape))
+        for name, value in {"q": q, "k": k, "v": v, "past": past}.items()
+    ]
+    feeds = {"q": q, "k": k, "v": v, "past": past}
+    if update_rule == "gated_delta":
+        graph_inputs.extend(
+            [
+                helper.make_tensor_value_info("decay", TensorProto.FLOAT16, list(decay.shape)),
+                helper.make_tensor_value_info("beta", TensorProto.FLOAT16, list(beta.shape)),
+            ]
+        )
+        feeds.update(decay=decay, beta=beta)
+    else:
+        inputs[4:] = ["", ""]
+
+    model = helper.make_model(
+        helper.make_graph(
+            [
+                helper.make_node(
+                    "LinearAttention",
+                    inputs,
+                    ["output", "present"],
+                    domain="com.microsoft",
+                    q_num_heads=query_heads,
+                    kv_num_heads=value_heads,
+                    update_rule=update_rule,
+                    scale=scale,
+                )
+            ],
+            "linear_attention",
+            graph_inputs,
+            [
+                helper.make_tensor_value_info("output", TensorProto.FLOAT16, list(expected.shape)),
+                helper.make_tensor_value_info("present", TensorProto.FLOAT16, list(expected_state.shape)),
+            ],
+        ),
+        opset_imports=[helper.make_opsetid("", 21), helper.make_opsetid("com.microsoft", 1)],
+    )
+    model.ir_version = 10
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        runtime = OnnxRuntime(str(path), device=device)
+        warp_feeds = {name: wp.array(value, dtype=wp.float16, device=device) for name, value in feeds.items()}
+        outputs = runtime(warp_feeds)
+        np.testing.assert_allclose(outputs["output"].numpy(), expected, rtol=5.0e-2, atol=5.0e-2)
+        np.testing.assert_allclose(outputs["present"].numpy(), expected_state, rtol=5.0e-2, atol=5.0e-2)
+        wp.capture_begin(device=device)
+        try:
+            runtime(warp_feeds)
+            graph = wp.capture_end(device=device)
+        except Exception:
+            wp.capture_end(device=device)
+            raise
+        wp.capture_launch(graph)
+        np.testing.assert_allclose(outputs["output"].numpy(), expected, rtol=5.0e-2, atol=5.0e-2)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize(
     "data_type,np_dtype,wp_dtype",
     [
         (TensorProto.FLOAT16, np.float16, wp.float16),
