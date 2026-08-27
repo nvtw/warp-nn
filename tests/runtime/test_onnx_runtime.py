@@ -714,13 +714,14 @@ def test_gather_block_quantized_int8(device):
 
 
 @pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("batch,sequence", [(2, 3), (1, 1)])
 @pytest.mark.parametrize("device", ["cuda"])
-def test_matmul_nbits(device, bits):
+def test_matmul_nbits(device, bits, batch, sequence):
     if not is_device_available(device):
         pytest.skip(f"Device '{device}' is not available")
 
     rng = np.random.default_rng(37 + bits)
-    batch, sequence, K, N = 2, 3, 256, 5
+    K, N = 256, 5
     blocks = K // 128
     activations = rng.standard_normal((batch, sequence, K)).astype(np.float16)
     quantized = rng.integers(0, 1 << bits, size=(N, blocks, 128), dtype=np.uint8)

@@ -394,6 +394,61 @@ def _matmul_nbits_kernel(
     output[row, column] = wp.float16(total)
 
 
+@wp.func_native(
+    """
+#if defined(__CUDA_ARCH__)
+    for (int offset = 16; offset > 0; offset >>= 1)
+        value += __shfl_down_sync(0xffffffff, value, offset);
+#endif
+    return value;
+    """
+)
+def _warp_sum(value: float) -> float: ...
+
+
+def _create_matmul_nbits_gemv_kernel(bits: int):
+    values_per_byte = 8 // bits
+    loads_per_lane = 128 // values_per_byte // 32
+
+    @wp.kernel(enable_backward=False)
+    def kernel(
+        activations: wp.array2d[wp.float16],
+        weights: wp.array3d[wp.uint8],
+        scales: wp.array2d[wp.float16],
+        zero_points: wp.array2d[wp.uint8],
+        output: wp.array2d[wp.float16],
+    ):
+        thread = wp.tid()
+        lane = thread & 31
+        column = thread / 32
+        total = wp.float32(0.0)
+
+        for block in range(weights.shape[1]):
+            packed_zero = wp.int32(zero_points[column, block / values_per_byte])
+            zero = (packed_zero >> ((block % values_per_byte) * bits)) & ((1 << bits) - 1)
+            scale = wp.float32(scales[column, block])
+            for group in range(loads_per_lane):
+                packed_offset = lane + group * 32
+                packed = wp.int32(weights[column, block, packed_offset])
+                activation_offset = block * 128 + packed_offset * values_per_byte
+                for value_index in range(values_per_byte):
+                    quantized = (packed >> (value_index * bits)) & ((1 << bits) - 1)
+                    total += (
+                        wp.float32(activations[0, activation_offset + value_index])
+                        * wp.float32(quantized - zero)
+                        * scale
+                    )
+
+        total = _warp_sum(total)
+        if lane == 0:
+            output[0, column] = wp.float16(total)
+
+    return kernel
+
+
+_matmul_nbits_gemv_kernels = {bits: _create_matmul_nbits_gemv_kernel(bits) for bits in (4, 8)}
+
+
 @wp.kernel
 def _simplified_layer_normalization_fp16_kernel(
     x: wp.array2d[wp.float16],
@@ -1759,6 +1814,22 @@ def _exec_gather_block_quantized(op, tensors, shapes, device):
 def _exec_matmul_nbits(op, tensors, shapes, device):
     K = int(op.attrs["K"])
     N = int(op.attrs["N"])
+    bits = int(op.attrs["bits"])
+    if op.attrs["_rows"] == 1:
+        wp.launch(
+            _matmul_nbits_gemv_kernels[bits],
+            dim=N * 32,
+            inputs=[
+                tensors[op.inputs[0]].reshape((1, K)),
+                tensors[op.inputs[1]],
+                tensors[op.inputs[2]],
+                tensors[op.inputs[3]],
+                op.attrs["_output_2d"],
+            ],
+            block_dim=128,
+            device=device,
+        )
+        return
     wp.launch(
         _matmul_nbits_kernel,
         dim=(op.attrs["_rows"], N),
@@ -1769,7 +1840,7 @@ def _exec_matmul_nbits(op, tensors, shapes, device):
             tensors[op.inputs[3]],
             op.attrs["_output_2d"],
             K,
-            int(op.attrs["bits"]),
+            bits,
         ],
         device=device,
     )
