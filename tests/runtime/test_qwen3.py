@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import codecs
 import json
 from pathlib import Path
 
@@ -55,6 +56,10 @@ def test_qwen_tokenizer_and_chat_template(tmp_path):
     token_ids = tokenizer.encode(text)
     assert tokenizer.decode(token_ids) == text
     assert tokenizer._vocabulary["hello"] in token_ids
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    streamed = "".join(decoder.decode(tokenizer.token_bytes(token_id)) for token_id in token_ids)
+    streamed += decoder.decode(b"", final=True)
+    assert streamed == text
 
     messages = [{"role": "system", "content": "Be concise."}, {"role": "user", "content": "Hello"}]
     formatted = tokenizer.format_chat(messages, enable_thinking=False)

@@ -247,6 +247,15 @@ class Qwen3Tokenizer:
         flush_bytes()
         return "".join(output)
 
+    def token_bytes(self, token_id: int, skip_special_tokens: bool = False) -> bytes:
+        """Return one token as bytes for use with an incremental UTF-8 decoder."""
+        added = self._added_by_id.get(int(token_id))
+        if added is not None:
+            if skip_special_tokens and added["special"]:
+                return b""
+            return added["content"].encode("utf-8")
+        return bytes(_BYTE_DECODER[character] for character in self._tokens[int(token_id)])
+
     def format_chat(
         self,
         messages: Sequence[Mapping[str, str]],

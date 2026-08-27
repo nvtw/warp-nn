@@ -4,6 +4,7 @@
 """Chat with a local Qwen3 ONNX model in a terminal."""
 
 import argparse
+import codecs
 from pathlib import Path
 
 from warp_nn.runtime import Qwen3OnnxRunner, Qwen3Tokenizer, sample_token
@@ -51,17 +52,20 @@ def main():
             print("The conversation no longer fits in the KV cache; use /clear or a larger --cache-capacity.")
             continue
 
+        print("Qwen: ", end="", flush=True)
         logits = runner.prefill(token_ids)
         generated = []
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
         for _ in range(min(args.max_new_tokens, args.cache_capacity - len(token_ids))):
             token_id = sample_token(logits, temperature=args.temperature)
             generated.append(token_id)
             if token_id == tokenizer.eos_token_id:
                 break
+            print(decoder.decode(tokenizer.token_bytes(token_id, skip_special_tokens=True)), end="", flush=True)
             logits = runner.decode(token_id)
 
+        print(decoder.decode(b"", final=True))
         response = tokenizer.decode(generated, skip_special_tokens=True)
-        print(f"Qwen: {response}")
         messages.append({"role": "assistant", "content": response})
 
 
