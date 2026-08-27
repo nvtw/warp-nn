@@ -860,6 +860,156 @@ def test_qwen_normalization_and_swiglu(device):
 
 
 @pytest.mark.parametrize("device", ["cuda"])
+def test_qwen_group_query_attention(device):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    rng = np.random.default_rng(59)
+    batch, sequence_length, past_length = 1, 2, 2
+    query_heads, kv_heads, head_size = 4, 2, 16
+    total_length = sequence_length + past_length
+    query = rng.normal(0.0, 0.2, (batch, sequence_length, query_heads * head_size)).astype(np.float16)
+    key = rng.normal(0.0, 0.2, (batch, sequence_length, kv_heads * head_size)).astype(np.float16)
+    value = rng.normal(0.0, 0.2, key.shape).astype(np.float16)
+    past_key = rng.normal(0.0, 0.2, (batch, kv_heads, past_length, head_size)).astype(np.float16)
+    past_value = rng.normal(0.0, 0.2, past_key.shape).astype(np.float16)
+    attention_mask = np.ones((batch, total_length), dtype=np.int64)
+    positions = np.arange(16, dtype=np.float32)[:, None]
+    frequencies = 1.0 / (10000.0 ** (np.arange(head_size // 2, dtype=np.float32) * 2.0 / head_size))
+    cos_cache = np.cos(positions * frequencies).astype(np.float16)
+    sin_cache = np.sin(positions * frequencies).astype(np.float16)
+
+    def rotate(x, heads):
+        shaped = x.reshape(batch, sequence_length, heads, head_size).transpose(0, 2, 1, 3).astype(np.float32)
+        first, second = np.split(shaped, 2, axis=-1)
+        cosine = cos_cache[past_length : past_length + sequence_length].astype(np.float32)[None, None]
+        sine = sin_cache[past_length : past_length + sequence_length].astype(np.float32)[None, None]
+        return np.concatenate((first * cosine - second * sine, second * cosine + first * sine), axis=-1).astype(
+            np.float16
+        )
+
+    rotated_query = rotate(query, query_heads)
+    rotated_key = rotate(key, kv_heads)
+    present_key = np.concatenate((past_key, rotated_key), axis=2)
+    present_value = np.concatenate(
+        (past_value, value.reshape(batch, sequence_length, kv_heads, head_size).transpose(0, 2, 1, 3)), axis=2
+    )
+    expanded_key = np.repeat(present_key, query_heads // kv_heads, axis=1)
+    expanded_value = np.repeat(present_value, query_heads // kv_heads, axis=1)
+    scores = np.einsum("bhsd,bhtd->bhst", rotated_query.astype(np.float32), expanded_key.astype(np.float32)) * (
+        head_size**-0.5
+    )
+    for token in range(sequence_length):
+        scores[:, :, token, past_length + token + 1 :] = -np.inf
+    probabilities = np.exp(scores - np.max(scores, axis=-1, keepdims=True))
+    probabilities /= np.sum(probabilities, axis=-1, keepdims=True)
+    output = np.einsum("bhst,bhtd->bshd", probabilities, expanded_value.astype(np.float32)).reshape(
+        batch, sequence_length, query_heads * head_size
+    )
+    expected = {"output": output.astype(np.float16), "present_key": present_key, "present_value": present_value}
+
+    axes = numpy_helper.from_array(np.array([1], dtype=np.int64), name="axes")
+    one = numpy_helper.from_array(np.array([1], dtype=np.int64), name="one")
+    model = helper.make_model(
+        helper.make_graph(
+            [
+                helper.make_node("ReduceSum", ["attention_mask", "axes"], ["mask_sum"], keepdims=0),
+                helper.make_node("Sub", ["mask_sum", "one"], ["sequence_lengths_i64"]),
+                helper.make_node("Cast", ["sequence_lengths_i64"], ["sequence_lengths"], to=TensorProto.INT32),
+                helper.make_node("Shape", ["attention_mask"], ["mask_shape"]),
+                helper.make_node("Gather", ["mask_shape", "one"], ["total_length_i64"], axis=0),
+                helper.make_node("Cast", ["total_length_i64"], ["total_length"], to=TensorProto.INT32),
+                helper.make_node(
+                    "GroupQueryAttention",
+                    [
+                        "query",
+                        "key",
+                        "value",
+                        "past_key",
+                        "past_value",
+                        "sequence_lengths",
+                        "total_length",
+                        "cos_cache",
+                        "sin_cache",
+                        "",
+                        "",
+                    ],
+                    ["output", "present_key", "present_value"],
+                    domain="com.microsoft",
+                    num_heads=query_heads,
+                    kv_num_heads=kv_heads,
+                    scale=head_size**-0.5,
+                    softcap=0.0,
+                    do_rotary=1,
+                    rotary_interleaved=0,
+                ),
+            ],
+            "qwen_attention",
+            [
+                helper.make_tensor_value_info(
+                    "query", TensorProto.FLOAT16, ["batch", "sequence", query_heads * head_size]
+                ),
+                helper.make_tensor_value_info("key", TensorProto.FLOAT16, ["batch", "sequence", kv_heads * head_size]),
+                helper.make_tensor_value_info(
+                    "value", TensorProto.FLOAT16, ["batch", "sequence", kv_heads * head_size]
+                ),
+                helper.make_tensor_value_info("past_key", TensorProto.FLOAT16, ["batch", kv_heads, "past", head_size]),
+                helper.make_tensor_value_info(
+                    "past_value", TensorProto.FLOAT16, ["batch", kv_heads, "past", head_size]
+                ),
+                helper.make_tensor_value_info("attention_mask", TensorProto.INT64, ["batch", "total"]),
+            ],
+            [
+                helper.make_tensor_value_info(
+                    "output", TensorProto.FLOAT16, ["batch", "sequence", query_heads * head_size]
+                ),
+                helper.make_tensor_value_info(
+                    "present_key", TensorProto.FLOAT16, ["batch", kv_heads, "total", head_size]
+                ),
+                helper.make_tensor_value_info(
+                    "present_value", TensorProto.FLOAT16, ["batch", kv_heads, "total", head_size]
+                ),
+            ],
+            [
+                axes,
+                one,
+                numpy_helper.from_array(cos_cache, name="cos_cache"),
+                numpy_helper.from_array(sin_cache, name="sin_cache"),
+            ],
+        ),
+        opset_imports=[helper.make_opsetid("", 21), helper.make_opsetid("com.microsoft", 1)],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    inputs = {
+        "query": query,
+        "key": key,
+        "value": value,
+        "past_key": past_key,
+        "past_value": past_value,
+        "attention_mask": attention_mask,
+    }
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        runtime = OnnxRuntime(
+            str(path), device=device, input_shapes={name: value.shape for name, value in inputs.items()}
+        )
+        outputs = runtime(
+            {
+                name: wp.array(value, dtype=wp.dtype_from_numpy(value.dtype), device=device)
+                for name, value in inputs.items()
+            }
+        )
+        for name, reference in expected.items():
+            np.testing.assert_allclose(outputs[name].numpy(), reference, rtol=4.0e-3, atol=4.0e-3)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("device", ["cuda"])
 def test_rejects_unsupported_ops(device):
     if not is_device_available(device):
         pytest.skip(f"Device '{device}' is not available")

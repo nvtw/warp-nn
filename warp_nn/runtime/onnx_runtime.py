@@ -40,6 +40,10 @@ Supported ONNX operators (all graph-capturable after one warmup call):
 * **MatMulNBits** -- Qwen-style INT4/INT8 block-quantized matrix multiplication
 * **SimplifiedLayerNormalization**, **SkipSimplifiedLayerNormalization** --
   Qwen FP16 last-axis RMS normalization, with optional residual addition
+* **GroupQueryAttention** -- causal FP16 grouped-query attention with
+  non-interleaved rotary embeddings and an external FP16 KV cache
+* **Cast**, **Gather**, **ReduceSum**, **Shape** -- the integer metadata subset
+  used by transformer attention-mask subgraphs
 * **Squeeze** -- alias passthrough (the output array shares memory with the
   input). Only used to drop unit dims, no copy is performed.
 * **LSTM** -- forward, single-direction, single-layer, ``seq_length=1``. The
@@ -231,6 +235,21 @@ def _reduce_mean_rows_kernel(x: wp.array2d[Any], out: wp.array2d[Any]):
     for column in range(x.shape[1]):
         total += x[row, column]
     out[row, 0] = total / x.dtype(x.shape[1])
+
+
+@wp.kernel
+def _reduce_sum_rows_int64_kernel(x: wp.array2d[wp.int64], out: wp.array1d[wp.int64]):
+    row = wp.tid()
+    total = wp.int64(0)
+    for column in range(x.shape[1]):
+        total += x[row, column]
+    out[row] = total
+
+
+@wp.kernel
+def _cast_int64_to_int32_kernel(x: wp.array1d[wp.int64], out: wp.array1d[wp.int32]):
+    index = wp.tid()
+    out[index] = wp.int32(x[index])
 
 
 @wp.kernel
@@ -427,6 +446,113 @@ def _swiglu_fp16_kernel(
     output[row, column] = wp.float16(silu * wp.float32(up[row, column]))
 
 
+@wp.kernel
+def _gqa_copy_past_fp16_kernel(
+    past_key: wp.array4d[wp.float16],
+    past_value: wp.array4d[wp.float16],
+    present_key: wp.array4d[wp.float16],
+    present_value: wp.array4d[wp.float16],
+):
+    batch, head, token, column = wp.tid()
+    present_key[batch, head, token, column] = past_key[batch, head, token, column]
+    present_value[batch, head, token, column] = past_value[batch, head, token, column]
+
+
+@wp.kernel
+def _gqa_prepare_fp16_kernel(
+    query: wp.array3d[wp.float16],
+    key: wp.array3d[wp.float16],
+    value: wp.array3d[wp.float16],
+    sequence_lengths_minus_one: wp.array1d[wp.int32],
+    cos_cache: wp.array2d[wp.float16],
+    sin_cache: wp.array2d[wp.float16],
+    rotated_query: wp.array4d[wp.float16],
+    present_key: wp.array4d[wp.float16],
+    present_value: wp.array4d[wp.float16],
+    query_heads: int,
+    kv_heads: int,
+    sequence_length: int,
+    past_length: int,
+    head_size: int,
+):
+    batch, head, token, column = wp.tid()
+    cache_column = column % (head_size // 2)
+    paired_column = column + head_size // 2 if column < head_size // 2 else column - head_size // 2
+    sign = wp.float32(-1.0) if column < head_size // 2 else wp.float32(1.0)
+    position = wp.int32(sequence_lengths_minus_one[batch]) - sequence_length + 1 + token
+    cosine = wp.float32(cos_cache[position, cache_column])
+    sine = wp.float32(sin_cache[position, cache_column])
+
+    if head < query_heads:
+        offset = head * head_size
+        current = wp.float32(query[batch, token, offset + column])
+        paired = wp.float32(query[batch, token, offset + paired_column])
+        rotated_query[batch, head, token, column] = wp.float16(current * cosine + sign * paired * sine)
+
+    if head < kv_heads:
+        offset = head * head_size
+        current = wp.float32(key[batch, token, offset + column])
+        paired = wp.float32(key[batch, token, offset + paired_column])
+        present_key[batch, head, past_length + token, column] = wp.float16(current * cosine + sign * paired * sine)
+        present_value[batch, head, past_length + token, column] = value[batch, token, offset + column]
+
+
+@wp.kernel
+def _gqa_scores_fp16_kernel(
+    query: wp.array4d[wp.float16],
+    key: wp.array4d[wp.float16],
+    scores: wp.array4d[wp.float32],
+    kv_group_size: int,
+    past_length: int,
+    head_size: int,
+    scale: float,
+):
+    batch, head, query_token, key_token = wp.tid()
+    if key_token <= past_length + query_token:
+        total = wp.float32(0.0)
+        kv_head = head // kv_group_size
+        for column in range(head_size):
+            total += wp.float32(query[batch, head, query_token, column]) * wp.float32(
+                key[batch, kv_head, key_token, column]
+            )
+        scores[batch, head, query_token, key_token] = total * wp.float32(scale)
+    else:
+        scores[batch, head, query_token, key_token] = wp.float32(-3.402823466e38)
+
+
+@wp.kernel
+def _gqa_softmax_fp32_kernel(scores: wp.array4d[wp.float32], valid_key_offset: int):
+    batch, head, query_token = wp.tid()
+    valid_keys = valid_key_offset + query_token + 1
+    maximum = wp.float32(-3.402823466e38)
+    for key_token in range(valid_keys):
+        maximum = wp.max(maximum, scores[batch, head, query_token, key_token])
+    total = wp.float32(0.0)
+    for key_token in range(valid_keys):
+        value = wp.exp(scores[batch, head, query_token, key_token] - maximum)
+        scores[batch, head, query_token, key_token] = value
+        total += value
+    for key_token in range(valid_keys):
+        scores[batch, head, query_token, key_token] /= total
+
+
+@wp.kernel
+def _gqa_output_fp16_kernel(
+    scores: wp.array4d[wp.float32],
+    value: wp.array4d[wp.float16],
+    output: wp.array3d[wp.float16],
+    kv_group_size: int,
+    past_length: int,
+    head_size: int,
+):
+    batch, query_token, head, column = wp.tid()
+    total = wp.float32(0.0)
+    kv_head = head // kv_group_size
+    for key_token in range(past_length + query_token + 1):
+        total += scores[batch, head, query_token, key_token] * wp.float32(value[batch, kv_head, key_token, column])
+    output[batch, query_token, head * head_size + column] = wp.float16(total)
+
+
 def _array_type(dtype: type, ndim: int):
     return wp.array(dtype=dtype, ndim=ndim)
 
@@ -613,6 +739,8 @@ class OnnxRuntime:
             current default device.
         batch_size: Fixed batch dimension used to pre-allocate intermediate
             buffers.  Defaults to ``1``.
+        input_shapes: Optional exact shapes for graph inputs with symbolic
+            dimensions, such as a transformer's sequence and KV-cache lengths.
         input_batch_axes: Optional batch-axis override for graph inputs.  If
             an integer is provided, it is applied to every graph input; if a
             dictionary is provided, it maps graph input names to their batch
@@ -630,6 +758,7 @@ class OnnxRuntime:
         device: str | wp.Device | None = None,
         batch_size: int = 1,
         input_batch_axes: int | dict[str, int] | None = None,
+        input_shapes: dict[str, tuple[int, ...]] | None = None,
         requires_grad: bool = False,
     ):
         self._device = parse_device(device)
@@ -673,11 +802,26 @@ class OnnxRuntime:
                 raise KeyError(
                     f"OnnxRuntime: input_batch_axes references unknown graph inputs {sorted(unknown_inputs)}"
                 )
+        if input_shapes is not None:
+            unknown_inputs = set(input_shapes) - set(self.input_names)
+            if unknown_inputs:
+                raise KeyError(f"OnnxRuntime: input_shapes references unknown graph inputs {sorted(unknown_inputs)}")
 
         for inp in graph.input:
             if inp.name in initializer_names:
                 continue
             dims = list(inp.type.tensor_type.shape.dim)
+            explicit_shape = input_shapes.get(inp.name) if input_shapes is not None else None
+            if explicit_shape is not None:
+                if len(explicit_shape) != len(dims):
+                    raise ValueError(
+                        f"OnnxRuntime: input '{inp.name}' shape {explicit_shape} does not match rank {len(dims)}"
+                    )
+                for axis, (declared, actual) in enumerate(zip(dims, explicit_shape)):
+                    if actual < 0 or (declared.HasField("dim_value") and declared.dim_value != actual):
+                        raise ValueError(
+                            f"OnnxRuntime: input '{inp.name}' shape {explicit_shape} conflicts with dimension {axis}"
+                        )
             batch_axis = None
             if input_batch_axes is not None:
                 if isinstance(input_batch_axes, dict):
@@ -694,7 +838,9 @@ class OnnxRuntime:
                         )
             shape = []
             for axis, d in enumerate(dims):
-                if axis == batch_axis:
+                if explicit_shape is not None:
+                    shape.append(explicit_shape[axis])
+                elif axis == batch_axis:
                     shape.append(batch_size)
                 elif d.HasField("dim_value") and d.dim_value > 0:
                     shape.append(d.dim_value)
@@ -825,7 +971,19 @@ def _shape_elementwise_binary(op, shapes, dtypes, tensors, device, requires_grad
     if len(lhs_shape) not in (1, 2) or len(rhs_shape) not in (1, 2):
         raise NotImplementedError(f"OnnxRuntime {op.op_type}: only 1-D and 2-D tensors are supported")
     if len(lhs_shape) == 1 and len(rhs_shape) == 1:
-        raise NotImplementedError(f"OnnxRuntime {op.op_type}: at least one input must be 2-D")
+        if op.op_type != "Sub" or dtypes[op.inputs[0]] != wp.int64 or dtypes[op.inputs[1]] != wp.int64:
+            raise NotImplementedError(f"OnnxRuntime {op.op_type}: at least one input must be 2-D")
+        if lhs_shape != rhs_shape and lhs_shape != (1,) and rhs_shape != (1,):
+            raise ValueError(f"OnnxRuntime Sub: shapes {lhs_shape} and {rhs_shape} do not broadcast")
+        out_shape = (max(lhs_shape[0], rhs_shape[0]),)
+        tensors[op.outputs[0]] = wp.zeros(out_shape, dtype=wp.int64, device=device)
+        shapes[op.outputs[0]] = out_shape
+        dtypes[op.outputs[0]] = wp.int64
+        op.attrs["_lhs_shape_2d"] = (1, lhs_shape[0])
+        op.attrs["_rhs_shape_2d"] = (1, rhs_shape[0])
+        op.attrs["_out_shape_2d"] = (1, out_shape[0])
+        op.attrs["_output_view"] = tensors[op.outputs[0]].reshape(op.attrs["_out_shape_2d"])
+        return
     lhs_2d = (1, lhs_shape[0]) if len(lhs_shape) == 1 else lhs_shape
     rhs_2d = (1, rhs_shape[0]) if len(rhs_shape) == 1 else rhs_shape
     for lhs_size, rhs_size in zip(lhs_2d, rhs_2d):
@@ -840,6 +998,7 @@ def _shape_elementwise_binary(op, shapes, dtypes, tensors, device, requires_grad
         tensors[out_name] = wp.zeros(out_shape, dtype=dtype, device=device, requires_grad=requires_grad)
     shapes[out_name] = out_shape
     dtypes[out_name] = dtype
+    op.attrs["_out_shape_2d"] = out_shape
     op.attrs["_lhs_shape_2d"] = lhs_2d
     op.attrs["_rhs_shape_2d"] = rhs_2d
     if op.inputs[0] in tensors and len(lhs_shape) == 1:
@@ -861,6 +1020,46 @@ def _shape_reduce_mean(op, shapes, dtypes, tensors, device, requires_grad=False)
         tensors[out_name] = wp.zeros(out_shape, dtype=dtype, device=device, requires_grad=requires_grad)
     shapes[out_name] = out_shape
     dtypes[out_name] = dtype
+
+
+def _shape_reduce_sum(op, shapes, dtypes, tensors, device, requires_grad=False):
+    axes = tuple(int(value) for value in tensors[op.inputs[1]].numpy().reshape(-1))
+    in_shape = shapes[op.inputs[0]]
+    if len(in_shape) != 2 or axes != (1,) or int(op.attrs.get("keepdims", 1)) != 0:
+        raise NotImplementedError("OnnxRuntime ReduceSum: only Qwen's 2-D integer row reduction is supported")
+    if dtypes[op.inputs[0]] != wp.int64:
+        raise TypeError("OnnxRuntime ReduceSum: expected an INT64 input")
+    out_shape = (in_shape[0],)
+    tensors[op.outputs[0]] = wp.zeros(out_shape, dtype=wp.int64, device=device)
+    shapes[op.outputs[0]] = out_shape
+    dtypes[op.outputs[0]] = wp.int64
+
+
+def _shape_shape(op, shapes, dtypes, tensors, device, requires_grad=False):
+    if op.attr_names:
+        raise NotImplementedError("OnnxRuntime Shape: start/end attributes are not supported")
+    value = np.asarray(shapes[op.inputs[0]], dtype=np.int64)
+    tensors[op.outputs[0]] = _np_to_warp(value, device)
+    shapes[op.outputs[0]] = value.shape
+    dtypes[op.outputs[0]] = wp.int64
+
+
+def _shape_gather(op, shapes, dtypes, tensors, device, requires_grad=False):
+    if op.inputs[0] not in tensors or op.inputs[1] not in tensors or int(op.attrs.get("axis", 0)) != 0:
+        raise NotImplementedError("OnnxRuntime Gather: only constant axis-0 gathers are supported")
+    value = np.take(tensors[op.inputs[0]].numpy(), tensors[op.inputs[1]].numpy().astype(np.int64), axis=0)
+    tensors[op.outputs[0]] = _np_to_warp(value, device)
+    shapes[op.outputs[0]] = tuple(tensors[op.outputs[0]].shape)
+    dtypes[op.outputs[0]] = tensors[op.outputs[0]].dtype
+
+
+def _shape_cast(op, shapes, dtypes, tensors, device, requires_grad=False):
+    if dtypes[op.inputs[0]] != wp.int64 or int(op.attrs.get("to", 0)) != 6 or len(shapes[op.inputs[0]]) != 1:
+        raise NotImplementedError("OnnxRuntime Cast: only 1-D INT64 to INT32 casts are supported")
+    shape = shapes[op.inputs[0]]
+    tensors[op.outputs[0]] = wp.zeros(shape, dtype=wp.int32, device=device)
+    shapes[op.outputs[0]] = shape
+    dtypes[op.outputs[0]] = wp.int32
 
 
 def _shape_batch_normalization(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -1105,6 +1304,64 @@ def _shape_swiglu(op, shapes, dtypes, tensors, device, requires_grad=False):
     op.attrs["_output_2d"] = tensors[op.outputs[0]].reshape(op.attrs["_shape_2d"])
 
 
+def _shape_group_query_attention(op, shapes, dtypes, tensors, device, requires_grad=False):
+    if requires_grad:
+        raise NotImplementedError("OnnxRuntime GroupQueryAttention: gradients are not supported")
+    query_heads = int(op.attrs.get("num_heads", 0))
+    kv_heads = int(op.attrs.get("kv_num_heads", 0))
+    query_shape, key_shape, value_shape = (shapes[name] for name in op.inputs[:3])
+    if len(query_shape) != 3 or len(key_shape) != 3 or value_shape != key_shape or query_shape[:2] != key_shape[:2]:
+        raise ValueError("OnnxRuntime GroupQueryAttention: expected matching 3-D Q/K/V inputs")
+    batch, sequence_length, hidden_size = query_shape
+    if query_heads <= 0 or kv_heads <= 0 or query_heads % kv_heads != 0 or hidden_size % query_heads != 0:
+        raise ValueError("OnnxRuntime GroupQueryAttention: invalid query/KV head counts")
+    head_size = hidden_size // query_heads
+    if key_shape[2] != kv_heads * head_size or head_size % 2 != 0:
+        raise ValueError("OnnxRuntime GroupQueryAttention: Q/K/V head dimensions do not match")
+    past_shape = (batch, kv_heads, shapes[op.inputs[3]][2], head_size)
+    if shapes[op.inputs[3]] != past_shape or shapes[op.inputs[4]] != past_shape:
+        raise ValueError("OnnxRuntime GroupQueryAttention: invalid past KV-cache shape")
+    if shapes[op.inputs[5]] != (batch,) or dtypes[op.inputs[5]] != wp.int32:
+        raise ValueError("OnnxRuntime GroupQueryAttention: sequence lengths must be an INT32 batch vector")
+    if shapes[op.inputs[6]] != (1,) or dtypes[op.inputs[6]] != wp.int32:
+        raise ValueError("OnnxRuntime GroupQueryAttention: total sequence length must be an INT32 scalar")
+    if shapes[op.inputs[7]] != shapes[op.inputs[8]] or shapes[op.inputs[7]][1] != head_size // 2:
+        raise ValueError("OnnxRuntime GroupQueryAttention: invalid rotary cache shape")
+    if any(dtypes[name] != wp.float16 for name in op.inputs[:5] + op.inputs[7:9]):
+        raise TypeError("OnnxRuntime GroupQueryAttention: Q/K/V, caches, and rotary tables must be FP16")
+    if (
+        len(op.inputs) != 11
+        or any(op.inputs[9:])
+        or int(op.attrs.get("do_rotary", 0)) != 1
+        or int(op.attrs.get("rotary_interleaved", 0)) != 0
+        or float(op.attrs.get("softcap", 0.0)) != 0.0
+    ):
+        raise NotImplementedError("OnnxRuntime GroupQueryAttention: only causal non-interleaved RoPE is supported")
+
+    past_length = past_shape[2]
+    total_length = past_length + sequence_length
+    output_shape = query_shape
+    present_shape = (batch, kv_heads, total_length, head_size)
+    tensors[op.outputs[0]] = wp.zeros(output_shape, dtype=wp.float16, device=device)
+    tensors[op.outputs[1]] = wp.zeros(present_shape, dtype=wp.float16, device=device)
+    tensors[op.outputs[2]] = wp.zeros(present_shape, dtype=wp.float16, device=device)
+    shapes[op.outputs[0]], shapes[op.outputs[1]], shapes[op.outputs[2]] = output_shape, present_shape, present_shape
+    dtypes[op.outputs[0]] = dtypes[op.outputs[1]] = dtypes[op.outputs[2]] = wp.float16
+    op.attrs.update(
+        {
+            "_batch": batch,
+            "_sequence_length": sequence_length,
+            "_past_length": past_length,
+            "_total_length": total_length,
+            "_head_size": head_size,
+            "_rotated_query": wp.zeros(
+                (batch, query_heads, sequence_length, head_size), dtype=wp.float16, device=device
+            ),
+            "_scores": wp.zeros((batch, query_heads, sequence_length, total_length), dtype=wp.float32, device=device),
+        }
+    )
+
+
 def _shape_squeeze(op, shapes, dtypes, tensors, device, requires_grad=False):
     in_shape = shapes[op.inputs[0]]
     axes = None
@@ -1318,9 +1575,9 @@ def _exec_binary(op, tensors, shapes, device):
     operation = {"Add": 0, "Sub": 1, "Mul": 2, "Div": 3}[op.op_type]
     wp.launch(
         _kernel_for_dtype(_binary_broadcast_kernel, lhs.dtype, (2,), (2,), int, (2,)),
-        dim=shapes[op.outputs[0]],
+        dim=op.attrs["_out_shape_2d"],
         inputs=[lhs, rhs, operation],
-        outputs=[tensors[op.outputs[0]]],
+        outputs=[op.attrs.get("_output_view", tensors[op.outputs[0]])],
         device=device,
     )
 
@@ -1331,6 +1588,28 @@ def _exec_reduce_mean(op, tensors, shapes, device):
         dim=shapes[op.inputs[0]][0],
         inputs=[tensors[op.inputs[0]]],
         outputs=[tensors[op.outputs[0]]],
+        device=device,
+    )
+
+
+def _exec_reduce_sum(op, tensors, shapes, device):
+    wp.launch(
+        _reduce_sum_rows_int64_kernel,
+        dim=shapes[op.inputs[0]][0],
+        inputs=[tensors[op.inputs[0]], tensors[op.outputs[0]]],
+        device=device,
+    )
+
+
+def _exec_static(op, tensors, shapes, device):
+    pass
+
+
+def _exec_cast(op, tensors, shapes, device):
+    wp.launch(
+        _cast_int64_to_int32_kernel,
+        dim=shapes[op.inputs[0]][0],
+        inputs=[tensors[op.inputs[0]], tensors[op.outputs[0]]],
         device=device,
     )
 
@@ -1464,6 +1743,79 @@ def _exec_swiglu(op, tensors, shapes, device):
     )
 
 
+def _exec_group_query_attention(op, tensors, shapes, device):
+    batch = op.attrs["_batch"]
+    sequence_length = op.attrs["_sequence_length"]
+    past_length = op.attrs["_past_length"]
+    total_length = op.attrs["_total_length"]
+    head_size = op.attrs["_head_size"]
+    query_heads = int(op.attrs["num_heads"])
+    kv_heads = int(op.attrs["kv_num_heads"])
+    present_key = tensors[op.outputs[1]]
+    present_value = tensors[op.outputs[2]]
+    if past_length:
+        wp.launch(
+            _gqa_copy_past_fp16_kernel,
+            dim=(batch, kv_heads, past_length, head_size),
+            inputs=[tensors[op.inputs[3]], tensors[op.inputs[4]], present_key, present_value],
+            device=device,
+        )
+    wp.launch(
+        _gqa_prepare_fp16_kernel,
+        dim=(batch, query_heads, sequence_length, head_size),
+        inputs=[
+            tensors[op.inputs[0]],
+            tensors[op.inputs[1]],
+            tensors[op.inputs[2]],
+            tensors[op.inputs[5]],
+            tensors[op.inputs[7]],
+            tensors[op.inputs[8]],
+            op.attrs["_rotated_query"],
+            present_key,
+            present_value,
+            query_heads,
+            kv_heads,
+            sequence_length,
+            past_length,
+            head_size,
+        ],
+        device=device,
+    )
+    wp.launch(
+        _gqa_scores_fp16_kernel,
+        dim=(batch, query_heads, sequence_length, total_length),
+        inputs=[
+            op.attrs["_rotated_query"],
+            present_key,
+            op.attrs["_scores"],
+            query_heads // kv_heads,
+            past_length,
+            head_size,
+            float(op.attrs.get("scale", head_size**-0.5)),
+        ],
+        device=device,
+    )
+    wp.launch(
+        _gqa_softmax_fp32_kernel,
+        dim=(batch, query_heads, sequence_length),
+        inputs=[op.attrs["_scores"], past_length],
+        device=device,
+    )
+    wp.launch(
+        _gqa_output_fp16_kernel,
+        dim=(batch, sequence_length, query_heads, head_size),
+        inputs=[
+            op.attrs["_scores"],
+            present_value,
+            tensors[op.outputs[0]],
+            query_heads // kv_heads,
+            past_length,
+            head_size,
+        ],
+        device=device,
+    )
+
+
 def _exec_squeeze(op, tensors, shapes, device):
     src = tensors[op.inputs[0]]
     out_shape = op.attrs["_out_shape"]
@@ -1521,17 +1873,22 @@ _OP_DISPATCH: dict[str, Any] = {
     "_SwiGLU": _exec_swiglu,
     "Add": _exec_binary,
     "BatchNormalization": _exec_batch_normalization,
+    "Cast": _exec_cast,
     "Constant": _exec_constant,
     "Div": _exec_binary,
     "Elu": _exec_elu,
     "Gemm": _exec_gemm,
+    "Gather": _exec_static,
     "GatherBlockQuantized": _exec_gather_block_quantized,
+    "GroupQueryAttention": _exec_group_query_attention,
     "LSTM": _exec_lstm,
     "MatMulNBits": _exec_matmul_nbits,
     "Mul": _exec_binary,
     "ReduceMean": _exec_reduce_mean,
+    "ReduceSum": _exec_reduce_sum,
     "Relu": _exec_unary,
     "Reshape": _exec_reshape,
+    "Shape": _exec_static,
     "Sqrt": _exec_unary,
     "SimplifiedLayerNormalization": _exec_simplified_layer_normalization,
     "Squeeze": _exec_squeeze,
@@ -1546,17 +1903,22 @@ _SHAPE_DISPATCH: dict[str, Any] = {
     "_SwiGLU": _shape_swiglu,
     "Add": _shape_elementwise_binary,
     "BatchNormalization": _shape_batch_normalization,
+    "Cast": _shape_cast,
     "Constant": _shape_constant,
     "Div": _shape_elementwise_binary,
     "Elu": _shape_elementwise_unary,
     "Gemm": _shape_gemm,
+    "Gather": _shape_gather,
     "GatherBlockQuantized": _shape_gather_block_quantized,
+    "GroupQueryAttention": _shape_group_query_attention,
     "LSTM": _shape_lstm,
     "MatMulNBits": _shape_matmul_nbits,
     "Mul": _shape_elementwise_binary,
     "ReduceMean": _shape_reduce_mean,
+    "ReduceSum": _shape_reduce_sum,
     "Relu": _shape_elementwise_unary,
     "Reshape": _shape_reshape,
+    "Shape": _shape_shape,
     "Sqrt": _shape_elementwise_unary,
     "SimplifiedLayerNormalization": _shape_simplified_layer_normalization,
     "Squeeze": _shape_squeeze,
