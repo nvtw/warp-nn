@@ -16,6 +16,7 @@ def main():
     parser.add_argument("--system", help="Optional system message")
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--cache-capacity", type=int, default=1024)
+    parser.add_argument("--prefill-chunk-size", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--thinking", action="store_true", help="Enable Qwen3 thinking mode")
     parser.add_argument("--device", default="cuda:0")
@@ -26,6 +27,7 @@ def main():
         str(args.model_dir / "model.onnx"),
         device=args.device,
         cache_capacity=args.cache_capacity,
+        prefill_chunk_size=args.prefill_chunk_size,
     )
     messages = [] if args.system is None else [{"role": "system", "content": args.system}]
 

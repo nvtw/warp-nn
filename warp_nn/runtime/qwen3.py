@@ -320,6 +320,7 @@ class Qwen3OnnxRunner:
         path: str,
         device: str | wp.Device | None = None,
         cache_capacity: int | None = None,
+        prefill_chunk_size: int | None = None,
         use_cublas: bool = True,
     ):
         self.runtime = OnnxRuntime(path, device=device, use_cublas=use_cublas)
@@ -348,6 +349,9 @@ class Qwen3OnnxRunner:
         self.cache_capacity = cache_capacity or self.max_sequence_length
         if not 0 < self.cache_capacity <= self.max_sequence_length:
             raise ValueError("Qwen3OnnxRunner: cache_capacity must be within the model's rotary cache")
+        if prefill_chunk_size is not None and not 1 < prefill_chunk_size <= self.cache_capacity:
+            raise ValueError("Qwen3OnnxRunner: prefill_chunk_size must be between 2 and cache_capacity")
+        self.prefill_chunk_size = prefill_chunk_size
         self._cache = {
             name: wp.zeros(
                 (1, shape[1], self.cache_capacity, shape[3]) if name in self._variable_cache_names else shape,
@@ -371,6 +375,25 @@ class Qwen3OnnxRunner:
         }
         if "position_ids" in self.runtime.input_names:
             self._decode_inputs["position_ids"] = self._decode_position_ids
+        self._chunk_runtime = None
+        if prefill_chunk_size is not None:
+            self._chunk_input_ids = wp.zeros((1, prefill_chunk_size), dtype=wp.int64, device=self.runtime._device)
+            self._chunk_position_ids = wp.zeros((1, prefill_chunk_size), dtype=wp.int64, device=self.runtime._device)
+            chunk_shapes = {
+                "input_ids": (1, prefill_chunk_size),
+                "attention_mask": (1, self.cache_capacity),
+                **{name: tuple(cache.shape) for name, cache in self._cache.items()},
+            }
+            if "position_ids" in self.runtime.input_names:
+                chunk_shapes["position_ids"] = (1, prefill_chunk_size)
+            self._chunk_runtime = self.runtime._fork(chunk_shapes, share_kv_cache=True)
+            self._chunk_inputs = {
+                "input_ids": self._chunk_input_ids,
+                "attention_mask": self._decode_attention_mask,
+                **self._cache,
+            }
+            if "position_ids" in self.runtime.input_names:
+                self._chunk_inputs["position_ids"] = self._chunk_position_ids
         self._decode_position = wp.zeros(1, dtype=wp.int32, device=self.runtime._device)
         self._generated_count = wp.zeros(1, dtype=wp.int32, device=self.runtime._device)
         self._generated_ids = wp.zeros(self.cache_capacity, dtype=wp.int64, device=self.runtime._device)
@@ -391,6 +414,8 @@ class Qwen3OnnxRunner:
             raise ValueError("Qwen3OnnxRunner: token_ids must not be empty")
         if current_length >= self.cache_capacity:
             raise ValueError("Qwen3OnnxRunner: prompt must leave room for at least one decoded token")
+        if self._chunk_runtime is not None and current_length > self.prefill_chunk_size:
+            return self._prefill_chunked(token_ids)
         shapes = {"input_ids": (1, current_length), "attention_mask": (1, current_length)}
         if "position_ids" in self.runtime.input_names:
             shapes["position_ids"] = (1, current_length)
@@ -417,6 +442,40 @@ class Qwen3OnnxRunner:
         self.sequence_length = current_length
         self._prepare_decode()
         return outputs["logits"]
+
+    def _prefill_chunked(self, token_ids: Sequence[int]) -> wp.array:
+        """Prefill through bounded fixed-size chunks and return the final logits."""
+        chunk_size = self.prefill_chunk_size
+        for cache in self._cache.values():
+            cache.zero_()
+        wp.launch(
+            _initialize_attention_mask,
+            dim=self.cache_capacity,
+            inputs=[self._decode_attention_mask, 0],
+            device=self.runtime._device,
+        )
+
+        full_length = len(token_ids) // chunk_size * chunk_size
+        outputs = None
+        for start in range(0, full_length, chunk_size):
+            end = start + chunk_size
+            self._chunk_input_ids.assign(np.asarray(token_ids[start:end], dtype=np.int64)[None, :])
+            if "position_ids" in self.runtime.input_names:
+                self._chunk_position_ids.assign(np.arange(start, end, dtype=np.int64)[None, :])
+            wp.launch(
+                _initialize_attention_mask,
+                dim=self.cache_capacity,
+                inputs=[self._decode_attention_mask, end],
+                device=self.runtime._device,
+            )
+            outputs = self._chunk_runtime(self._chunk_inputs)
+            self.sequence_length = end
+
+        logits = outputs["logits"]
+        for token_id in token_ids[full_length:]:
+            logits = self.decode(token_id)
+        self._past = dict(self._cache)
+        return logits
 
     def decode(self, token_id: int) -> wp.array:
         """Append one token and return its logits."""
