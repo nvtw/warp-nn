@@ -29,7 +29,7 @@ import numpy as np
 import warp as wp
 
 from tests.utilities import check_arrays, is_device_available
-from warp_nn.runtime import OnnxRuntime
+from warp_nn.runtime import OnnxRuntime, Qwen3OnnxRunner
 
 
 def _convert_float_model_dtype(model: onnx.ModelProto, np_dtype, tensor_type: int) -> onnx.ModelProto:
@@ -1005,6 +1005,111 @@ def test_qwen_group_query_attention(device):
         )
         for name, reference in expected.items():
             np.testing.assert_allclose(outputs[name].numpy(), reference, rtol=4.0e-3, atol=4.0e-3)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("device", ["cuda"])
+def test_qwen_stateful_prefill_and_decode(device):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    rng = np.random.default_rng(67)
+    vocabulary, head_size, cache_length = 4, 128, 8
+    embedding = rng.integers(96, 160, size=(vocabulary, head_size), dtype=np.uint8)
+    scales = rng.uniform(0.005, 0.02, size=(vocabulary, 1)).astype(np.float16)
+    zero_points = np.full((vocabulary, 1), 128, dtype=np.uint8)
+    positions = np.arange(cache_length, dtype=np.float32)[:, None]
+    frequencies = 1.0 / (10000.0 ** (np.arange(head_size // 2, dtype=np.float32) * 2.0 / head_size))
+    cos_cache = np.cos(positions * frequencies).astype(np.float16)
+    sin_cache = np.sin(positions * frequencies).astype(np.float16)
+    axes = numpy_helper.from_array(np.array([1], dtype=np.int64), name="axes")
+    one = numpy_helper.from_array(np.array([1], dtype=np.int64), name="one")
+    nodes = [
+        helper.make_node("ReduceSum", ["attention_mask", "axes"], ["mask_sum"], keepdims=0),
+        helper.make_node("Sub", ["mask_sum", "one"], ["sequence_lengths_i64"]),
+        helper.make_node("Cast", ["sequence_lengths_i64"], ["sequence_lengths"], to=TensorProto.INT32),
+        helper.make_node("Shape", ["attention_mask"], ["mask_shape"]),
+        helper.make_node("Gather", ["mask_shape", "one"], ["total_length_i64"], axis=0),
+        helper.make_node("Cast", ["total_length_i64"], ["total_length"], to=TensorProto.INT32),
+        helper.make_node(
+            "GatherBlockQuantized",
+            ["embedding", "input_ids", "scales", "zero_points"],
+            ["hidden"],
+            domain="com.microsoft",
+            bits=8,
+            block_size=128,
+        ),
+        helper.make_node(
+            "GroupQueryAttention",
+            [
+                "hidden",
+                "hidden",
+                "hidden",
+                "past_key_values.0.key",
+                "past_key_values.0.value",
+                "sequence_lengths",
+                "total_length",
+                "cos_cache",
+                "sin_cache",
+                "",
+                "",
+            ],
+            ["logits", "present.0.key", "present.0.value"],
+            domain="com.microsoft",
+            num_heads=1,
+            kv_num_heads=1,
+            scale=head_size**-0.5,
+            softcap=0.0,
+            do_rotary=1,
+            rotary_interleaved=0,
+        ),
+    ]
+    model = helper.make_model(
+        helper.make_graph(
+            nodes,
+            "stateful_qwen",
+            [
+                helper.make_tensor_value_info("input_ids", TensorProto.INT64, ["batch", "sequence"]),
+                helper.make_tensor_value_info("attention_mask", TensorProto.INT64, ["batch", "total"]),
+                helper.make_tensor_value_info(
+                    "past_key_values.0.key", TensorProto.FLOAT16, ["batch", 1, "past", head_size]
+                ),
+                helper.make_tensor_value_info(
+                    "past_key_values.0.value", TensorProto.FLOAT16, ["batch", 1, "past", head_size]
+                ),
+            ],
+            [
+                helper.make_tensor_value_info("logits", TensorProto.FLOAT16, ["batch", "sequence", head_size]),
+                helper.make_tensor_value_info("present.0.key", TensorProto.FLOAT16, ["batch", 1, "total", head_size]),
+                helper.make_tensor_value_info("present.0.value", TensorProto.FLOAT16, ["batch", 1, "total", head_size]),
+            ],
+            [
+                axes,
+                one,
+                numpy_helper.from_array(embedding, name="embedding"),
+                numpy_helper.from_array(scales, name="scales"),
+                numpy_helper.from_array(zero_points, name="zero_points"),
+                numpy_helper.from_array(cos_cache, name="cos_cache"),
+                numpy_helper.from_array(sin_cache, name="sin_cache"),
+            ],
+        ),
+        opset_imports=[helper.make_opsetid("", 21), helper.make_opsetid("com.microsoft", 1)],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        runner = Qwen3OnnxRunner(str(path), device=device)
+        prompt_logits = runner.prefill([0, 1])
+        assert prompt_logits.shape == (1, 2, head_size)
+        decoded = runner.decode(2).numpy()
+        assert runner.sequence_length == 3
+        full = runner.prefill([0, 1, 2]).numpy()
+        np.testing.assert_array_equal(decoded, full[:, -1:, :])
     finally:
         path.unlink(missing_ok=True)
 

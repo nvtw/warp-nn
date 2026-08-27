@@ -793,8 +793,17 @@ class OnnxRuntime:
             self._dtypes[init.name] = tensor.dtype
 
         initializer_names = {init.name for init in graph.initializer}
+        self._initializer_names = initializer_names
         self.input_names: list[str] = [inp.name for inp in graph.input if inp.name not in initializer_names]
         self.output_names: list[str] = [out.name for out in graph.output]
+        self._input_dims = {
+            inp.name: tuple(
+                dim.dim_value if dim.HasField("dim_value") and dim.dim_value > 0 else None
+                for dim in inp.type.tensor_type.shape.dim
+            )
+            for inp in graph.input
+            if inp.name not in initializer_names
+        }
 
         if isinstance(input_batch_axes, dict):
             unknown_inputs = set(input_batch_axes) - set(self.input_names)
@@ -848,6 +857,7 @@ class OnnxRuntime:
                     shape.append(batch_size)
             self._shapes[inp.name] = tuple(shape)
             self._dtypes[inp.name] = _warp_dtype_from_onnx(onnx, inp.type.tensor_type.elem_type)
+        self._input_dtypes = {name: self._dtypes[name] for name in self.input_names}
 
         self._ops: list[_Op] = []
         for node in graph.node:
@@ -870,6 +880,30 @@ class OnnxRuntime:
         if not self._requires_grad:
             self._ops = _fuse_inference_ops(self._ops, set(self.output_names), initializer_names)
 
+        self._preallocate_buffers()
+
+    def resize_inputs(self, input_shapes: dict[str, tuple[int, ...]]) -> None:
+        """Rebuild shape-dependent buffers while retaining loaded initializers."""
+        if set(input_shapes) != set(self.input_names):
+            missing = sorted(set(self.input_names) - set(input_shapes))
+            extra = sorted(set(input_shapes) - set(self.input_names))
+            raise KeyError(f"OnnxRuntime: resize_inputs requires every graph input; missing={missing}, extra={extra}")
+        for name, shape in input_shapes.items():
+            declared = self._input_dims[name]
+            if len(shape) != len(declared) or any(
+                actual < 0 or (fixed is not None and actual != fixed) for actual, fixed in zip(shape, declared)
+            ):
+                raise ValueError(f"OnnxRuntime: input '{name}' shape {shape} conflicts with declared shape {declared}")
+
+        wp.synchronize_device(self._device)
+        self._tensors = {name: self._tensors[name] for name in self._initializer_names}
+        self._shapes = {name: tuple(tensor.shape) for name, tensor in self._tensors.items()}
+        self._dtypes = {name: tensor.dtype for name, tensor in self._tensors.items()}
+        for name, shape in input_shapes.items():
+            self._shapes[name] = tuple(shape)
+            self._dtypes[name] = self._input_dtypes[name]
+        for op in self._ops:
+            op.attrs = {name: value for name, value in op.attrs.items() if not name.startswith("_") or name == "_value"}
         self._preallocate_buffers()
 
     def _preallocate_buffers(self) -> None:
@@ -1347,6 +1381,14 @@ def _shape_group_query_attention(op, shapes, dtypes, tensors, device, requires_g
     tensors[op.outputs[2]] = wp.zeros(present_shape, dtype=wp.float16, device=device)
     shapes[op.outputs[0]], shapes[op.outputs[1]], shapes[op.outputs[2]] = output_shape, present_shape, present_shape
     dtypes[op.outputs[0]] = dtypes[op.outputs[1]] = dtypes[op.outputs[2]] = wp.float16
+    rotated_shape = (batch, query_heads, sequence_length, head_size)
+    scores_shape = (batch, query_heads, sequence_length, total_length)
+    rotated_name = f"__onnx_runtime_gqa_query_{rotated_shape}"
+    scores_name = f"__onnx_runtime_gqa_scores_{scores_shape}"
+    if rotated_name not in tensors:
+        tensors[rotated_name] = wp.zeros(rotated_shape, dtype=wp.float16, device=device)
+    if scores_name not in tensors:
+        tensors[scores_name] = wp.zeros(scores_shape, dtype=wp.float32, device=device)
     op.attrs.update(
         {
             "_batch": batch,
@@ -1354,10 +1396,8 @@ def _shape_group_query_attention(op, shapes, dtypes, tensors, device, requires_g
             "_past_length": past_length,
             "_total_length": total_length,
             "_head_size": head_size,
-            "_rotated_query": wp.zeros(
-                (batch, query_heads, sequence_length, head_size), dtype=wp.float16, device=device
-            ),
-            "_scores": wp.zeros((batch, query_heads, sequence_length, total_length), dtype=wp.float32, device=device),
+            "_rotated_query": tensors[rotated_name],
+            "_scores": tensors[scores_name],
         }
     )
 
