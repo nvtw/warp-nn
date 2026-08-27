@@ -37,6 +37,7 @@ Supported ONNX operators (all graph-capturable after one warmup call):
 * **Constant** -- tensor-valued constants resolved during construction
 * **Reshape** -- view-only reshape with a construction-time shape tensor
 * **GatherBlockQuantized** -- Qwen-style INT8 block-quantized embedding lookup
+* **MatMulNBits** -- Qwen-style INT4/INT8 block-quantized matrix multiplication
 * **Squeeze** -- alias passthrough (the output array shares memory with the
   input). Only used to drop unit dims, no copy is performed.
 * **LSTM** -- forward, single-direction, single-layer, ``seq_length=1``. The
@@ -342,6 +343,34 @@ def _gather_block_quantized_int8_kernel(
     output[batch, sequence, column] = wp.float16(
         (wp.float32(data[row, column]) - wp.float32(zero_points[row, block])) * wp.float32(scales[row, block])
     )
+
+
+@wp.kernel
+def _matmul_nbits_kernel(
+    activations: wp.array2d[wp.float16],
+    weights: wp.array3d[wp.uint8],
+    scales: wp.array2d[wp.float16],
+    zero_points: wp.array2d[wp.uint8],
+    output: wp.array2d[wp.float16],
+    K: int,
+    bits: int,
+):
+    row, column = wp.tid()
+    total = wp.float32(0.0)
+    for k in range(K):
+        block = k / 128
+        offset = k - block * 128
+        if bits == 4:
+            packed = wp.int32(weights[column, block, offset / 2])
+            quantized = wp.where(offset % 2 == 0, packed & 15, (packed >> 4) & 15)
+            packed_zero = wp.int32(zero_points[column, block / 2])
+            zero = wp.where(block % 2 == 0, packed_zero & 15, (packed_zero >> 4) & 15)
+        else:
+            quantized = wp.int32(weights[column, block, offset])
+            zero = wp.int32(zero_points[column, block])
+        dequantized = wp.float32(quantized - zero) * wp.float32(scales[column, block])
+        total += wp.float32(activations[row, k]) * dequantized
+    output[row, column] = wp.float16(total)
 
 
 def _array_type(dtype: type, ndim: int):
@@ -884,6 +913,54 @@ def _shape_gather_block_quantized(op, shapes, dtypes, tensors, device, requires_
     dtypes[op.outputs[0]] = wp.float16
 
 
+def _shape_matmul_nbits(op, shapes, dtypes, tensors, device, requires_grad=False):
+    if requires_grad:
+        raise NotImplementedError("OnnxRuntime MatMulNBits: gradients are not supported")
+    bits = int(op.attrs.get("bits", 4))
+    block_size = int(op.attrs.get("block_size", 128))
+    if bits not in (4, 8) or block_size != 128 or int(op.attrs.get("accuracy_level", 0)) != 0:
+        raise NotImplementedError(
+            "OnnxRuntime MatMulNBits: only 4/8-bit blocks of 128 at accuracy level 0 are supported"
+        )
+    if len(op.inputs) != 4:
+        raise NotImplementedError("OnnxRuntime MatMulNBits: zero points are required")
+
+    activation_shape = shapes[op.inputs[0]]
+    if len(activation_shape) not in (2, 3):
+        raise NotImplementedError("OnnxRuntime MatMulNBits: only 2-D and 3-D activations are supported")
+    K = int(op.attrs.get("K", activation_shape[-1]))
+    N = int(op.attrs.get("N", shapes[op.inputs[1]][0]))
+    if activation_shape[-1] != K:
+        raise ValueError(f"OnnxRuntime MatMulNBits: activation width is {activation_shape[-1]}, expected {K}")
+
+    blocks = (K + 127) // 128
+    packed_block = 128 * bits // 8
+    expected_weight_shape = (N, blocks, packed_block)
+    expected_scale_shape = (N, blocks)
+    expected_zero_shape = (N, blocks if bits == 8 else (blocks + 1) // 2)
+    if shapes[op.inputs[1]] != expected_weight_shape:
+        raise ValueError(f"OnnxRuntime MatMulNBits: weights must have shape {expected_weight_shape}")
+    if shapes[op.inputs[2]] != expected_scale_shape or shapes[op.inputs[3]] != expected_zero_shape:
+        raise ValueError(
+            f"OnnxRuntime MatMulNBits: scales and zero points must have shapes "
+            f"{expected_scale_shape} and {expected_zero_shape}"
+        )
+    actual_dtypes = tuple(dtypes[name] for name in op.inputs)
+    if actual_dtypes != (wp.float16, wp.uint8, wp.float16, wp.uint8):
+        raise TypeError(
+            "OnnxRuntime MatMulNBits: expected float16, uint8, float16, uint8 inputs, "
+            f"got {tuple(dtype.__name__ for dtype in actual_dtypes)}"
+        )
+
+    rows = int(np.prod(activation_shape[:-1]))
+    out_shape = (*activation_shape[:-1], N)
+    tensors[op.outputs[0]] = wp.zeros(out_shape, dtype=wp.float16, device=device)
+    shapes[op.outputs[0]] = out_shape
+    dtypes[op.outputs[0]] = wp.float16
+    op.attrs["_rows"] = rows
+    op.attrs["_output_2d"] = tensors[op.outputs[0]].reshape((rows, N))
+
+
 def _shape_squeeze(op, shapes, dtypes, tensors, device, requires_grad=False):
     in_shape = shapes[op.inputs[0]]
     axes = None
@@ -1178,6 +1255,25 @@ def _exec_gather_block_quantized(op, tensors, shapes, device):
     )
 
 
+def _exec_matmul_nbits(op, tensors, shapes, device):
+    K = int(op.attrs["K"])
+    N = int(op.attrs["N"])
+    wp.launch(
+        _matmul_nbits_kernel,
+        dim=(op.attrs["_rows"], N),
+        inputs=[
+            tensors[op.inputs[0]].reshape((op.attrs["_rows"], K)),
+            tensors[op.inputs[1]],
+            tensors[op.inputs[2]],
+            tensors[op.inputs[3]],
+            op.attrs["_output_2d"],
+            K,
+            int(op.attrs["bits"]),
+        ],
+        device=device,
+    )
+
+
 def _exec_squeeze(op, tensors, shapes, device):
     src = tensors[op.inputs[0]]
     out_shape = op.attrs["_out_shape"]
@@ -1240,6 +1336,7 @@ _OP_DISPATCH: dict[str, Any] = {
     "Gemm": _exec_gemm,
     "GatherBlockQuantized": _exec_gather_block_quantized,
     "LSTM": _exec_lstm,
+    "MatMulNBits": _exec_matmul_nbits,
     "Mul": _exec_binary,
     "ReduceMean": _exec_reduce_mean,
     "Relu": _exec_unary,
@@ -1261,6 +1358,7 @@ _SHAPE_DISPATCH: dict[str, Any] = {
     "Gemm": _shape_gemm,
     "GatherBlockQuantized": _shape_gather_block_quantized,
     "LSTM": _shape_lstm,
+    "MatMulNBits": _shape_matmul_nbits,
     "Mul": _shape_elementwise_binary,
     "ReduceMean": _shape_reduce_mean,
     "Relu": _shape_elementwise_unary,

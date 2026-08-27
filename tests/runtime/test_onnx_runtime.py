@@ -713,6 +713,72 @@ def test_gather_block_quantized_int8(device):
         path.unlink(missing_ok=True)
 
 
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("device", ["cuda"])
+def test_matmul_nbits(device, bits):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    rng = np.random.default_rng(37 + bits)
+    batch, sequence, K, N = 2, 3, 256, 5
+    blocks = K // 128
+    activations = rng.standard_normal((batch, sequence, K)).astype(np.float16)
+    quantized = rng.integers(0, 1 << bits, size=(N, blocks, 128), dtype=np.uint8)
+    scales = rng.uniform(0.001, 0.02, size=(N, blocks)).astype(np.float16)
+    zero_values = rng.integers(0, 1 << bits, size=(N, blocks), dtype=np.uint8)
+    if bits == 4:
+        weights = quantized[:, :, 0::2] | (quantized[:, :, 1::2] << 4)
+        zero_points = zero_values[:, 0::2] | (zero_values[:, 1::2] << 4)
+    else:
+        weights = quantized
+        zero_points = zero_values
+
+    dequantized = (
+        (quantized.astype(np.float32) - zero_values[:, :, None].astype(np.float32))
+        * scales[:, :, None].astype(np.float32)
+    ).reshape(N, K)
+    expected = (activations.astype(np.float32) @ dequantized.T).astype(np.float16)
+    model = helper.make_model(
+        helper.make_graph(
+            [
+                helper.make_node(
+                    "MatMulNBits",
+                    ["activations", "weights", "scales", "zero_points"],
+                    ["output"],
+                    domain="com.microsoft",
+                    K=K,
+                    N=N,
+                    bits=bits,
+                    block_size=128,
+                    accuracy_level=0,
+                )
+            ],
+            "quantized_matmul",
+            [helper.make_tensor_value_info("activations", TensorProto.FLOAT16, [batch, sequence, K])],
+            [helper.make_tensor_value_info("output", TensorProto.FLOAT16, [batch, sequence, N])],
+            [
+                numpy_helper.from_array(weights, name="weights"),
+                numpy_helper.from_array(scales, name="scales"),
+                numpy_helper.from_array(zero_points, name="zero_points"),
+            ],
+        ),
+        opset_imports=[helper.make_opsetid("", 21), helper.make_opsetid("com.microsoft", 1)],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        output = OnnxRuntime(str(path), device=device)(
+            {"activations": wp.array(activations, dtype=wp.float16, device=device)}
+        )["output"]
+        np.testing.assert_allclose(output.numpy(), expected, rtol=2.0e-2, atol=2.0e-2)
+    finally:
+        path.unlink(missing_ok=True)
+
+
 @pytest.mark.parametrize("device", ["cuda"])
 def test_rejects_unsupported_ops(device):
     if not is_device_available(device):
