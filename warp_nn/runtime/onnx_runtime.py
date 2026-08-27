@@ -420,7 +420,9 @@ def _create_matmul_nbits_gemv_kernel(bits: int):
     ):
         thread = wp.tid()
         lane = thread & 31
-        column = thread / 32
+        warp = thread / 32
+        row = warp / weights.shape[0]
+        column = warp % weights.shape[0]
         total = wp.float32(0.0)
 
         for block in range(weights.shape[1]):
@@ -434,14 +436,14 @@ def _create_matmul_nbits_gemv_kernel(bits: int):
                 for value_index in range(values_per_byte):
                     quantized = (packed >> (value_index * bits)) & ((1 << bits) - 1)
                     total += (
-                        wp.float32(activations[0, activation_offset + value_index])
+                        wp.float32(activations[row, activation_offset + value_index])
                         * wp.float32(quantized - zero)
                         * scale
                     )
 
         total = _warp_sum(total)
         if lane == 0:
-            output[0, column] = wp.float16(total)
+            output[row, column] = wp.float16(total)
 
     return kernel
 
@@ -1869,12 +1871,12 @@ def _exec_matmul_nbits(op, tensors, shapes, device):
     K = int(op.attrs["K"])
     N = int(op.attrs["N"])
     bits = int(op.attrs["bits"])
-    if op.attrs["_rows"] == 1:
+    if device.is_cuda:
         wp.launch(
             _matmul_nbits_gemv_kernels[bits],
-            dim=N * 32,
+            dim=op.attrs["_rows"] * N * 32,
             inputs=[
-                tensors[op.inputs[0]].reshape((1, K)),
+                tensors[op.inputs[0]].reshape((op.attrs["_rows"], K)),
                 tensors[op.inputs[1]],
                 tensors[op.inputs[2]],
                 tensors[op.inputs[3]],
