@@ -445,7 +445,6 @@ class Qwen3OnnxRunner:
 
     def _prefill_chunked(self, token_ids: Sequence[int]) -> wp.array:
         """Prefill through bounded fixed-size chunks and return the final logits."""
-        chunk_size = self.prefill_chunk_size
         for cache in self._cache.values():
             cache.zero_()
         wp.launch(
@@ -454,14 +453,31 @@ class Qwen3OnnxRunner:
             inputs=[self._decode_attention_mask, 0],
             device=self.runtime._device,
         )
+        self.sequence_length = 0
+        return self._append(token_ids)
 
+    def append(self, token_ids: Sequence[int]) -> wp.array:
+        """Process new prompt tokens while retaining the existing KV cache."""
+        if self.sequence_length == 0:
+            raise RuntimeError("Qwen3OnnxRunner.append requires a preceding prefill call")
+        return self._append(token_ids)
+
+    def _append(self, token_ids: Sequence[int]) -> wp.array:
+        if not token_ids:
+            raise ValueError("Qwen3OnnxRunner.append requires at least one token")
+        if self.sequence_length + len(token_ids) > self.cache_capacity:
+            raise ValueError("Qwen3OnnxRunner: appended tokens exceed the KV-cache capacity")
+
+        chunk_size = self.prefill_chunk_size or len(token_ids) + 1
         full_length = len(token_ids) // chunk_size * chunk_size
         outputs = None
+        consumed = 0
         for start in range(0, full_length, chunk_size):
-            end = start + chunk_size
-            self._chunk_input_ids.assign(np.asarray(token_ids[start:end], dtype=np.int64)[None, :])
+            position = self.sequence_length
+            end = position + chunk_size
+            self._chunk_input_ids.assign(np.asarray(token_ids[start : start + chunk_size], dtype=np.int64)[None, :])
             if "position_ids" in self.runtime.input_names:
-                self._chunk_position_ids.assign(np.arange(start, end, dtype=np.int64)[None, :])
+                self._chunk_position_ids.assign(np.arange(position, end, dtype=np.int64)[None, :])
             wp.launch(
                 _initialize_attention_mask,
                 dim=self.cache_capacity,
@@ -470,9 +486,10 @@ class Qwen3OnnxRunner:
             )
             outputs = self._chunk_runtime(self._chunk_inputs)
             self.sequence_length = end
+            consumed += chunk_size
 
-        logits = outputs["logits"]
-        for token_id in token_ids[full_length:]:
+        logits = outputs["logits"] if outputs is not None else None
+        for token_id in token_ids[consumed:]:
             logits = self.decode(token_id)
         self._past = dict(self._cache)
         return logits

@@ -1769,6 +1769,9 @@ def test_qwen_stateful_prefill_and_decode(device):
         chunked_logits = chunked.prefill(prompt).numpy()
         assert chunked.sequence_length == len(prompt)
         np.testing.assert_allclose(chunked_logits[:, -1:, :], reference, rtol=1.0e-3, atol=1.0e-3)
+        chunked.prefill([0, 1])
+        appended = chunked.append([2, 3, 0]).numpy()
+        np.testing.assert_allclose(appended[:, -1:, :], reference, rtol=1.0e-3, atol=1.0e-3)
     finally:
         path.unlink(missing_ok=True)
 

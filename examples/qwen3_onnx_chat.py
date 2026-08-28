@@ -30,6 +30,7 @@ def main():
         prefill_chunk_size=args.prefill_chunk_size,
     )
     messages = [] if args.system is None else [{"role": "system", "content": args.system}]
+    cached_ids = []
 
     print("Enter /clear to forget the conversation or /exit to quit.")
     print("The first response may spend a few minutes compiling Warp kernels with no GPU activity.")
@@ -45,6 +46,7 @@ def main():
             break
         if prompt == "/clear":
             messages = [] if args.system is None else [{"role": "system", "content": args.system}]
+            cached_ids.clear()
             print("History cleared.")
             continue
 
@@ -56,7 +58,11 @@ def main():
             continue
 
         print("Qwen: ", end="", flush=True)
-        logits = runner.prefill(token_ids)
+        if cached_ids and token_ids[: len(cached_ids)] == cached_ids:
+            logits = runner.append(token_ids[len(cached_ids) :])
+        else:
+            logits = runner.prefill(token_ids)
+        cached_ids = list(token_ids)
         generated = []
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         generation_limit = min(args.max_new_tokens, args.cache_capacity - len(token_ids))
@@ -67,6 +73,7 @@ def main():
                 break
             print(decoder.decode(tokenizer.token_bytes(token_id, skip_special_tokens=True)), end="", flush=True)
             logits = runner.decode(token_id)
+            cached_ids.append(token_id)
 
         print(decoder.decode(b"", final=True))
         if not generated or generated[-1] != tokenizer.eos_token_id:
