@@ -49,6 +49,8 @@ You have access to the following functions:
 <tools>{tools}
 </tools>
 
+Use a function only when the request requires it. Answer directly for conversation, translation, or creative writing.
+
 If you choose to call a function, reply with no suffix in this format:
 
 <tool_call>
@@ -65,6 +67,8 @@ applies, answer normally."""
 _JSON_TOOL_PROMPT = """# Tools
 
 You may call one or more functions to assist with the user query.
+
+Use a function only when the request requires it. Answer directly for conversation, translation, or creative writing.
 
 You are provided with function signatures within <tools></tools> XML tags:
 <tools>{tools}

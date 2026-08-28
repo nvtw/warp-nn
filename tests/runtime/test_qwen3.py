@@ -160,6 +160,12 @@ def test_console_generation_streams_text_and_hides_tool_markup(capsys):
     assert text == "Checking."
     assert calls == [{"name": "read_file", "arguments": {"path": "README.md"}}]
 
+    cached_ids = []
+    generated, text, calls = _generate(
+        Runner(), Tokenizer(), 1, 4, 0.0, cached_ids, "<tool_call>", cancelled=lambda: True
+    )
+    assert (generated, text, calls, cached_ids) == ([], "", [], [])
+
 
 def test_qwen3_json_tool_dialect(tmp_path):
     path = tmp_path / "tokenizer.json"

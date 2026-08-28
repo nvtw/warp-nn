@@ -9,7 +9,9 @@ import fnmatch
 import os
 import shutil
 import subprocess
-from collections.abc import Iterator, Mapping
+import threading
+import time
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 
 from warp_nn.runtime.sandbox import is_sandbox_available, run_sandboxed
@@ -17,6 +19,7 @@ from warp_nn.runtime.sandbox import is_sandbox_available, run_sandboxed
 
 _SKIP_DIRECTORIES = {".git", ".hg", ".svn", ".venv", "__pycache__", "node_modules"}
 _MAX_OUTPUT = 64 * 1024
+_SEARCH_TIMEOUT = 30.0
 
 
 def _schema(name, description, properties, required=()):
@@ -109,7 +112,9 @@ class CodingTools:
         self.schemas = FILE_TOOL_SCHEMAS + ((COMMAND_TOOL_SCHEMA,) if self.shell_available else ())
         self._rg = shutil.which("rg")
 
-    def execute(self, name: str, arguments: Mapping[str, object]) -> str:
+    def execute(
+        self, name: str, arguments: Mapping[str, object], cancelled: Callable[[], bool] | None = None
+    ) -> str:
         """Run a named tool and return a bounded text result."""
         methods = {
             "read_file": self._read,
@@ -124,7 +129,10 @@ class CodingTools:
             method = methods.get(name)
             if method is None:
                 raise ValueError(f"unknown tool {name!r}")
-            return method(**arguments)[:_MAX_OUTPUT]
+            keywords = dict(arguments)
+            if name == "search_files":
+                keywords["_cancelled"] = cancelled
+            return method(**keywords)[:_MAX_OUTPUT]
         except Exception as error:
             return f"Error: {error}"
 
@@ -180,16 +188,21 @@ class CodingTools:
                     break
         return "\n".join(sorted(items)) or "(no matches)"
 
-    def _search(self, query, path=".", pattern="*", case_sensitive=False, max_results=100):
+    def _search(self, query, path=".", pattern="*", case_sensitive=False, max_results=100, _cancelled=None):
         if not isinstance(query, str) or not query:
             raise ValueError("query must be a non-empty string")
         path = self._path(path)
         limit = min(1000, max(1, int(max_results)))
         if self._rg:
-            return self._search_rg(query, path, str(pattern), bool(case_sensitive), limit)
+            return self._search_rg(query, path, str(pattern), bool(case_sensitive), limit, _cancelled)
         needle = query if case_sensitive else query.casefold()
         matches = []
+        deadline = time.monotonic() + _SEARCH_TIMEOUT
         for file in self._walk(path):
+            if _cancelled and _cancelled():
+                raise RuntimeError("search cancelled")
+            if time.monotonic() >= deadline:
+                raise RuntimeError("search timed out")
             relative = file.relative_to(self.root).as_posix()
             if not (fnmatch.fnmatch(relative, str(pattern)) or fnmatch.fnmatch(file.name, str(pattern))):
                 continue
@@ -205,12 +218,30 @@ class CodingTools:
                 continue
         return "\n".join(matches) or "(no matches)"
 
-    def _search_rg(self, query: str, path: Path, pattern: str, case_sensitive: bool, limit: int):
+    def _search_rg(self, query: str, path: Path, pattern: str, case_sensitive: bool, limit: int, cancelled):
         command = [self._rg, "--line-number", "--no-heading", "--color=never", "--fixed-strings", "--glob", pattern]
         if not case_sensitive:
             command.append("--ignore-case")
         command.extend(["--", query, str(path)])
         process = subprocess.Popen(command, cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        done = threading.Event()
+        stopped = threading.Event()
+        timed_out = threading.Event()
+
+        def watch():
+            deadline = time.monotonic() + _SEARCH_TIMEOUT
+            while not done.wait(0.05):
+                if cancelled and cancelled():
+                    stopped.set()
+                    process.terminate()
+                    return
+                if time.monotonic() >= deadline:
+                    timed_out.set()
+                    process.terminate()
+                    return
+
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
         lines = []
         try:
             for line in process.stdout:
@@ -219,7 +250,13 @@ class CodingTools:
                     process.terminate()
                     break
         finally:
+            done.set()
             process.wait()
+            watcher.join()
+        if stopped.is_set():
+            raise RuntimeError("search cancelled")
+        if timed_out.is_set():
+            raise RuntimeError("search timed out")
         if not lines and process.returncode not in (0, 1):
             raise RuntimeError(process.stderr.read().strip() or "rg failed")
         return "\n".join(lines) or "(no matches)"

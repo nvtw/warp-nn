@@ -24,6 +24,14 @@ def test_coding_tools_reject_paths_outside_trusted_folder(tmp_path):
     assert tools.execute("read_file", {"path": "../outside.txt"}).startswith("Error: path is outside")
 
 
+def test_coding_tools_cancel_search(tmp_path):
+    tools = CodingTools(tmp_path)
+    tools._rg = None
+    (tmp_path / "text.txt").write_text("text", encoding="utf-8")
+    result = tools.execute("search_files", {"query": "text"}, cancelled=lambda: True)
+    assert result == "Error: search cancelled"
+
+
 def test_coding_tools_run_command(tmp_path):
     result = CodingTools(tmp_path, shell="unsafe").execute("run_command", {"command": "echo hello"})
     assert result.startswith("Exit code: 0")

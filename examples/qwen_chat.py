@@ -6,13 +6,65 @@
 import argparse
 import codecs
 import json
+import os
 from pathlib import Path
+import sys
+import threading
 
 import numpy as np
 
 from warp_nn.runtime import Qwen3OnnxRunner, Qwen3Tokenizer, Qwen35Runner, sample_token
 from warp_nn.runtime.chat import split_tool_prefix
 from warp_nn.runtime.coding_tools import CodingTools
+
+
+class _EscapeMonitor:
+    """Watch Esc without blocking model generation or tool execution."""
+
+    def __init__(self):
+        self.cancelled = threading.Event()
+        self._done = threading.Event()
+        self._terminal_state = None
+        self._thread = None
+
+    def __enter__(self):
+        if not sys.stdin.isatty():
+            return self
+        if os.name != "nt":
+            import termios
+            import tty
+
+            self._terminal_state = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+        self._thread = threading.Thread(target=self._watch, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self._done.set()
+        if self._thread:
+            self._thread.join(0.2)
+        if self._terminal_state is not None:
+            import termios
+
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._terminal_state)
+
+    def _watch(self):
+        if os.name == "nt":
+            import msvcrt
+
+            while not self._done.wait(0.05):
+                if msvcrt.kbhit() and msvcrt.getwch() == "\x1b":
+                    self.cancelled.set()
+                    return
+        else:
+            import select
+
+            while not self._done.is_set():
+                readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+                if readable and sys.stdin.read(1) == "\x1b":
+                    self.cancelled.set()
+                    return
 
 
 def _generate(
@@ -27,12 +79,15 @@ def _generate(
     top_k=0,
     presence_penalty=0.0,
     rng=None,
+    cancelled=None,
 ):
     generated = []
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     pending = ""
     tool_started = False
     for _ in range(limit):
+        if cancelled and cancelled():
+            break
         token_id = (
             runner.sample_greedy(logits)
             if temperature <= 0.0
@@ -120,7 +175,10 @@ def main():
     )
     system = args.system
     if args.coding_agent and system is None:
-        system = "You are a coding agent. Inspect relevant files, make focused changes, and verify your work."
+        system = (
+            "You are a coding agent. Use tools only when a request requires inspecting or changing the trusted "
+            "workspace. Never use tools for conversation, general knowledge, translation, or creative writing."
+        )
     messages = [] if system is None else [{"role": "system", "content": system}]
     cached_ids = []
     if args.unsafe_shell and not args.coding_agent:
@@ -129,6 +187,7 @@ def main():
     coding_tools = CodingTools(args.trusted_folder, shell=shell) if args.coding_agent else None
 
     print("Enter /clear to forget the conversation or /exit to quit.")
+    print("Press Esc to stop a response and return to user input.")
     print("The first response may spend a few minutes compiling Warp kernels with no GPU activity.")
     if coding_tools:
         print(f"Coding tools confined to trusted folder {coding_tools.root}.")
@@ -153,60 +212,84 @@ def main():
             continue
 
         messages.append({"role": "user", "content": prompt})
-        for tool_round in range(8):
-            token_ids = tokenizer.encode_chat(
-                messages,
-                enable_thinking=args.thinking,
-                tools=coding_tools.schemas if coding_tools else None,
-            )
-            if len(token_ids) >= args.cache_capacity:
-                if tool_round == 0:
-                    messages.pop()
-                print("The conversation no longer fits in the KV cache; use /clear or a larger --cache-capacity.")
-                break
-            print("Qwen: ", end="", flush=True)
-            if cached_ids and token_ids[: len(cached_ids)] == cached_ids:
-                logits = runner.append(token_ids[len(cached_ids) :])
-            else:
-                logits = runner.prefill(token_ids)
-            cached_ids = list(token_ids)
-            generation_limit = min(args.max_new_tokens, args.cache_capacity - len(token_ids))
-            generated, response, calls = _generate(
-                runner,
-                tokenizer,
-                logits,
-                generation_limit,
-                temperature,
-                cached_ids,
-                tool_marker=tokenizer.tool_call_start if coding_tools else None,
-                top_p=top_p,
-                top_k=args.top_k,
-                presence_penalty=args.presence_penalty,
-                rng=rng,
-            )
-            print()
-            if not generated or generated[-1] != tokenizer.eos_token_id:
-                print(f"[Stopped at the {generation_limit}-token limit; use --max-new-tokens or /clear.]")
-            if not calls:
-                history_response = tokenizer.generation_prefix(args.thinking) + response
-                messages.append({"role": "assistant", "content": history_response})
-                break
-            tool_calls = []
-            for index, call in enumerate(calls):
-                call_id = f"call_{tool_round}_{index}"
-                arguments = json.dumps(call["arguments"], ensure_ascii=False, separators=(",", ":"))
-                tool_calls.append(
-                    {"id": call_id, "type": "function", "function": {"name": call["name"], "arguments": arguments}}
+        with _EscapeMonitor() as cancel:
+            for tool_round in range(8):
+                token_ids = tokenizer.encode_chat(
+                    messages,
+                    enable_thinking=args.thinking,
+                    tools=coding_tools.schemas if coding_tools else None,
                 )
-            history_response = tokenizer.generation_prefix(args.thinking) + response
-            messages.append({"role": "assistant", "content": history_response, "tool_calls": tool_calls})
-            for call, tool_call in zip(calls, tool_calls):
-                print(f"[tool] {call['name']}({json.dumps(call['arguments'], ensure_ascii=False)})")
-                result = coding_tools.execute(call["name"], call["arguments"])
-                _show_tool_result(result)
-                messages.append({"role": "tool", "tool_call_id": tool_call["id"], "content": result})
-            if tool_round == 7:
-                print("[Stopped after 8 tool rounds.]")
+                if len(token_ids) >= args.cache_capacity:
+                    if tool_round == 0:
+                        messages.pop()
+                    print("The conversation no longer fits in the KV cache; use /clear or a larger --cache-capacity.")
+                    break
+                print("Qwen: ", end="", flush=True)
+                if cached_ids and token_ids[: len(cached_ids)] == cached_ids:
+                    logits = runner.append(token_ids[len(cached_ids) :])
+                else:
+                    logits = runner.prefill(token_ids)
+                cached_ids = list(token_ids)
+                generation_limit = min(args.max_new_tokens, args.cache_capacity - len(token_ids))
+                generated, response, calls = _generate(
+                    runner,
+                    tokenizer,
+                    logits,
+                    generation_limit,
+                    temperature,
+                    cached_ids,
+                    tool_marker=tokenizer.tool_call_start if coding_tools else None,
+                    top_p=top_p,
+                    top_k=args.top_k,
+                    presence_penalty=args.presence_penalty,
+                    rng=rng,
+                    cancelled=cancel.cancelled.is_set,
+                )
+                print()
+                if cancel.cancelled.is_set():
+                    messages.append(
+                        {"role": "assistant", "content": tokenizer.generation_prefix(args.thinking) + response}
+                    )
+                    print("[Cancelled.]")
+                    break
+                if not generated or generated[-1] != tokenizer.eos_token_id:
+                    print(f"[Stopped at the {generation_limit}-token limit; use --max-new-tokens or /clear.]")
+                if not calls:
+                    history_response = tokenizer.generation_prefix(args.thinking) + response
+                    messages.append({"role": "assistant", "content": history_response})
+                    break
+                tool_calls = []
+                for index, call in enumerate(calls):
+                    call_id = f"call_{tool_round}_{index}"
+                    arguments = json.dumps(call["arguments"], ensure_ascii=False, separators=(",", ":"))
+                    tool_calls.append(
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": call["name"], "arguments": arguments},
+                        }
+                    )
+                history_response = tokenizer.generation_prefix(args.thinking) + response
+                assistant_index = len(messages)
+                messages.append({"role": "assistant", "content": history_response, "tool_calls": tool_calls})
+                for call, tool_call in zip(calls, tool_calls):
+                    print(f"[tool] {call['name']}({json.dumps(call['arguments'], ensure_ascii=False)})")
+                    result = coding_tools.execute(
+                        call["name"], call["arguments"], cancelled=cancel.cancelled.is_set
+                    )
+                    if cancel.cancelled.is_set():
+                        del messages[assistant_index:]
+                        if response:
+                            messages.append({"role": "assistant", "content": history_response})
+                        cached_ids.clear()
+                        print("[Cancelled.]")
+                        break
+                    _show_tool_result(result)
+                    messages.append({"role": "tool", "tool_call_id": tool_call["id"], "content": result})
+                if cancel.cancelled.is_set():
+                    break
+                if tool_round == 7:
+                    print("[Stopped after 8 tool rounds.]")
 
 
 if __name__ == "__main__":
