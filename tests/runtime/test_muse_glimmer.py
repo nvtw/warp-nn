@@ -206,6 +206,34 @@ def test_muse_tokenizer_chat_and_atem_tools(tmp_path):
     assert "".join(stream.feed(piece) for piece in pieces) + stream.feed("", final=True) == "Answer"
 
 
+def test_muse_yarn_context_extension_is_explicit(tmp_path):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    model_path = tmp_path / "tiny-muse-yarn"
+    _write_tiny_muse(model_path)
+    with pytest.raises(ValueError, match="enable YaRN"):
+        MuseGlimmerRunner(
+            model_path,
+            device="cuda:0",
+            cache_capacity=17,
+            prefill_chunk_size=4,
+            use_cublas=False,
+        )
+    runner = MuseGlimmerRunner(
+        model_path,
+        device="cuda:0",
+        cache_capacity=20,
+        prefill_chunk_size=4,
+        use_cublas=False,
+        rope_scaling={"rope_type": "yarn", "factor": 2.0},
+    )
+    assert runner.rope_parameters["original_max_position_embeddings"] == 16
+    assert runner.cos_cache.shape == (20, 2)
+    logits = runner.prefill([1, 2] * 9).numpy()
+    assert logits.shape[-1] == 16
+    assert np.isfinite(logits).all()
+
+
 @pytest.mark.parametrize("use_cublas", [False, True])
 def test_muse_glimmer_prefill_decode_ring_cache_and_graph_replay(tmp_path, use_cublas):
     if not is_device_available("cuda:0"):

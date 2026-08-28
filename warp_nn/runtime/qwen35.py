@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Mapping, Sequence
 
 import json
 from pathlib import Path
@@ -53,6 +53,7 @@ from warp_nn.runtime.operators import (
     plan_swiglu,
 )
 from warp_nn.runtime.safetensors import SafeTensorArchive
+from warp_nn.runtime.rope import resolve_rope_parameters, rotary_cache_values
 from warp_nn.utils.device import parse_device
 
 
@@ -792,6 +793,7 @@ class Qwen35Runner:
         cache_capacity: int = 4096,
         prefill_chunk_size: int = 16,
         use_cublas: bool = True,
+        rope_scaling: Mapping[str, object] | None = None,
     ):
         path = Path(path)
         directory = path if path.is_dir() else path.parent
@@ -809,8 +811,14 @@ class Qwen35Runner:
         _validate_config(self.config)
         self.device = parse_device(device)
         self.cache_capacity = int(cache_capacity)
-        if not 0 < self.cache_capacity <= int(self.config["max_position_embeddings"]):
-            raise ValueError("cache_capacity must be within max_position_embeddings")
+        if self.cache_capacity <= 0:
+            raise ValueError("cache_capacity must be positive")
+        self.rope_parameters = resolve_rope_parameters(
+            self.config["rope_parameters"],
+            rope_scaling,
+            int(self.config["max_position_embeddings"]),
+            self.cache_capacity,
+        )
         if prefill_chunk_size < 2 or prefill_chunk_size > self.cache_capacity:
             raise ValueError("prefill_chunk_size must be between 2 and cache_capacity")
         self.prefill_chunk_size = int(prefill_chunk_size)
@@ -823,7 +831,7 @@ class Qwen35Runner:
         self.linear_key_size = int(self.config["linear_key_head_dim"])
         self.linear_value_size = int(self.config["linear_value_head_dim"])
         self.epsilon = float(self.config["rms_norm_eps"])
-        rope = self.config["rope_parameters"]
+        rope = self.rope_parameters
         self.rotary_dim = int(
             self.head_size * float(rope.get("partial_rotary_factor", 1.0))
         )
@@ -849,6 +857,7 @@ class Qwen35Runner:
         required_bytes += (
             full_layers * 2 * self.kv_heads * self.cache_capacity * self.head_size * 2
         )
+        required_bytes += self.cache_capacity * self.rotary_dim * 4
         if self.device.is_cuda and required_bytes > self.device.free_memory * 0.95:
             raise MemoryError(
                 f"Qwen 3.5 needs at least {required_bytes / 2**30:.1f} GiB for selected weights and KV cache; "
@@ -905,14 +914,11 @@ class Qwen35Runner:
                     wp.empty(shape, dtype=self.dtype, device=self.device),
                     wp.empty(shape, dtype=self.dtype, device=self.device),
                 )
-        positions = np.arange(self.cache_capacity, dtype=np.float32)[:, None]
-        frequencies = 1.0 / (
-            float(rope.get("rope_theta", 10000.0))
-            ** (np.arange(0, self.rotary_dim, 2, dtype=np.float32) / self.rotary_dim)
+        cos_cache, sin_cache = rotary_cache_values(
+            self.cache_capacity, self.rotary_dim, self.rope_parameters
         )
-        angles = positions * frequencies[None, :]
-        self.cos_cache = wp.array(np.cos(angles), dtype=self.dtype, device=self.device)
-        self.sin_cache = wp.array(np.sin(angles), dtype=self.dtype, device=self.device)
+        self.cos_cache = wp.array(cos_cache, dtype=self.dtype, device=self.device)
+        self.sin_cache = wp.array(sin_cache, dtype=self.dtype, device=self.device)
         self._decode_plan = _Qwen35Plan(self, 1)
         self._chunk_plan = _Qwen35Plan(self, self.prefill_chunk_size)
         self._sample_partial_values = wp.empty(

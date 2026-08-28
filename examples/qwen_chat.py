@@ -145,6 +145,8 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--cache-capacity", type=int, default=1024)
     parser.add_argument("--prefill-chunk-size", type=int, default=16)
+    parser.add_argument("--yarn", action="store_true", help="Explicitly extend RoPE to cache capacity with YaRN")
+    parser.add_argument("--yarn-factor", type=float, help="Optional YaRN extension factor")
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--top-p", type=float)
     parser.add_argument("--top-k", type=int, default=20)
@@ -171,17 +173,26 @@ def main():
         parser.error("invalid sampling parameters")
     if not -2.0 <= presence_penalty <= 2.0:
         parser.error("--presence-penalty must be between -2 and 2")
+    if args.yarn_factor is not None and (not args.yarn or args.yarn_factor < 1.0):
+        parser.error("--yarn-factor requires --yarn and must be at least 1")
     if args.reasoning_effort and not thinking:
         parser.error("--reasoning-effort requires thinking mode")
     if args.reasoning_effort and not tokenizer.supports_reasoning_effort:
         parser.error("this model's chat template does not support --reasoning-effort")
     rng = np.random.default_rng(args.seed)
 
+    rope_scaling = None
+    if args.yarn:
+        rope_scaling = {"rope_type": "yarn"}
+        if args.yarn_factor is not None:
+            rope_scaling["factor"] = args.yarn_factor
+    runner_options = {"rope_scaling": rope_scaling} if rope_scaling else {}
     runner = create_text_runner(
         args.model_dir,
         device=args.device,
         cache_capacity=args.cache_capacity,
         prefill_chunk_size=args.prefill_chunk_size,
+        **runner_options,
     )
     system = args.system
     if args.coding_agent and system is None:

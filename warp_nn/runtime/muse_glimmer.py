@@ -11,7 +11,6 @@ import json
 from pathlib import Path
 import re
 
-import numpy as np
 import warp as wp
 
 from warp_nn.runtime._cublas import try_create_cublas
@@ -43,6 +42,7 @@ from warp_nn.runtime.operators import (
 from warp_nn.runtime.qwen35 import Qwen35Runner
 from warp_nn.runtime.qwen3 import Qwen3Tokenizer, _pretokenize_o200k
 from warp_nn.runtime.safetensors import SafeTensorArchive
+from warp_nn.runtime.rope import resolve_rope_parameters, rotary_cache_values
 from warp_nn.utils.device import parse_device
 
 
@@ -988,6 +988,7 @@ class MuseGlimmerRunner(Qwen35Runner):
         cache_capacity: int = 4096,
         prefill_chunk_size: int = 16,
         use_cublas: bool = True,
+        rope_scaling: Mapping[str, object] | None = None,
     ):
         path = Path(path)
         directory = path if path.is_dir() else path.parent
@@ -1007,8 +1008,14 @@ class MuseGlimmerRunner(Qwen35Runner):
         _validate_config(self.config)
         self.device = parse_device(device)
         self.cache_capacity = int(cache_capacity)
-        if not 0 < self.cache_capacity <= int(self.config["max_position_embeddings"]):
-            raise ValueError("cache_capacity must be within max_position_embeddings")
+        if self.cache_capacity <= 0:
+            raise ValueError("cache_capacity must be positive")
+        self.rope_parameters = resolve_rope_parameters(
+            self.config.get("rope_parameters", {}),
+            rope_scaling,
+            int(self.config["max_position_embeddings"]),
+            self.cache_capacity,
+        )
         if not 2 <= prefill_chunk_size <= self.cache_capacity:
             raise ValueError("prefill_chunk_size must be between 2 and cache_capacity")
         self.prefill_chunk_size = int(prefill_chunk_size)
@@ -1051,6 +1058,7 @@ class MuseGlimmerRunner(Qwen35Runner):
                 else self.cache_capacity
             )
             required_bytes += 2 * self.kv_heads * capacity * self.head_dim * 2
+        required_bytes += self.cache_capacity * self.head_dim * 4
         if self.device.is_cuda and required_bytes > self.device.free_memory * 0.95:
             raise MemoryError(
                 f"Muse Glimmer needs at least {required_bytes / 2**30:.1f} GiB for text weights and KV cache; "
@@ -1084,16 +1092,11 @@ class MuseGlimmerRunner(Qwen35Runner):
                 wp.empty(shape, dtype=self.dtype, device=self.device),
                 wp.empty(shape, dtype=self.dtype, device=self.device),
             )
-        positions = np.arange(self.cache_capacity, dtype=np.float32)[:, None]
-        theta = float(
-            self.config.get("rope_parameters", {}).get("rope_theta", 500000.0)
+        cos_cache, sin_cache = rotary_cache_values(
+            self.cache_capacity, self.head_dim, self.rope_parameters
         )
-        frequencies = 1.0 / (
-            theta ** (np.arange(0, self.head_dim, 2, dtype=np.float32) / self.head_dim)
-        )
-        angles = positions * frequencies[None, :]
-        self.cos_cache = wp.array(np.cos(angles), dtype=self.dtype, device=self.device)
-        self.sin_cache = wp.array(np.sin(angles), dtype=self.dtype, device=self.device)
+        self.cos_cache = wp.array(cos_cache, dtype=self.dtype, device=self.device)
+        self.sin_cache = wp.array(sin_cache, dtype=self.dtype, device=self.device)
         self._decode_plan = _MusePlan(self, 1)
         self._chunk_plan = _MusePlan(self, self.prefill_chunk_size)
         self._sample_partial_values = wp.empty(
