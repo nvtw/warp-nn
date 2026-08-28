@@ -99,8 +99,6 @@ from warp_nn.runtime.kernels import (
     _get_matmul_int8_q8_kernel,
     _get_matmul_nbits_kernel,
     _get_reduce_sum_rows_kernel,
-    _get_rms_norm_kernels,
-    _get_swiglu_kernel,
     _kernel_for_dtype,
     _lstm_cell_update_kernel,
     _lstm_gates_kernel,
@@ -115,7 +113,14 @@ from warp_nn.runtime.kernels import (
     _unary_kernel,
     _where_kernel_for_dtype,
 )
-from warp_nn.runtime.operators import _OP_DISPATCH, Operation, execute_operations
+from warp_nn.runtime.operators import (
+    _OP_DISPATCH,
+    Operation,
+    execute_operations,
+    plan_residual_rms_norm,
+    plan_rms_norm,
+    plan_swiglu,
+)
 from warp_nn.utils.device import parse_device
 
 
@@ -1404,14 +1409,8 @@ def _shape_simplified_layer_normalization(op, shapes, dtypes, tensors, device, r
     dtype = _require_matching_float_dtypes(op, dtypes, op.inputs)
     if dtype not in (wp.float16, wp.bfloat16) or shapes[op.inputs[1]] != (width,):
         raise ValueError("OnnxRuntime SimplifiedLayerNormalization: expected matching FP16/BF16 input and scale")
-    rows = int(np.prod(shape[:-1]))
-    tensors[op.outputs[0]] = wp.zeros(shape, dtype=dtype, device=device)
-    shapes[op.outputs[0]] = shape
+    plan_rms_norm(op, tensors, shapes, device, dtype=dtype)
     dtypes[op.outputs[0]] = dtype
-    op.attrs["_rows"] = rows
-    op.attrs["_width"] = width
-    op.attrs["_output_2d"] = tensors[op.outputs[0]].reshape((rows, width))
-    op.attrs["_tile_width"], op.attrs["_rms_norm_kernels"] = _get_rms_norm_kernels(width, dtype)
 
 
 def _shape_skip_simplified_layer_normalization(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -1429,22 +1428,10 @@ def _shape_skip_simplified_layer_normalization(op, shapes, dtypes, tensors, devi
     if any(output for output in op.outputs[1:3]):
         raise NotImplementedError("OnnxRuntime SkipSimplifiedLayerNormalization: statistics outputs are not supported")
 
-    rows = int(np.prod(shape[:-1]))
-    tensors[op.outputs[0]] = wp.zeros(shape, dtype=dtype, device=device)
-    shapes[op.outputs[0]] = shape
+    plan_residual_rms_norm(op, tensors, shapes, device, dtype=dtype)
     dtypes[op.outputs[0]] = dtype
     if len(op.outputs) > 3 and op.outputs[3]:
-        residual = wp.zeros(shape, dtype=dtype, device=device)
-        tensors[op.outputs[3]] = residual
-        shapes[op.outputs[3]] = shape
         dtypes[op.outputs[3]] = dtype
-    else:
-        residual = wp.zeros(shape, dtype=dtype, device=device)
-    op.attrs["_rows"] = rows
-    op.attrs["_width"] = width
-    op.attrs["_output_2d"] = tensors[op.outputs[0]].reshape((rows, width))
-    op.attrs["_residual_2d"] = residual.reshape((rows, width))
-    op.attrs["_tile_width"], op.attrs["_rms_norm_kernels"] = _get_rms_norm_kernels(width, dtype)
 
 
 def _shape_swiglu(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -1454,12 +1441,8 @@ def _shape_swiglu(op, shapes, dtypes, tensors, device, requires_grad=False):
     dtype = _require_matching_float_dtypes(op, dtypes, op.inputs)
     if dtype not in (wp.float16, wp.bfloat16):
         raise TypeError("OnnxRuntime fused SwiGLU requires FP16/BF16 inputs")
-    tensors[op.outputs[0]] = wp.zeros(shape, dtype=dtype, device=device)
-    shapes[op.outputs[0]] = shape
+    plan_swiglu(op, tensors, shapes, device, dtype=dtype)
     dtypes[op.outputs[0]] = dtype
-    op.attrs["_shape_2d"] = (int(np.prod(shape[:-1])), shape[-1])
-    op.attrs["_output_2d"] = tensors[op.outputs[0]].reshape(op.attrs["_shape_2d"])
-    op.attrs["_kernel"] = _get_swiglu_kernel(dtype)
 
 
 def _shape_group_query_attention(op, shapes, dtypes, tensors, device, requires_grad=False):

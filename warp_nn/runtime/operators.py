@@ -18,6 +18,8 @@ from warp_nn.runtime.kernels import (
     _gather_block_quantized_int8_kernel,
     _get_linear_tiled_kernel,
     _get_linear_vector_kernel,
+    _get_rms_norm_kernels,
+    _get_swiglu_kernel,
     _gqa_copy_past_fp16_kernel,
     _gqa_prepare_fp16_kernel,
     _linear_kernel,
@@ -107,6 +109,59 @@ def plan_linear(op: Operation, tensors: dict[str, wp.array], shapes: dict[str, t
             op.attrs["_vector_kernel"] = True
         else:
             op.attrs["_kernel"], op.attrs["_tile_shape"] = _get_linear_tiled_kernel(dtype, rows)
+
+
+def _plan_rms_norm_buffers(op, x_name, scale_name, tensors, shapes, device, dtype):
+    shape = shapes[x_name]
+    rows, width = int(np.prod(shape[:-1])), shape[-1]
+    dtype = dtype or tensors[x_name].dtype
+    if dtype not in (wp.float16, wp.bfloat16) or tensors[scale_name].dtype != dtype or shapes[scale_name] != (width,):
+        raise ValueError("RMSNorm requires a matching width-sized scale")
+    output = wp.empty(shape, dtype=dtype, device=device)
+    tensors[op.outputs[0]] = output
+    shapes[op.outputs[0]] = shape
+    op.attrs.update({"_rows": rows, "_width": width, "_output_2d": output.reshape((rows, width))})
+    op.attrs["_tile_width"], op.attrs["_rms_norm_kernels"] = _get_rms_norm_kernels(width, dtype)
+
+
+def plan_rms_norm(op: Operation, tensors: dict[str, wp.array], shapes: dict[str, tuple[int, ...]], device, dtype=None):
+    """Allocate and specialize last-axis RMS normalization."""
+    _plan_rms_norm_buffers(op, op.inputs[0], op.inputs[1], tensors, shapes, device, dtype)
+
+
+def plan_residual_rms_norm(
+    op: Operation, tensors: dict[str, wp.array], shapes: dict[str, tuple[int, ...]], device, dtype=None
+):
+    """Allocate and specialize fused residual addition and RMSNorm."""
+    shape = shapes[op.inputs[0]]
+    if shapes[op.inputs[1]] != shape or (
+        op.inputs[0] in tensors
+        and op.inputs[1] in tensors
+        and tensors[op.inputs[1]].dtype != tensors[op.inputs[0]].dtype
+    ):
+        raise ValueError("ResidualRMSNorm requires matching activation shapes")
+    _plan_rms_norm_buffers(op, op.inputs[0], op.inputs[2], tensors, shapes, device, dtype)
+    residual = wp.empty(shape, dtype=dtype or tensors[op.inputs[0]].dtype, device=device)
+    if len(op.outputs) > 3 and op.outputs[3]:
+        tensors[op.outputs[3]] = residual
+        shapes[op.outputs[3]] = shape
+    op.attrs["_residual_2d"] = residual.reshape((op.attrs["_rows"], op.attrs["_width"]))
+
+
+def plan_swiglu(op: Operation, tensors: dict[str, wp.array], shapes: dict[str, tuple[int, ...]], device, dtype=None):
+    """Allocate and specialize fused SiLU-gate multiplication."""
+    shape = shapes[op.inputs[0]]
+    if shapes[op.inputs[1]] != shape:
+        raise ValueError("SwiGLU requires matching activation shapes")
+    dtype = dtype or tensors[op.inputs[0]].dtype
+    if (op.inputs[1] in tensors and tensors[op.inputs[1]].dtype != dtype) or dtype not in (wp.float16, wp.bfloat16):
+        raise TypeError("SwiGLU requires matching FP16 or BF16 inputs")
+    output = wp.empty(shape, dtype=dtype, device=device)
+    tensors[op.outputs[0]] = output
+    shapes[op.outputs[0]] = shape
+    op.attrs["_shape_2d"] = (int(np.prod(shape[:-1])), shape[-1])
+    op.attrs["_output_2d"] = output.reshape(op.attrs["_shape_2d"])
+    op.attrs["_kernel"] = _get_swiglu_kernel(dtype)
 
 
 def _exec_gemm(op, tensors, shapes, device):
