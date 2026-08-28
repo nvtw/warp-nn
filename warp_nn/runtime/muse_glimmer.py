@@ -61,9 +61,7 @@ def _gguf_config(metadata: Mapping[str, object]) -> dict:
     layers = int(metadata[prefix + "block_count"])
     pattern = int(metadata[prefix + "attention.sliding_window_pattern"])
     rope_theta = float(metadata[prefix + "rope.freq_base"])
-    layer_types = [
-        "full_attention" if (index + 1) % pattern == 0 else "sliding_attention" for index in range(layers)
-    ]
+    layer_types = ["full_attention" if (index + 1) % pattern == 0 else "sliding_attention" for index in range(layers)]
     return {
         "model_type": "muse_glimmer_text",
         "hidden_size": int(metadata[prefix + "embedding_length"]),
@@ -219,8 +217,7 @@ def _atem_tool_definitions(tools: Sequence[Mapping[str, object]]) -> str:
         "In this environment you have access to a set of tools you can use to answer the user's question.\n\n"
         'Invoke a function with <atem:function_calls><atem:invoke name="$FUNCTION_NAME"> and one '
         '<atem:parameter name="$PARAMETER_NAME">value</atem:parameter> per argument. Lists and objects use JSON.\n\n'
-        "// Function schemas\n"
-        + "\n".join(schemas)
+        "// Function schemas\n" + "\n".join(schemas)
     )
 
 
@@ -336,9 +333,7 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
     def _reasoning_strength(enable_thinking: bool, reasoning_effort: str | None) -> str:
         if not enable_thinking:
             return "low"
-        return {None: "high", "xhigh": "high", "medium": "medium", "low": "low"}.get(
-            reasoning_effort, reasoning_effort
-        )
+        return {None: "high", "xhigh": "high", "medium": "medium", "low": "low"}.get(reasoning_effort, reasoning_effort)
 
     @staticmethod
     def _tool_call_text(call: Mapping[str, object]) -> str:
@@ -416,9 +411,7 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
                 if calls:
                     for call in calls:
                         name = call.get("function", call)["name"]
-                        output.append(
-                            f"<|start|>assistant to={name}<|message|>{self._tool_call_text(call)}<|eot|>"
-                        )
+                        output.append(f"<|start|>assistant to={name}<|message|>{self._tool_call_text(call)}<|eot|>")
                 else:
                     output.append(f"<|start|>assistant to=user<|message|>{content}<|eot|>")
             elif role == "tool":
@@ -512,9 +505,7 @@ class _MusePlan:
 
     def _build(self) -> None:
         hidden = "hidden.0"
-        self.embedding_norm = self._rms(
-            "embedding.normalized", hidden, "__unit_hidden", self.runner.rms_epsilon
-        )
+        self.embedding_norm = self._rms("embedding.normalized", hidden, "__unit_hidden", self.runner.rms_epsilon)
         hidden = self.embedding_norm.outputs[0]
         for index in range(self.runner.num_layers):
             prefix = f"model.language_model.layers.{index}."
@@ -590,12 +581,8 @@ class _MusePlan:
         layer["v"] = wp.empty(kv_shape, dtype=self.dtype, device=self.device)
         self._register(f"layer.{index}.q", layer["q"])
         self._register(f"layer.{index}.k", layer["k"])
-        layer["q_norm"] = self._rms(
-            f"layer.{index}.q_norm", f"layer.{index}.q", "__unit_head", self.runner.rms_epsilon
-        )
-        layer["k_norm"] = self._rms(
-            f"layer.{index}.k_norm", f"layer.{index}.k", "__unit_head", self.runner.rms_epsilon
-        )
+        layer["q_norm"] = self._rms(f"layer.{index}.q_norm", f"layer.{index}.q", "__unit_head", self.runner.rms_epsilon)
+        layer["k_norm"] = self._rms(f"layer.{index}.k_norm", f"layer.{index}.k", "__unit_head", self.runner.rms_epsilon)
         if layer["local"]:
             layer["q_ready"] = wp.empty_like(layer["q"])
             layer["k_ready"] = wp.empty_like(layer["k"])

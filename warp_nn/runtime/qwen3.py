@@ -174,9 +174,7 @@ def _pretokenize_o200k(text: str):
                 if unicodedata.category(text[index - 1]) == "Ll" and unicodedata.category(text[index]) in ("Lu", "Lt"):
                     break
                 index += 1
-            contraction = next(
-                (item for item in contractions if text[index : index + len(item)].lower() == item), None
-            )
+            contraction = next((item for item in contractions if text[index : index + len(item)].lower() == item), None)
             if contraction:
                 index += len(contraction)
             yield text[start:index]

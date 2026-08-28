@@ -444,9 +444,7 @@ def _gather_block_quantized_int8_kernel(
 
 
 @wp.kernel(enable_backward=False)
-def _dequantize_e4m3_kernel(
-    packed: wp.array1d[wp.uint8], scale: wp.array1d[Any], output: wp.array1d[Any]
-):
+def _dequantize_e4m3_kernel(packed: wp.array1d[wp.uint8], scale: wp.array1d[Any], output: wp.array1d[Any]):
     """Convert finite E4M3 values to ``output.dtype`` and apply one scale."""
     index = wp.tid()
     bits = wp.int32(packed[index])
@@ -954,9 +952,7 @@ def _create_rms_norm_kernels(tile_width: int, dtype: type, scale_dtype: type):
     @wp.func
     def skip_normalize(value: dtype, skip: dtype, scale: SCALE_DTYPE, inverse_rms: float, scale_offset: float):
         return dtype(
-            (wp.float32(value) + wp.float32(skip))
-            * (wp.float32(SCALE_DTYPE(scale)) + scale_offset)
-            * inverse_rms
+            (wp.float32(value) + wp.float32(skip)) * (wp.float32(SCALE_DTYPE(scale)) + scale_offset) * inverse_rms
         )
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -1039,9 +1035,7 @@ def _get_rms_norm_kernels(width: int, dtype: type, scale_dtype: type | None = No
     return tile_width, _rms_norm_kernel_cache[key]
 
 
-def _create_gated_rms_norm_kernel(
-    tile_width: int, dtype: type, scale_dtype: type, norm_before_gate: bool
-):
+def _create_gated_rms_norm_kernel(tile_width: int, dtype: type, scale_dtype: type, norm_before_gate: bool):
     """Build fused RMSNorm-times-SiLU gating for recurrent attention."""
     TILE_WIDTH = tile_width
     DTYPE = dtype
@@ -1115,14 +1109,10 @@ def _create_gated_rms_norm_kernel(
 
 
 @lru_cache(maxsize=None)
-def _get_gated_rms_norm_kernel(
-    width: int, dtype: type, norm_before_gate: bool = True, scale_dtype: type | None = None
-):
+def _get_gated_rms_norm_kernel(width: int, dtype: type, norm_before_gate: bool = True, scale_dtype: type | None = None):
     """Return a cached recurrent gated-RMSNorm kernel and tile width."""
     tile_width = min(512, max(32, 1 << (width - 1).bit_length()))
-    return tile_width, _create_gated_rms_norm_kernel(
-        tile_width, dtype, scale_dtype or dtype, norm_before_gate
-    )
+    return tile_width, _create_gated_rms_norm_kernel(tile_width, dtype, scale_dtype or dtype, norm_before_gate)
 
 
 @wp.kernel(enable_backward=False, module="unique")
