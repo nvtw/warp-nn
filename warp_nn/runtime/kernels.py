@@ -143,12 +143,12 @@ def _get_linear_vector_kernel(dtype: type):
     return _create_linear_vector_kernel(dtype)
 
 
-def _create_linear_tiled_kernel(dtype: type, tile_m: int):
+def _create_linear_tiled_kernel(dtype: type, tile_m: int, tile_k: int):
     """Build a typed tensor-core-friendly dense projection kernel."""
     DTYPE = dtype
     TILE_M = tile_m
     TILE_N = 32
-    TILE_K = 32
+    TILE_K = tile_k
 
     @wp.func
     def cast_output(value: wp.float32):
@@ -189,7 +189,8 @@ def _create_linear_tiled_kernel(dtype: type, tile_m: int):
 def _get_linear_tiled_kernel(dtype: type, rows: int):
     """Return a dense projection kernel and its tile shape for ``rows``."""
     tile_m = 8 if rows < 16 else 16 if rows < 32 else 32
-    return _create_linear_tiled_kernel(dtype, tile_m), (tile_m, 32)
+    tile_k = 128 if tile_m == 16 else 32
+    return _create_linear_tiled_kernel(dtype, tile_m, tile_k), (tile_m, 32)
 
 
 @wp.kernel
