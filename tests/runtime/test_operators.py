@@ -389,6 +389,39 @@ def test_partitioned_decode_attention_matches_serial(
     np.testing.assert_allclose(actual.numpy(), expected.numpy(), atol=0.01, rtol=0.01)
 
 
+def test_partitioned_attention_130k_indexing():
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    length, query_heads, kv_heads, head_size = 130_001, 4, 1, 32
+    query = wp.zeros((query_heads, head_size), dtype=wp.bfloat16, device="cuda:0")
+    key = wp.zeros((length, head_size), dtype=wp.bfloat16, device="cuda:0")
+    feature = np.linspace(-1.0, 1.0, head_size, dtype=np.float32)
+    alternating = (np.arange(length, dtype=np.int32) & 1).astype(np.float32)
+    values_np = alternating[:, None] * feature[None, :]
+    value = wp.array(values_np, dtype=wp.bfloat16, device="cuda:0")
+    sequence_end = wp.array([length - 1], dtype=wp.int32, device="cuda:0")
+    output = wp.empty((1, query_heads * head_size), dtype=wp.bfloat16, device="cuda:0")
+    workspace = _allocate_partitioned_gqa(query_heads, head_size, wp.bfloat16, "cuda:0")
+    _launch_partitioned_gqa(
+        workspace,
+        query,
+        key,
+        value,
+        sequence_end,
+        output,
+        query_heads,
+        kv_heads,
+        length,
+        head_size**-0.5,
+        0,
+        "cuda:0",
+    )
+
+    expected_head = values_np.mean(axis=0)
+    expected = np.tile(expected_head, query_heads)
+    np.testing.assert_allclose(output.numpy()[0], expected, atol=0.005, rtol=0.005)
+
+
 def test_head_layout_cache_and_bfloat16_argmax():
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
