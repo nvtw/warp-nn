@@ -30,6 +30,8 @@ def create_text_runner(path, **kwargs):
     path = Path(path)
     if (path / "model.onnx").is_file():
         return Qwen3OnnxRunner(path / "model.onnx", **kwargs)
+    if not (path / "config.json").is_file():
+        return MuseGlimmerRunner(path, **kwargs)
     config = json.loads((path / "config.json").read_text(encoding="utf-8"))
     runner_types = {"muse_glimmer": MuseGlimmerRunner, "nemotron_h": NemotronHRunner}
     runner_type = runner_types.get(config.get("model_type"), Qwen35Runner)
@@ -39,6 +41,8 @@ def create_text_runner(path, **kwargs):
 def create_tokenizer(path):
     """Create the matching dependency-free tokenizer for a model directory."""
     path = Path(path)
+    if not (path / "config.json").is_file():
+        return MuseGlimmerTokenizer(path)
     config = json.loads((path / "config.json").read_text(encoding="utf-8"))
     tokenizer_type = MuseGlimmerTokenizer if config.get("model_type") == "muse_glimmer" else Qwen3Tokenizer
     return tokenizer_type(path)

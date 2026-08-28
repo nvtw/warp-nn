@@ -477,6 +477,15 @@ def _reorder_heads_kernel(x: wp.array2d[Any], output: wp.array2d[Any], head_size
 
 
 @wp.kernel(enable_backward=False, module="unique")
+def _reorder_interleaved_heads_kernel(x: wp.array2d[Any], output: wp.array2d[Any], head_size: int):
+    """Reorder GGUF interleaved-RoPE heads into split-half head-major rows."""
+    row, head, column = wp.tid()
+    half = head_size / 2
+    source_column = (column % half) * 2 + column / half
+    output[head * x.shape[0] + row, column] = x[row, head * head_size + source_column]
+
+
+@wp.kernel(enable_backward=False, module="unique")
 def _unpack_gated_heads_kernel(x: wp.array2d[Any], values: wp.array2d[Any], gate: wp.array2d[Any], head_size: int):
     """Split per-head value/gate pairs and reorder values head-major."""
     row, head, column = wp.tid()

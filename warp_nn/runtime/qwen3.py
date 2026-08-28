@@ -228,14 +228,18 @@ class Qwen3Tokenizer:
 
     tool_call_start = "<tool_call>"
 
-    def __init__(self, path: str | Path):
-        path = Path(path)
-        if path.is_dir():
-            directory = path
-            path /= "tokenizer.json"
+    def __init__(self, path: str | Path | Mapping):
+        if isinstance(path, Mapping):
+            data = path
+            directory = None
         else:
-            directory = path.parent
-        data = json.loads(path.read_text(encoding="utf-8"))
+            path = Path(path)
+            if path.is_dir():
+                directory = path
+                path /= "tokenizer.json"
+            else:
+                directory = path.parent
+            data = json.loads(path.read_text(encoding="utf-8"))
         model = data["model"]
         normalizer = data.get("normalizer")
         if model["type"] != "BPE" or normalizer not in (None, {"type": "NFC"}):
@@ -250,14 +254,14 @@ class Qwen3Tokenizer:
         self._added_by_id = {item["id"]: item for item in data["added_tokens"]}
         alternatives = "|".join(re.escape(token) for token in sorted(self._added_tokens, key=len, reverse=True))
         self._added_pattern = re.compile(f"({alternatives})")
-        tokenizer_config_path = directory / "tokenizer_config.json"
-        tokenizer_config = (
-            json.loads(tokenizer_config_path.read_text(encoding="utf-8")) if tokenizer_config_path.is_file() else {}
-        )
-        generation_path = directory / "generation_config.json"
-        self.generation_config = (
-            json.loads(generation_path.read_text(encoding="utf-8")) if generation_path.is_file() else {}
-        )
+        tokenizer_config_path = directory / "tokenizer_config.json" if directory is not None else None
+        tokenizer_config = data.get("tokenizer_config", {})
+        if tokenizer_config_path is not None and tokenizer_config_path.is_file():
+            tokenizer_config = json.loads(tokenizer_config_path.read_text(encoding="utf-8"))
+        generation_path = directory / "generation_config.json" if directory is not None else None
+        self.generation_config = data.get("generation_config", {})
+        if generation_path is not None and generation_path.is_file():
+            self.generation_config = json.loads(generation_path.read_text(encoding="utf-8"))
         eos_token = tokenizer_config.get("eos_token")
         if isinstance(eos_token, dict):
             eos_token = eos_token.get("content")
@@ -278,12 +282,10 @@ class Qwen3Tokenizer:
         self.eos_token_ids = tuple(dict.fromkeys(int(token_id) for token_id in end_tokens))
         if not self.eos_token_ids:
             raise ValueError("Qwen3Tokenizer: generation_config has no EOS token")
-        template_path = directory / "chat_template.jinja"
-        template = (
-            template_path.read_text(encoding="utf-8")
-            if template_path.is_file()
-            else tokenizer_config.get("chat_template", "")
-        )
+        template_path = directory / "chat_template.jinja" if directory is not None else None
+        template = data.get("chat_template", tokenizer_config.get("chat_template", ""))
+        if template_path is not None and template_path.is_file():
+            template = template_path.read_text(encoding="utf-8")
         self._tool_dialect = "json" if "args-json-object" in template else "parameters"
         self.supports_reasoning_effort = "reasoning_effort" in template
         self.default_enable_thinking = self.supports_reasoning_effort or "set enable_thinking" in template

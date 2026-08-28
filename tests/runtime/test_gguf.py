@@ -110,6 +110,31 @@ def test_gguf_supports_v2_and_selected_loading(tmp_path):
         archive.load("cpu", ["missing"])
 
 
+def test_gguf_loads_split_archive(tmp_path):
+    first = tmp_path / "tiny-00001-of-00002.gguf"
+    second = tmp_path / "tiny-00002-of-00002.gguf"
+    split_total = ("split.tensors.count", 4, 2)
+    _write_gguf(
+        first,
+        [("first", 0, np.array([1.0], dtype=np.float32))],
+        [("split.count", 4, 2), ("split.no", 4, 0), split_total],
+    )
+    _write_gguf(
+        second,
+        [("second", 0, np.array([2.0], dtype=np.float32))],
+        [("split.count", 4, 2), ("split.no", 4, 1), split_total],
+    )
+
+    archive = GGUFArchive((first, second))
+    loaded = archive.load("cpu")
+
+    assert archive.names == ("first", "second")
+    assert loaded["first"].numpy()[0] == 1.0
+    assert loaded["second"].numpy()[0] == 2.0
+    with pytest.raises(ValueError, match="out of order"):
+        GGUFArchive((second, first))
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Text-only Muse Glimmer runner for Hugging Face safetensors checkpoints."""
+"""Text-only Muse Glimmer runner for safetensors and unquantized GGUF checkpoints."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import numpy as np
 import warp as wp
 
 from warp_nn.runtime._cublas import try_create_cublas
+from warp_nn.runtime.gguf import GGUFArchive
 from warp_nn.runtime.kernels import (
     _append_circular_head_cache_kernel,
     _append_head_cache_kernel,
@@ -23,6 +24,7 @@ from warp_nn.runtime.kernels import (
     _get_gqa_attention_kernel,
     _get_greedy_argmax_kernels,
     _logit_softcap_kernel,
+    _reorder_interleaved_heads_kernel,
     _reorder_heads_kernel,
     _rotary_embedding_kernel_for_dtype,
     _scale_kernel,
@@ -33,6 +35,101 @@ from warp_nn.runtime.qwen35 import Qwen35Runner
 from warp_nn.runtime.qwen3 import Qwen3Tokenizer, _pretokenize_o200k
 from warp_nn.runtime.safetensors import SafeTensorArchive
 from warp_nn.utils.device import parse_device
+
+
+def _gguf_paths(path: str | Path) -> tuple[Path, ...]:
+    path = Path(path)
+    directory = path if path.is_dir() else path.parent
+    if path.is_dir():
+        first_files = sorted(directory.glob("*-00001-of-*.gguf"))
+        if not first_files:
+            first_files = [item for item in sorted(directory.glob("*.gguf")) if "mmproj" not in item.name.lower()]
+        if len(first_files) != 1:
+            raise FileNotFoundError(f"Expected one GGUF model in '{directory}', found {len(first_files)}")
+        path = first_files[0]
+    match = re.fullmatch(r"(.+)-(\d{5})-of-(\d{5})\.gguf", path.name)
+    if match is None:
+        return (path,)
+    count = int(match.group(3))
+    return tuple(directory / f"{match.group(1)}-{index:05d}-of-{count:05d}.gguf" for index in range(1, count + 1))
+
+
+def _gguf_config(metadata: Mapping[str, object]) -> dict:
+    if metadata.get("general.architecture") != "muse-glimmer":
+        raise ValueError("GGUF checkpoint is not a Muse Glimmer model")
+    prefix = "muse-glimmer."
+    layers = int(metadata[prefix + "block_count"])
+    pattern = int(metadata[prefix + "attention.sliding_window_pattern"])
+    rope_theta = float(metadata[prefix + "rope.freq_base"])
+    layer_types = [
+        "full_attention" if (index + 1) % pattern == 0 else "sliding_attention" for index in range(layers)
+    ]
+    return {
+        "model_type": "muse_glimmer_text",
+        "hidden_size": int(metadata[prefix + "embedding_length"]),
+        "intermediate_size": int(metadata[prefix + "feed_forward_length"]),
+        "vocab_size": len(metadata["tokenizer.ggml.tokens"]),
+        "num_hidden_layers": layers,
+        "layer_types": layer_types,
+        "layer_rope_theta": [0.0 if kind == "full_attention" else rope_theta for kind in layer_types],
+        "num_attention_heads": int(metadata[prefix + "attention.head_count"]),
+        "num_key_value_heads": int(metadata[prefix + "attention.head_count_kv"]),
+        "head_dim": int(metadata[prefix + "attention.key_length"]),
+        "max_position_embeddings": int(metadata[prefix + "context_length"]),
+        "sliding_window": int(metadata[prefix + "attention.sliding_window"]),
+        "qk_scale_factor": 3.87,
+        "rms_norm_eps": float(metadata[prefix + "attention.layer_norm_rms_epsilon"]),
+        "post_norm_eps": 1.0e-8,
+        "output_multiplier": float(metadata[prefix + "logit_scale"]),
+        "final_logit_softcapping": float(metadata[prefix + "final_logit_softcapping"]),
+        "hidden_activation": "silu",
+        "attention_bias": False,
+        "rope_parameters": {"rope_type": "default", "rope_theta": rope_theta},
+    }
+
+
+def _gguf_weight_map(config: Mapping[str, object]) -> dict[str, str]:
+    names = {
+        "model.language_model.embed_tokens.weight": "token_embd.weight",
+        "model.language_model.norm.weight": "output_norm.weight",
+        "lm_head.weight": "output.weight",
+    }
+    suffixes = {
+        "input_layernorm.weight": "attn_norm.weight",
+        "post_attention_layernorm.weight": "post_attention_norm.weight",
+        "pre_feedforward_layernorm.weight": "ffn_norm.weight",
+        "post_feedforward_layernorm.weight": "post_ffw_norm.weight",
+        "self_attn.q_proj.weight": "attn_q.weight",
+        "self_attn.k_proj.weight": "attn_k.weight",
+        "self_attn.v_proj.weight": "attn_v.weight",
+        "self_attn.gate_proj.weight": "attn_gate.weight",
+        "self_attn.o_proj.weight": "attn_output.weight",
+        "mlp.gate_proj.weight": "ffn_gate.weight",
+        "mlp.up_proj.weight": "ffn_up.weight",
+        "mlp.down_proj.weight": "ffn_down.weight",
+    }
+    for index in range(int(config["num_hidden_layers"])):
+        prefix = f"model.language_model.layers.{index}."
+        names.update({prefix + target: f"blk.{index}.{source}" for target, source in suffixes.items()})
+    return names
+
+
+class _MappedGGUFArchive:
+    def __init__(self, archive: GGUFArchive, names: Mapping[str, str]):
+        self.archive = archive
+        self._names = dict(names)
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(self._names)
+
+    def metadata(self, name: str):
+        return self.archive.tensor(self._names[name])
+
+    def load(self, device=None, names=None) -> dict[str, wp.array]:
+        selected = self.names if names is None else tuple(names)
+        loaded = self.archive.load(device, [self._names[name] for name in selected])
+        return {name: loaded[self._names[name]] for name in selected}
 
 
 def _validate_config(config: dict) -> None:
@@ -201,7 +298,36 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
     tool_call_start = "<atem:function_calls>"
 
     def __init__(self, path: str | Path):
-        super().__init__(path)
+        path = Path(path)
+        if (path / "tokenizer.json").is_file():
+            super().__init__(path)
+        else:
+            archive = GGUFArchive(_gguf_paths(path))
+            metadata = archive.metadata
+            if metadata.get("tokenizer.ggml.model") != "gpt2":
+                raise ValueError("Muse GGUF requires an embedded GPT-2 BPE tokenizer")
+            tokens = metadata["tokenizer.ggml.tokens"]
+            token_types = metadata["tokenizer.ggml.token_type"]
+            merges = [merge.split(" ", 1) for merge in metadata["tokenizer.ggml.merges"]]
+            added = [
+                {"id": token_id, "content": token, "special": token_type == 3}
+                for token_id, (token, token_type) in enumerate(zip(tokens, token_types))
+                if token_type != 1
+            ]
+            eos = int(metadata["tokenizer.ggml.eos_token_id"])
+            eot = int(metadata["tokenizer.ggml.eot_token_id"])
+            super().__init__(
+                {
+                    "normalizer": None,
+                    "added_tokens": added,
+                    "model": {"type": "BPE", "vocab": dict(zip(tokens, range(len(tokens)))), "merges": merges},
+                    "generation_config": {
+                        "eos_token_id": [eos, eot],
+                        "pad_token_id": int(metadata["tokenizer.ggml.padding_token_id"]),
+                    },
+                    "chat_template": metadata.get("tokenizer.chat_template", ""),
+                }
+            )
         self._pretokenize = _pretokenize_o200k
         self.supports_reasoning_effort = True
         self.default_enable_thinking = True
@@ -398,7 +524,7 @@ class _MusePlan:
                 hidden,
                 prefix + "input_layernorm.weight",
                 self.runner.rms_epsilon,
-                True,
+                self.runner.centered_norm_scales,
             )
             self._build_attention(layer, index, prefix, layer["input_norm"].outputs[0])
             layer["post_attention"] = self._rms(
@@ -406,7 +532,7 @@ class _MusePlan:
                 layer["attention_output"].outputs[0],
                 prefix + "post_attention_layernorm.weight",
                 self.runner.post_epsilon,
-                True,
+                self.runner.centered_norm_scales,
             )
             attention_residual = self._register(
                 f"layer.{index}.attention_residual",
@@ -418,7 +544,7 @@ class _MusePlan:
                 attention_residual,
                 prefix + "pre_feedforward_layernorm.weight",
                 self.runner.rms_epsilon,
-                True,
+                self.runner.centered_norm_scales,
             )
             layer["mlp_gate"] = self._linear(
                 f"layer.{index}.mlp_gate", layer["feedforward_input"].outputs[0], prefix + "mlp.gate_proj.weight"
@@ -437,7 +563,7 @@ class _MusePlan:
                 layer["mlp_down"].outputs[0],
                 prefix + "post_feedforward_layernorm.weight",
                 self.runner.post_epsilon,
-                True,
+                self.runner.centered_norm_scales,
             )
             hidden = self._register(
                 f"hidden.{index + 1}",
@@ -497,8 +623,13 @@ class _MusePlan:
         for projection in ("q", "k", "v"):
             output = layer[projection]
             heads = self.runner.query_heads if projection == "q" else self.runner.kv_heads
+            reorder_kernel = (
+                _reorder_interleaved_heads_kernel
+                if self.runner.gguf_layout and projection in ("q", "k")
+                else _reorder_heads_kernel
+            )
             wp.launch(
-                _reorder_heads_kernel,
+                reorder_kernel,
                 dim=(self.rows, heads, self.runner.head_dim),
                 inputs=[self.tensors[layer[projection + "_proj"].outputs[0]], output, self.runner.head_dim],
                 device=self.device,
@@ -621,7 +752,7 @@ class _MusePlan:
 
 
 class MuseGlimmerRunner(Qwen35Runner):
-    """Run text-only Muse Glimmer BF16 safetensors checkpoints."""
+    """Run text-only Muse Glimmer BF16 safetensors or GGUF checkpoints."""
 
     def __init__(
         self,
@@ -632,8 +763,20 @@ class MuseGlimmerRunner(Qwen35Runner):
         use_cublas: bool = True,
     ):
         path = Path(path)
-        outer_config = json.loads((path / "config.json").read_text(encoding="utf-8"))
-        self.config = outer_config.get("text_config", outer_config)
+        directory = path if path.is_dir() else path.parent
+        config_path = directory / "config.json"
+        if config_path.is_file():
+            outer_config = json.loads(config_path.read_text(encoding="utf-8"))
+            self.config = outer_config.get("text_config", outer_config)
+            archive = SafeTensorArchive(directory)
+            self.gguf_layout = False
+            self.centered_norm_scales = True
+        else:
+            gguf = GGUFArchive(_gguf_paths(path))
+            self.config = _gguf_config(gguf.metadata)
+            archive = _MappedGGUFArchive(gguf, _gguf_weight_map(self.config))
+            self.gguf_layout = True
+            self.centered_norm_scales = False
         _validate_config(self.config)
         self.device = parse_device(device)
         self.cache_capacity = int(cache_capacity)
@@ -661,7 +804,6 @@ class MuseGlimmerRunner(Qwen35Runner):
             else self.local_window + self.prefill_chunk_size - 1
         )
 
-        archive = SafeTensorArchive(path)
         names = _weight_names(self.config)
         missing = set(names) - set(archive.names)
         if missing:

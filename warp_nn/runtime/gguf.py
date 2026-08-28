@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 import math
 import mmap
@@ -114,10 +114,42 @@ def _release_mapping(resources, event: wp.Event | None) -> None:
 
 
 class GGUFArchive:
-    """Index and upload an unquantized, single-file GGUF archive."""
+    """Index and upload an unquantized GGUF archive, including split files."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path | Sequence[str | Path]):
+        if not isinstance(path, (str, Path)):
+            paths = tuple(path)
+            if not paths:
+                raise ValueError("A split GGUF archive needs at least one file")
+            archives = tuple(GGUFArchive(item) for item in paths)
+            expected = len(archives)
+            if expected > 1:
+                for index, archive in enumerate(archives):
+                    if archive.metadata.get("split.count") != expected or archive.metadata.get("split.no") != index:
+                        raise ValueError("GGUF shards are missing, duplicated, or out of order")
+            self.path = archives[0].path
+            self.paths = tuple(archive.path for archive in archives)
+            self.version = archives[0].version
+            self.alignment = archives[0].alignment
+            self.data_offset = archives[0].data_offset
+            self.metadata = dict(archives[0].metadata)
+            self._archives = archives
+            self._tensors = {}
+            self._tensor_archives = {}
+            for archive in archives:
+                for name in archive.names:
+                    if name in self._tensors:
+                        raise ValueError(f"Split GGUF archive has duplicate tensor '{name}'")
+                    self._tensors[name] = archive.tensor(name)
+                    self._tensor_archives[name] = archive
+            total = self.metadata.get("split.tensors.count")
+            if total is not None and total != len(self._tensors):
+                raise ValueError(f"Split GGUF archive has {len(self._tensors)} of {total} tensors")
+            return
+
         self.path = Path(path).resolve()
+        self.paths = (self.path,)
+        self._archives = None
         if not self.path.is_file():
             raise FileNotFoundError(f"GGUF file not found: '{self.path}'")
 
@@ -197,6 +229,15 @@ class GGUFArchive:
             raise KeyError(f"Unknown GGUF tensors: {sorted(unknown)}")
         if not selected:
             return {}
+
+        if self._archives is not None:
+            by_archive = {}
+            for name in selected:
+                by_archive.setdefault(self._tensor_archives[name], []).append(name)
+            output = {}
+            for archive, shard_names in by_archive.items():
+                output.update(archive.load(device, shard_names))
+            return output
 
         stream = self.path.open("rb")
         mapping = mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ)
