@@ -5,11 +5,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 import math
 import mmap
 from pathlib import Path
+import re
 import struct
 from threading import Thread
 
@@ -37,6 +38,54 @@ _TENSOR_TYPES = {
     1: (wp.float16, 2, "F16"),
     30: (wp.bfloat16, 2, "BF16"),
 }
+
+
+def find_gguf_files(path: str | Path) -> tuple[Path, ...]:
+    """Resolve a model file or directory to one complete GGUF shard set."""
+    path = Path(path)
+    directory = path if path.is_dir() else path.parent
+    if path.is_dir():
+        first_files = sorted(directory.glob("*-00001-of-*.gguf"))
+        if not first_files:
+            first_files = [item for item in sorted(directory.glob("*.gguf")) if "mmproj" not in item.name.lower()]
+        if len(first_files) != 1:
+            raise FileNotFoundError(f"Expected one GGUF model in '{directory}', found {len(first_files)}")
+        path = first_files[0]
+    match = re.fullmatch(r"(.+)-(\d{5})-of-(\d{5})\.gguf", path.name)
+    if match is None:
+        return (path,)
+    count = int(match.group(3))
+    return tuple(directory / f"{match.group(1)}-{index:05d}-of-{count:05d}.gguf" for index in range(1, count + 1))
+
+
+def gguf_tokenizer_data(metadata: Mapping[str, object]) -> dict:
+    """Translate an embedded GGUF GPT-2 BPE tokenizer to Qwen3Tokenizer data."""
+    if metadata.get("tokenizer.ggml.model") != "gpt2":
+        raise ValueError("GGUF checkpoint requires an embedded GPT-2 BPE tokenizer")
+    tokens = metadata["tokenizer.ggml.tokens"]
+    token_types = metadata["tokenizer.ggml.token_type"]
+    merges = [merge.split(" ", 1) for merge in metadata["tokenizer.ggml.merges"]]
+    added = [
+        {"id": token_id, "content": token, "special": token_type == 3}
+        for token_id, (token, token_type) in enumerate(zip(tokens, token_types))
+        if token_type != 1
+    ]
+    end_ids = [
+        int(metadata[key])
+        for key in ("tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id")
+        if key in metadata
+    ]
+    return {
+        "normalizer": None,
+        "added_tokens": added,
+        "model": {"type": "BPE", "vocab": dict(zip(tokens, range(len(tokens)))), "merges": merges},
+        "generation_config": {
+            "eos_token_id": list(dict.fromkeys(end_ids)),
+            "pad_token_id": int(metadata["tokenizer.ggml.padding_token_id"]),
+        },
+        "chat_template": metadata.get("tokenizer.chat_template", ""),
+        "_pretokenizer": "o200k",
+    }
 
 
 @dataclass(frozen=True)
@@ -266,3 +315,23 @@ class GGUFArchive:
         else:
             Thread(target=_release_mapping, args=(resources, event), daemon=True).start()
         return output
+
+
+class MappedGGUFArchive:
+    """Expose GGUF tensors under runtime-native checkpoint names."""
+
+    def __init__(self, archive: GGUFArchive, names: Mapping[str, str]):
+        self.archive = archive
+        self._names = dict(names)
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(self._names)
+
+    def metadata(self, name: str):
+        return self.archive.tensor(self._names[name])
+
+    def load(self, device=None, names=None) -> dict[str, wp.array]:
+        selected = self.names if names is None else tuple(names)
+        loaded = self.archive.load(device, [self._names[name] for name in selected])
+        return {name: loaded[self._names[name]] for name in selected}

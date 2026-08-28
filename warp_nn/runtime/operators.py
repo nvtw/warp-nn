@@ -607,6 +607,7 @@ def _exec_linear_attention(op, tensors, shapes, device):
             query_heads,
             key_heads,
             value_heads,
+            False,
             op.attrs["_needs_decay"],
             op.attrs["_decay_per_key"],
             op.attrs["_needs_beta"],

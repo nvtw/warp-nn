@@ -26,7 +26,7 @@ def _write_tiny_qwen35(path):
         "vocab_size": 16,
         "num_hidden_layers": 2,
         "layer_types": ["linear_attention", "full_attention"],
-        "num_attention_heads": 2,
+        "num_attention_heads": 3,
         "num_key_value_heads": 1,
         "head_dim": 4,
         "linear_num_key_heads": 1,
@@ -74,12 +74,12 @@ def _write_tiny_qwen35(path):
     attention = "model.language_model.layers.1.self_attn."
     shapes.update(
         {
-            attention + "q_proj.weight": (16, 8),
+            attention + "q_proj.weight": (24, 8),
             attention + "k_proj.weight": (4, 8),
             attention + "v_proj.weight": (4, 8),
             attention + "q_norm.weight": (4,),
             attention + "k_norm.weight": (4,),
-            attention + "o_proj.weight": (8, 8),
+            attention + "o_proj.weight": (8, 12),
         }
     )
     tensors = {}

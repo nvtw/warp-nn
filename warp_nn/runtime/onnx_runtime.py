@@ -94,6 +94,7 @@ from warp_nn.runtime.kernels import (
     _get_dequantize_nbits_kernel,
     _get_gqa_attention_kernel,
     _get_linear_attention_kernel,
+    _linear_attention_value_blocks,
     _get_lp_normalization_kernel,
     _get_matmul_int4_tile_gemm_kernel,
     _get_matmul_int8_q8_kernel,
@@ -1385,7 +1386,7 @@ def _shape_linear_attention(op, shapes, dtypes, tensors, device, requires_grad=F
     op.attrs["_value_heads"] = value_heads
     op.attrs["_key_size"] = key_size
     op.attrs["_value_size"] = value_size
-    op.attrs["_value_blocks"] = value_size // min(64, value_size & -value_size)
+    op.attrs["_value_blocks"] = _linear_attention_value_blocks(value_size)
     op.attrs["_has_past"] = has_past
     op.attrs["_share_state"] = share_state
     op.attrs["_past"] = None if has_past else wp.zeros(state_shape, dtype=dtype, device=device)

@@ -484,11 +484,19 @@ def _reorder_interleaved_heads_kernel(x: wp.array2d[Any], output: wp.array2d[Any
 
 
 @wp.kernel(enable_backward=False, module="unique")
-def _unpack_gated_heads_kernel(x: wp.array2d[Any], values: wp.array2d[Any], gate: wp.array2d[Any], head_size: int):
+def _unpack_gated_heads_kernel(
+    x: wp.array2d[Any],
+    values: wp.array2d[Any],
+    gate: wp.array2d[Any],
+    head_size: int,
+    interleaved: bool,
+):
     """Split per-head value/gate pairs and reorder values head-major."""
     row, head, column = wp.tid()
     offset = head * head_size * 2
-    values[head * x.shape[0] + row, column] = x[row, offset + column]
+    half = head_size / 2
+    source_column = (column % half) * 2 + column / half if interleaved else column
+    values[head * x.shape[0] + row, column] = x[row, offset + source_column]
     gate[row, head * head_size + column] = x[row, offset + head_size + column]
 
 
@@ -901,6 +909,7 @@ def _prepare_gated_delta_kernel(
     b: wp.array2d[Any],
     a_log: wp.array1d[Any],
     dt_bias: wp.array1d[Any],
+    a_is_decay: bool,
     decay: wp.array2d[wp.float32],
     beta: wp.array2d[wp.float32],
 ):
@@ -910,7 +919,8 @@ def _prepare_gated_delta_kernel(
     beta[row, head] = wp.float32(1.0) / (wp.float32(1.0) + wp.exp(-b_value))
     dt = wp.float32(a[row, head]) + wp.float32(dt_bias[head])
     softplus = wp.max(dt, wp.float32(0.0)) + wp.log(wp.float32(1.0) + wp.exp(-wp.abs(dt)))
-    decay[row, head] = -wp.exp(wp.float32(a_log[head])) * softplus
+    a_value = wp.float32(a_log[head])
+    decay[row, head] = (a_value if a_is_decay else -wp.exp(a_value)) * softplus
 
 
 _dequantize_nbits_kernel_cache = {}
@@ -1188,13 +1198,18 @@ def _get_reduce_sum_rows_kernel(width: int, dtype: type):
     return tile_width, kernel
 
 
+def _linear_attention_value_blocks(value_size: int) -> int:
+    """Return the number of independently scheduled value-column tiles."""
+    return value_size // min(32, value_size & -value_size)
+
+
 def _create_linear_attention_kernel(key_size: int, value_size: int, dtype: type, state_dtype: type):
     """Build recurrent linear attention for fixed key and value widths.
-    Value channels are processed in tiles of at most 64."""
+    Value channels are processed in tiles of at most 32."""
     KEY_SIZE = key_size
     VALUE_SIZE = value_size
-    VALUE_TILE = min(64, value_size & -value_size)
-    VALUE_BLOCKS = VALUE_SIZE // VALUE_TILE
+    VALUE_TILE = min(32, value_size & -value_size)
+    VALUE_BLOCKS = _linear_attention_value_blocks(value_size)
     DTYPE = dtype
     STATE_DTYPE = state_dtype
 
@@ -1224,6 +1239,7 @@ def _create_linear_attention_kernel(key_size: int, value_size: int, dtype: type,
         query_heads: int,
         key_heads: int,
         value_heads: int,
+        tiled_value_heads: bool,
         needs_decay: bool,
         decay_per_key: bool,
         needs_beta: bool,
@@ -1237,7 +1253,9 @@ def _create_linear_attention_kernel(key_size: int, value_size: int, dtype: type,
         state_item = item / VALUE_BLOCKS
         batch = state_item / value_heads
         value_head = state_item % value_heads
-        key_head = value_head * key_heads / value_heads
+        # HF groups value heads below each key head. Some checkpoint formats
+        # transpose those two head axes for contiguous tiled execution.
+        key_head = value_head % key_heads if tiled_value_heads else value_head * key_heads / value_heads
         state_offset = state_item * KEY_SIZE
         value_offset = value_block * VALUE_TILE
         state = wp.tile_load(past, shape=(KEY_SIZE, VALUE_TILE), offset=(state_offset, value_offset))
@@ -1288,7 +1306,9 @@ def _create_linear_attention_kernel(key_size: int, value_size: int, dtype: type,
                         offset=(token_row, query_head * VALUE_SIZE + value_offset),
                     )
             else:
-                query_head = value_head * query_heads / value_heads
+                query_head = (
+                    key_head * query_heads / key_heads if tiled_value_heads else value_head * query_heads / value_heads
+                )
                 query_row = wp.tile_map(
                     to_state,
                     wp.tile_load(query, shape=(1, KEY_SIZE), offset=(token_row, query_head * KEY_SIZE)),

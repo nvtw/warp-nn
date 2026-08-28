@@ -16,7 +16,7 @@
 import json
 from pathlib import Path
 
-from warp_nn.runtime.gguf import GGUFArchive
+from warp_nn.runtime.gguf import GGUFArchive, find_gguf_files, gguf_tokenizer_data
 from warp_nn.runtime.onnx_runtime import OnnxRuntime
 from warp_nn.runtime.openai_server import ChatCompletions, OpenAIHTTPServer
 from warp_nn.runtime.muse_glimmer import MuseGlimmerRunner, MuseGlimmerTokenizer, parse_atem_tool_calls
@@ -43,6 +43,9 @@ def create_tokenizer(path):
     path = Path(path)
     if not (path / "config.json").is_file():
         return MuseGlimmerTokenizer(path)
+    if not (path / "tokenizer.json").is_file():
+        archive = GGUFArchive(find_gguf_files(path))
+        return Qwen3Tokenizer(gguf_tokenizer_data(archive.metadata))
     config = json.loads((path / "config.json").read_text(encoding="utf-8"))
     tokenizer_type = MuseGlimmerTokenizer if config.get("model_type") == "muse_glimmer" else Qwen3Tokenizer
     return tokenizer_type(path)

@@ -205,7 +205,7 @@ def test_head_layout_cache_and_bfloat16_argmax():
     wp.launch(
         _unpack_gated_heads_kernel,
         dim=(rows, heads, head_size),
-        inputs=[packed, values, gate, head_size],
+        inputs=[packed, values, gate, head_size, False],
         device="cuda:0",
     )
     row_major = wp.array(packed_np[:, : heads * head_size], dtype=wp.bfloat16, device="cuda:0")
@@ -257,7 +257,8 @@ def test_head_layout_cache_and_bfloat16_argmax():
     assert token.numpy()[0] == 7
 
 
-def test_mixed_state_linear_attention_bfloat16():
+@pytest.mark.parametrize("tiled_value_heads", [False, True])
+def test_mixed_state_linear_attention_bfloat16(tiled_value_heads):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
     rng = np.random.default_rng(23)
@@ -288,6 +289,7 @@ def test_mixed_state_linear_attention_bfloat16():
             query_heads,
             key_heads,
             value_heads,
+            tiled_value_heads,
             True,
             False,
             True,
@@ -304,13 +306,13 @@ def test_mixed_state_linear_attention_bfloat16():
     decay_np, beta_np = decay.numpy(), beta.numpy()
     for row in range(rows):
         for value_head in range(value_heads):
-            key_head = value_head * key_heads // value_heads
+            key_head = value_head % key_heads if tiled_value_heads else value_head * key_heads // value_heads
             key_vector = k_np[row, key_head * width : (key_head + 1) * width]
             value_vector = v_np[row, value_head * width : (value_head + 1) * width]
             state[value_head] *= np.exp(decay_np[row, value_head])
             delta = beta_np[row, value_head] * (value_vector - key_vector @ state[value_head])
             state[value_head] += np.outer(key_vector, delta)
-            query_head = value_head * query_heads // value_heads
+            query_head = (key_head * query_heads // key_heads) if tiled_value_heads else (value_head * query_heads // value_heads)
             query_vector = q_np[row, query_head * width : (query_head + 1) * width]
             expected[row, value_head * width : (value_head + 1) * width] = (
                 width**-0.5 * query_vector @ state[value_head]
@@ -344,7 +346,12 @@ def test_gated_delta_preparation_and_row_causal_conv():
         device="cpu",
     )
     wp.launch(_update_conv_rows_state_kernel, dim=channels, inputs=[x, state], device="cpu")
-    wp.launch(_prepare_gated_delta_kernel, dim=(rows, heads), inputs=[a, b, a_log, dt_bias, decay, beta], device="cpu")
+    wp.launch(
+        _prepare_gated_delta_kernel,
+        dim=(rows, heads),
+        inputs=[a, b, a_log, dt_bias, False, decay, beta],
+        device="cpu",
+    )
 
     padded = np.concatenate((state_np.T, x_np), axis=0)
     expected_conv = np.empty_like(x_np)

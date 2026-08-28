@@ -247,7 +247,7 @@ class Qwen3Tokenizer:
         self._tokens = {token_id: token for token, token_id in self._vocabulary.items()}
         self._merge_ranks = {tuple(pair): rank for rank, pair in enumerate(model["merges"])}
         self._ignore_merges = bool(model.get("ignore_merges", False))
-        self._pretokenize = _pretokenize
+        self._pretokenize = _pretokenize_o200k if data.get("_pretokenizer") == "o200k" else _pretokenize
         self._added_tokens = {item["content"]: item["id"] for item in data["added_tokens"]}
         self._added_by_id = {item["id"]: item for item in data["added_tokens"]}
         alternatives = "|".join(re.escape(token) for token in sorted(self._added_tokens, key=len, reverse=True))
