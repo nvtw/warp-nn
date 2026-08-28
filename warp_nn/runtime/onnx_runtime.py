@@ -600,29 +600,39 @@ def _matmul_int4_q8_kernel(
         output[row, column] = wp.float16(total)
 
 
-@wp.kernel(enable_backward=False, module="unique", grid_stride=False)
-def _matmul_int8_q8_kernel(
-    activations: wp.array3d[wp.uint32],
-    activation_scales: wp.array2d[wp.float32],
-    weights: wp.array3d[wp.uint32],
-    weight_scales: wp.array2d[wp.float16],
-    output: wp.array2d[wp.float16],
-):
-    thread = wp.tid()
-    lane = thread % 8
-    item = thread / 8
-    row = item / weights.shape[0]
-    column = item % weights.shape[0]
-    total = wp.float32(0.0)
-    for block in range(weights.shape[1]):
-        packed_activation = wp.int32(activations[row, block, lane])
-        signed_weights = wp.int32(weights[column, block, lane] ^ wp.uint32(0x80808080))
-        block_total = _dp4a(signed_weights, packed_activation, 0)
-        reduced = _subgroup_sum(wp.float32(block_total), 8)
+@lru_cache(maxsize=None)
+def _get_matmul_int8_q8_kernel(reduction_width: int):
+    REDUCTION_WIDTH = reduction_width
+    WORDS_PER_LANE = 8 // reduction_width
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(
+        activations: wp.array3d[wp.uint32],
+        activation_scales: wp.array2d[wp.float32],
+        weights: wp.array3d[wp.uint32],
+        weight_scales: wp.array2d[wp.float16],
+        output: wp.array2d[wp.float16],
+    ):
+        thread = wp.tid()
+        lane = thread % REDUCTION_WIDTH
+        item = thread / REDUCTION_WIDTH
+        row = item / weights.shape[0]
+        column = item % weights.shape[0]
+        total = wp.float32(0.0)
+        for block in range(weights.shape[1]):
+            block_total = 0
+            for group in range(WORDS_PER_LANE):
+                word = lane + group * REDUCTION_WIDTH
+                packed_activation = wp.int32(activations[row, block, word])
+                signed_weights = wp.int32(weights[column, block, word] ^ wp.uint32(0x80808080))
+                block_total = _dp4a(signed_weights, packed_activation, block_total)
+            reduced = _subgroup_sum(wp.float32(block_total), REDUCTION_WIDTH)
+            if lane == 0:
+                total += reduced * activation_scales[row, block] * wp.float32(weight_scales[column, block])
         if lane == 0:
-            total += reduced * activation_scales[row, block] * wp.float32(weight_scales[column, block])
-    if lane == 0:
-        output[row, column] = wp.float16(total)
+            output[row, column] = wp.float16(total)
+
+    return kernel
 
 
 @lru_cache(maxsize=None)
@@ -2369,8 +2379,8 @@ def _shape_matmul_nbits(op, shapes, dtypes, tensors, device, requires_grad=False
             shape=(N, blocks, bits),
             device=device,
         )
-        op.attrs["_q8_kernel"] = _matmul_int4_q8_kernel if bits == 4 else _matmul_int8_q8_kernel
-        op.attrs["_q8_width"] = bits
+        op.attrs["_q8_kernel"] = _matmul_int4_q8_kernel if bits == 4 else _get_matmul_int8_q8_kernel(4)
+        op.attrs["_q8_width"] = 4
     if device.is_cuda and rows > 1 and bits == 4 and block_size == 32 and dtype == wp.float16 and not has_zero_points:
         tile_m = 64 if rows >= 64 else 32 if rows >= 32 else 16
         tile_n = 32 if rows >= 32 else 16
