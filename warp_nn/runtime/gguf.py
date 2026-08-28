@@ -113,6 +113,17 @@ class GGUFTensorMetadata:
     format: str
 
 
+@dataclass(frozen=True)
+class BlockQuantizedTensor:
+    """A packed block tensor with logical shape and device-side typed views."""
+
+    raw: wp.array
+    values: wp.array
+    scales: wp.array
+    shape: tuple[int, ...]
+    format: str
+
+
 class _Reader:
     def __init__(self, stream, path: Path, size: int):
         self.stream = stream
@@ -367,18 +378,52 @@ class GGUFArchive:
             raw = np.ndarray(
                 (info.nbytes,), dtype=np.uint8, buffer=mapping, offset=info.offset
             )
-            storage_shape = (info.nbytes,) if info.format == "Q8_0" else info.shape
-            host = wp.array(
-                ptr=raw.ctypes.data,
-                dtype=info.dtype,
-                shape=storage_shape,
-                capacity=info.nbytes,
-                device="cpu",
-            )
             byte_views.append(raw)
-            host_views.append(host)
-            output[name] = wp.clone(host, device=device)
-        del host, raw
+            if info.format == "Q8_0":
+                rows = math.prod(info.shape[:-1])
+                blocks = info.shape[-1] // 32
+                row_stride = blocks * 34
+                host = wp.array(
+                    ptr=raw.ctypes.data,
+                    dtype=wp.uint8,
+                    shape=(info.nbytes,),
+                    capacity=info.nbytes,
+                    device="cpu",
+                )
+                host_views.append(host)
+                packed = wp.clone(host, device=device)
+                scales = wp.array(
+                    ptr=packed.ptr,
+                    dtype=wp.float16,
+                    shape=(rows, blocks),
+                    strides=(row_stride, 34),
+                    capacity=packed.capacity,
+                    device=device,
+                    copy=False,
+                )
+                values = wp.array(
+                    ptr=packed.ptr + 2,
+                    dtype=wp.int8,
+                    shape=(rows, blocks, 32),
+                    strides=(row_stride, 34, 1),
+                    capacity=packed.capacity - 2,
+                    device=device,
+                    copy=False,
+                )
+                output[name] = BlockQuantizedTensor(
+                    packed, values, scales, info.shape, info.format
+                )
+            else:
+                host = wp.array(
+                    ptr=raw.ctypes.data,
+                    dtype=info.dtype,
+                    shape=info.shape,
+                    capacity=info.nbytes,
+                    device="cpu",
+                )
+                host_views.append(host)
+                output[name] = wp.clone(host, device=device)
+        del raw
 
         event = wp.record_event() if device.is_cuda else None
         resources = (host_views, byte_views, mapping, stream)

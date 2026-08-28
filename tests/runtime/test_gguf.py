@@ -108,7 +108,16 @@ def test_gguf_indexes_q8_0_blocks_as_raw_storage(tmp_path):
     assert info.shape == (2, 32)
     assert info.format == "Q8_0"
     assert info.nbytes == 68
-    np.testing.assert_array_equal(archive.load("cpu")["weight"].numpy(), raw)
+    loaded = archive.load("cpu")["weight"]
+    assert loaded.shape == (2, 32)
+    np.testing.assert_array_equal(loaded.raw.numpy(), raw)
+    np.testing.assert_array_equal(
+        loaded.values.numpy(),
+        np.stack((raw[2:34].view(np.int8), raw[36:68].view(np.int8)))[:, None, :],
+    )
+    np.testing.assert_array_equal(
+        loaded.scales.numpy().view(np.uint16), np.array([[0x0100], [0x2322]], dtype=np.uint16)
+    )
 
 
 def test_gguf_supports_v2_and_selected_loading(tmp_path):
