@@ -125,6 +125,41 @@ def _get_linear_vector_kernel(dtype: type):
     return _create_linear_vector_kernel(dtype)
 
 
+def _create_linear_packed_vector_kernel(dtype: type):
+    """Build a vec4-loaded single-token projection with one output per warp."""
+    DTYPE = dtype
+    VTYPE = wp.vec4h if dtype == wp.float16 else wp.types.vector(4, wp.bfloat16)
+    SUBGROUP = 32
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(
+        x: wp.array2d(dtype=VTYPE),
+        weight: wp.array2d(dtype=VTYPE),
+        output: wp.array2d(dtype=DTYPE),
+    ):
+        thread = wp.tid()
+        lane = thread % SUBGROUP
+        column = thread / SUBGROUP
+        total = wp.float32(0.0)
+        for inner in range(lane, x.shape[1], SUBGROUP):
+            activation = VTYPE(x[0, inner])
+            weights = VTYPE(weight[column, inner])
+            for component in range(4):
+                total += wp.float32(activation[component]) * wp.float32(weights[component])
+        total = subgroup_sum(total, SUBGROUP)
+        if lane == 0:
+            output[0, column] = DTYPE(total)
+
+    kernel.module.options["enable_backward"] = False
+    return kernel, VTYPE
+
+
+@lru_cache(maxsize=None)
+def _get_linear_packed_vector_kernel(dtype: type):
+    """Return the vec4 single-token projection kernel and packed dtype."""
+    return _create_linear_packed_vector_kernel(dtype)
+
+
 def _create_linear_tiled_kernel(dtype: type, tile_m: int):
     """Build a typed tensor-core-friendly dense projection kernel."""
     DTYPE = dtype

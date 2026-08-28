@@ -71,6 +71,30 @@ def test_linear_operation_cublas():
     np.testing.assert_allclose(tensors["output"].numpy(), x_np @ weight_np.T, atol=0.2, rtol=0.02)
 
 
+@pytest.mark.parametrize("dtype", [wp.float16, wp.bfloat16])
+def test_single_token_linear_uses_graph_captured_packed_warp(dtype):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(18)
+    x_np = rng.normal(0.0, 0.1, (1, 68)).astype(np.float32)
+    weight_np = rng.normal(0.0, 0.1, (41, 68)).astype(np.float32)
+    tensors = {
+        "x": wp.array(x_np, dtype=dtype, device="cuda:0"),
+        "weight": wp.array(weight_np, dtype=dtype, device="cuda:0"),
+    }
+    shapes = {name: tuple(value.shape) for name, value in tensors.items()}
+    operation = Operation("Linear", ["x", "weight"], ["output"])
+    plan_linear(operation, tensors, shapes, wp.get_device("cuda:0"), cublas=try_create_cublas())
+
+    assert operation.attrs["_packed_vector"]
+    with wp.ScopedCapture("cuda:0") as capture:
+        execute_operations([operation], tensors, shapes, wp.get_device("cuda:0"))
+    wp.capture_launch(capture.graph)
+
+    expected = tensors["x"].numpy().astype(np.float32) @ tensors["weight"].numpy().astype(np.float32).T
+    np.testing.assert_allclose(tensors["output"].numpy(), expected, atol=0.02, rtol=0.02)
+
+
 def test_gated_rms_norm_bfloat16():
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")

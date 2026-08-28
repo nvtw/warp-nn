@@ -16,6 +16,7 @@ from warp_nn.runtime.kernels import (
     _GEMM_CONFIG,
     _GEMM_TRANSB_TILED_KERNEL,
     _gather_block_quantized_int8_kernel,
+    _get_linear_packed_vector_kernel,
     _get_linear_tiled_kernel,
     _get_linear_vector_kernel,
     _get_rms_norm_kernels,
@@ -55,7 +56,15 @@ def _exec_linear(op, tensors, shapes, device):
     weight = tensors[op.inputs[1]]
     output = tensors[op.outputs[0]].reshape((op.attrs["_rows"], op.attrs["_columns"]))
     cublas = op.attrs.get("_cublas")
-    if cublas is not None:
+    if op.attrs.get("_packed_vector"):
+        wp.launch(
+            op.attrs["_kernel"],
+            dim=weight.shape[0] * 32,
+            inputs=[op.attrs["_packed_x"], op.attrs["_packed_weight"], output],
+            block_dim=256,
+            device=device,
+        )
+    elif cublas is not None:
         cublas.gemm(
             x.ptr,
             weight.ptr,
@@ -101,7 +110,35 @@ def plan_linear(op: Operation, tensors: dict[str, wp.array], shapes: dict[str, t
     tensors[op.outputs[0]] = output
     shapes[op.outputs[0]] = output.shape
     op.attrs.update({"_rows": rows, "_columns": columns, "_inner": inner})
-    if cublas is not None and device.is_cuda and dtype in (wp.float16, wp.bfloat16):
+    x = tensors[op.inputs[0]]
+    weight = tensors[op.inputs[1]]
+    if (
+        device.is_cuda
+        and rows == 1
+        and inner % 4 == 0
+        and dtype in (wp.float16, wp.bfloat16)
+        and x.is_contiguous
+        and weight.is_contiguous
+        and x.ptr % 8 == 0
+        and weight.ptr % 8 == 0
+    ):
+        op.attrs["_kernel"], vector_type = _get_linear_packed_vector_kernel(dtype)
+        op.attrs["_packed_vector"] = True
+        op.attrs["_packed_x"] = wp.array(
+            ptr=tensors[op.inputs[0]].ptr,
+            capacity=tensors[op.inputs[0]].capacity,
+            shape=(1, inner // 4),
+            dtype=vector_type,
+            device=device,
+        )
+        op.attrs["_packed_weight"] = wp.array(
+            ptr=tensors[op.inputs[1]].ptr,
+            capacity=tensors[op.inputs[1]].capacity,
+            shape=(columns, inner // 4),
+            dtype=vector_type,
+            device=device,
+        )
+    elif cublas is not None and device.is_cuda and dtype in (wp.float16, wp.bfloat16):
         op.attrs["_cublas"] = cublas
     elif device.is_cuda:
         if rows < 8:
