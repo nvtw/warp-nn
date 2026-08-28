@@ -23,6 +23,8 @@ from warp_nn.runtime.kernels import (
     _gather_rows_kernel,
     _get_gqa_attention_kernel,
     _get_greedy_argmax_kernels,
+    _allocate_partitioned_gqa,
+    _launch_partitioned_gqa,
     _logit_softcap_kernel,
     _reorder_interleaved_heads_kernel,
     _reorder_heads_kernel,
@@ -626,6 +628,12 @@ class _MusePlan:
         layer["attention_block"], layer["attention_kernel"] = _get_gqa_attention_kernel(
             self.runner.head_dim, self.dtype
         )
+        if self.rows == 1:
+            if not hasattr(self, "partitioned_attention"):
+                self.partitioned_attention = _allocate_partitioned_gqa(
+                    self.runner.query_heads, self.runner.head_dim, self.dtype, self.device
+                )
+            layer["partitioned_attention"] = self.partitioned_attention
 
     def _execute_op(self, op: Operation) -> None:
         execute_operations(op.attrs["_sequence"], self.tensors, self.shapes, self.device)
@@ -687,10 +695,10 @@ class _MusePlan:
                 inputs=[source, self.position_ids, cache, self.runner.kv_heads, self.runner.head_dim],
                 device=self.device,
             )
-        wp.launch_tiled(
-            layer["attention_kernel"],
-            dim=self.runner.query_heads * self.rows,
-            inputs=[
+        window = self.runner.local_window if layer["local"] else 0
+        if "partitioned_attention" in layer:
+            _launch_partitioned_gqa(
+                layer["partitioned_attention"],
                 layer["q_ready"],
                 key_cache,
                 value_cache,
@@ -698,14 +706,31 @@ class _MusePlan:
                 layer["core"],
                 self.runner.query_heads,
                 self.runner.kv_heads,
-                self.rows,
                 cache_capacity,
                 self.runner.head_dim**-0.5,
-                self.runner.local_window if layer["local"] else 0,
-            ],
-            block_dim=layer["attention_block"],
-            device=self.device,
-        )
+                window,
+                self.device,
+            )
+        else:
+            wp.launch_tiled(
+                layer["attention_kernel"],
+                dim=self.runner.query_heads * self.rows,
+                inputs=[
+                    layer["q_ready"],
+                    key_cache,
+                    value_cache,
+                    self.runner.sequence_end,
+                    layer["core"],
+                    self.runner.query_heads,
+                    self.runner.kv_heads,
+                    self.rows,
+                    cache_capacity,
+                    self.runner.head_dim**-0.5,
+                    window,
+                ],
+                block_dim=layer["attention_block"],
+                device=self.device,
+            )
         wp.launch(
             _sigmoid_gate_kernel,
             dim=layer["core"].shape,

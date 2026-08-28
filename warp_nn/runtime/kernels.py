@@ -1932,7 +1932,143 @@ def _create_gqa_attention_kernel(head_size: int, dtype: type):
     return kernel
 
 
+def _create_partitioned_gqa_attention_kernels(head_size: int, dtype: type, partitions: int):
+    """Build parallel decode attention and its stable partial-softmax reduction."""
+    DTYPE = dtype
+    PARTITIONS = partitions
+
+    @wp.func
+    def dot(left: DTYPE, right: DTYPE):
+        return wp.float32(DTYPE(left)) * wp.float32(right)
+
+    @wp.func
+    def accumulate(total: wp.float32, value: DTYPE, old_scale: wp.float32, weight: wp.float32):
+        return total * old_scale + wp.float32(DTYPE(value)) * weight
+
+    @wp.func
+    def scale_value(value: wp.float32, scale: wp.float32):
+        return value * scale
+
+    @wp.func
+    def normalize(value: wp.float32, denominator: wp.float32):
+        return DTYPE(value / denominator)
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def partial(
+        query: wp.array2d(dtype=DTYPE),
+        key: wp.array2d(dtype=DTYPE),
+        value: wp.array2d(dtype=DTYPE),
+        sequence_lengths_minus_one: wp.array1d[wp.int32],
+        partial_maximum: wp.array1d[wp.float32],
+        partial_denominator: wp.array1d[wp.float32],
+        partial_output: wp.array2d[wp.float32],
+        query_heads: int,
+        kv_heads: int,
+        total_length: int,
+        scale: float,
+        window: int,
+    ):
+        item = wp.tid()
+        partition = item % PARTITIONS
+        group_item = item / PARTITIONS
+        queries_per_kv = query_heads / kv_heads
+        groups_per_kv = (queries_per_kv + 1) / 2
+        groups_per_batch = kv_heads * groups_per_kv
+        batch = group_item / groups_per_batch
+        group = group_item % groups_per_batch
+        kv_head = group / groups_per_kv
+        pair = group % groups_per_kv
+        head_0 = kv_head * queries_per_kv + pair * 2
+        head_1 = wp.min(head_0 + 1, (kv_head + 1) * queries_per_kv - 1)
+        has_second = head_1 != head_0
+        head_item_0 = batch * query_heads + head_0
+        head_item_1 = batch * query_heads + head_1
+        partial_item_0 = head_item_0 * PARTITIONS + partition
+        partial_item_1 = head_item_1 * PARTITIONS + partition
+
+        valid_keys = wp.int32(sequence_lengths_minus_one[batch]) + 1
+        first_key = wp.max(0, valid_keys - window) if window > 0 else 0
+        key_count = valid_keys - first_key
+        keys_per_partition = (key_count + PARTITIONS - 1) / PARTITIONS
+        partition_start = first_key + partition * keys_per_partition
+        partition_end = wp.min(valid_keys, partition_start + keys_per_partition)
+
+        query_0 = wp.tile_load(query[head_item_0], shape=(head_size,))
+        query_1 = wp.tile_load(query[head_item_1], shape=(head_size,))
+        accumulator_0 = wp.tile_zeros(shape=(head_size,), dtype=wp.float32)
+        accumulator_1 = wp.tile_zeros(shape=(head_size,), dtype=wp.float32)
+        maximum_0 = wp.float32(-3.402823466e38) + wp.float32(DTYPE(0.0))
+        maximum_1 = maximum_0
+        denominator_0 = wp.float32(0.0)
+        denominator_1 = wp.float32(0.0)
+        for key_token in range(partition_start, partition_end):
+            cache_token = key_token % total_length if window > 0 else key_token
+            cache_row = (batch * kv_heads + kv_head) * total_length + cache_token
+            key_values = wp.tile_load(key[cache_row], shape=(head_size,))
+            value_values = wp.tile_load(value[cache_row], shape=(head_size,))
+
+            score_0 = wp.tile_extract(wp.tile_sum(wp.tile_map(dot, query_0, key_values)), 0) * wp.float32(scale)
+            new_maximum_0 = wp.max(maximum_0, score_0)
+            old_scale_0 = wp.exp(maximum_0 - new_maximum_0)
+            weight_0 = wp.exp(score_0 - new_maximum_0)
+            denominator_0 = denominator_0 * old_scale_0 + weight_0
+            accumulator_0 = wp.tile_map(accumulate, accumulator_0, value_values, old_scale_0, weight_0)
+            maximum_0 = new_maximum_0
+
+            score_1 = wp.tile_extract(wp.tile_sum(wp.tile_map(dot, query_1, key_values)), 0) * wp.float32(scale)
+            new_maximum_1 = wp.max(maximum_1, score_1)
+            old_scale_1 = wp.exp(maximum_1 - new_maximum_1)
+            weight_1 = wp.exp(score_1 - new_maximum_1)
+            denominator_1 = denominator_1 * old_scale_1 + weight_1
+            accumulator_1 = wp.tile_map(accumulate, accumulator_1, value_values, old_scale_1, weight_1)
+            maximum_1 = new_maximum_1
+
+        partial_maximum[partial_item_0] = maximum_0
+        partial_denominator[partial_item_0] = denominator_0
+        wp.tile_store(partial_output[partial_item_0], accumulator_0)
+        if has_second:
+            partial_maximum[partial_item_1] = maximum_1
+            partial_denominator[partial_item_1] = denominator_1
+            wp.tile_store(partial_output[partial_item_1], accumulator_1)
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def reduce(
+        partial_maximum: wp.array1d[wp.float32],
+        partial_denominator: wp.array1d[wp.float32],
+        partial_output: wp.array2d[wp.float32],
+        output: wp.array2d(dtype=DTYPE),
+        query_heads: int,
+    ):
+        head_item = wp.tid()
+        typed_zero = DTYPE(0.0)
+        head = head_item % query_heads
+        batch = head_item / query_heads
+        offset = head_item * PARTITIONS
+        maximum = wp.float32(-3.402823466e38) + wp.float32(typed_zero)
+        for partition in range(PARTITIONS):
+            maximum = wp.max(maximum, partial_maximum[offset + partition])
+
+        denominator = wp.float32(0.0)
+        accumulator = wp.tile_zeros(shape=(head_size,), dtype=wp.float32)
+        for partition in range(PARTITIONS):
+            item = offset + partition
+            partial_scale = wp.exp(partial_maximum[item] - maximum)
+            denominator += partial_denominator[item] * partial_scale
+            values = wp.tile_load(partial_output[item], shape=(head_size,))
+            accumulator += wp.tile_map(scale_value, values, partial_scale)
+        wp.tile_store(
+            output[batch],
+            wp.tile_map(normalize, accumulator, denominator),
+            offset=(head * head_size,),
+        )
+
+    partial.module.options["enable_backward"] = False
+    reduce.module.options["enable_backward"] = False
+    return partial, reduce
+
+
 _gqa_attention_kernel_cache = {}
+_partitioned_gqa_attention_kernel_cache = {}
 
 
 def _get_gqa_attention_kernel(head_size: int, dtype: type = wp.float16):
@@ -1942,6 +2078,76 @@ def _get_gqa_attention_kernel(head_size: int, dtype: type = wp.float16):
         _gqa_attention_kernel_cache[key] = _create_gqa_attention_kernel(*key)
     block_dim = min(1024, max(32, 1 << (head_size - 1).bit_length()))
     return block_dim, _gqa_attention_kernel_cache[key]
+
+def _get_partitioned_gqa_attention_kernels(head_size: int, dtype: type = wp.float16):
+    """Return 256-way decode attention kernels and their launch dimensions."""
+    partitions = 256
+    key = (head_size, dtype, partitions)
+    if key not in _partitioned_gqa_attention_kernel_cache:
+        _partitioned_gqa_attention_kernel_cache[key] = _create_partitioned_gqa_attention_kernels(*key)
+    block_dim = min(1024, max(32, 1 << (head_size - 1).bit_length()))
+    return block_dim, partitions, _partitioned_gqa_attention_kernel_cache[key]
+
+def _allocate_partitioned_gqa(heads: int, head_size: int, dtype: type, device):
+    """Allocate one reusable workspace for partitioned decode attention."""
+    block_dim, partitions, kernels = _get_partitioned_gqa_attention_kernels(head_size, dtype)
+    items = heads * partitions
+    return (
+        block_dim,
+        partitions,
+        kernels,
+        wp.empty(items, dtype=wp.float32, device=device),
+        wp.empty(items, dtype=wp.float32, device=device),
+        wp.empty((items, head_size), dtype=wp.float32, device=device),
+    )
+
+
+def _launch_partitioned_gqa(
+    workspace,
+    query,
+    key,
+    value,
+    sequence_end,
+    output,
+    query_heads: int,
+    kv_heads: int,
+    total_length: int,
+    scale: float,
+    window: int,
+    device,
+):
+    """Launch partitioned decode attention using a reusable workspace."""
+    block_dim, partitions, kernels, partial_maximum, partial_denominator, partial_output = workspace
+    queries_per_kv = query_heads // kv_heads
+    groups_per_batch = kv_heads * ((queries_per_kv + 1) // 2)
+    batches = query.shape[0] // query_heads
+    wp.launch_tiled(
+        kernels[0],
+        dim=batches * groups_per_batch * partitions,
+        inputs=[
+            query,
+            key,
+            value,
+            sequence_end,
+            partial_maximum,
+            partial_denominator,
+            partial_output,
+            query_heads,
+            kv_heads,
+            total_length,
+            scale,
+            window,
+        ],
+        block_dim=block_dim,
+        device=device,
+    )
+    wp.launch_tiled(
+        kernels[1],
+        dim=query_heads,
+        inputs=[partial_maximum, partial_denominator, partial_output, output, query_heads],
+        block_dim=block_dim,
+        device=device,
+    )
 
 
 @wp.kernel

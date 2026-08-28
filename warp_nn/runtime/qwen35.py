@@ -23,6 +23,8 @@ from warp_nn.runtime.kernels import (
     _get_gqa_attention_kernel,
     _get_greedy_argmax_kernels,
     _get_linear_attention_kernel,
+    _allocate_partitioned_gqa,
+    _launch_partitioned_gqa,
     _linear_attention_value_blocks,
     _get_lp_normalization_kernel,
     _prepare_gated_delta_kernel,
@@ -425,6 +427,12 @@ class _Qwen35Plan:
         layer["attention_block"], layer["attention_kernel"] = _get_gqa_attention_kernel(
             self.runner.head_size, self.dtype
         )
+        if self.rows == 1:
+            if not hasattr(self, "partitioned_attention"):
+                self.partitioned_attention = _allocate_partitioned_gqa(
+                    self.runner.query_heads, self.runner.head_size, self.dtype, self.device
+                )
+            layer["partitioned_attention"] = self.partitioned_attention
         self.tensors[f"layer.{index}.gated"] = layer["gated"]
         self.shapes[f"layer.{index}.gated"] = tuple(layer["gated"].shape)
         layer["output"] = self._linear(
@@ -630,10 +638,9 @@ class _Qwen35Plan:
                 ],
                 device=self.device,
             )
-        wp.launch_tiled(
-            layer["attention_kernel"],
-            dim=self.runner.query_heads * self.rows,
-            inputs=[
+        if "partitioned_attention" in layer:
+            _launch_partitioned_gqa(
+                layer["partitioned_attention"],
                 layer["q_rotated"],
                 key_cache,
                 value_cache,
@@ -641,14 +648,31 @@ class _Qwen35Plan:
                 layer["core"],
                 self.runner.query_heads,
                 self.runner.kv_heads,
-                self.rows,
                 self.runner.cache_capacity,
                 self.runner.head_size**-0.5,
                 0,
-            ],
-            block_dim=layer["attention_block"],
-            device=self.device,
-        )
+                self.device,
+            )
+        else:
+            wp.launch_tiled(
+                layer["attention_kernel"],
+                dim=self.runner.query_heads * self.rows,
+                inputs=[
+                    layer["q_rotated"],
+                    key_cache,
+                    value_cache,
+                    self.runner.sequence_end,
+                    layer["core"],
+                    self.runner.query_heads,
+                    self.runner.kv_heads,
+                    self.rows,
+                    self.runner.cache_capacity,
+                    self.runner.head_size**-0.5,
+                    0,
+                ],
+                block_dim=layer["attention_block"],
+                device=self.device,
+            )
         wp.launch(
             _sigmoid_gate_kernel,
             dim=layer["core"].shape,
@@ -893,7 +917,7 @@ class Qwen35Runner:
         self.sequence_length = end
         return logits
 
-    def _append(self, token_ids: Sequence[int]) -> wp.array:
+    def _append(self, token_ids: Sequence[int], *, prefer_decode: bool = False) -> wp.array:
         if not token_ids:
             raise ValueError("Qwen35Runner requires at least one token")
         if self.sequence_length + len(token_ids) > self.cache_capacity:
@@ -902,7 +926,11 @@ class Qwen35Runner:
         start = 0
         while start < len(token_ids):
             remaining = len(token_ids) - start
-            rows = min(self.prefill_chunk_size, 1 << (remaining.bit_length() - 1))
+            rows = (
+                1
+                if prefer_decode and self.sequence_length >= 24_576
+                else min(self.prefill_chunk_size, 1 << (remaining.bit_length() - 1))
+            )
             if rows == 1:
                 logits = self._stage_one(int(token_ids[start]))
             else:
@@ -923,7 +951,7 @@ class Qwen35Runner:
         """Append prompt tokens while retaining the current conversation state."""
         if self.sequence_length == 0:
             raise RuntimeError("Qwen35Runner.append requires a preceding prefill")
-        return self._append(token_ids)
+        return self._append(token_ids, prefer_decode=True)
 
     def decode(self, token_id: int) -> wp.array:
         """Append one generated token and return its logits."""
