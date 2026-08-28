@@ -32,7 +32,13 @@ from warp_nn.runtime.kernels import (
     _scale_kernel,
     _sigmoid_gate_kernel,
 )
-from warp_nn.runtime.operators import Operation, execute_operations, plan_linear, plan_rms_norm, plan_swiglu
+from warp_nn.runtime.operators import (
+    Operation,
+    execute_operations,
+    plan_linear,
+    plan_rms_norm,
+    plan_swiglu,
+)
 from warp_nn.runtime.qwen35 import Qwen35Runner
 from warp_nn.runtime.qwen3 import Qwen3Tokenizer, _pretokenize_o200k
 from warp_nn.runtime.safetensors import SafeTensorArchive
@@ -45,15 +51,24 @@ def _gguf_paths(path: str | Path) -> tuple[Path, ...]:
     if path.is_dir():
         first_files = sorted(directory.glob("*-00001-of-*.gguf"))
         if not first_files:
-            first_files = [item for item in sorted(directory.glob("*.gguf")) if "mmproj" not in item.name.lower()]
+            first_files = [
+                item
+                for item in sorted(directory.glob("*.gguf"))
+                if "mmproj" not in item.name.lower()
+            ]
         if len(first_files) != 1:
-            raise FileNotFoundError(f"Expected one GGUF model in '{directory}', found {len(first_files)}")
+            raise FileNotFoundError(
+                f"Expected one GGUF model in '{directory}', found {len(first_files)}"
+            )
         path = first_files[0]
     match = re.fullmatch(r"(.+)-(\d{5})-of-(\d{5})\.gguf", path.name)
     if match is None:
         return (path,)
     count = int(match.group(3))
-    return tuple(directory / f"{match.group(1)}-{index:05d}-of-{count:05d}.gguf" for index in range(1, count + 1))
+    return tuple(
+        directory / f"{match.group(1)}-{index:05d}-of-{count:05d}.gguf"
+        for index in range(1, count + 1)
+    )
 
 
 def _gguf_config(metadata: Mapping[str, object]) -> dict:
@@ -63,7 +78,10 @@ def _gguf_config(metadata: Mapping[str, object]) -> dict:
     layers = int(metadata[prefix + "block_count"])
     pattern = int(metadata[prefix + "attention.sliding_window_pattern"])
     rope_theta = float(metadata[prefix + "rope.freq_base"])
-    layer_types = ["full_attention" if (index + 1) % pattern == 0 else "sliding_attention" for index in range(layers)]
+    layer_types = [
+        "full_attention" if (index + 1) % pattern == 0 else "sliding_attention"
+        for index in range(layers)
+    ]
     return {
         "model_type": "muse_glimmer_text",
         "hidden_size": int(metadata[prefix + "embedding_length"]),
@@ -71,7 +89,9 @@ def _gguf_config(metadata: Mapping[str, object]) -> dict:
         "vocab_size": len(metadata["tokenizer.ggml.tokens"]),
         "num_hidden_layers": layers,
         "layer_types": layer_types,
-        "layer_rope_theta": [0.0 if kind == "full_attention" else rope_theta for kind in layer_types],
+        "layer_rope_theta": [
+            0.0 if kind == "full_attention" else rope_theta for kind in layer_types
+        ],
         "num_attention_heads": int(metadata[prefix + "attention.head_count"]),
         "num_key_value_heads": int(metadata[prefix + "attention.head_count_kv"]),
         "head_dim": int(metadata[prefix + "attention.key_length"]),
@@ -110,7 +130,12 @@ def _gguf_weight_map(config: Mapping[str, object]) -> dict[str, str]:
     }
     for index in range(int(config["num_hidden_layers"])):
         prefix = f"model.language_model.layers.{index}."
-        names.update({prefix + target: f"blk.{index}.{source}" for target, source in suffixes.items()})
+        names.update(
+            {
+                prefix + target: f"blk.{index}.{source}"
+                for target, source in suffixes.items()
+            }
+        )
     return names
 
 
@@ -155,18 +180,27 @@ def _validate_config(config: dict) -> None:
     if missing:
         raise ValueError(f"Muse Glimmer text config is missing {missing}")
     layers = int(config["num_hidden_layers"])
-    if len(config["layer_types"]) != layers or len(config["layer_rope_theta"]) != layers:
+    if (
+        len(config["layer_types"]) != layers
+        or len(config["layer_rope_theta"]) != layers
+    ):
         raise ValueError("Muse Glimmer layer metadata must match num_hidden_layers")
     if set(config["layer_types"]) - {"sliding_attention", "full_attention"}:
-        raise ValueError("Muse Glimmer supports sliding_attention and full_attention layers")
+        raise ValueError(
+            "Muse Glimmer supports sliding_attention and full_attention layers"
+        )
     if any(
         (kind == "sliding_attention") != bool(theta)
         for kind, theta in zip(config["layer_types"], config["layer_rope_theta"])
     ):
-        raise ValueError("Muse Glimmer expects RoPE on sliding layers and NoPE on full layers")
+        raise ValueError(
+            "Muse Glimmer expects RoPE on sliding layers and NoPE on full layers"
+        )
     if int(config["num_attention_heads"]) % int(config["num_key_value_heads"]):
         raise ValueError("Muse Glimmer query heads must be divisible by KV heads")
-    if config.get("hidden_activation", "silu") != "silu" or config.get("attention_bias", False):
+    if config.get("hidden_activation", "silu") != "silu" or config.get(
+        "attention_bias", False
+    ):
         raise ValueError("Muse Glimmer runner requires SiLU and bias-free attention")
     rope = config.get("rope_parameters", {})
     if rope.get("rope_type", "default") != "default":
@@ -174,7 +208,11 @@ def _validate_config(config: dict) -> None:
 
 
 def _weight_names(config: dict) -> list[str]:
-    names = ["model.language_model.embed_tokens.weight", "model.language_model.norm.weight", "lm_head.weight"]
+    names = [
+        "model.language_model.embed_tokens.weight",
+        "model.language_model.norm.weight",
+        "lm_head.weight",
+    ]
     suffixes = (
         "input_layernorm.weight",
         "post_attention_layernorm.weight",
@@ -226,8 +264,12 @@ def _atem_tool_definitions(tools: Sequence[Mapping[str, object]]) -> str:
 def parse_atem_tool_calls(text: str) -> tuple[str, list[dict[str, object]]]:
     """Extract Muse ATEM function calls and return remaining assistant text."""
     calls = []
-    invoke_pattern = re.compile(r'<atem:invoke\s+name="([^"]+)">(.*?)</atem:invoke>', re.DOTALL)
-    parameter_pattern = re.compile(r'<atem:parameter\s+name="([^"]+)">(.*?)</atem:parameter>', re.DOTALL)
+    invoke_pattern = re.compile(
+        r'<atem:invoke\s+name="([^"]+)">(.*?)</atem:invoke>', re.DOTALL
+    )
+    parameter_pattern = re.compile(
+        r'<atem:parameter\s+name="([^"]+)">(.*?)</atem:parameter>', re.DOTALL
+    )
     for invoke in invoke_pattern.finditer(text):
         arguments = {}
         for parameter in parameter_pattern.finditer(invoke.group(2)):
@@ -238,7 +280,9 @@ def parse_atem_tool_calls(text: str) -> tuple[str, list[dict[str, object]]]:
                 pass
             arguments[parameter.group(1)] = value
         calls.append({"name": invoke.group(1), "arguments": arguments})
-    clean = re.sub(r"<atem:function_calls>.*?</atem:function_calls>", "", text, flags=re.DOTALL).strip()
+    clean = re.sub(
+        r"<atem:function_calls>.*?</atem:function_calls>", "", text, flags=re.DOTALL
+    ).strip()
     return clean, calls
 
 
@@ -307,7 +351,9 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
                 raise ValueError("Muse GGUF requires an embedded GPT-2 BPE tokenizer")
             tokens = metadata["tokenizer.ggml.tokens"]
             token_types = metadata["tokenizer.ggml.token_type"]
-            merges = [merge.split(" ", 1) for merge in metadata["tokenizer.ggml.merges"]]
+            merges = [
+                merge.split(" ", 1) for merge in metadata["tokenizer.ggml.merges"]
+            ]
             added = [
                 {"id": token_id, "content": token, "special": token_type == 3}
                 for token_id, (token, token_type) in enumerate(zip(tokens, token_types))
@@ -319,10 +365,16 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
                 {
                     "normalizer": None,
                     "added_tokens": added,
-                    "model": {"type": "BPE", "vocab": dict(zip(tokens, range(len(tokens)))), "merges": merges},
+                    "model": {
+                        "type": "BPE",
+                        "vocab": dict(zip(tokens, range(len(tokens)))),
+                        "merges": merges,
+                    },
                     "generation_config": {
                         "eos_token_id": [eos, eot],
-                        "pad_token_id": int(metadata["tokenizer.ggml.padding_token_id"]),
+                        "pad_token_id": int(
+                            metadata["tokenizer.ggml.padding_token_id"]
+                        ),
                     },
                     "chat_template": metadata.get("tokenizer.chat_template", ""),
                 }
@@ -335,7 +387,9 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
     def _reasoning_strength(enable_thinking: bool, reasoning_effort: str | None) -> str:
         if not enable_thinking:
             return "low"
-        return {None: "high", "xhigh": "high", "medium": "medium", "low": "low"}.get(reasoning_effort, reasoning_effort)
+        return {None: "high", "xhigh": "high", "medium": "medium", "low": "low"}.get(
+            reasoning_effort, reasoning_effort
+        )
 
     @staticmethod
     def _tool_call_text(call: Mapping[str, object]) -> str:
@@ -347,7 +401,9 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
         for name, value in arguments.items():
             structured = isinstance(value, (dict, list, bool)) or value is None
             encoded = json.dumps(value, ensure_ascii=False) if structured else value
-            parameters.append(f'<atem:parameter name="{name}">{encoded}</atem:parameter>\n')
+            parameters.append(
+                f'<atem:parameter name="{name}">{encoded}</atem:parameter>\n'
+            )
         return (
             f'<atem:function_calls>\n<atem:invoke name="{function["name"]}">\n{"".join(parameters)}'
             "</atem:invoke>\n</atem:function_calls>"
@@ -397,7 +453,12 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
                 raise ValueError("MuseGlimmerTokenizer supports text message content")
             content = "" if content is None else content
             if role == "system":
-                system = re.sub("reasoning effort", "reasoning strength", content, flags=re.IGNORECASE)
+                system = re.sub(
+                    "reasoning effort",
+                    "reasoning strength",
+                    content,
+                    flags=re.IGNORECASE,
+                )
                 if "reasoning strength" not in system.lower():
                     system += f"\n\nReasoning strength: {strength}."
                 if tools:
@@ -408,18 +469,26 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
             elif role == "assistant":
                 raw_token_ids = message.get("_raw_token_ids")
                 if isinstance(raw_token_ids, (list, tuple)):
-                    output.append(f"<|start|>assistant{self.decode(raw_token_ids, skip_special_tokens=False)}")
+                    output.append(
+                        f"<|start|>assistant{self.decode(raw_token_ids, skip_special_tokens=False)}"
+                    )
                     continue
                 reasoning = message.get("reasoning_content")
                 if isinstance(reasoning, str) and reasoning:
-                    output.append(f"<|start|>assistant to=self<|message|>{reasoning}<|eom|>")
+                    output.append(
+                        f"<|start|>assistant to=self<|message|>{reasoning}<|eom|>"
+                    )
                 calls = message.get("tool_calls") or ()
                 if calls:
                     for call in calls:
                         name = call.get("function", call)["name"]
-                        output.append(f"<|start|>assistant to={name}<|message|>{self._tool_call_text(call)}<|eot|>")
+                        output.append(
+                            f"<|start|>assistant to={name}<|message|>{self._tool_call_text(call)}<|eot|>"
+                        )
                 else:
-                    output.append(f"<|start|>assistant to=user<|message|>{content}<|eot|>")
+                    output.append(
+                        f"<|start|>assistant to=user<|message|>{content}<|eot|>"
+                    )
             elif role == "tool":
                 call_id = message.get("tool_call_id", "")
                 name = message.get("name") or call_names.get(call_id, call_id)
@@ -432,10 +501,16 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
             output.append("<|start|>assistant")
         return "".join(output)
 
-    def encode_chat(self, messages: Sequence[Mapping[str, object]], **kwargs) -> list[int]:
+    def encode_chat(
+        self, messages: Sequence[Mapping[str, object]], **kwargs
+    ) -> list[int]:
         """Format chat while retaining the model's exact generated token sequence."""
         rendered = self.format_chat(messages, **kwargs)
-        raw_messages = [message for message in messages if isinstance(message.get("_raw_token_ids"), (list, tuple))]
+        raw_messages = [
+            message
+            for message in messages
+            if isinstance(message.get("_raw_token_ids"), (list, tuple))
+        ]
         if not raw_messages:
             return self.encode(rendered)
         encoded = []
@@ -446,7 +521,9 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
             raw = self.decode(raw_token_ids, skip_special_tokens=False)
             start = rendered.find(anchor + raw, cursor)
             if start < 0:
-                raise ValueError("Muse raw assistant history is inconsistent with the formatted chat")
+                raise ValueError(
+                    "Muse raw assistant history is inconsistent with the formatted chat"
+                )
             raw_start = start + len(anchor)
             encoded.extend(self.encode(rendered[cursor:raw_start]))
             encoded.extend(int(token_id) for token_id in raw_token_ids)
@@ -454,7 +531,9 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
         encoded.extend(self.encode(rendered[cursor:]))
         return encoded
 
-    def decode(self, token_ids: Sequence[int], skip_special_tokens: bool = False) -> str:
+    def decode(
+        self, token_ids: Sequence[int], skip_special_tokens: bool = False
+    ) -> str:
         """Decode tokens, reducing generated Muse channels to user/tool content."""
         raw = super().decode(token_ids, skip_special_tokens=False)
         if not skip_special_tokens:
@@ -499,7 +578,9 @@ class _MusePlan:
         self.shapes = {name: tuple(value.shape) for name, value in self.tensors.items()}
         self.input_ids = wp.zeros((1, rows), dtype=wp.int64, device=self.device)
         self.position_ids = wp.zeros((1, rows), dtype=wp.int64, device=self.device)
-        self.embedding = wp.empty((1, rows, runner.hidden_size), dtype=self.dtype, device=self.device)
+        self.embedding = wp.empty(
+            (1, rows, runner.hidden_size), dtype=self.dtype, device=self.device
+        )
         self.tensors["hidden.0"] = self.embedding.reshape((rows, runner.hidden_size))
         self.shapes["hidden.0"] = (rows, runner.hidden_size)
         self.layers = []
@@ -508,12 +589,18 @@ class _MusePlan:
 
     def _linear(self, name: str, x: str, weight: str) -> Operation:
         op = Operation("Linear", [x, weight], [name])
-        plan_linear(op, self.tensors, self.shapes, self.device, cublas=self.runner.cublas)
+        plan_linear(
+            op, self.tensors, self.shapes, self.device, cublas=self.runner.cublas
+        )
         op.attrs["_sequence"] = (op,)
         return op
 
-    def _rms(self, name: str, x: str, scale: str, epsilon: float, centered: bool = False) -> Operation:
-        op = Operation("SimplifiedLayerNormalization", [x, scale], [name], {"epsilon": epsilon})
+    def _rms(
+        self, name: str, x: str, scale: str, epsilon: float, centered: bool = False
+    ) -> Operation:
+        op = Operation(
+            "SimplifiedLayerNormalization", [x, scale], [name], {"epsilon": epsilon}
+        )
         if centered:
             op.attrs["_scale_offset"] = 1.0
         plan_rms_norm(op, self.tensors, self.shapes, self.device)
@@ -533,7 +620,9 @@ class _MusePlan:
 
     def _build(self) -> None:
         hidden = "hidden.0"
-        self.embedding_norm = self._rms("embedding.normalized", hidden, "__unit_hidden", self.runner.rms_epsilon)
+        self.embedding_norm = self._rms(
+            "embedding.normalized", hidden, "__unit_hidden", self.runner.rms_epsilon
+        )
         hidden = self.embedding_norm.outputs[0]
         for index in range(self.runner.num_layers):
             prefix = f"model.language_model.layers.{index}."
@@ -555,7 +644,11 @@ class _MusePlan:
             )
             attention_residual = self._register(
                 f"layer.{index}.attention_residual",
-                wp.empty((self.rows, self.runner.hidden_size), dtype=self.dtype, device=self.device),
+                wp.empty(
+                    (self.rows, self.runner.hidden_size),
+                    dtype=self.dtype,
+                    device=self.device,
+                ),
             )
             layer["attention_residual"] = attention_residual
             layer["feedforward_input"] = self._rms(
@@ -566,16 +659,24 @@ class _MusePlan:
                 self.runner.centered_norm_scales,
             )
             layer["mlp_gate"] = self._linear(
-                f"layer.{index}.mlp_gate", layer["feedforward_input"].outputs[0], prefix + "mlp.gate_proj.weight"
+                f"layer.{index}.mlp_gate",
+                layer["feedforward_input"].outputs[0],
+                prefix + "mlp.gate_proj.weight",
             )
             layer["mlp_up"] = self._linear(
-                f"layer.{index}.mlp_up", layer["feedforward_input"].outputs[0], prefix + "mlp.up_proj.weight"
+                f"layer.{index}.mlp_up",
+                layer["feedforward_input"].outputs[0],
+                prefix + "mlp.up_proj.weight",
             )
             layer["swiglu"] = self._swiglu(
-                f"layer.{index}.swiglu", layer["mlp_gate"].outputs[0], layer["mlp_up"].outputs[0]
+                f"layer.{index}.swiglu",
+                layer["mlp_gate"].outputs[0],
+                layer["mlp_up"].outputs[0],
             )
             layer["mlp_down"] = self._linear(
-                f"layer.{index}.mlp_down", layer["swiglu"].outputs[0], prefix + "mlp.down_proj.weight"
+                f"layer.{index}.mlp_down",
+                layer["swiglu"].outputs[0],
+                prefix + "mlp.down_proj.weight",
             )
             layer["post_feedforward"] = self._rms(
                 f"layer.{index}.feedforward_post",
@@ -586,21 +687,34 @@ class _MusePlan:
             )
             hidden = self._register(
                 f"hidden.{index + 1}",
-                wp.empty((self.rows, self.runner.hidden_size), dtype=self.dtype, device=self.device),
+                wp.empty(
+                    (self.rows, self.runner.hidden_size),
+                    dtype=self.dtype,
+                    device=self.device,
+                ),
             )
             layer["output"] = hidden
             self.layers.append(layer)
         self.final_norm = self._rms(
-            "final.normalized", hidden, "model.language_model.norm.weight", self.runner.rms_epsilon
+            "final.normalized",
+            hidden,
+            "model.language_model.norm.weight",
+            self.runner.rms_epsilon,
         )
-        self.lm_head = self._linear("logits", self.final_norm.outputs[0], "lm_head.weight")
-        self.logits = self.tensors["logits"].reshape((1, self.rows, self.runner.vocab_size))
+        self.lm_head = self._linear(
+            "logits", self.final_norm.outputs[0], "lm_head.weight"
+        )
+        self.logits = self.tensors["logits"].reshape(
+            (1, self.rows, self.runner.vocab_size)
+        )
 
     def _build_attention(self, layer: dict, index: int, prefix: str, x: str) -> None:
         attention = prefix + "self_attn."
         for projection in ("q", "k", "v", "gate"):
             layer[projection + "_proj"] = self._linear(
-                f"layer.{index}.{projection}_projected", x, attention + projection + "_proj.weight"
+                f"layer.{index}.{projection}_projected",
+                x,
+                attention + projection + "_proj.weight",
             )
         q_shape = (self.runner.query_heads * self.rows, self.runner.head_dim)
         kv_shape = (self.runner.kv_heads * self.rows, self.runner.head_dim)
@@ -609,8 +723,18 @@ class _MusePlan:
         layer["v"] = wp.empty(kv_shape, dtype=self.dtype, device=self.device)
         self._register(f"layer.{index}.q", layer["q"])
         self._register(f"layer.{index}.k", layer["k"])
-        layer["q_norm"] = self._rms(f"layer.{index}.q_norm", f"layer.{index}.q", "__unit_head", self.runner.rms_epsilon)
-        layer["k_norm"] = self._rms(f"layer.{index}.k_norm", f"layer.{index}.k", "__unit_head", self.runner.rms_epsilon)
+        layer["q_norm"] = self._rms(
+            f"layer.{index}.q_norm",
+            f"layer.{index}.q",
+            "__unit_head",
+            self.runner.rms_epsilon,
+        )
+        layer["k_norm"] = self._rms(
+            f"layer.{index}.k_norm",
+            f"layer.{index}.k",
+            "__unit_head",
+            self.runner.rms_epsilon,
+        )
         if layer["local"]:
             layer["q_ready"] = wp.empty_like(layer["q"])
             layer["k_ready"] = wp.empty_like(layer["k"])
@@ -618,7 +742,9 @@ class _MusePlan:
             layer["q_ready"] = self.tensors[layer["q_norm"].outputs[0]]
             layer["k_ready"] = self.tensors[layer["k_norm"].outputs[0]]
         layer["core"] = wp.empty(
-            (self.rows, self.runner.query_heads * self.runner.head_dim), dtype=self.dtype, device=self.device
+            (self.rows, self.runner.query_heads * self.runner.head_dim),
+            dtype=self.dtype,
+            device=self.device,
         )
         layer["gated"] = wp.empty_like(layer["core"])
         core_name = self._register(f"layer.{index}.attention_gated", layer["gated"])
@@ -631,19 +757,26 @@ class _MusePlan:
         if self.rows == 1:
             if not hasattr(self, "partitioned_attention"):
                 self.partitioned_attention = _allocate_partitioned_gqa(
-                    self.runner.query_heads, self.runner.head_dim, self.dtype, self.device
+                    self.runner.query_heads,
+                    self.runner.head_dim,
+                    self.dtype,
+                    self.device,
                 )
             layer["partitioned_attention"] = self.partitioned_attention
 
     def _execute_op(self, op: Operation) -> None:
-        execute_operations(op.attrs["_sequence"], self.tensors, self.shapes, self.device)
+        execute_operations(
+            op.attrs["_sequence"], self.tensors, self.shapes, self.device
+        )
 
     def _execute_attention(self, layer: dict, index: int) -> None:
         for projection in ("q", "k", "v", "gate"):
             self._execute_op(layer[projection + "_proj"])
         for projection in ("q", "k", "v"):
             output = layer[projection]
-            heads = self.runner.query_heads if projection == "q" else self.runner.kv_heads
+            heads = (
+                self.runner.query_heads if projection == "q" else self.runner.kv_heads
+            )
             reorder_kernel = (
                 _reorder_interleaved_heads_kernel
                 if self.runner.gguf_layout and projection in ("q", "k")
@@ -652,7 +785,11 @@ class _MusePlan:
             wp.launch(
                 reorder_kernel,
                 dim=(self.rows, heads, self.runner.head_dim),
-                inputs=[self.tensors[layer[projection + "_proj"].outputs[0]], output, self.runner.head_dim],
+                inputs=[
+                    self.tensors[layer[projection + "_proj"].outputs[0]],
+                    output,
+                    self.runner.head_dim,
+                ],
                 device=self.device,
             )
         self._execute_op(layer["q_norm"])
@@ -668,7 +805,11 @@ class _MusePlan:
             rotary = _rotary_embedding_kernel_for_dtype(self.dtype)
             for source, output, heads in (
                 (q_normalized, layer["q_ready"], self.runner.query_heads),
-                (self.tensors[layer["k_norm"].outputs[0]], layer["k_ready"], self.runner.kv_heads),
+                (
+                    self.tensors[layer["k_norm"].outputs[0]],
+                    layer["k_ready"],
+                    self.runner.kv_heads,
+                ),
             ):
                 wp.launch(
                     rotary,
@@ -687,12 +828,22 @@ class _MusePlan:
                 )
         key_cache, value_cache = self.runner.kv_caches[index]
         cache_capacity = self.runner.cache_capacities[index]
-        append_kernel = _append_circular_head_cache_kernel if layer["local"] else _append_head_cache_kernel
+        append_kernel = (
+            _append_circular_head_cache_kernel
+            if layer["local"]
+            else _append_head_cache_kernel
+        )
         for source, cache in ((layer["k_ready"], key_cache), (layer["v"], value_cache)):
             wp.launch(
                 append_kernel,
                 dim=(self.runner.kv_heads, self.rows, self.runner.head_dim),
-                inputs=[source, self.position_ids, cache, self.runner.kv_heads, self.runner.head_dim],
+                inputs=[
+                    source,
+                    self.position_ids,
+                    cache,
+                    self.runner.kv_heads,
+                    self.runner.head_dim,
+                ],
                 device=self.device,
             )
         window = self.runner.local_window if layer["local"] else 0
@@ -734,7 +885,11 @@ class _MusePlan:
         wp.launch(
             _sigmoid_gate_kernel,
             dim=layer["core"].shape,
-            inputs=[layer["core"], self.tensors[layer["gate_proj"].outputs[0]], layer["gated"]],
+            inputs=[
+                layer["core"],
+                self.tensors[layer["gate_proj"].outputs[0]],
+                layer["gated"],
+            ],
             device=self.device,
         )
         self._execute_op(layer["attention_output"])
@@ -744,7 +899,11 @@ class _MusePlan:
         wp.launch(
             _gather_rows_kernel,
             dim=self.embedding.shape,
-            inputs=[self.runner.weights["model.language_model.embed_tokens.weight"], self.input_ids, self.embedding],
+            inputs=[
+                self.runner.weights["model.language_model.embed_tokens.weight"],
+                self.input_ids,
+                self.embedding,
+            ],
             device=self.device,
         )
         self._execute_op(self.embedding_norm)
@@ -764,7 +923,14 @@ class _MusePlan:
                 ],
                 device=self.device,
             )
-            for name in ("feedforward_input", "mlp_gate", "mlp_up", "swiglu", "mlp_down", "post_feedforward"):
+            for name in (
+                "feedforward_input",
+                "mlp_gate",
+                "mlp_up",
+                "swiglu",
+                "mlp_down",
+                "post_feedforward",
+            ):
                 self._execute_op(layer[name])
             wp.launch(
                 _binary_broadcast_kernel,
@@ -783,7 +949,12 @@ class _MusePlan:
         wp.launch(
             _logit_softcap_kernel,
             dim=self.logits.shape,
-            inputs=[self.logits, self.logits, self.runner.output_multiplier, self.runner.logit_cap],
+            inputs=[
+                self.logits,
+                self.logits,
+                self.runner.output_multiplier,
+                self.runner.logit_cap,
+            ],
             device=self.device,
         )
         return self.logits
@@ -845,13 +1016,21 @@ class MuseGlimmerRunner(Qwen35Runner):
         names = _weight_names(self.config)
         missing = set(names) - set(archive.names)
         if missing:
-            raise ValueError(f"Muse Glimmer checkpoint is missing {sorted(missing)[:5]}")
-        embedding_dtype = archive.metadata("model.language_model.embed_tokens.weight").dtype
+            raise ValueError(
+                f"Muse Glimmer checkpoint is missing {sorted(missing)[:5]}"
+            )
+        embedding_dtype = archive.metadata(
+            "model.language_model.embed_tokens.weight"
+        ).dtype
         if embedding_dtype not in (wp.float16, wp.bfloat16):
             raise TypeError("Muse Glimmer embeddings must use FP16 or BF16")
         required_bytes = sum(archive.metadata(name).nbytes for name in names)
         for layer_type in self.layer_types:
-            capacity = self.local_cache_capacity if layer_type == "sliding_attention" else self.cache_capacity
+            capacity = (
+                self.local_cache_capacity
+                if layer_type == "sliding_attention"
+                else self.cache_capacity
+            )
             required_bytes += 2 * self.kv_heads * capacity * self.head_dim * 2
         if self.device.is_cuda and required_bytes > self.device.free_memory * 0.95:
             raise MemoryError(
@@ -861,17 +1040,25 @@ class MuseGlimmerRunner(Qwen35Runner):
         self.weights = archive.load(self.device, names)
         self.dtype = embedding_dtype
         self.unit_scales = {
-            "__unit_hidden": wp.ones(self.hidden_size, dtype=wp.float32, device=self.device),
+            "__unit_hidden": wp.ones(
+                self.hidden_size, dtype=wp.float32, device=self.device
+            ),
             "__unit_head": wp.ones(self.head_dim, dtype=wp.float32, device=self.device),
         }
-        self.cublas = try_create_cublas() if use_cublas and self.device.is_cuda else None
+        self.cublas = (
+            try_create_cublas() if use_cublas and self.device.is_cuda else None
+        )
         self.sequence_end = wp.zeros(1, dtype=wp.int32, device=self.device)
         self.conv_states = {}
         self.recurrent_states = {}
         self.kv_caches = {}
         self.cache_capacities = {}
         for index, layer_type in enumerate(self.layer_types):
-            capacity = self.local_cache_capacity if layer_type == "sliding_attention" else self.cache_capacity
+            capacity = (
+                self.local_cache_capacity
+                if layer_type == "sliding_attention"
+                else self.cache_capacity
+            )
             self.cache_capacities[index] = capacity
             shape = (self.kv_heads * capacity, self.head_dim)
             self.kv_caches[index] = (
@@ -879,17 +1066,25 @@ class MuseGlimmerRunner(Qwen35Runner):
                 wp.empty(shape, dtype=self.dtype, device=self.device),
             )
         positions = np.arange(self.cache_capacity, dtype=np.float32)[:, None]
-        theta = float(self.config.get("rope_parameters", {}).get("rope_theta", 500000.0))
-        frequencies = 1.0 / (theta ** (np.arange(0, self.head_dim, 2, dtype=np.float32) / self.head_dim))
+        theta = float(
+            self.config.get("rope_parameters", {}).get("rope_theta", 500000.0)
+        )
+        frequencies = 1.0 / (
+            theta ** (np.arange(0, self.head_dim, 2, dtype=np.float32) / self.head_dim)
+        )
         angles = positions * frequencies[None, :]
         self.cos_cache = wp.array(np.cos(angles), dtype=self.dtype, device=self.device)
         self.sin_cache = wp.array(np.sin(angles), dtype=self.dtype, device=self.device)
         self._decode_plan = _MusePlan(self, 1)
         self._chunk_plan = _MusePlan(self, self.prefill_chunk_size)
-        self._sample_partial_values = wp.empty(128, dtype=wp.float32, device=self.device)
+        self._sample_partial_values = wp.empty(
+            128, dtype=wp.float32, device=self.device
+        )
         self._sample_partial_tokens = wp.empty(128, dtype=wp.int32, device=self.device)
         self._sampled_token = wp.empty(1, dtype=wp.int32, device=self.device)
-        self._sampled_token_host = wp.empty(1, dtype=wp.int32, device="cpu", pinned=self.device.is_cuda)
+        self._sampled_token_host = wp.empty(
+            1, dtype=wp.int32, device="cpu", pinned=self.device.is_cuda
+        )
         self._sampled_token_host_view = self._sampled_token_host.numpy()
         self._greedy_argmax_kernels = _get_greedy_argmax_kernels(1024, 128, self.dtype)
         self.sequence_length = 0

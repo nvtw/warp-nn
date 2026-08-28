@@ -430,7 +430,10 @@ class _Qwen35Plan:
         if self.rows == 1:
             if not hasattr(self, "partitioned_attention"):
                 self.partitioned_attention = _allocate_partitioned_gqa(
-                    self.runner.query_heads, self.runner.head_size, self.dtype, self.device
+                    self.runner.query_heads,
+                    self.runner.head_size,
+                    self.dtype,
+                    self.device,
                 )
             layer["partitioned_attention"] = self.partitioned_attention
         self.tensors[f"layer.{index}.gated"] = layer["gated"]
@@ -917,7 +920,9 @@ class Qwen35Runner:
         self.sequence_length = end
         return logits
 
-    def _append(self, token_ids: Sequence[int], *, prefer_decode: bool = False) -> wp.array:
+    def _append(
+        self, token_ids: Sequence[int], *, prefer_decode: bool = False
+    ) -> wp.array:
         if not token_ids:
             raise ValueError("Qwen35Runner requires at least one token")
         if self.sequence_length + len(token_ids) > self.cache_capacity:

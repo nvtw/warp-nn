@@ -257,7 +257,9 @@ def test_circular_window_attention_and_logit_softcap():
     np.testing.assert_allclose(capped.numpy()[0, 0], expected_logits * 2.0, atol=0.06)
 
 
-@pytest.mark.parametrize(("length", "capacity", "window"), [(1, 1, 0), (13, 16, 0), (19, 8, 5)])
+@pytest.mark.parametrize(
+    ("length", "capacity", "window"), [(1, 1, 0), (13, 16, 0), (19, 8, 5)]
+)
 def test_partitioned_decode_attention_matches_serial(length, capacity, window):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
@@ -276,9 +278,13 @@ def test_partitioned_decode_attention_matches_serial(length, capacity, window):
         key_cache[:, token % capacity] = key_np[:, token]
         value_cache[:, token % capacity] = value_np[:, token]
     key = wp.array(key_cache.reshape(-1, head_size), dtype=wp.bfloat16, device="cuda:0")
-    value = wp.array(value_cache.reshape(-1, head_size), dtype=wp.bfloat16, device="cuda:0")
+    value = wp.array(
+        value_cache.reshape(-1, head_size), dtype=wp.bfloat16, device="cuda:0"
+    )
     lengths = wp.array(np.array([length - 1], dtype=np.int32), device="cuda:0")
-    expected = wp.empty((1, query_heads * head_size), dtype=wp.bfloat16, device="cuda:0")
+    expected = wp.empty(
+        (1, query_heads * head_size), dtype=wp.bfloat16, device="cuda:0"
+    )
     actual = wp.empty_like(expected)
 
     block_dim, serial = _get_gqa_attention_kernel(head_size, wp.bfloat16)
@@ -318,6 +324,7 @@ def test_partitioned_decode_attention_matches_serial(length, capacity, window):
         "cuda:0",
     )
     np.testing.assert_allclose(actual.numpy(), expected.numpy(), atol=0.01, rtol=0.01)
+
 
 def test_head_layout_cache_and_bfloat16_argmax():
     if not is_device_available("cuda:0"):
