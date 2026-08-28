@@ -1,18 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Chat with a local Qwen3 ONNX model in a terminal."""
+"""Chat with a local Qwen ONNX or safetensors model in a terminal."""
 
 import argparse
 import codecs
 from pathlib import Path
 
-from warp_nn.runtime import Qwen3OnnxRunner, Qwen3Tokenizer, sample_token
+from warp_nn.runtime import Qwen3OnnxRunner, Qwen3Tokenizer, Qwen35Runner, sample_token
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("model_dir", type=Path, help="Directory containing model.onnx and tokenizer.json")
+    parser.add_argument("model_dir", type=Path, help="Directory containing an ONNX or safetensors Qwen model")
     parser.add_argument("--system", help="Optional system message")
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--cache-capacity", type=int, default=1024)
@@ -23,8 +23,10 @@ def main():
     args = parser.parse_args()
 
     tokenizer = Qwen3Tokenizer(args.model_dir)
-    runner = Qwen3OnnxRunner(
-        str(args.model_dir / "model.onnx"),
+    runner_type = Qwen3OnnxRunner if (args.model_dir / "model.onnx").is_file() else Qwen35Runner
+    model_path = args.model_dir / "model.onnx" if runner_type is Qwen3OnnxRunner else args.model_dir
+    runner = runner_type(
+        model_path,
         device=args.device,
         cache_capacity=args.cache_capacity,
         prefill_chunk_size=args.prefill_chunk_size,
