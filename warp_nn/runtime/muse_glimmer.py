@@ -5,8 +5,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+from datetime import date
 import json
 from pathlib import Path
+import re
 
 import numpy as np
 import warp as wp
@@ -27,6 +30,7 @@ from warp_nn.runtime.kernels import (
 )
 from warp_nn.runtime.operators import Operation, execute_operations, plan_linear, plan_rms_norm, plan_swiglu
 from warp_nn.runtime.qwen35 import Qwen35Runner
+from warp_nn.runtime.qwen3 import Qwen3Tokenizer, _pretokenize_o200k
 from warp_nn.runtime.safetensors import SafeTensorArchive
 from warp_nn.utils.device import parse_device
 
@@ -92,6 +96,247 @@ def _weight_names(config: dict) -> list[str]:
         prefix = f"model.language_model.layers.{index}."
         names.extend(prefix + suffix for suffix in suffixes)
     return names
+
+
+def _atem_tool_definitions(tools: Sequence[Mapping[str, object]]) -> str:
+    schemas = []
+    namespaces = []
+    for tool in tools:
+        function = tool.get("function", tool)
+        name = function["name"]
+        namespace = name.split(".", 1)[0]
+        if namespace not in namespaces:
+            namespaces.append(namespace)
+        schemas.append(
+            json.dumps(
+                {
+                    "name": name,
+                    "description": function.get("description", ""),
+                    "parameters": function.get("parameters", {}),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+    return (
+        "In this environment you have access to a set of tools you can use to answer the user's question.\n\n"
+        'Invoke a function with <atem:function_calls><atem:invoke name="$FUNCTION_NAME"> and one '
+        '<atem:parameter name="$PARAMETER_NAME">value</atem:parameter> per argument. Lists and objects use JSON.\n\n'
+        "// Function schemas\n"
+        + "\n".join(schemas)
+    )
+
+
+def parse_atem_tool_calls(text: str) -> tuple[str, list[dict[str, object]]]:
+    """Extract Muse ATEM function calls and return remaining assistant text."""
+    calls = []
+    invoke_pattern = re.compile(r'<atem:invoke\s+name="([^"]+)">(.*?)</atem:invoke>', re.DOTALL)
+    parameter_pattern = re.compile(r'<atem:parameter\s+name="([^"]+)">(.*?)</atem:parameter>', re.DOTALL)
+    for invoke in invoke_pattern.finditer(text):
+        arguments = {}
+        for parameter in parameter_pattern.finditer(invoke.group(2)):
+            value = parameter.group(2)
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                pass
+            arguments[parameter.group(1)] = value
+        calls.append({"name": invoke.group(1), "arguments": arguments})
+    clean = re.sub(r"<atem:function_calls>.*?</atem:function_calls>", "", text, flags=re.DOTALL).strip()
+    return clean, calls
+
+
+class _MuseStreamFilter:
+    """Stream only Muse's user channel while retaining partial control tags."""
+
+    _end_markers = ("<|eom|>", "<|eot|>")
+
+    def __init__(self):
+        self.buffer = ""
+        self.visible = False
+        self.in_content = False
+
+    def feed(self, text: str, final: bool = False) -> str:
+        self.buffer += text
+        output = []
+        while self.buffer:
+            if not self.in_content:
+                marker = self.buffer.find("<|message|>")
+                if marker < 0:
+                    if final:
+                        self.buffer = ""
+                    break
+                header = self.buffer[:marker]
+                recipient = re.search(r"(?:^|\s)to=([^<\s]+)", header)
+                self.visible = recipient is not None and recipient.group(1) == "user"
+                self.buffer = self.buffer[marker + len("<|message|>") :]
+                self.in_content = True
+                continue
+            ends = [(self.buffer.find(marker), marker) for marker in self._end_markers]
+            ends = [(position, marker) for position, marker in ends if position >= 0]
+            if ends:
+                position, marker = min(ends)
+                if self.visible:
+                    output.append(self.buffer[:position])
+                self.buffer = self.buffer[position + len(marker) :]
+                self.in_content = False
+                self.visible = False
+                continue
+            keep = max(len(marker) for marker in self._end_markers) - 1
+            if final:
+                if self.visible:
+                    output.append(self.buffer)
+                self.buffer = ""
+            elif len(self.buffer) > keep:
+                if self.visible:
+                    output.append(self.buffer[:-keep])
+                self.buffer = self.buffer[-keep:]
+            break
+        return "".join(output)
+
+
+class MuseGlimmerTokenizer(Qwen3Tokenizer):
+    """Dependency-free o200k tokenizer and ATEM text/tool chat formatter."""
+
+    tool_call_start = "<atem:function_calls>"
+
+    def __init__(self, path: str | Path):
+        super().__init__(path)
+        self._pretokenize = _pretokenize_o200k
+        self.supports_reasoning_effort = True
+        self.default_enable_thinking = True
+
+    @staticmethod
+    def _reasoning_strength(enable_thinking: bool, reasoning_effort: str | None) -> str:
+        if not enable_thinking:
+            return "low"
+        return {None: "high", "xhigh": "high", "medium": "medium", "low": "low"}.get(
+            reasoning_effort, reasoning_effort
+        )
+
+    @staticmethod
+    def _tool_call_text(call: Mapping[str, object]) -> str:
+        function = call.get("function", call)
+        arguments = function.get("arguments", {})
+        if isinstance(arguments, str):
+            arguments = json.loads(arguments)
+        parameters = []
+        for name, value in arguments.items():
+            structured = isinstance(value, (dict, list, bool)) or value is None
+            encoded = json.dumps(value, ensure_ascii=False) if structured else value
+            parameters.append(f'<atem:parameter name="{name}">{encoded}</atem:parameter>\n')
+        return (
+            f'<atem:function_calls>\n<atem:invoke name="{function["name"]}">\n{"".join(parameters)}'
+            "</atem:invoke>\n</atem:function_calls>"
+        )
+
+    def format_chat(
+        self,
+        messages: Sequence[Mapping[str, object]],
+        add_generation_prompt: bool = True,
+        enable_thinking: bool = True,
+        tools: Sequence[Mapping[str, object]] | None = None,
+        reasoning_effort: str | None = None,
+        preserve_thinking: bool = True,
+    ) -> str:
+        """Format text messages and OpenAI function tools using Muse ATEM."""
+        del preserve_thinking
+        strength = self._reasoning_strength(enable_thinking, reasoning_effort)
+        recipients = ['"self"']
+        if tools:
+            for tool in tools:
+                namespace = tool.get("function", tool)["name"].split(".", 1)[0]
+                recipient = f'"{namespace}.*"'
+                if recipient not in recipients:
+                    recipients.append(recipient)
+        recipients.append('"user"')
+        meta = f"# Valid recipients: {', '.join(recipients)}."
+        output = ["<|begin_of_text|>"]
+        has_system = any(message.get("role") == "system" for message in messages)
+        if not has_system:
+            system = (
+                "You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\n"
+                f"Current date: {date.today().isoformat()}.\n\nReasoning strength: {strength}."
+            )
+            if tools:
+                system += "\n\n" + _atem_tool_definitions(tools)
+            output.append(f"<|start|>system<|message|>{system}\n\n{meta}<|eot|>")
+
+        call_names = {}
+        for prior in messages:
+            for call in prior.get("tool_calls") or ():
+                if call.get("id"):
+                    call_names[call["id"]] = call.get("function", call)["name"]
+        for message in messages:
+            role = message.get("role")
+            content = message.get("content")
+            if content is not None and not isinstance(content, str):
+                raise ValueError("MuseGlimmerTokenizer supports text message content")
+            content = "" if content is None else content
+            if role == "system":
+                system = re.sub("reasoning effort", "reasoning strength", content, flags=re.IGNORECASE)
+                if "reasoning strength" not in system.lower():
+                    system += f"\n\nReasoning strength: {strength}."
+                if tools:
+                    system += "\n\n" + _atem_tool_definitions(tools)
+                output.append(f"<|start|>system<|message|>{system}\n\n{meta}<|eot|>")
+            elif role == "user":
+                output.append(f"<|start|>user<|message|>{content}<|eot|>")
+            elif role == "assistant":
+                reasoning = message.get("reasoning_content")
+                if isinstance(reasoning, str) and reasoning:
+                    output.append(f"<|start|>assistant to=self<|message|>{reasoning}<|eom|>")
+                calls = message.get("tool_calls") or ()
+                if calls:
+                    for call in calls:
+                        name = call.get("function", call)["name"]
+                        output.append(
+                            f"<|start|>assistant to={name}<|message|>{self._tool_call_text(call)}<|eot|>"
+                        )
+                else:
+                    output.append(f"<|start|>assistant to=user<|message|>{content}<|eot|>")
+            elif role == "tool":
+                call_id = message.get("tool_call_id", "")
+                name = message.get("name") or call_names.get(call_id, call_id)
+                output.append(
+                    f'<|start|>tool {name}<|message|><tool_output name="{name}">\n{content}\n</tool_output><|eot|>'
+                )
+            else:
+                raise ValueError(f"MuseGlimmerTokenizer does not support role {role!r}")
+        if add_generation_prompt:
+            output.append("<|start|>assistant")
+        return "".join(output)
+
+    def decode(self, token_ids: Sequence[int], skip_special_tokens: bool = False) -> str:
+        """Decode tokens, reducing generated Muse channels to user/tool content."""
+        raw = super().decode(token_ids, skip_special_tokens=False)
+        if not skip_special_tokens:
+            return raw
+        candidate = raw
+        if raw.startswith(" to=") or raw.startswith("<|message|>"):
+            candidate = "<|start|>assistant" + raw
+        channels = re.findall(
+            r"<\|start\|>assistant(?: to=([^<]+))?<\|message\|>(.*?)(?:<\|eom\|>|<\|eot\|>|$)",
+            candidate,
+            re.DOTALL,
+        )
+        if not channels:
+            return super().decode(token_ids, skip_special_tokens=True)
+        visible = [content for recipient, content in channels if recipient != "self"]
+        return "".join(visible)
+
+    def generation_prefix(self, enable_thinking: bool) -> str:
+        """Return the empty suffix after Muse's assistant start anchor."""
+        del enable_thinking
+        return ""
+
+    def stream_filter(self) -> _MuseStreamFilter:
+        """Create a per-response ATEM channel filter for incremental output."""
+        return _MuseStreamFilter()
+
+    def parse_tool_calls(self, text: str) -> tuple[str, list[dict[str, object]]]:
+        """Extract structured ATEM calls from Muse assistant text."""
+        return parse_atem_tool_calls(text)
 
 
 class _MusePlan:
@@ -236,7 +481,9 @@ class _MusePlan:
         )
         layer["gated"] = wp.empty_like(layer["core"])
         core_name = self._register(f"layer.{index}.attention_gated", layer["gated"])
-        layer["attention_output"] = self._linear(f"layer.{index}.attention_output", core_name, attention + "o_proj.weight")
+        layer["attention_output"] = self._linear(
+            f"layer.{index}.attention_output", core_name, attention + "o_proj.weight"
+        )
         layer["attention_block"], layer["attention_kernel"] = _get_gqa_attention_kernel(
             self.runner.head_dim, self.dtype
         )

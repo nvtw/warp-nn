@@ -13,7 +13,7 @@ import threading
 
 import numpy as np
 
-from warp_nn.runtime import Qwen3Tokenizer, create_text_runner, sample_token
+from warp_nn.runtime import create_text_runner, create_tokenizer, sample_token
 from warp_nn.runtime.chat import is_eos_token, split_tool_prefix
 from warp_nn.runtime.coding_tools import CodingTools
 
@@ -85,6 +85,7 @@ def _generate(
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     pending = ""
     tool_started = False
+    stream_filter = tokenizer.stream_filter() if hasattr(tokenizer, "stream_filter") else None
     for _ in range(limit):
         if cancelled and cancelled():
             break
@@ -104,7 +105,9 @@ def _generate(
         generated.append(token_id)
         if is_eos_token(tokenizer, token_id):
             break
-        text = decoder.decode(tokenizer.token_bytes(token_id, skip_special_tokens=True))
+        text = decoder.decode(tokenizer.token_bytes(token_id, skip_special_tokens=stream_filter is None))
+        if stream_filter:
+            text = stream_filter.feed(text)
         if tool_started:
             pending += text
         elif tool_marker:
@@ -115,6 +118,8 @@ def _generate(
         logits = runner.decode(token_id)
         cached_ids.append(token_id)
     tail = decoder.decode(b"", final=True)
+    if stream_filter:
+        tail = stream_filter.feed(tail, final=True)
     if tool_started:
         pending += tail
     elif tool_marker:
@@ -157,7 +162,7 @@ def main():
     parser.add_argument("--trusted-folder", type=Path, default=Path.cwd(), help="Root allowed for coding tools")
     parser.add_argument("--unsafe-shell", action="store_true", help="Allow shell commands without containment")
     args = parser.parse_args()
-    tokenizer = Qwen3Tokenizer(args.model_dir)
+    tokenizer = create_tokenizer(args.model_dir)
     thinking = tokenizer.default_enable_thinking if args.thinking is None else args.thinking
     temperature = args.temperature if args.temperature is not None else (1.0 if thinking else 0.7)
     top_p = args.top_p if args.top_p is not None else (0.95 if thinking else 0.8)

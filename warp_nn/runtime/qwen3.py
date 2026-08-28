@@ -160,6 +160,69 @@ def _pretokenize(text: str):
         index += 1
 
 
+def _pretokenize_o200k(text: str):
+    """Implement the dependency-free o200k Unicode split used by Muse."""
+    index = 0
+    contractions = ("'s", "'t", "'re", "'ve", "'m", "'ll", "'d")
+    while index < len(text):
+        start = index
+        if text[index] not in "\r\n" and not _is_letter(text[index]) and not _is_number(text[index]):
+            index += 1
+        if index < len(text) and _is_letter(text[index]):
+            index += 1
+            while index < len(text) and _is_letter(text[index]):
+                if unicodedata.category(text[index - 1]) == "Ll" and unicodedata.category(text[index]) in ("Lu", "Lt"):
+                    break
+                index += 1
+            contraction = next(
+                (item for item in contractions if text[index : index + len(item)].lower() == item), None
+            )
+            if contraction:
+                index += len(contraction)
+            yield text[start:index]
+            continue
+        index = start
+        if _is_number(text[index]):
+            end = index + 1
+            while end < len(text) and end - index < 3 and _is_number(text[end]):
+                end += 1
+            yield text[index:end]
+            index = end
+            continue
+
+        symbol_start = index + 1 if text[index] == " " else index
+        if symbol_start < len(text):
+            symbol = text[symbol_start]
+            if not symbol.isspace() and not _is_letter(symbol) and not _is_number(symbol):
+                end = symbol_start + 1
+                while end < len(text):
+                    symbol = text[end]
+                    if symbol.isspace() or _is_letter(symbol) or _is_number(symbol):
+                        break
+                    end += 1
+                while end < len(text) and text[end] in "\r\n/":
+                    end += 1
+                yield text[index:end]
+                index = end
+                continue
+
+        if text[index].isspace():
+            end = index + 1
+            while end < len(text) and text[end].isspace():
+                end += 1
+            last_newline = max(text.rfind("\r", index, end), text.rfind("\n", index, end))
+            if last_newline >= index:
+                end = last_newline + 1
+            elif end < len(text) and end - index > 1:
+                end -= 1
+            yield text[index:end]
+            index = end
+            continue
+
+        yield text[index]
+        index += 1
+
+
 class Qwen3Tokenizer:
     """Dependency-free ByteLevel-BPE tokenizer for Qwen and Nemotron chat models."""
 
@@ -181,11 +244,12 @@ class Qwen3Tokenizer:
         self._vocabulary = model["vocab"]
         self._tokens = {token_id: token for token, token_id in self._vocabulary.items()}
         self._merge_ranks = {tuple(pair): rank for rank, pair in enumerate(model["merges"])}
+        self._ignore_merges = bool(model.get("ignore_merges", False))
+        self._pretokenize = _pretokenize
         self._added_tokens = {item["content"]: item["id"] for item in data["added_tokens"]}
         self._added_by_id = {item["id"]: item for item in data["added_tokens"]}
         alternatives = "|".join(re.escape(token) for token in sorted(self._added_tokens, key=len, reverse=True))
         self._added_pattern = re.compile(f"({alternatives})")
-        self.eos_token_id = self._added_tokens["<|im_end|>"]
         tokenizer_config_path = directory / "tokenizer_config.json"
         tokenizer_config = (
             json.loads(tokenizer_config_path.read_text(encoding="utf-8")) if tokenizer_config_path.is_file() else {}
@@ -194,6 +258,15 @@ class Qwen3Tokenizer:
         self.generation_config = (
             json.loads(generation_path.read_text(encoding="utf-8")) if generation_path.is_file() else {}
         )
+        eos_token = tokenizer_config.get("eos_token")
+        if isinstance(eos_token, dict):
+            eos_token = eos_token.get("content")
+        eos_token_id = self.generation_config.get(
+            "eos_token_id", self._added_tokens.get(eos_token, self._added_tokens.get("<|im_end|>", 0))
+        )
+        if isinstance(eos_token_id, list):
+            eos_token_id = eos_token_id[0]
+        self.eos_token_id = int(eos_token_id)
         pad_token = tokenizer_config.get("pad_token")
         self.pad_token_id = int(
             self.generation_config.get(
@@ -219,6 +292,8 @@ class Qwen3Tokenizer:
 
     @lru_cache(maxsize=8192)
     def _bpe(self, piece: str) -> tuple[str, ...]:
+        if self._ignore_merges and piece in self._vocabulary:
+            return (piece,)
         symbols = list(piece)
         while len(symbols) > 1:
             candidates = {(symbols[index], symbols[index + 1]) for index in range(len(symbols) - 1)}
@@ -248,7 +323,7 @@ class Qwen3Tokenizer:
                 continue
             if self._normalize_nfc:
                 chunk = unicodedata.normalize("NFC", chunk)
-            for piece in _pretokenize(chunk):
+            for piece in self._pretokenize(chunk):
                 byte_piece = "".join(_BYTE_ENCODER[value] for value in piece.encode("utf-8"))
                 token_ids.extend(self._vocabulary[token] for token in self._bpe(byte_piece))
         return token_ids

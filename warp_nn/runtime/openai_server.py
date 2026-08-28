@@ -145,11 +145,12 @@ class ChatCompletions:
         created = int(time.time())
         generated = []
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        stream_filter = self.tokenizer.stream_filter() if hasattr(self.tokenizer, "stream_filter") else None
         tool_marker = self.tokenizer.tool_call_start if tools else None
         pending = ""
         tool_started = bool(tools) and not tool_marker
         reasoning_pending = ""
-        reasoning_done = not enable_thinking
+        reasoning_done = stream_filter is not None or not enable_thinking
 
         response_started = False
 
@@ -205,14 +206,19 @@ class ChatCompletions:
                 generated.append(token_id)
                 if is_eos_token(self.tokenizer, token_id):
                     break
-                text = decoder.decode(self.tokenizer.token_bytes(token_id, skip_special_tokens=True))
+                text = decoder.decode(
+                    self.tokenizer.token_bytes(token_id, skip_special_tokens=stream_filter is None)
+                )
+                if stream_filter:
+                    text = stream_filter.feed(text)
                 emit_text(text)
         tail = decoder.decode(b"", final=True)
+        if stream_filter:
+            tail = stream_filter.feed(tail, final=True)
         emit_text(tail, final=True)
 
-        text, reasoning = split_reasoning(
-            self.tokenizer.decode(generated, skip_special_tokens=True), enable_thinking
-        )
+        decoded = self.tokenizer.decode(generated, skip_special_tokens=True)
+        text, reasoning = (decoded, None) if stream_filter else split_reasoning(decoded, enable_thinking)
         text, tool_calls = self.tokenizer.parse_tool_calls(text)
         finish_reason = "tool_calls" if tool_calls else (
             "stop" if generated and is_eos_token(self.tokenizer, generated[-1]) else "length"
