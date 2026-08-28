@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from warp_nn.runtime import Qwen3Tokenizer, sample_token
+from warp_nn.runtime import Qwen3Tokenizer, parse_qwen_tool_calls, sample_token
 from warp_nn.runtime.qwen3 import _BYTE_ENCODER
 
 
@@ -78,3 +78,34 @@ def test_sample_token():
     samples = {sample_token(logits, top_k=2, rng=rng) for _ in range(20)}
     assert samples <= {2, 3}
     assert samples
+
+
+def test_qwen_tool_template_and_parser(tmp_path):
+    path = tmp_path / "tokenizer.json"
+    _write_tokenizer(path)
+    tokenizer = Qwen3Tokenizer(path)
+    tools = [{"type": "function", "function": {"name": "read", "parameters": {"type": "object"}}}]
+    messages = [
+        {"role": "system", "content": "Be concise."},
+        {"role": "user", "content": "Read it."},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"type": "function", "function": {"name": "read", "arguments": '{"path":"README.md"}'}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "Warp NN"},
+    ]
+    formatted = tokenizer.format_chat(messages, tools=tools, enable_thinking=False)
+    assert '"name":"read"' in formatted
+    assert "<function=read>\n<parameter=path>\nREADME.md\n</parameter>" in formatted
+    assert "<tool_response>\nWarp NN\n</tool_response>" in formatted
+    assert formatted.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+
+    text, calls = parse_qwen_tool_calls(
+        'I will inspect it.\n<tool_call>\n<function=read>\n<parameter=path>\n"README.md"\n</parameter>\n'
+        "</function>\n</tool_call>"
+    )
+    assert text == "I will inspect it."
+    assert calls == [{"name": "read", "arguments": {"path": "README.md"}}]

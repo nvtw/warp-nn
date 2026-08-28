@@ -41,6 +41,26 @@ def _byte_alphabet() -> tuple[dict[int, str], dict[str, int]]:
 
 _BYTE_ENCODER, _BYTE_DECODER = _byte_alphabet()
 
+_TOOL_PROMPT = """# Tools
+
+You have access to the following functions:
+
+<tools>{tools}
+</tools>
+
+If you choose to call a function, reply with no suffix in this format:
+
+<tool_call>
+<function=function_name>
+<parameter=parameter_name>
+value
+</parameter>
+</function>
+</tool_call>
+
+Required parameters must be specified. You may reason before the function call, but not after it. If no function
+applies, answer normally."""
+
 
 def _is_letter(character: str) -> bool:
     return unicodedata.category(character).startswith("L")
@@ -200,18 +220,65 @@ class Qwen3Tokenizer:
 
     def format_chat(
         self,
-        messages: Sequence[Mapping[str, str]],
+        messages: Sequence[Mapping[str, object]],
         add_generation_prompt: bool = True,
         enable_thinking: bool = True,
+        tools: Sequence[Mapping[str, object]] | None = None,
     ) -> str:
-        """Format ordinary system/user/assistant messages using Qwen3's template."""
+        """Format text messages and OpenAI function tools using Qwen's template."""
         formatted = []
-        for message in messages:
+        first = 0
+        if tools:
+            definitions = "".join(f"\n{json.dumps(tool, ensure_ascii=False, separators=(',', ':'))}" for tool in tools)
+            system = _TOOL_PROMPT.format(tools=definitions)
+            if messages and messages[0].get("role") in ("system", "developer"):
+                content = messages[0].get("content")
+                if not isinstance(content, str):
+                    raise ValueError("Qwen3Tokenizer.format_chat requires text message content")
+                if content.strip():
+                    system += "\n\n" + content.strip()
+                first = 1
+            formatted.append(f"<|im_start|>system\n{system}<|im_end|>\n")
+
+        index = first
+        while index < len(messages):
+            message = messages[index]
             role = message.get("role")
             content = message.get("content")
-            if role not in ("system", "user", "assistant") or not isinstance(content, str):
-                raise ValueError("Qwen3Tokenizer.format_chat supports text system/user/assistant messages")
-            formatted.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+            if role == "developer":
+                role = "system"
+            if role == "tool":
+                responses = []
+                while index < len(messages) and messages[index].get("role") == "tool":
+                    tool_content = messages[index].get("content")
+                    if not isinstance(tool_content, str):
+                        raise ValueError("Qwen3Tokenizer.format_chat requires text tool results")
+                    responses.append(f"\n<tool_response>\n{tool_content.strip()}\n</tool_response>")
+                    index += 1
+                formatted.append(f"<|im_start|>user{''.join(responses)}<|im_end|>\n")
+                continue
+            if role not in ("system", "user", "assistant") or content is not None and not isinstance(content, str):
+                raise ValueError("Qwen3Tokenizer.format_chat supports text OpenAI chat messages")
+            body = "" if content is None else content.strip()
+            if role == "assistant":
+                for tool_call in message.get("tool_calls") or ():
+                    function = tool_call.get("function", tool_call)
+                    arguments = function.get("arguments", {})
+                    if isinstance(arguments, str):
+                        arguments = json.loads(arguments)
+                    if not isinstance(arguments, Mapping):
+                        raise ValueError("Qwen3Tokenizer.format_chat requires object-valued tool arguments")
+                    parameters = "".join(
+                        f"<parameter={name}>\n{_format_tool_value(value)}\n</parameter>\n"
+                        for name, value in arguments.items()
+                    )
+                    separator = "\n\n" if body else ""
+                    body += (
+                        f"{separator}<tool_call>\n<function={function['name']}>\n"
+                        f"{parameters}</function>\n</tool_call>"
+                    )
+            formatted.append(f"<|im_start|>{role}\n{body}<|im_end|>\n")
+            index += 1
         if add_generation_prompt:
             formatted.append("<|im_start|>assistant\n")
             if not enable_thinking:
@@ -221,6 +288,34 @@ class Qwen3Tokenizer:
     def encode_chat(self, messages: Sequence[Mapping[str, str]], **kwargs) -> list[int]:
         """Format and encode a chat prompt."""
         return self.encode(self.format_chat(messages, **kwargs))
+
+
+def _format_tool_value(value: object) -> str:
+    if isinstance(value, (Mapping, list, tuple)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return str(value)
+
+
+def parse_qwen_tool_calls(text: str) -> tuple[str, list[dict[str, object]]]:
+    """Extract Qwen XML function calls and return remaining assistant text."""
+    calls = []
+    spans = []
+    pattern = re.compile(r"<tool_call>\s*<function=([^>\n]+)>\s*(.*?)</function>\s*</tool_call>", re.DOTALL)
+    parameter_pattern = re.compile(r"<parameter=([^>\n]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
+    for match in pattern.finditer(text):
+        arguments = {}
+        for parameter in parameter_pattern.finditer(match.group(2)):
+            value = parameter.group(2).strip()
+            try:
+                value = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                pass
+            arguments[parameter.group(1).strip()] = value
+        calls.append({"name": match.group(1).strip(), "arguments": arguments})
+        spans.append(match.span())
+    for start, end in reversed(spans):
+        text = text[:start] + text[end:]
+    return text.strip(), calls
 
 
 def sample_token(
