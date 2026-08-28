@@ -593,9 +593,10 @@ def _matmul_int4_q8_kernel(
         activation_sum = _dp4a(0x01010101, packed_activation_0, 0)
         activation_sum = _dp4a(0x01010101, packed_activation_1, activation_sum)
         block_total -= 8 * activation_sum
-        reduced = _subgroup_sum(wp.float32(block_total), 4)
-        if lane == 0:
-            total += reduced * activation_scales[row, block] * wp.float32(weight_scales[column, block])
+        total += (
+            wp.float32(block_total) * activation_scales[row, block] * wp.float32(weight_scales[column, block])
+        )
+    total = _subgroup_sum(total, 4)
     if lane == 0:
         output[row, column] = wp.float16(total)
 
