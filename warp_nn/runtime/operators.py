@@ -16,6 +16,7 @@ from warp_nn.runtime.kernels import (
     _GEMM_CONFIG,
     _GEMM_TRANSB_TILED_KERNEL,
     _gather_block_quantized_int8_kernel,
+    _get_linear_mma_kernel,
     _get_linear_packed_vector_kernel,
     _get_linear_tiled_kernel,
     _get_linear_vector_kernel,
@@ -61,6 +62,20 @@ def _exec_linear(op, tensors, shapes, device):
             op.attrs["_kernel"],
             dim=weight.shape[0] * 32,
             inputs=[op.attrs["_packed_x"], op.attrs["_packed_weight"], output],
+            block_dim=256,
+            device=device,
+        )
+    elif op.attrs.get("_mma"):
+        wp.launch(
+            op.attrs["_kernel"],
+            dim=(op.attrs["_columns"] // 16) * 32,
+            inputs=[
+                op.attrs["_mma_x"],
+                op.attrs["_mma_weight"],
+                op.attrs["_mma_output"],
+                op.attrs["_columns"],
+                op.attrs["_inner"],
+            ],
             block_dim=256,
             device=device,
         )
@@ -138,6 +153,24 @@ def plan_linear(op: Operation, tensors: dict[str, wp.array], shapes: dict[str, t
             dtype=vector_type,
             device=device,
         )
+    elif (
+        device.is_cuda
+        and cublas is None
+        and device.arch >= 80
+        and rows == 16
+        and columns % 16 == 0
+        and inner % 32 == 0
+        and dtype in (wp.float16, wp.bfloat16)
+        and x.is_contiguous
+        and weight.is_contiguous
+        and x.ptr % 16 == 0
+        and weight.ptr % 16 == 0
+    ):
+        op.attrs["_kernel"] = _get_linear_mma_kernel(dtype)
+        op.attrs["_mma"] = True
+        op.attrs["_mma_x"] = x.flatten()
+        op.attrs["_mma_weight"] = weight.flatten()
+        op.attrs["_mma_output"] = output.flatten()
     elif cublas is not None and device.is_cuda and dtype in (wp.float16, wp.bfloat16):
         op.attrs["_cublas"] = cublas
     elif device.is_cuda:

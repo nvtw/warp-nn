@@ -25,6 +25,7 @@ import warp as wp
 
 from warp_nn.modules.layers._common import tile_transposed_gemm_2d
 from warp_nn.runtime._cuda import dp4a, expand_int4x4_high, expand_int4x4_low, subgroup_sum, warp_max_broadcast
+from warp_nn.runtime._cuda_mma import get_mma_16x16
 from warp_nn.utils.config import get_kernel_config
 
 
@@ -158,6 +159,32 @@ def _create_linear_packed_vector_kernel(dtype: type):
 def _get_linear_packed_vector_kernel(dtype: type):
     """Return the vec4 single-token projection kernel and packed dtype."""
     return _create_linear_packed_vector_kernel(dtype)
+
+
+def _create_linear_mma_kernel(dtype: type):
+    """Build the SM80 16-row FP16/BF16 projection wrapper."""
+    DTYPE = dtype
+    mma = get_mma_16x16(dtype)
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(
+        x: wp.array(dtype=DTYPE),
+        weight: wp.array(dtype=DTYPE),
+        output: wp.array(dtype=DTYPE),
+        columns: int,
+        inner: int,
+    ):
+        typed_zero = DTYPE(0.0)
+        wp.static(mma)(x, weight, output, wp.tid(), columns, inner)
+
+    kernel.module.options["enable_backward"] = False
+    return kernel
+
+
+@lru_cache(maxsize=None)
+def _get_linear_mma_kernel(dtype: type):
+    """Return the SM80 16-row projection kernel."""
+    return _create_linear_mma_kernel(dtype)
 
 
 def _create_linear_tiled_kernel(dtype: type, tile_m: int):

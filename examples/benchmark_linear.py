@@ -23,7 +23,7 @@ def _projection(rows, columns, inner, dtype, device, cublas=None, force_cublas=F
     plan_linear(operation, tensors, shapes, device, cublas=cublas)
     if force_cublas:
         for name in tuple(operation.attrs):
-            if name.startswith("_packed"):
+            if name.startswith(("_packed", "_mma")):
                 del operation.attrs[name]
         operation.attrs["_cublas"] = cublas
     with wp.ScopedCapture(device) as capture:
