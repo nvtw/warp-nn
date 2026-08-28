@@ -67,7 +67,11 @@ def main():
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         generation_limit = min(args.max_new_tokens, args.cache_capacity - len(token_ids))
         for _ in range(generation_limit):
-            token_id = sample_token(logits, temperature=args.temperature)
+            token_id = (
+                runner.sample_greedy(logits)
+                if args.temperature <= 0.0
+                else sample_token(logits, temperature=args.temperature)
+            )
             generated.append(token_id)
             if token_id == tokenizer.eos_token_id:
                 break

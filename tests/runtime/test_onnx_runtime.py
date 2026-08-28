@@ -1754,6 +1754,7 @@ def test_qwen_stateful_prefill_and_decode(device):
         np.testing.assert_allclose(decoded, full[:, -1:, :], rtol=1.0e-3, atol=1.0e-3)
 
         logits = runner.prefill([0, 1])
+        assert runner.sample_greedy(logits) == int(np.argmax(logits.numpy()[0, -1]))
         expected = []
         for _ in range(3):
             token_id = int(np.argmax(logits.numpy()[0, -1]))

@@ -49,38 +49,97 @@ def _initialize_generation_state(
     finished[0] = wp.int32(0)
 
 
-@wp.kernel
-def _greedy_sample_next(
-    logits: wp.array3d[wp.float16],
-    input_ids: wp.array2d[wp.int64],
-    attention_mask: wp.array2d[wp.int64],
-    position_ids: wp.array2d[wp.int64],
-    position: wp.array1d[wp.int32],
-    generated_count: wp.array1d[wp.int32],
-    generated_ids: wp.array1d[wp.int64],
-    finished: wp.array1d[wp.int32],
-    eos_token_id: int,
-):
-    if finished[0] != 0:
-        return
-    sequence = logits.shape[1] - 1
-    best_token = wp.int32(0)
-    best_logit = wp.float32(logits[0, sequence, 0])
-    for token in range(1, logits.shape[2]):
-        value = wp.float32(logits[0, sequence, token])
-        if value > best_logit:
-            best_logit = value
-            best_token = token
-    count = generated_count[0]
-    generated_ids[count] = wp.int64(best_token)
-    generated_count[0] = count + 1
-    input_ids[0, 0] = wp.int64(best_token)
-    token_position = position[0]
-    attention_mask[0, token_position] = wp.int64(1)
-    position_ids[0, 0] = wp.int64(token_position)
-    position[0] = token_position + 1
-    if best_token == eos_token_id:
-        finished[0] = wp.int32(1)
+@lru_cache(maxsize=None)
+def _get_greedy_argmax_kernels(tile_width: int, partial_count: int):
+    TILE_WIDTH = tile_width
+    PARTIAL_COUNT = partial_count
+
+    @wp.func
+    def add_offset(index: wp.int32, offset: wp.int32):
+        return index + offset
+
+    @wp.func
+    def mask_logit(value: wp.float16, index: wp.int32, vocabulary: wp.int32):
+        return wp.float32(value) if index < vocabulary else wp.float32(-3.402823466e38)
+
+    @wp.func
+    def matching_token(value: wp.float32, token: wp.int32, maximum: wp.float32, vocabulary: wp.int32):
+        return token if value == maximum else vocabulary
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def partial_argmax(logits: wp.array3d[wp.float16], values: wp.array1d[wp.float32], tokens: wp.array1d[wp.int32]):
+        partial = wp.tid()
+        vocabulary = logits.shape[2]
+        tile_count = (vocabulary + TILE_WIDTH - 1) / TILE_WIDTH
+        best_value = wp.float32(-3.402823466e38)
+        best_token = vocabulary
+        local_indices = wp.tile_arange(0, TILE_WIDTH, dtype=wp.int32)
+        for tile_id in range(partial, tile_count, PARTIAL_COUNT):
+            offset = tile_id * TILE_WIDTH
+            indices = wp.tile_map(add_offset, local_indices, offset)
+            tile = wp.tile_map(
+                mask_logit,
+                wp.tile_load(logits[0, logits.shape[1] - 1], shape=TILE_WIDTH, offset=offset),
+                indices,
+                vocabulary,
+            )
+            local_token = wp.tile_extract(wp.tile_argmax(tile), 0)
+            value = wp.tile_extract(tile, local_token)
+            token = offset + local_token
+            if value > best_value or (value == best_value and token < best_token):
+                best_value = value
+                best_token = token
+        wp.tile_store(values, wp.tile_full(shape=1, value=best_value, dtype=wp.float32), offset=partial)
+        wp.tile_store(tokens, wp.tile_full(shape=1, value=best_token, dtype=wp.int32), offset=partial)
+
+    @wp.func
+    def select_token(values: wp.array1d[wp.float32], tokens: wp.array1d[wp.int32], vocabulary: int):
+        value_tile = wp.tile_load(values, shape=PARTIAL_COUNT)
+        token_tile = wp.tile_load(tokens, shape=PARTIAL_COUNT)
+        maximum_index = wp.tile_extract(wp.tile_argmax(value_tile), 0)
+        maximum = wp.tile_extract(value_tile, maximum_index)
+        candidates = wp.tile_map(matching_token, value_tile, token_tile, maximum, vocabulary)
+        winner = wp.tile_extract(wp.tile_argmin(candidates), 0)
+        return wp.tile_extract(token_tile, winner)
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def store_token(
+        values: wp.array1d[wp.float32],
+        tokens: wp.array1d[wp.int32],
+        output: wp.array1d[wp.int32],
+        vocabulary: int,
+    ):
+        wp.tile_store(output, wp.tile_full(shape=1, value=select_token(values, tokens, vocabulary), dtype=wp.int32))
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def advance_generation(
+        values: wp.array1d[wp.float32],
+        tokens: wp.array1d[wp.int32],
+        vocabulary: int,
+        input_ids: wp.array2d[wp.int64],
+        attention_mask: wp.array2d[wp.int64],
+        position_ids: wp.array2d[wp.int64],
+        position: wp.array1d[wp.int32],
+        generated_count: wp.array1d[wp.int32],
+        generated_ids: wp.array1d[wp.int64],
+        finished: wp.array1d[wp.int32],
+        eos_token_id: int,
+    ):
+        if finished[0] != 0:
+            return
+        best_token = select_token(values, tokens, vocabulary)
+        count = generated_count[0]
+        generated_ids[count] = wp.int64(best_token)
+        generated_count[0] = count + 1
+        input_ids[0, 0] = wp.int64(best_token)
+        token_position = position[0]
+        attention_mask[0, token_position] = wp.int64(1)
+        position_ids[0, 0] = wp.int64(token_position)
+        position[0] = token_position + 1
+        if best_token == eos_token_id:
+            finished[0] = wp.int32(1)
+
+    return partial_argmax, store_token, advance_generation
 
 
 def _byte_alphabet() -> tuple[dict[int, str], dict[str, int]]:
@@ -398,6 +457,12 @@ class Qwen3OnnxRunner:
         self._generated_count = wp.zeros(1, dtype=wp.int32, device=self.runtime._device)
         self._generated_ids = wp.zeros(self.cache_capacity, dtype=wp.int64, device=self.runtime._device)
         self._generation_finished = wp.zeros(1, dtype=wp.int32, device=self.runtime._device)
+        self._sample_partial_values = wp.empty(128, dtype=wp.float32, device=self.runtime._device)
+        self._sample_partial_tokens = wp.empty(128, dtype=wp.int32, device=self.runtime._device)
+        self._sampled_token = wp.empty(1, dtype=wp.int32, device=self.runtime._device)
+        self._sampled_token_host = wp.empty(1, dtype=wp.int32, device="cpu", pinned=self.runtime._device.is_cuda)
+        self._sampled_token_host_view = self._sampled_token_host.numpy()
+        self._greedy_argmax_kernels = _get_greedy_argmax_kernels(1024, 128)
         self._decode_graph = None
         self._decode_graph_outputs = None
         self._past: dict[str, wp.array] = {}
@@ -519,6 +584,33 @@ class Qwen3OnnxRunner:
         self.sequence_length += 1
         return outputs["logits"]
 
+    def _launch_greedy_partials(self, logits: wp.array) -> None:
+        wp.launch_tiled(
+            self._greedy_argmax_kernels[0],
+            dim=128,
+            inputs=[logits, self._sample_partial_values, self._sample_partial_tokens],
+            block_dim=256,
+            device=self.runtime._device,
+        )
+
+    def sample_greedy(self, logits: wp.array) -> int:
+        """Select the largest logit while transferring only its token ID to the host."""
+        if not self.runtime._device.is_cuda:
+            return sample_token(logits, temperature=0.0)
+        if logits.device != self.runtime._device or logits.dtype != wp.float16 or logits.ndim != 3:
+            raise TypeError("Qwen3OnnxRunner.sample_greedy expects a 3-D FP16 array on the runner device")
+        self._launch_greedy_partials(logits)
+        wp.launch_tiled(
+            self._greedy_argmax_kernels[1],
+            dim=1,
+            inputs=[self._sample_partial_values, self._sample_partial_tokens, self._sampled_token, logits.shape[2]],
+            block_dim=128,
+            device=self.runtime._device,
+        )
+        wp.copy(self._sampled_token_host, self._sampled_token, count=1)
+        wp.synchronize_stream(self.runtime._device)
+        return int(self._sampled_token_host_view[0])
+
     def generate_greedy(self, token_ids: Sequence[int], max_new_tokens: int, eos_token_id: int) -> list[int]:
         """Generate with an allocation-free captured CUDA graph and device-side argmax."""
         if max_new_tokens <= 0:
@@ -538,6 +630,9 @@ class Qwen3OnnxRunner:
             device=self.runtime._device,
         )
         sample_inputs = [
+            self._sample_partial_values,
+            self._sample_partial_tokens,
+            prompt_logits.shape[2],
             self._decode_input_ids,
             self._decode_attention_mask,
             self._decode_position_ids,
@@ -547,15 +642,16 @@ class Qwen3OnnxRunner:
             self._generation_finished,
             eos_token_id,
         ]
-        wp.launch(_greedy_sample_next, dim=1, inputs=[prompt_logits, *sample_inputs], device=self.runtime._device)
+        self._launch_greedy_partials(prompt_logits)
+        wp.launch_tiled(
+            self._greedy_argmax_kernels[2], dim=1, inputs=sample_inputs, block_dim=128, device=self.runtime._device
+        )
         wp.capture_begin(device=self.runtime._device)
         try:
             outputs = self._decode_runtime(self._decode_inputs)
-            wp.launch(
-                _greedy_sample_next,
-                dim=1,
-                inputs=[outputs["logits"], *sample_inputs],
-                device=self.runtime._device,
+            self._launch_greedy_partials(outputs["logits"])
+            wp.launch_tiled(
+                self._greedy_argmax_kernels[2], dim=1, inputs=sample_inputs, block_dim=128, device=self.runtime._device
             )
             graph = wp.capture_end(device=self.runtime._device)
         except Exception:
