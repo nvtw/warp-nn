@@ -188,7 +188,7 @@ def _create_linear_tiled_kernel(dtype: type, tile_m: int):
 @lru_cache(maxsize=None)
 def _get_linear_tiled_kernel(dtype: type, rows: int):
     """Return a dense projection kernel and its tile shape for ``rows``."""
-    tile_m = 8 if rows < 16 else 32
+    tile_m = 8 if rows < 16 else 16 if rows < 32 else 32
     return _create_linear_tiled_kernel(dtype, tile_m), (tile_m, 32)
 
 
