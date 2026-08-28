@@ -846,6 +846,44 @@ def test_transformer_layout_ops(device):
 
 
 @pytest.mark.parametrize("device", ["cuda"])
+def test_single_row_split_uses_views(device):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    x = np.arange(6, dtype=np.float16).reshape(1, 6)
+    model = helper.make_model(
+        helper.make_graph(
+            [
+                helper.make_node("Cast", ["x"], ["converted"], to=TensorProto.FLOAT),
+                helper.make_node("Split", ["converted", "split"], ["left", "right"], axis=-1),
+            ],
+            "single_row_split",
+            [helper.make_tensor_value_info("x", TensorProto.FLOAT16, list(x.shape))],
+            [
+                helper.make_tensor_value_info("left", TensorProto.FLOAT, [1, 2]),
+                helper.make_tensor_value_info("right", TensorProto.FLOAT, [1, 4]),
+            ],
+            [numpy_helper.from_array(np.array([2, 4], dtype=np.int64), name="split")],
+        ),
+        opset_imports=[helper.make_opsetid("", 21)],
+    )
+    model.ir_version = 10
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        runtime = OnnxRuntime(str(path), device=device)
+        outputs = runtime({"x": wp.array(x, dtype=wp.float16, device=device)})
+        np.testing.assert_array_equal(outputs["left"].numpy(), x[:, :2])
+        np.testing.assert_array_equal(outputs["right"].numpy(), x[:, 2:])
+        assert runtime._tensors["left"].ptr == runtime._tensors["converted"].ptr
+        assert runtime._tensors["right"].ptr == runtime._tensors["converted"].ptr + 2 * 4
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("device", ["cuda"])
 def test_transformer_activations_and_normalization(device):
     if not is_device_available(device):
         pytest.skip(f"Device '{device}' is not available")

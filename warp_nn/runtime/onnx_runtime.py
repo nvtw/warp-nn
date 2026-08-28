@@ -2781,14 +2781,27 @@ def _shape_split(op, shapes, dtypes, tensors, device, requires_grad=False):
 
     dtype = dtypes[op.inputs[0]]
     rows = int(np.prod(in_shape[:-1]))
+    view_only = rows == 1 and not requires_grad and op.inputs[0] in tensors
+    offset = 0
     for name, width in zip(op.outputs, split_sizes):
         out_shape = (*in_shape[:-1], width)
-        tensors[name] = wp.zeros(out_shape, dtype=dtype, device=device)
+        if view_only:
+            tensors[name] = wp.array(
+                ptr=tensors[op.inputs[0]].ptr + offset * wp.types.type_size_in_bytes(dtype),
+                shape=out_shape,
+                dtype=dtype,
+                device=device,
+            )
+        else:
+            tensors[name] = wp.zeros(out_shape, dtype=dtype, device=device)
         shapes[name] = out_shape
         dtypes[name] = dtype
+        offset += width
     op.attrs["_rows"] = rows
     op.attrs["_split_sizes"] = split_sizes
-    op.attrs["_kernel"] = _kernel_for_dtype(_split_last_axis_kernel, dtype, (2,), (2,), int)
+    op.attrs["_view_only"] = view_only
+    if not view_only:
+        op.attrs["_kernel"] = _kernel_for_dtype(_split_last_axis_kernel, dtype, (2,), (2,), int)
 
 
 def _shape_tile(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -3141,6 +3154,8 @@ def _exec_transpose(op, tensors, shapes, device):
 
 
 def _exec_split(op, tensors, shapes, device):
+    if op.attrs["_view_only"]:
+        return
     rows = op.attrs["_rows"]
     source = tensors[op.inputs[0]].reshape((rows, shapes[op.inputs[0]][-1]))
     offset = 0
