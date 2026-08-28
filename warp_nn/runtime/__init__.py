@@ -13,19 +13,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+from pathlib import Path
+
 from warp_nn.runtime.onnx_runtime import OnnxRuntime
 from warp_nn.runtime.openai_server import ChatCompletions, OpenAIHTTPServer
+from warp_nn.runtime.nemotron_h import NemotronHRunner
 from warp_nn.runtime.qwen3 import Qwen3OnnxRunner, Qwen3Tokenizer, parse_qwen_tool_calls, sample_token
 from warp_nn.runtime.qwen35 import Qwen35Runner
+
+
+def create_text_runner(path, **kwargs):
+    """Create the matching text runner for a supported local model directory."""
+    path = Path(path)
+    if (path / "model.onnx").is_file():
+        return Qwen3OnnxRunner(path / "model.onnx", **kwargs)
+    config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    runner_type = NemotronHRunner if config.get("model_type") == "nemotron_h" else Qwen35Runner
+    return runner_type(path, **kwargs)
 
 
 __all__ = [
     "OnnxRuntime",
     "ChatCompletions",
     "OpenAIHTTPServer",
+    "NemotronHRunner",
     "Qwen3OnnxRunner",
     "Qwen35Runner",
     "Qwen3Tokenizer",
+    "create_text_runner",
     "parse_qwen_tool_calls",
     "sample_token",
 ]

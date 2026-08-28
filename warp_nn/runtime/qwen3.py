@@ -93,7 +93,7 @@ _REASONING_INSTRUCTIONS = {
 
 
 def _is_letter(character: str) -> bool:
-    return unicodedata.category(character).startswith("L")
+    return unicodedata.category(character)[0] in "LM"
 
 
 def _is_number(character: str) -> bool:
@@ -161,7 +161,7 @@ def _pretokenize(text: str):
 
 
 class Qwen3Tokenizer:
-    """Dependency-free ByteLevel-BPE tokenizer for Qwen3 tokenizer JSON files."""
+    """Dependency-free ByteLevel-BPE tokenizer for Qwen and Nemotron chat models."""
 
     tool_call_start = "<tool_call>"
 
@@ -174,8 +174,10 @@ class Qwen3Tokenizer:
             directory = path.parent
         data = json.loads(path.read_text(encoding="utf-8"))
         model = data["model"]
-        if model["type"] != "BPE" or data["normalizer"] != {"type": "NFC"}:
-            raise ValueError("Qwen3Tokenizer: expected Qwen's NFC ByteLevel-BPE tokenizer")
+        normalizer = data.get("normalizer")
+        if model["type"] != "BPE" or normalizer not in (None, {"type": "NFC"}):
+            raise ValueError("Qwen3Tokenizer: expected an NFC or unnormalized ByteLevel-BPE tokenizer")
+        self._normalize_nfc = normalizer is not None
         self._vocabulary = model["vocab"]
         self._tokens = {token_id: token for token, token_id in self._vocabulary.items()}
         self._merge_ranks = {tuple(pair): rank for rank, pair in enumerate(model["merges"])}
@@ -184,10 +186,19 @@ class Qwen3Tokenizer:
         alternatives = "|".join(re.escape(token) for token in sorted(self._added_tokens, key=len, reverse=True))
         self._added_pattern = re.compile(f"({alternatives})")
         self.eos_token_id = self._added_tokens["<|im_end|>"]
-        self.pad_token_id = self._added_tokens["<|endoftext|>"]
+        tokenizer_config_path = directory / "tokenizer_config.json"
+        tokenizer_config = (
+            json.loads(tokenizer_config_path.read_text(encoding="utf-8")) if tokenizer_config_path.is_file() else {}
+        )
         generation_path = directory / "generation_config.json"
         self.generation_config = (
             json.loads(generation_path.read_text(encoding="utf-8")) if generation_path.is_file() else {}
+        )
+        pad_token = tokenizer_config.get("pad_token")
+        self.pad_token_id = int(
+            self.generation_config.get(
+                "pad_token_id", self._added_tokens.get(pad_token, self._added_tokens.get("<|endoftext|>", 0))
+            )
         )
         end_tokens = self.generation_config.get("eos_token_id", self.eos_token_id)
         end_tokens = end_tokens if isinstance(end_tokens, list) else [end_tokens]
@@ -195,10 +206,16 @@ class Qwen3Tokenizer:
         if not self.eos_token_ids:
             raise ValueError("Qwen3Tokenizer: generation_config has no EOS token")
         template_path = directory / "chat_template.jinja"
-        template = template_path.read_text(encoding="utf-8") if template_path.is_file() else ""
+        template = (
+            template_path.read_text(encoding="utf-8")
+            if template_path.is_file()
+            else tokenizer_config.get("chat_template", "")
+        )
         self._tool_dialect = "json" if "args-json-object" in template else "parameters"
         self.supports_reasoning_effort = "reasoning_effort" in template
-        self.default_enable_thinking = self.supports_reasoning_effort
+        self.default_enable_thinking = self.supports_reasoning_effort or "set enable_thinking" in template
+        self._compact_empty_thinking = "<think></think>" in template
+        self._always_system_prompt = 'set system_message = ""' in template
 
     @lru_cache(maxsize=8192)
     def _bpe(self, piece: str) -> tuple[str, ...]:
@@ -229,7 +246,8 @@ class Qwen3Tokenizer:
             if chunk in self._added_tokens:
                 token_ids.append(self._added_tokens[chunk])
                 continue
-            chunk = unicodedata.normalize("NFC", chunk)
+            if self._normalize_nfc:
+                chunk = unicodedata.normalize("NFC", chunk)
             for piece in _pretokenize(chunk):
                 byte_piece = "".join(_BYTE_ENCODER[value] for value in piece.encode("utf-8"))
                 token_ids.extend(self._vocabulary[token] for token in self._bpe(byte_piece))
@@ -320,6 +338,8 @@ class Qwen3Tokenizer:
                     system += "\n\n" + content.strip()
                 first = 1
             formatted.append(f"<|im_start|>system\n{system}<|im_end|>\n")
+        elif self._always_system_prompt and (not messages or messages[0].get("role") not in ("system", "developer")):
+            formatted.append("<|im_start|>system\n<|im_end|>\n")
 
         index = first
         while index < len(messages):
@@ -382,8 +402,8 @@ class Qwen3Tokenizer:
     def generation_prefix(self, enable_thinking: bool) -> str:
         """Return tokens inserted before generated assistant content."""
         if not enable_thinking:
-            return "<think>\n\n</think>\n\n"
-        return "<think>\n" if self.supports_reasoning_effort else ""
+            return "<think></think>" if self._compact_empty_thinking else "<think>\n\n</think>\n\n"
+        return "<think>\n" if self.default_enable_thinking else ""
 
     def encode_chat(self, messages: Sequence[Mapping[str, object]], **kwargs) -> list[int]:
         """Format and encode a chat prompt."""

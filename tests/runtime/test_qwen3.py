@@ -87,6 +87,35 @@ def test_qwen_tokenizer_and_chat_template(tmp_path):
     assert tokenizer.encode_chat(messages, enable_thinking=False)[: len(cached)] == cached
 
 
+def test_nemotron_tokenizer_metadata(tmp_path):
+    path = tmp_path / "tokenizer.json"
+    _write_tokenizer(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["normalizer"] = None
+    data["added_tokens"] = [item for item in data["added_tokens"] if item["content"] != "<|endoftext|>"]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    (tmp_path / "generation_config.json").write_text(
+        json.dumps({"eos_token_id": 2, "pad_token_id": 0}), encoding="utf-8"
+    )
+    (tmp_path / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": 'set enable_thinking set system_message = "" <think></think>'}),
+        encoding="utf-8",
+    )
+
+    tokenizer = Qwen3Tokenizer(path)
+    text = "Cafe\u0301"
+    assert tokenizer.decode(tokenizer.encode(text)) == text
+    assert tokenizer.pad_token_id == 0
+    assert tokenizer.eos_token_ids == (2,)
+    assert tokenizer.default_enable_thinking
+    assert tokenizer.generation_prefix(False) == "<think></think>"
+    assert tokenizer.format_chat([{"role": "user", "content": "Hello"}], enable_thinking=False) == (
+        "<|im_start|>system\n<|im_end|>\n"
+        "<|im_start|>user\nHello<|im_end|>\n"
+        "<|im_start|>assistant\n<think></think>"
+    )
+
+
 def test_sample_token():
     logits = np.array([[[0.0, 1.0, 4.0, 3.0]]], dtype=np.float16)
     assert sample_token(logits, temperature=0.0) == 2
