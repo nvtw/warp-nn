@@ -77,7 +77,7 @@ def _exec_linear(op, tensors, shapes, device):
                 op.attrs["_kernel"],
                 dim=x.shape[0] * weight.shape[0],
                 inputs=[x, weight, output],
-                block_dim=256,
+                block_dim=128,
                 device=device,
             )
         else:
