@@ -306,18 +306,30 @@ def test_circular_window_attention_and_logit_softcap():
 
 
 @pytest.mark.parametrize(
-    ("query_heads", "kv_heads", "length", "capacity", "window", "rows"),
+    (
+        "query_heads",
+        "kv_heads",
+        "length",
+        "capacity",
+        "window",
+        "rows",
+        "rows_per_group",
+    ),
     [
-        (4, 2, 1, 1, 0, 1),
-        (4, 2, 13, 16, 0, 1),
-        (6, 1, 19, 20, 0, 1),
-        (4, 2, 19, 8, 5, 1),
-        (6, 1, 19, 20, 0, 4),
-        (4, 2, 19, 8, 5, 4),
+        (4, 2, 1, 1, 0, 1, 1),
+        (4, 2, 13, 16, 0, 1, 1),
+        (6, 1, 19, 20, 0, 1, 1),
+        (4, 2, 19, 8, 5, 1, 1),
+        (6, 1, 19, 20, 0, 4, 1),
+        (4, 2, 19, 8, 5, 4, 1),
+        (6, 1, 19, 20, 0, 3, 2),
+        (4, 2, 19, 8, 5, 3, 2),
+        (6, 1, 19, 20, 0, 5, 4),
+        (4, 2, 19, 8, 5, 5, 4),
     ],
 )
 def test_partitioned_decode_attention_matches_serial(
-    query_heads, kv_heads, length, capacity, window, rows
+    query_heads, kv_heads, length, capacity, window, rows, rows_per_group
 ):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
@@ -370,7 +382,12 @@ def test_partitioned_decode_attention_matches_serial(
     )
 
     workspace = _allocate_partitioned_gqa(
-        query_heads, head_size, wp.bfloat16, "cuda:0", rows=rows
+        query_heads,
+        head_size,
+        wp.bfloat16,
+        "cuda:0",
+        rows=rows,
+        rows_per_group=rows_per_group,
     )
     _launch_partitioned_gqa(
         workspace,
