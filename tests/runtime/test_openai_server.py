@@ -53,9 +53,11 @@ def _request(server, body, path="/v1/chat/completions"):
         return response.read(), response.headers.get_content_type()
 
 
-def _serve(text):
+def _serve(text, enable_thinking=False):
     tokenizer = _Tokenizer(text)
-    server = OpenAIHTTPServer(("127.0.0.1", 0), ChatCompletions("warp-qwen", _Runner(), tokenizer))
+    server = OpenAIHTTPServer(
+        ("127.0.0.1", 0), ChatCompletions("warp-qwen", _Runner(), tokenizer, enable_thinking=enable_thinking)
+    )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, thread, tokenizer
@@ -69,8 +71,6 @@ def test_chat_completions_streams_text_and_usage():
             {
                 "model": "warp-qwen",
                 "messages": [{"role": "user", "content": "Hello"}],
-                "reasoning_effort": "low",
-                "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": False},
                 "stream": True,
                 "stream_options": {"include_usage": True},
             },
@@ -88,9 +88,47 @@ def test_chat_completions_streams_text_and_usage():
     assert chunks[-1]["choices"] == []
     assert chunks[-1]["usage"] == {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
     assert tokenizer.request[0] == [{"role": "user", "content": "Hello"}]
+
+
+def test_chat_completions_separates_reasoning():
+    server, thread, tokenizer = _serve("Reasoning</think>\n\nAnswer", enable_thinking=True)
+    try:
+        body, _ = _request(
+            server,
+            {
+                "model": "warp-qwen",
+                "messages": [{"role": "user", "content": "Think"}],
+                "reasoning_effort": "low",
+                "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": False},
+                "stream": True,
+            },
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+    events = [line[6:] for line in body.decode().splitlines() if line.startswith("data: ")][:-1]
+    chunks = [json.loads(event) for event in events]
+    deltas = [chunk["choices"][0]["delta"] for chunk in chunks]
+    assert "".join(delta.get("reasoning_content", "") for delta in deltas) == "Reasoning"
+    assert "".join(delta.get("content", "") for delta in deltas) == "Answer"
     assert tokenizer.request[1]["enable_thinking"] is True
     assert tokenizer.request[1]["reasoning_effort"] == "low"
     assert tokenizer.request[1]["preserve_thinking"] is False
+
+
+def test_chat_completions_returns_reasoning():
+    server, thread, _ = _serve("Reasoning</think>\n\nAnswer", enable_thinking=True)
+    try:
+        body, _ = _request(server, {"model": "warp-qwen", "messages": [{"role": "user", "content": "Think"}]})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+    message = json.loads(body)["choices"][0]["message"]
+    assert message["content"] == "Answer"
+    assert message["reasoning_content"] == "Reasoning"
+    assert message["reasoning"] == "Reasoning"
 
 
 def test_chat_completions_returns_structured_tool_call():

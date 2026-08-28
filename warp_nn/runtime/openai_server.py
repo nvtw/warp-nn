@@ -14,7 +14,7 @@ from collections.abc import Callable, Mapping, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from warp_nn.runtime.chat import Runner, Tokenizer, generate_tokens, is_eos_token, split_tool_prefix
+from warp_nn.runtime.chat import Runner, Tokenizer, generate_tokens, is_eos_token, split_reasoning, split_tool_prefix
 
 
 class APIError(Exception):
@@ -148,8 +148,46 @@ class ChatCompletions:
         tool_marker = self.tokenizer.tool_call_start if tools else None
         pending = ""
         tool_started = bool(tools) and not tool_marker
+        reasoning_pending = ""
+        reasoning_done = not enable_thinking
 
         response_started = False
+
+        def emit_content(text: str):
+            nonlocal pending, tool_started
+            if emit is None or not text:
+                return
+            if tool_started:
+                pending += text
+            elif tool_marker:
+                text, pending, tool_started = split_tool_prefix(pending + text, tool_marker)
+                if text:
+                    emit(self._chunk(completion_id, created, {"content": text}))
+            else:
+                emit(self._chunk(completion_id, created, {"content": text}))
+
+        def emit_text(text: str, final: bool = False):
+            nonlocal reasoning_pending, reasoning_done
+            if reasoning_done:
+                emit_content(text)
+                return
+            text = reasoning_pending + text
+            before, marker, after = text.partition("</think>")
+            if marker:
+                if emit is not None and before:
+                    emit(self._chunk(completion_id, created, {"reasoning_content": before}))
+                reasoning_pending = ""
+                reasoning_done = True
+                emit_content(after.lstrip())
+                return
+            keep = 0 if final else min(len(text), len("</think>") - 1)
+            while keep and not "</think>".startswith(text[-keep:]):
+                keep -= 1
+            streamable = text[:-keep] if keep else text
+            reasoning_pending = text[-keep:] if keep else ""
+            if emit is not None and streamable:
+                emit(self._chunk(completion_id, created, {"reasoning_content": streamable}))
+
         with self.lock:
             for token_id in generate_tokens(
                 self.runner,
@@ -168,32 +206,21 @@ class ChatCompletions:
                 if is_eos_token(self.tokenizer, token_id):
                     break
                 text = decoder.decode(self.tokenizer.token_bytes(token_id, skip_special_tokens=True))
-                if emit is not None and text:
-                    if tool_started:
-                        pending += text
-                    elif tool_marker:
-                        text, pending, tool_started = split_tool_prefix(pending + text, tool_marker)
-                        if text:
-                            emit(self._chunk(completion_id, created, {"content": text}))
-                    else:
-                        emit(self._chunk(completion_id, created, {"content": text}))
+                emit_text(text)
         tail = decoder.decode(b"", final=True)
-        if emit is not None and tail:
-            if tool_started:
-                pending += tail
-            elif tool_marker:
-                text, pending, tool_started = split_tool_prefix(pending + tail, tool_marker)
-                if text:
-                    emit(self._chunk(completion_id, created, {"content": text}))
-            else:
-                emit(self._chunk(completion_id, created, {"content": tail}))
+        emit_text(tail, final=True)
 
-        text = self.tokenizer.decode(generated, skip_special_tokens=True)
+        text, reasoning = split_reasoning(
+            self.tokenizer.decode(generated, skip_special_tokens=True), enable_thinking
+        )
         text, tool_calls = self.tokenizer.parse_tool_calls(text)
         finish_reason = "tool_calls" if tool_calls else (
             "stop" if generated and is_eos_token(self.tokenizer, generated[-1]) else "length"
         )
         message: dict[str, object] = {"role": "assistant", "content": text or None}
+        if reasoning is not None:
+            message["reasoning_content"] = reasoning
+            message["reasoning"] = reasoning
         if tool_calls:
             message["tool_calls"] = [
                 {

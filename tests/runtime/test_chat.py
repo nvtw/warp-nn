@@ -3,7 +3,7 @@
 
 import numpy as np
 
-from warp_nn.runtime.chat import generate_tokens, split_tool_prefix
+from warp_nn.runtime.chat import generate_tokens, split_reasoning, split_tool_prefix
 
 
 class _Runner:
@@ -47,3 +47,8 @@ def test_generate_tokens_accepts_multiple_end_tokens():
 def test_split_tool_prefix_preserves_partial_marker():
     assert split_tool_prefix("answer<tool_", "<tool_call>") == ("answer", "<tool_", False)
     assert split_tool_prefix("<tool_call>body", "<tool_call>") == ("", "<tool_call>body", True)
+
+
+def test_split_reasoning():
+    assert split_reasoning("Reason\n</think>\n\nAnswer", True) == ("Answer", "Reason")
+    assert split_reasoning("Answer", False) == ("Answer", None)

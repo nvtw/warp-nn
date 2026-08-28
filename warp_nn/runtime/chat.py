@@ -59,6 +59,14 @@ def split_tool_prefix(text: str, marker: str) -> tuple[str, str, bool]:
     return (text[:-keep], text[-keep:], False) if keep else (text, "", False)
 
 
+def split_reasoning(text: str, enable_thinking: bool) -> tuple[str, str | None]:
+    """Separate a Qwen thinking response into answer and reasoning text."""
+    if not enable_thinking:
+        return text, None
+    reasoning, marker, answer = text.partition("</think>")
+    return (answer.lstrip(), reasoning.strip()) if marker else ("", reasoning.strip())
+
+
 def sample_token(
     logits: Any,
     temperature: float = 1.0,
