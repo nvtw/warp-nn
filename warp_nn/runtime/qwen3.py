@@ -398,6 +398,8 @@ class Qwen3OnnxRunner:
         self._generated_count = wp.zeros(1, dtype=wp.int32, device=self.runtime._device)
         self._generated_ids = wp.zeros(self.cache_capacity, dtype=wp.int64, device=self.runtime._device)
         self._generation_finished = wp.zeros(1, dtype=wp.int32, device=self.runtime._device)
+        self._decode_graph = None
+        self._decode_graph_outputs = None
         self._past: dict[str, wp.array] = {}
         self.sequence_length = 0
 
@@ -501,7 +503,19 @@ class Qwen3OnnxRunner:
         if self.sequence_length >= self.cache_capacity:
             raise ValueError("Qwen3OnnxRunner: KV cache is full")
         self._stage_decode_token(token_id)
-        outputs = self._decode_runtime(self._decode_inputs)
+        if self.runtime._device.is_cuda:
+            if self._decode_graph is None:
+                wp.capture_begin(device=self.runtime._device)
+                try:
+                    self._decode_graph_outputs = self._decode_runtime(self._decode_inputs)
+                    self._decode_graph = wp.capture_end(device=self.runtime._device)
+                except Exception:
+                    wp.capture_end(device=self.runtime._device)
+                    raise
+            wp.capture_launch(self._decode_graph)
+            outputs = self._decode_graph_outputs
+        else:
+            outputs = self._decode_runtime(self._decode_inputs)
         self.sequence_length += 1
         return outputs["logits"]
 
