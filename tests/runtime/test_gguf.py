@@ -96,6 +96,21 @@ def test_gguf_uploads_selected_tensor_to_cuda(tmp_path):
     np.testing.assert_array_equal(loaded["weight"].numpy(), values)
 
 
+def test_gguf_indexes_q8_0_blocks_as_raw_storage(tmp_path):
+    raw = np.arange(68, dtype=np.uint8)
+    path = tmp_path / "q8.gguf"
+    _write_gguf(path, [("weight", 8, raw[:64].reshape(2, 32))])
+    path.write_bytes(path.read_bytes() + raw[64:].tobytes())
+
+    archive = GGUFArchive(path)
+    info = archive.tensor("weight")
+
+    assert info.shape == (2, 32)
+    assert info.format == "Q8_0"
+    assert info.nbytes == 68
+    np.testing.assert_array_equal(archive.load("cpu")["weight"].numpy(), raw)
+
+
 def test_gguf_supports_v2_and_selected_loading(tmp_path):
     values = np.arange(6, dtype=np.float32).reshape(2, 3)
     path = tmp_path / "v2.gguf"
@@ -149,6 +164,14 @@ def test_gguf_rejects_malformed_files(tmp_path, mutate, message):
     path.write_bytes(mutate(path.read_bytes()))
 
     with pytest.raises(ValueError, match=message):
+        GGUFArchive(path)
+
+
+def test_gguf_rejects_partial_q8_0_rows(tmp_path):
+    path = tmp_path / "partial-q8.gguf"
+    _write_gguf(path, [("weight", 8, np.zeros((2, 16), dtype=np.uint8))])
+
+    with pytest.raises(ValueError, match="partial Q8_0 block"):
         GGUFArchive(path)
 
 

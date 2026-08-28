@@ -34,9 +34,10 @@ _VALUE_FORMATS = {
 _STRING = 8
 _ARRAY = 9
 _TENSOR_TYPES = {
-    0: (wp.float32, 4, "F32"),
-    1: (wp.float16, 2, "F16"),
-    30: (wp.bfloat16, 2, "BF16"),
+    0: (wp.float32, 1, 4, "F32"),
+    1: (wp.float16, 1, 2, "F16"),
+    8: (wp.uint8, 32, 34, "Q8_0"),
+    30: (wp.bfloat16, 1, 2, "BF16"),
 }
 
 
@@ -309,7 +310,7 @@ class GGUFArchive:
         self._tensors: dict[str, GGUFTensorMetadata] = {}
         for name, gguf_shape, tensor_type, relative_offset in descriptors:
             try:
-                dtype, itemsize, format = _TENSOR_TYPES[tensor_type]
+                dtype, block_elements, block_bytes, format = _TENSOR_TYPES[tensor_type]
             except KeyError as exc:
                 raise ValueError(
                     f"GGUF tensor '{name}' has unsupported type {tensor_type}"
@@ -318,8 +319,10 @@ class GGUFArchive:
                 raise ValueError(f"GGUF tensor '{name}' has an unaligned data offset")
             shape = tuple(reversed(gguf_shape))
             elements = math.prod(shape)
+            if shape and shape[-1] % block_elements:
+                raise ValueError(f"GGUF tensor '{name}' has a partial {format} block")
             offset = self.data_offset + relative_offset
-            nbytes = elements * itemsize
+            nbytes = elements // block_elements * block_bytes
             if offset > size or nbytes > size - offset:
                 raise ValueError(f"GGUF tensor '{name}' has an invalid data range")
             self._tensors[name] = GGUFTensorMetadata(
@@ -364,10 +367,11 @@ class GGUFArchive:
             raw = np.ndarray(
                 (info.nbytes,), dtype=np.uint8, buffer=mapping, offset=info.offset
             )
+            storage_shape = (info.nbytes,) if info.format == "Q8_0" else info.shape
             host = wp.array(
                 ptr=raw.ctypes.data,
                 dtype=info.dtype,
-                shape=info.shape,
+                shape=storage_shape,
                 capacity=info.nbytes,
                 device="cpu",
             )
