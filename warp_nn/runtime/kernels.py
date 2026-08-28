@@ -2092,9 +2092,10 @@ def _get_gqa_attention_kernel(head_size: int, dtype: type = wp.float16):
     return block_dim, _gqa_attention_kernel_cache[key]
 
 
-def _get_partitioned_gqa_attention_kernels(head_size: int, dtype: type = wp.float16):
-    """Return 256-way decode attention kernels and their launch dimensions."""
-    partitions = 256
+def _get_partitioned_gqa_attention_kernels(
+    head_size: int, dtype: type = wp.float16, partitions: int = 256
+):
+    """Return cached partitioned decode attention kernels and their launch dimensions."""
     key = (head_size, dtype, partitions)
     if key not in _partitioned_gqa_attention_kernel_cache:
         _partitioned_gqa_attention_kernel_cache[key] = (
@@ -2104,10 +2105,12 @@ def _get_partitioned_gqa_attention_kernels(head_size: int, dtype: type = wp.floa
     return block_dim, partitions, _partitioned_gqa_attention_kernel_cache[key]
 
 
-def _allocate_partitioned_gqa(heads: int, head_size: int, dtype: type, device):
+def _allocate_partitioned_gqa(
+    heads: int, head_size: int, dtype: type, device, partitions: int = 256
+):
     """Allocate one reusable workspace for partitioned decode attention."""
     block_dim, partitions, kernels = _get_partitioned_gqa_attention_kernels(
-        head_size, dtype
+        head_size, dtype, partitions
     )
     items = heads * partitions
     return (

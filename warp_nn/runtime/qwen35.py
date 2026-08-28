@@ -204,7 +204,7 @@ class _Qwen35Plan:
         self.shapes["hidden.0"] = (rows, runner.hidden_size)
         self.layers = []
         self._build()
-        self.graph = None
+        self.graphs = {}
 
     def _linear(self, name: str, x: str, weight: str) -> Operation:
         op = Operation("Linear", [x, weight], [name])
@@ -429,12 +429,17 @@ class _Qwen35Plan:
         )
         if self.rows == 1:
             if not hasattr(self, "partitioned_attention"):
-                self.partitioned_attention = _allocate_partitioned_gqa(
-                    self.runner.query_heads,
-                    self.runner.head_size,
-                    self.dtype,
-                    self.device,
-                )
+                self.partitioned_attention = {
+                    partitions: _allocate_partitioned_gqa(
+                        self.runner.query_heads,
+                        self.runner.head_size,
+                        self.dtype,
+                        self.device,
+                        partitions,
+                    )
+                    for partitions in (256, 1024)
+                }
+                self.attention_partitions = 256
             layer["partitioned_attention"] = self.partitioned_attention
         self.tensors[f"layer.{index}.gated"] = layer["gated"]
         self.shapes[f"layer.{index}.gated"] = tuple(layer["gated"].shape)
@@ -643,7 +648,7 @@ class _Qwen35Plan:
             )
         if "partitioned_attention" in layer:
             _launch_partitioned_gqa(
-                layer["partitioned_attention"],
+                layer["partitioned_attention"][self.attention_partitions],
                 layer["q_rotated"],
                 key_cache,
                 value_cache,
@@ -856,22 +861,36 @@ class Qwen35Runner:
             state.zero_()
         self.sequence_length = 0
 
-    def _run(self, plan: _Qwen35Plan) -> wp.array:
+    def _run(self, plan: _Qwen35Plan, graph_key=None) -> wp.array:
         if self.device.is_cuda:
-            if plan.graph is None and not getattr(plan, "_capture_ready", True):
+            if not hasattr(plan, "graphs"):
+                plan.graphs = {}
+                if getattr(plan, "graph", None) is not None:
+                    plan.graphs[None] = (plan.graph, plan.outputs)
+            graph_entry = plan.graphs.get(graph_key)
+            if graph_entry is None and graph_key is not None:
+                ready_keys = getattr(plan, "_capture_ready_keys", set())
+                if graph_key not in ready_keys:
+                    ready_keys.add(graph_key)
+                    plan._capture_ready_keys = ready_keys
+                    return plan.execute()
+            if graph_entry is None and not getattr(plan, "_capture_ready", True):
                 plan._capture_ready = True
                 return plan.execute()
-            if plan.graph is None:
+            if graph_entry is None:
                 wp.capture_begin(device=self.device)
                 try:
                     outputs = plan.execute()
-                    plan.graph = wp.capture_end(device=self.device)
-                    plan.outputs = outputs
+                    graph_entry = (
+                        wp.capture_end(device=self.device),
+                        outputs,
+                    )
+                    plan.graphs[graph_key] = graph_entry
                 except Exception:
                     wp.capture_end(device=self.device)
                     raise
-            wp.capture_launch(plan.graph)
-            return plan.outputs
+            wp.capture_launch(graph_entry[0])
+            return graph_entry[1]
         return plan.execute()
 
     def _stage_one(self, token_id: int) -> wp.array:
@@ -888,7 +907,9 @@ class Qwen35Runner:
             ],
             device=self.device,
         )
-        logits = self._run(self._decode_plan)
+        partitions = 1024 if position >= 131_072 else 256
+        self._decode_plan.attention_partitions = partitions
+        logits = self._run(self._decode_plan, partitions)
         self.sequence_length += 1
         return logits
 

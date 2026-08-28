@@ -585,7 +585,7 @@ class _MusePlan:
         self.shapes["hidden.0"] = (rows, runner.hidden_size)
         self.layers = []
         self._build()
-        self.graph = None
+        self.graphs = {}
 
     def _linear(self, name: str, x: str, weight: str) -> Operation:
         op = Operation("Linear", [x, weight], [name])
@@ -756,12 +756,17 @@ class _MusePlan:
         )
         if self.rows == 1:
             if not hasattr(self, "partitioned_attention"):
-                self.partitioned_attention = _allocate_partitioned_gqa(
-                    self.runner.query_heads,
-                    self.runner.head_dim,
-                    self.dtype,
-                    self.device,
-                )
+                self.partitioned_attention = {
+                    partitions: _allocate_partitioned_gqa(
+                        self.runner.query_heads,
+                        self.runner.head_dim,
+                        self.dtype,
+                        self.device,
+                        partitions,
+                    )
+                    for partitions in (256, 1024)
+                }
+                self.attention_partitions = 256
             layer["partitioned_attention"] = self.partitioned_attention
 
     def _execute_op(self, op: Operation) -> None:
@@ -849,7 +854,7 @@ class _MusePlan:
         window = self.runner.local_window if layer["local"] else 0
         if "partitioned_attention" in layer:
             _launch_partitioned_gqa(
-                layer["partitioned_attention"],
+                layer["partitioned_attention"][self.attention_partitions],
                 layer["q_ready"],
                 key_cache,
                 value_cache,
