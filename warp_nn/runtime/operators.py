@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
+
+from dataclasses import dataclass, field
 
 import numpy as np
 import warp as wp
@@ -19,6 +21,28 @@ from warp_nn.runtime.kernels import (
     _quantize_activation_int8_kernel,
 )
 from warp_nn.utils.ops import resolve_dim
+
+
+@dataclass
+class Operation:
+    """A preplanned operation whose private attributes hold launch state."""
+
+    op_type: str
+    inputs: list[str]
+    outputs: list[str]
+    attrs: dict[str, Any] = field(default_factory=dict)
+
+
+def execute_operations(
+    operations: Iterable[Operation], tensors: dict[str, wp.array], shapes: dict[str, tuple[int, ...]], device
+) -> None:
+    """Launch a preplanned operation sequence on the current Warp stream."""
+    for operation in operations:
+        try:
+            dispatch = _OP_DISPATCH[operation.op_type]
+        except KeyError as exc:
+            raise NotImplementedError(f"Unsupported operation '{operation.op_type}'") from exc
+        dispatch(operation, tensors, shapes, device)
 
 
 def _exec_gemm(op, tensors, shapes, device):

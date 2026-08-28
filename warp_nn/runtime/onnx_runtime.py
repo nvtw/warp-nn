@@ -115,7 +115,7 @@ from warp_nn.runtime.kernels import (
     _unary_kernel,
     _where_kernel_for_dtype,
 )
-from warp_nn.runtime.operators import _OP_DISPATCH
+from warp_nn.runtime.operators import _OP_DISPATCH, Operation, execute_operations
 from warp_nn.utils.device import parse_device
 
 
@@ -186,11 +186,7 @@ _ATTR_DECODERS = {
 
 
 @dataclass
-class _Op:
-    op_type: str
-    inputs: list[str]
-    outputs: list[str]
-    attrs: dict[str, Any] = field(default_factory=dict)
+class _Op(Operation):
     attr_names: set[str] = field(default_factory=set)
 
 
@@ -656,11 +652,7 @@ class OnnxRuntime:
                 )
             tensors[name] = arr
 
-        for op in self._ops:
-            dispatch = _OP_DISPATCH.get(op.op_type)
-            if dispatch is None:
-                raise NotImplementedError(f"OnnxRuntime: unsupported op '{op.op_type}'")
-            dispatch(op, tensors, self._shapes, self._device)
+        execute_operations(self._ops, tensors, self._shapes, self._device)
 
         return {name: tensors[name] for name in self.output_names}
 
