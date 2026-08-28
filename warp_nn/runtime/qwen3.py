@@ -79,6 +79,18 @@ For each function call, return a JSON object with function name and arguments wi
 {{"name": <function-name>, "arguments": <args-json-object>}}
 </tool_call>"""
 
+_REASONING_INSTRUCTIONS = {
+    "xhigh": (
+        "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, "
+        "consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer."
+    ),
+    "medium": "",
+    "low": (
+        "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion "
+        "without unnecessary elaboration."
+    ),
+}
+
 
 def _is_letter(character: str) -> bool:
     return unicodedata.category(character).startswith("L")
@@ -185,6 +197,8 @@ class Qwen3Tokenizer:
         template_path = directory / "chat_template.jinja"
         template = template_path.read_text(encoding="utf-8") if template_path.is_file() else ""
         self._tool_dialect = "json" if "args-json-object" in template else "parameters"
+        self.supports_reasoning_effort = "reasoning_effort" in template
+        self.default_enable_thinking = self.supports_reasoning_effort
 
     @lru_cache(maxsize=8192)
     def _bpe(self, piece: str) -> tuple[str, ...]:
@@ -259,16 +273,31 @@ class Qwen3Tokenizer:
         add_generation_prompt: bool = True,
         enable_thinking: bool = True,
         tools: Sequence[Mapping[str, object]] | None = None,
+        reasoning_effort: str | None = None,
+        preserve_thinking: bool = True,
     ) -> str:
         """Format text messages and OpenAI function tools using Qwen's template."""
         formatted = []
         first = 0
+        reasoning_instruction = ""
+        if reasoning_effort is not None and not self.supports_reasoning_effort:
+            raise ValueError("This Qwen chat template does not support reasoning_effort")
+        if self.supports_reasoning_effort and enable_thinking:
+            reasoning_effort = reasoning_effort or "xhigh"
+            try:
+                reasoning_instruction = _REASONING_INSTRUCTIONS[reasoning_effort]
+            except KeyError as error:
+                raise ValueError("reasoning_effort must be 'low', 'medium', or 'xhigh'") from error
+        elif reasoning_effort is not None:
+            raise ValueError("reasoning_effort requires thinking mode")
         if tools:
             definitions = "".join(f"\n{json.dumps(tool, ensure_ascii=False, separators=(',', ':'))}" for tool in tools)
             prompt = (_JSON_TOOL_PROMPT if self._tool_dialect == "json" else _PARAMETER_TOOL_PROMPT).format(
                 tools=definitions
             )
             system = prompt
+            if reasoning_instruction:
+                system = reasoning_instruction + "\n\n" + system
             if messages and messages[0].get("role") in ("system", "developer"):
                 content = messages[0].get("content")
                 if not isinstance(content, str):
@@ -279,6 +308,16 @@ class Qwen3Tokenizer:
                         if self._tool_dialect == "json"
                         else prompt + "\n\n" + content.strip()
                     )
+                first = 1
+            formatted.append(f"<|im_start|>system\n{system}<|im_end|>\n")
+        elif reasoning_instruction:
+            system = reasoning_instruction
+            if messages and messages[0].get("role") in ("system", "developer"):
+                content = messages[0].get("content")
+                if not isinstance(content, str):
+                    raise ValueError("Qwen3Tokenizer.format_chat requires text message content")
+                if content.strip():
+                    system += "\n\n" + content.strip()
                 first = 1
             formatted.append(f"<|im_start|>system\n{system}<|im_end|>\n")
 
@@ -303,6 +342,16 @@ class Qwen3Tokenizer:
                 raise ValueError("Qwen3Tokenizer.format_chat supports text OpenAI chat messages")
             body = "" if content is None else content.strip()
             if role == "assistant":
+                reasoning = message.get("reasoning_content", message.get("reasoning"))
+                if (
+                    preserve_thinking
+                    and isinstance(reasoning, str)
+                    and reasoning.strip()
+                    and not body.startswith("<think>")
+                ):
+                    body = f"<think>\n{reasoning.strip()}\n</think>\n\n{body}"
+                elif not preserve_thinking and body.startswith("<think>"):
+                    body = re.sub(r"^<think>.*?</think>\s*", "", body, count=1, flags=re.DOTALL)
                 for tool_call in message.get("tool_calls") or ():
                     function = tool_call.get("function", tool_call)
                     arguments = function.get("arguments", {})
@@ -330,10 +379,11 @@ class Qwen3Tokenizer:
             formatted.append(self.generation_prefix(enable_thinking))
         return "".join(formatted)
 
-    @staticmethod
-    def generation_prefix(enable_thinking: bool) -> str:
+    def generation_prefix(self, enable_thinking: bool) -> str:
         """Return tokens inserted before generated assistant content."""
-        return "" if enable_thinking else "<think>\n\n</think>\n\n"
+        if not enable_thinking:
+            return "<think>\n\n</think>\n\n"
+        return "<think>\n" if self.supports_reasoning_effort else ""
 
     def encode_chat(self, messages: Sequence[Mapping[str, object]], **kwargs) -> list[int]:
         """Format and encode a chat prompt."""

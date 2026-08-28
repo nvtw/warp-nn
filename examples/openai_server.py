@@ -19,11 +19,12 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--cache-capacity", type=int, default=4096)
     parser.add_argument("--prefill-chunk-size", type=int, default=16)
-    parser.add_argument("--thinking", action="store_true", help="Enable Qwen thinking mode")
+    parser.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--reasoning-effort", choices=("low", "medium", "xhigh"))
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--top-p", type=float)
     parser.add_argument("--top-k", type=int, default=20)
-    parser.add_argument("--presence-penalty", type=float, default=1.5)
+    parser.add_argument("--presence-penalty", type=float)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--no-cublas", action="store_true")
     args = parser.parse_args()
@@ -46,18 +47,29 @@ def main():
             use_cublas=not args.no_cublas,
         )
     model_id = args.model_id or args.model_dir.name
-    temperature = args.temperature if args.temperature is not None else (1.0 if args.thinking else 0.7)
-    top_p = args.top_p if args.top_p is not None else (0.95 if args.thinking else 0.8)
+    thinking = tokenizer.default_enable_thinking if args.thinking is None else args.thinking
+    temperature = args.temperature if args.temperature is not None else (1.0 if thinking else 0.7)
+    top_p = args.top_p if args.top_p is not None else (0.95 if thinking else 0.8)
+    presence_penalty = args.presence_penalty if args.presence_penalty is not None else (0.0 if thinking else 1.5)
+    if temperature < 0.0 or not 0.0 < top_p <= 1.0 or args.top_k < 0:
+        parser.error("invalid sampling parameters")
+    if not -2.0 <= presence_penalty <= 2.0:
+        parser.error("--presence-penalty must be between -2 and 2")
+    if args.reasoning_effort and not thinking:
+        parser.error("--reasoning-effort requires thinking mode")
+    if args.reasoning_effort and not tokenizer.supports_reasoning_effort:
+        parser.error("this model's chat template does not support --reasoning-effort")
     backend = ChatCompletions(
         model_id,
         runner,
         tokenizer,
         args.max_new_tokens,
-        args.thinking,
+        thinking,
         temperature,
         top_p,
         args.top_k,
-        args.presence_penalty,
+        presence_penalty,
+        args.reasoning_effort,
     )
     server = OpenAIHTTPServer((args.host, args.port), backend, args.api_key)
     print(f"Serving {model_id} at http://{args.host}:{args.port}/v1")

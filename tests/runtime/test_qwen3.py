@@ -197,3 +197,32 @@ def test_qwen3_json_tool_dialect(tmp_path):
     )
     assert text == "Checking."
     assert calls == [{"name": "read_file", "arguments": {"path": "README.md"}}]
+
+
+def test_qwen38_reasoning_template_controls(tmp_path):
+    path = tmp_path / "tokenizer.json"
+    _write_tokenizer(path)
+    (tmp_path / "chat_template.jinja").write_text("reasoning_effort <think>\\n", encoding="utf-8")
+    tokenizer = Qwen3Tokenizer(path)
+
+    assert tokenizer.default_enable_thinking
+    formatted = tokenizer.format_chat(
+        [{"role": "system", "content": "Be concise."}, {"role": "user", "content": "Hello"}],
+        reasoning_effort="low",
+    )
+    assert "Reasoning effort is set to low." in formatted
+    assert "Be concise." in formatted
+    assert formatted.endswith("<|im_start|>assistant\n<think>\n")
+
+    history = tokenizer.format_chat(
+        [{"role": "assistant", "content": "Answer", "reasoning_content": "Reason"}],
+        add_generation_prompt=False,
+        reasoning_effort="medium",
+    )
+    assert "<think>\nReason\n</think>\n\nAnswer" in history
+    assert "<think>" not in tokenizer.format_chat(
+        [{"role": "assistant", "content": "<think>\nReason\n</think>\n\nAnswer"}],
+        add_generation_prompt=False,
+        reasoning_effort="medium",
+        preserve_thinking=False,
+    )

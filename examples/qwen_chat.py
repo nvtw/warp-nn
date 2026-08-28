@@ -143,9 +143,10 @@ def main():
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--top-p", type=float)
     parser.add_argument("--top-k", type=int, default=20)
-    parser.add_argument("--presence-penalty", type=float, default=1.5)
+    parser.add_argument("--presence-penalty", type=float)
     parser.add_argument("--seed", type=int)
-    parser.add_argument("--thinking", action="store_true", help="Enable Qwen3 thinking mode")
+    parser.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--reasoning-effort", choices=("low", "medium", "xhigh"))
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--coding-agent",
@@ -156,15 +157,21 @@ def main():
     parser.add_argument("--trusted-folder", type=Path, default=Path.cwd(), help="Root allowed for coding tools")
     parser.add_argument("--unsafe-shell", action="store_true", help="Allow shell commands without containment")
     args = parser.parse_args()
-    temperature = args.temperature if args.temperature is not None else (1.0 if args.thinking else 0.7)
-    top_p = args.top_p if args.top_p is not None else (0.95 if args.thinking else 0.8)
+    tokenizer = Qwen3Tokenizer(args.model_dir)
+    thinking = tokenizer.default_enable_thinking if args.thinking is None else args.thinking
+    temperature = args.temperature if args.temperature is not None else (1.0 if thinking else 0.7)
+    top_p = args.top_p if args.top_p is not None else (0.95 if thinking else 0.8)
+    presence_penalty = args.presence_penalty if args.presence_penalty is not None else (0.0 if thinking else 1.5)
     if temperature < 0.0 or not 0.0 < top_p <= 1.0 or args.top_k < 0:
         parser.error("invalid sampling parameters")
-    if not -2.0 <= args.presence_penalty <= 2.0:
+    if not -2.0 <= presence_penalty <= 2.0:
         parser.error("--presence-penalty must be between -2 and 2")
+    if args.reasoning_effort and not thinking:
+        parser.error("--reasoning-effort requires thinking mode")
+    if args.reasoning_effort and not tokenizer.supports_reasoning_effort:
+        parser.error("this model's chat template does not support --reasoning-effort")
     rng = np.random.default_rng(args.seed)
 
-    tokenizer = Qwen3Tokenizer(args.model_dir)
     runner_type = Qwen3OnnxRunner if (args.model_dir / "model.onnx").is_file() else Qwen35Runner
     model_path = args.model_dir / "model.onnx" if runner_type is Qwen3OnnxRunner else args.model_dir
     runner = runner_type(
@@ -216,8 +223,9 @@ def main():
             for tool_round in range(8):
                 token_ids = tokenizer.encode_chat(
                     messages,
-                    enable_thinking=args.thinking,
+                    enable_thinking=thinking,
                     tools=coding_tools.schemas if coding_tools else None,
+                    reasoning_effort=args.reasoning_effort,
                 )
                 if len(token_ids) >= args.cache_capacity:
                     if tool_round == 0:
@@ -241,21 +249,21 @@ def main():
                     tool_marker=tokenizer.tool_call_start if coding_tools else None,
                     top_p=top_p,
                     top_k=args.top_k,
-                    presence_penalty=args.presence_penalty,
+                    presence_penalty=presence_penalty,
                     rng=rng,
                     cancelled=cancel.cancelled.is_set,
                 )
                 print()
                 if cancel.cancelled.is_set():
                     messages.append(
-                        {"role": "assistant", "content": tokenizer.generation_prefix(args.thinking) + response}
+                        {"role": "assistant", "content": tokenizer.generation_prefix(thinking) + response}
                     )
                     print("[Cancelled.]")
                     break
                 if not generated or not is_eos_token(tokenizer, generated[-1]):
                     print(f"[Stopped at the {generation_limit}-token limit; use --max-new-tokens or /clear.]")
                 if not calls:
-                    history_response = tokenizer.generation_prefix(args.thinking) + response
+                    history_response = tokenizer.generation_prefix(thinking) + response
                     messages.append({"role": "assistant", "content": history_response})
                     break
                 tool_calls = []
@@ -269,7 +277,7 @@ def main():
                             "function": {"name": call["name"], "arguments": arguments},
                         }
                     )
-                history_response = tokenizer.generation_prefix(args.thinking) + response
+                history_response = tokenizer.generation_prefix(thinking) + response
                 assistant_index = len(messages)
                 messages.append({"role": "assistant", "content": history_response, "tool_calls": tool_calls})
                 for call, tool_call in zip(calls, tool_calls):

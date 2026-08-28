@@ -69,6 +69,8 @@ def test_chat_completions_streams_text_and_usage():
             {
                 "model": "warp-qwen",
                 "messages": [{"role": "user", "content": "Hello"}],
+                "reasoning_effort": "low",
+                "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": False},
                 "stream": True,
                 "stream_options": {"include_usage": True},
             },
@@ -86,6 +88,9 @@ def test_chat_completions_streams_text_and_usage():
     assert chunks[-1]["choices"] == []
     assert chunks[-1]["usage"] == {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
     assert tokenizer.request[0] == [{"role": "user", "content": "Hello"}]
+    assert tokenizer.request[1]["enable_thinking"] is True
+    assert tokenizer.request[1]["reasoning_effort"] == "low"
+    assert tokenizer.request[1]["preserve_thinking"] is False
 
 
 def test_chat_completions_returns_structured_tool_call():

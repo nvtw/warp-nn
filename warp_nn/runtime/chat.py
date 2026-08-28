@@ -22,6 +22,8 @@ class Tokenizer(Protocol):
         *,
         tools: Sequence[Mapping[str, object]] | None = None,
         enable_thinking: bool = False,
+        reasoning_effort: str | None = None,
+        preserve_thinking: bool = True,
     ) -> list[int]: ...
 
     def decode(self, token_ids: Sequence[int], skip_special_tokens: bool = False) -> str: ...

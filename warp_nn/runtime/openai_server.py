@@ -72,6 +72,8 @@ class ChatCompletions:
         top_p: float = 1.0,
         top_k: int = 0,
         presence_penalty: float = 0.0,
+        reasoning_effort: str | None = None,
+        preserve_thinking: bool = True,
     ):
         self.model = model
         self.runner = runner
@@ -82,6 +84,8 @@ class ChatCompletions:
         self.top_p = top_p
         self.top_k = top_k
         self.presence_penalty = presence_penalty
+        self.reasoning_effort = reasoning_effort
+        self.preserve_thinking = preserve_thinking
         self.lock = threading.Lock()
 
     def complete(self, request: Mapping[str, object], emit: Callable[[dict[str, object]], None] | None = None):
@@ -97,6 +101,18 @@ class ChatCompletions:
             raise APIError("tools must be an array", param="tools")
         if request.get("tool_choice") == "none":
             tools = None
+        template_kwargs = request.get("chat_template_kwargs") or {}
+        if not isinstance(template_kwargs, Mapping):
+            raise APIError("chat_template_kwargs must be an object", param="chat_template_kwargs")
+        enable_thinking = template_kwargs.get("enable_thinking", request.get("enable_thinking", self.enable_thinking))
+        preserve_thinking = template_kwargs.get(
+            "preserve_thinking", request.get("preserve_thinking", self.preserve_thinking)
+        )
+        reasoning_effort = request.get("reasoning_effort", self.reasoning_effort)
+        if not isinstance(enable_thinking, bool) or not isinstance(preserve_thinking, bool):
+            raise APIError("thinking controls must be boolean")
+        if reasoning_effort is not None and reasoning_effort not in ("low", "medium", "xhigh"):
+            raise APIError("reasoning_effort must be low, medium, or xhigh", param="reasoning_effort")
         try:
             temperature = float(request.get("temperature", self.temperature))
             top_p = float(request.get("top_p", self.top_p))
@@ -115,7 +131,9 @@ class ChatCompletions:
             prompt_ids = self.tokenizer.encode_chat(
                 messages,
                 tools=tools,
-                enable_thinking=self.enable_thinking,
+                enable_thinking=enable_thinking,
+                reasoning_effort=reasoning_effort,
+                preserve_thinking=preserve_thinking,
             )
         except (KeyError, TypeError, ValueError) as error:
             raise APIError(str(error), param="messages") from error
