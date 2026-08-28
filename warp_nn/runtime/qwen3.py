@@ -297,7 +297,7 @@ class Qwen3Tokenizer:
                         arguments = json.loads(arguments)
                     if not isinstance(arguments, Mapping):
                         raise ValueError("Qwen3Tokenizer.format_chat requires object-valued tool arguments")
-                    separator = "\n\n" if body else ""
+                    separator = "" if not body or body.endswith("\n") else "\n\n"
                     if self._tool_dialect == "json":
                         call = {"name": function["name"], "arguments": arguments}
                         body += f"{separator}<tool_call>\n{json.dumps(call, ensure_ascii=False)}\n</tool_call>"
@@ -314,9 +314,13 @@ class Qwen3Tokenizer:
             index += 1
         if add_generation_prompt:
             formatted.append("<|im_start|>assistant\n")
-            if not enable_thinking:
-                formatted.append("<think>\n\n</think>\n\n")
+            formatted.append(self.generation_prefix(enable_thinking))
         return "".join(formatted)
+
+    @staticmethod
+    def generation_prefix(enable_thinking: bool) -> str:
+        """Return tokens inserted before generated assistant content."""
+        return "" if enable_thinking else "<think>\n\n</think>\n\n"
 
     def encode_chat(self, messages: Sequence[Mapping[str, object]], **kwargs) -> list[int]:
         """Format and encode a chat prompt."""

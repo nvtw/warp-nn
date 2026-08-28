@@ -147,7 +147,8 @@ def main():
             if not generated or generated[-1] != tokenizer.eos_token_id:
                 print(f"[Stopped at the {generation_limit}-token limit; use --max-new-tokens or /clear.]")
             if not calls:
-                messages.append({"role": "assistant", "content": response})
+                history_response = tokenizer.generation_prefix(args.thinking) + response
+                messages.append({"role": "assistant", "content": history_response})
                 break
             tool_calls = []
             for index, call in enumerate(calls):
@@ -156,7 +157,8 @@ def main():
                 tool_calls.append(
                     {"id": call_id, "type": "function", "function": {"name": call["name"], "arguments": arguments}}
                 )
-            messages.append({"role": "assistant", "content": response or None, "tool_calls": tool_calls})
+            history_response = tokenizer.generation_prefix(args.thinking) + response
+            messages.append({"role": "assistant", "content": history_response, "tool_calls": tool_calls})
             for call, tool_call in zip(calls, tool_calls):
                 print(f"[tool] {call['name']}({json.dumps(call['arguments'], ensure_ascii=False)})")
                 result = coding_tools.execute(call["name"], call["arguments"])

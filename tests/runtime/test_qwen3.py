@@ -71,6 +71,15 @@ def test_qwen_tokenizer_and_chat_template(tmp_path):
     )
     assert tokenizer.decode(tokenizer.encode_chat(messages, enable_thinking=False)) == formatted
 
+    cached = tokenizer.encode_chat(messages, enable_thinking=False) + tokenizer.encode("Hello")
+    messages.extend(
+        [
+            {"role": "assistant", "content": tokenizer.generation_prefix(False) + "Hello"},
+            {"role": "user", "content": "Again"},
+        ]
+    )
+    assert tokenizer.encode_chat(messages, enable_thinking=False)[: len(cached)] == cached
+
 
 def test_sample_token():
     logits = np.array([[[0.0, 1.0, 4.0, 3.0]]], dtype=np.float16)
