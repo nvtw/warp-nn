@@ -82,6 +82,88 @@ _GEMM_TRANSB_TILED_KERNEL = _create_gemm_transb_tiled_kernel(_GEMM_CONFIG)
 
 
 @wp.kernel
+def _linear_kernel(x: wp.array2d[Any], weight: wp.array2d[Any], output: wp.array2d[Any]):
+    """Compute the fallback dense projection ``output = x @ weight.T``."""
+    row, column = wp.tid()
+    total = wp.float32(0.0)
+    for inner in range(x.shape[1]):
+        total += wp.float32(x[row, inner]) * wp.float32(weight[column, inner])
+    output[row, column] = x.dtype(total)
+
+
+def _create_linear_vector_kernel(dtype: type):
+    """Build a row-by-weight dot-product kernel for small activation batches."""
+    DTYPE = dtype
+    TILE_WIDTH = 256
+
+    @wp.func
+    def multiply(left: DTYPE, right: DTYPE):
+        return wp.float32(DTYPE(left)) * wp.float32(right)
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(x: wp.array2d(dtype=DTYPE), weight: wp.array2d(dtype=DTYPE), output: wp.array2d(dtype=DTYPE)):
+        """Project small row batches with one reduction tile per output."""
+        item = wp.tid()
+        row = item / weight.shape[0]
+        column = item % weight.shape[0]
+        partials = wp.tile_zeros(shape=(TILE_WIDTH,), dtype=wp.float32)
+        for inner_tile in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
+            offset = inner_tile * TILE_WIDTH
+            activations = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
+            weights = wp.tile_load(weight[column], shape=(TILE_WIDTH,), offset=(offset,))
+            partials += wp.tile_map(multiply, activations, weights)
+        output[row, column] = DTYPE(wp.tile_extract(wp.tile_sum(partials), 0))
+
+    kernel.module.options["enable_backward"] = False
+    return kernel
+
+
+@lru_cache(maxsize=None)
+def _get_linear_vector_kernel(dtype: type):
+    """Return a cached small-batch dense projection kernel."""
+    return _create_linear_vector_kernel(dtype)
+
+
+def _create_linear_tiled_kernel(dtype: type, tile_m: int):
+    """Build a typed tensor-core-friendly dense projection kernel."""
+    DTYPE = dtype
+    TILE_M = tile_m
+    TILE_N = 32
+    TILE_K = 32
+
+    @wp.func
+    def cast_output(value: wp.float32):
+        return DTYPE(value)
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(x: wp.array2d(dtype=DTYPE), weight: wp.array2d(dtype=DTYPE), output: wp.array2d(dtype=DTYPE)):
+        """Compute a tiled ``output = x @ weight.T`` projection."""
+        tile_row, tile_column = wp.tid()
+        typed_zero = DTYPE(0.0)
+        accumulator = wp.tile_zeros(shape=(TILE_M, TILE_N), dtype=wp.float32)
+        for inner_tile in range((x.shape[1] + TILE_K - 1) / TILE_K):
+            inner_offset = inner_tile * TILE_K
+            activations = wp.tile_load(x, shape=(TILE_M, TILE_K), offset=(tile_row * TILE_M, inner_offset))
+            weights = wp.tile_load(weight, shape=(TILE_N, TILE_K), offset=(tile_column * TILE_N, inner_offset))
+            wp.tile_matmul(activations, wp.tile_transpose(weights), accumulator)
+        wp.tile_store(
+            output,
+            wp.tile_map(cast_output, accumulator),
+            offset=(tile_row * TILE_M, tile_column * TILE_N),
+        )
+
+    kernel.module.options["enable_backward"] = False
+    return kernel
+
+
+@lru_cache(maxsize=None)
+def _get_linear_tiled_kernel(dtype: type, rows: int):
+    """Return a dense projection kernel and its tile shape for ``rows``."""
+    tile_m = 8 if rows < 16 else 32
+    return _create_linear_tiled_kernel(dtype, tile_m), (tile_m, 32)
+
+
+@wp.kernel
 def _elu_kernel(
     x: wp.array2d[Any],
     y: wp.array2d[Any],

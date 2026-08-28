@@ -16,8 +16,11 @@ from warp_nn.runtime.kernels import (
     _GEMM_CONFIG,
     _GEMM_TRANSB_TILED_KERNEL,
     _gather_block_quantized_int8_kernel,
+    _get_linear_tiled_kernel,
+    _get_linear_vector_kernel,
     _gqa_copy_past_fp16_kernel,
     _gqa_prepare_fp16_kernel,
+    _linear_kernel,
     _quantize_activation_int8_kernel,
 )
 from warp_nn.utils.ops import resolve_dim
@@ -43,6 +46,67 @@ def execute_operations(
         except KeyError as exc:
             raise NotImplementedError(f"Unsupported operation '{operation.op_type}'") from exc
         dispatch(operation, tensors, shapes, device)
+
+
+def _exec_linear(op, tensors, shapes, device):
+    x = tensors[op.inputs[0]].reshape((op.attrs["_rows"], op.attrs["_inner"]))
+    weight = tensors[op.inputs[1]]
+    output = tensors[op.outputs[0]].reshape((op.attrs["_rows"], op.attrs["_columns"]))
+    cublas = op.attrs.get("_cublas")
+    if cublas is not None:
+        cublas.gemm(
+            x.ptr,
+            weight.ptr,
+            output.ptr,
+            op.attrs["_rows"],
+            op.attrs["_columns"],
+            op.attrs["_inner"],
+            wp.get_stream(device).cuda_stream,
+            2 if x.dtype == wp.float16 else 14,
+        )
+    elif device.is_cuda:
+        if op.attrs.get("_vector_kernel"):
+            wp.launch_tiled(
+                op.attrs["_kernel"],
+                dim=x.shape[0] * weight.shape[0],
+                inputs=[x, weight, output],
+                block_dim=256,
+                device=device,
+            )
+        else:
+            tile_m, tile_n = op.attrs["_tile_shape"]
+            wp.launch_tiled(
+                op.attrs["_kernel"],
+                dim=((x.shape[0] + tile_m - 1) // tile_m, (weight.shape[0] + tile_n - 1) // tile_n),
+                inputs=[x, weight, output],
+                block_dim=128,
+                device=device,
+            )
+    else:
+        wp.launch(_linear_kernel, dim=output.shape, inputs=[x, weight, output], device=device)
+
+
+def plan_linear(op: Operation, tensors: dict[str, wp.array], shapes: dict[str, tuple[int, ...]], device, cublas=None):
+    """Allocate and specialize a dense projection operation."""
+    rows, inner = shapes[op.inputs[0]]
+    columns, weight_inner = shapes[op.inputs[1]]
+    if weight_inner != inner:
+        raise ValueError(f"Linear has incompatible shapes {(rows, inner)} and {(columns, weight_inner)}")
+    dtype = tensors[op.inputs[0]].dtype
+    if tensors[op.inputs[1]].dtype != dtype or dtype not in (wp.float16, wp.bfloat16, wp.float32):
+        raise TypeError("Linear requires matching FP16, BF16, or FP32 inputs")
+    output = wp.empty((rows, columns), dtype=dtype, device=device)
+    tensors[op.outputs[0]] = output
+    shapes[op.outputs[0]] = output.shape
+    op.attrs.update({"_rows": rows, "_columns": columns, "_inner": inner})
+    if cublas is not None and device.is_cuda and dtype in (wp.float16, wp.bfloat16):
+        op.attrs["_cublas"] = cublas
+    elif device.is_cuda:
+        if rows < 8:
+            op.attrs["_kernel"] = _get_linear_vector_kernel(dtype)
+            op.attrs["_vector_kernel"] = True
+        else:
+            op.attrs["_kernel"], op.attrs["_tile_shape"] = _get_linear_tiled_kernel(dtype, rows)
 
 
 def _exec_gemm(op, tensors, shapes, device):
@@ -673,6 +737,7 @@ _OP_DISPATCH: dict[str, Any] = {
     "GatherBlockQuantized": _exec_gather_block_quantized,
     "GroupQueryAttention": _exec_group_query_attention,
     "LSTM": _exec_lstm,
+    "Linear": _exec_linear,
     "LinearAttention": _exec_linear_attention,
     "LpNormalization": _exec_lp_normalization,
     "MatMulNBits": _exec_matmul_nbits,
