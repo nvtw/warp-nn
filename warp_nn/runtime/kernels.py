@@ -1223,6 +1223,71 @@ def _get_linear_attention_kernel(key_size: int, value_size: int, dtype: type, st
     return _linear_attention_kernel_cache[key]
 
 
+def _create_mamba2_decode_kernel(head_dim: int, state_size: int, heads_per_group: int, dtype: type):
+    """Build one-token Mamba-2 selective-state update and projection."""
+    HEAD_DIM = head_dim
+    STATE_TILE = max(32, 1 << (state_size - 1).bit_length())
+    HEADS_PER_GROUP = heads_per_group
+    DTYPE = dtype
+
+    @wp.func
+    def to_float(value: dtype):
+        return wp.float32(dtype(value))
+
+    @wp.func
+    def update_state(value: wp.float32, b: wp.float32, decay: wp.float32, source: wp.float32):
+        return value * decay + b * source
+
+    @wp.func
+    def multiply(value: wp.float32, scale: wp.float32):
+        return value * scale
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(
+        x: wp.array2d(dtype=DTYPE),
+        b: wp.array2d(dtype=DTYPE),
+        c: wp.array2d(dtype=DTYPE),
+        dt: wp.array1d(dtype=DTYPE),
+        a_log: wp.array1d[wp.float32],
+        dt_bias: wp.array1d[wp.float32],
+        d: wp.array1d[wp.float32],
+        state: wp.array2d[wp.float32],
+        output: wp.array2d(dtype=DTYPE),
+        time_step_min: float,
+        time_step_max: float,
+    ):
+        """Update FP32 state and emit one Mamba-2 token for each head."""
+        item = wp.tid()
+        head = item / HEAD_DIM
+        channel = item % HEAD_DIM
+        group = head / HEADS_PER_GROUP
+        step_input = wp.float32(dt[head]) + dt_bias[head]
+        step = wp.max(step_input, 0.0) + wp.log(1.0 + wp.exp(-wp.abs(step_input)))
+        step = wp.clamp(step, wp.float32(time_step_min), wp.float32(time_step_max))
+        decay = wp.exp(-wp.exp(a_log[head]) * step)
+        source = step * wp.float32(x[head, channel])
+
+        state_row = head * HEAD_DIM + channel
+        values = wp.tile_load(state[state_row], shape=(STATE_TILE,))
+        b_values = wp.tile_map(to_float, wp.tile_load(b[group], shape=(STATE_TILE,)))
+        c_values = wp.tile_map(to_float, wp.tile_load(c[group], shape=(STATE_TILE,)))
+        values = wp.tile_map(update_state, values, b_values, decay, source)
+        wp.tile_store(state[state_row], values)
+        projected = wp.tile_extract(wp.tile_sum(wp.tile_map(multiply, values, c_values)), 0)
+        output[head, channel] = DTYPE(projected + d[head] * wp.float32(x[head, channel]))
+
+    kernel.module.options["enable_backward"] = False
+    return STATE_TILE, kernel
+
+
+@lru_cache(maxsize=None)
+def _get_mamba2_decode_kernel(head_dim: int, state_size: int, heads_per_group: int, dtype: type):
+    """Return the cached one-token Mamba-2 kernel and reduction width."""
+    if min(head_dim, state_size, heads_per_group) <= 0:
+        raise ValueError("Mamba-2 dimensions must be positive")
+    return _create_mamba2_decode_kernel(head_dim, state_size, heads_per_group, dtype)
+
+
 def _create_swiglu_kernel(dtype: type):
     """Build a fused SiLU-gate-times-up-projection kernel."""
 
