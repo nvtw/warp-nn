@@ -2753,10 +2753,22 @@ def _shape_transpose(op, shapes, dtypes, tensors, device, requires_grad=False):
         raise NotImplementedError(f"OnnxRuntime Transpose: permutation {perm} is not supported")
     out_shape = tuple(in_shape[axis] for axis in perm)
     dtype = dtypes[op.inputs[0]]
-    tensors[op.outputs[0]] = wp.zeros(out_shape, dtype=dtype, device=device)
+    non_unit_axes = tuple(axis for axis, size in enumerate(in_shape) if size != 1)
+    view_only = (
+        not requires_grad
+        and op.inputs[0] in tensors
+        and tuple(axis for axis in perm if in_shape[axis] != 1) == non_unit_axes
+    )
+    tensors[op.outputs[0]] = (
+        tensors[op.inputs[0]].reshape(out_shape)
+        if view_only
+        else wp.zeros(out_shape, dtype=dtype, device=device)
+    )
     shapes[op.outputs[0]] = out_shape
     dtypes[op.outputs[0]] = dtype
-    op.attrs["_kernel"] = _kernel_for_dtype(kernel, dtype, (len(in_shape),), (len(in_shape),))
+    op.attrs["_view_only"] = view_only
+    if not view_only:
+        op.attrs["_kernel"] = _kernel_for_dtype(kernel, dtype, (len(in_shape),), (len(in_shape),))
 
 
 def _shape_split(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -3145,6 +3157,8 @@ def _exec_reshape(op, tensors, shapes, device):
 
 
 def _exec_transpose(op, tensors, shapes, device):
+    if op.attrs["_view_only"]:
+        return
     wp.launch(
         op.attrs["_kernel"],
         dim=shapes[op.outputs[0]],
