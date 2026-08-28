@@ -8,18 +8,44 @@ import codecs
 import json
 from pathlib import Path
 
+import numpy as np
+
 from warp_nn.runtime import Qwen3OnnxRunner, Qwen3Tokenizer, Qwen35Runner, sample_token
 from warp_nn.runtime.chat import split_tool_prefix
 from warp_nn.runtime.coding_tools import CodingTools
 
 
-def _generate(runner, tokenizer, logits, limit, temperature, cached_ids, tool_marker=None):
+def _generate(
+    runner,
+    tokenizer,
+    logits,
+    limit,
+    temperature,
+    cached_ids,
+    tool_marker=None,
+    top_p=1.0,
+    top_k=0,
+    presence_penalty=0.0,
+    rng=None,
+):
     generated = []
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     pending = ""
     tool_started = False
     for _ in range(limit):
-        token_id = runner.sample_greedy(logits) if temperature <= 0.0 else sample_token(logits, temperature=temperature)
+        token_id = (
+            runner.sample_greedy(logits)
+            if temperature <= 0.0
+            else sample_token(
+                logits,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                presence_penalty=presence_penalty,
+                previous_tokens=generated,
+                rng=rng,
+            )
+        )
         generated.append(token_id)
         if token_id == tokenizer.eos_token_id:
             break
@@ -59,7 +85,11 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--cache-capacity", type=int, default=1024)
     parser.add_argument("--prefill-chunk-size", type=int, default=16)
-    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--temperature", type=float)
+    parser.add_argument("--top-p", type=float)
+    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--presence-penalty", type=float, default=1.5)
+    parser.add_argument("--seed", type=int)
     parser.add_argument("--thinking", action="store_true", help="Enable Qwen3 thinking mode")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
@@ -71,6 +101,13 @@ def main():
     parser.add_argument("--trusted-folder", type=Path, default=Path.cwd(), help="Root allowed for coding tools")
     parser.add_argument("--unsafe-shell", action="store_true", help="Allow shell commands without containment")
     args = parser.parse_args()
+    temperature = args.temperature if args.temperature is not None else (1.0 if args.thinking else 0.7)
+    top_p = args.top_p if args.top_p is not None else (0.95 if args.thinking else 0.8)
+    if temperature < 0.0 or not 0.0 < top_p <= 1.0 or args.top_k < 0:
+        parser.error("invalid sampling parameters")
+    if not -2.0 <= args.presence_penalty <= 2.0:
+        parser.error("--presence-penalty must be between -2 and 2")
+    rng = np.random.default_rng(args.seed)
 
     tokenizer = Qwen3Tokenizer(args.model_dir)
     runner_type = Qwen3OnnxRunner if (args.model_dir / "model.onnx").is_file() else Qwen35Runner
@@ -139,9 +176,13 @@ def main():
                 tokenizer,
                 logits,
                 generation_limit,
-                args.temperature,
+                temperature,
                 cached_ids,
-                tokenizer.tool_call_start if coding_tools else None,
+                tool_marker=tokenizer.tool_call_start if coding_tools else None,
+                top_p=top_p,
+                top_k=args.top_k,
+                presence_penalty=args.presence_penalty,
+                rng=rng,
             )
             print()
             if not generated or generated[-1] != tokenizer.eos_token_id:

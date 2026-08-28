@@ -88,6 +88,12 @@ def test_sample_token():
     samples = {sample_token(logits, top_k=2, rng=rng) for _ in range(20)}
     assert samples <= {2, 3}
     assert samples
+    assert (
+        sample_token(
+            logits, temperature=0.01, presence_penalty=2.0, previous_tokens=[2], rng=np.random.default_rng(1)
+        )
+        == 3
+    )
 
 
 def test_qwen_tool_template_and_parser(tmp_path):

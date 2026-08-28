@@ -20,6 +20,10 @@ def main():
     parser.add_argument("--cache-capacity", type=int, default=4096)
     parser.add_argument("--prefill-chunk-size", type=int, default=16)
     parser.add_argument("--thinking", action="store_true", help="Enable Qwen thinking mode")
+    parser.add_argument("--temperature", type=float)
+    parser.add_argument("--top-p", type=float)
+    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--presence-penalty", type=float, default=1.5)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--no-cublas", action="store_true")
     args = parser.parse_args()
@@ -42,7 +46,19 @@ def main():
             use_cublas=not args.no_cublas,
         )
     model_id = args.model_id or args.model_dir.name
-    backend = ChatCompletions(model_id, runner, tokenizer, args.max_new_tokens, args.thinking)
+    temperature = args.temperature if args.temperature is not None else (1.0 if args.thinking else 0.7)
+    top_p = args.top_p if args.top_p is not None else (0.95 if args.thinking else 0.8)
+    backend = ChatCompletions(
+        model_id,
+        runner,
+        tokenizer,
+        args.max_new_tokens,
+        args.thinking,
+        temperature,
+        top_p,
+        args.top_k,
+        args.presence_penalty,
+    )
     server = OpenAIHTTPServer((args.host, args.port), backend, args.api_key)
     print(f"Serving {model_id} at http://{args.host}:{args.port}/v1")
     print("The first request may compile Warp kernels before it starts generating.")

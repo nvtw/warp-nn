@@ -68,12 +68,20 @@ class ChatCompletions:
         tokenizer: Tokenizer,
         max_new_tokens: int = 4096,
         enable_thinking: bool = False,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        presence_penalty: float = 0.0,
     ):
         self.model = model
         self.runner = runner
         self.tokenizer = tokenizer
         self.max_new_tokens = max_new_tokens
         self.enable_thinking = enable_thinking
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+        self.presence_penalty = presence_penalty
         self.lock = threading.Lock()
 
     def complete(self, request: Mapping[str, object], emit: Callable[[dict[str, object]], None] | None = None):
@@ -90,12 +98,14 @@ class ChatCompletions:
         if request.get("tool_choice") == "none":
             tools = None
         try:
-            temperature = float(request.get("temperature", 0.0) or 0.0)
-            top_p = float(request.get("top_p", 1.0) or 1.0)
+            temperature = float(request.get("temperature", self.temperature))
+            top_p = float(request.get("top_p", self.top_p))
+            top_k = int(request.get("top_k", self.top_k))
+            presence_penalty = float(request.get("presence_penalty", self.presence_penalty))
         except (TypeError, ValueError) as error:
-            raise APIError("temperature and top_p must be numbers") from error
-        if temperature < 0.0 or not 0.0 < top_p <= 1.0:
-            raise APIError("temperature must be non-negative and top_p must be within (0, 1]")
+            raise APIError("invalid sampling parameter") from error
+        if temperature < 0.0 or not 0.0 < top_p <= 1.0 or top_k < 0 or not -2.0 <= presence_penalty <= 2.0:
+            raise APIError("sampling parameters are outside their supported ranges")
         max_tokens = request.get("max_completion_tokens", request.get("max_tokens", self.max_new_tokens))
         if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
             raise APIError("max tokens must be a positive integer", param="max_completion_tokens")
@@ -129,7 +139,9 @@ class ChatCompletions:
                 prompt_ids,
                 max_tokens,
                 temperature=temperature,
+                top_k=top_k,
                 top_p=top_p,
+                presence_penalty=presence_penalty,
             ):
                 if emit is not None and not response_started:
                     emit(self._chunk(completion_id, created, {"role": "assistant", "content": ""}))

@@ -56,15 +56,21 @@ def sample_token(
     temperature: float = 1.0,
     top_k: int = 0,
     top_p: float = 1.0,
+    presence_penalty: float = 0.0,
+    previous_tokens: Sequence[int] = (),
     rng: np.random.Generator | None = None,
 ) -> int:
     """Sample one token from the last logits row on the host."""
     values = logits.numpy() if hasattr(logits, "numpy") else np.asarray(logits)
-    values = np.asarray(values, dtype=np.float64).reshape(-1, values.shape[-1])[-1]
+    values = np.asarray(values, dtype=np.float64).reshape(-1, values.shape[-1])[-1].copy()
     if temperature <= 0.0:
         return int(np.argmax(values))
-    if top_k < 0 or not 0.0 < top_p <= 1.0:
-        raise ValueError("sample_token requires top_k >= 0 and 0 < top_p <= 1")
+    if top_k < 0 or not 0.0 < top_p <= 1.0 or not -2.0 <= presence_penalty <= 2.0:
+        raise ValueError("invalid top_k, top_p, or presence_penalty")
+    if presence_penalty and previous_tokens:
+        seen = np.asarray(tuple(previous_tokens), dtype=np.int64)
+        seen = seen[(seen >= 0) & (seen < values.size)]
+        values[np.unique(seen)] -= presence_penalty
     candidates = np.arange(values.size)
     if 0 < top_k < values.size:
         candidates = np.argpartition(values, -top_k)[-top_k:]
@@ -89,16 +95,29 @@ def generate_tokens(
     temperature: float = 0.0,
     top_k: int = 0,
     top_p: float = 1.0,
+    presence_penalty: float = 0.0,
+    seed: int | None = None,
 ) -> Iterator[int]:
     """Generate tokens incrementally through the common stateful runner API."""
     logits = runner.prefill(prompt_ids)
+    generated = []
+    rng = np.random.default_rng(seed)
     for _ in range(max_new_tokens):
         token_id = (
             runner.sample_greedy(logits)
             if temperature <= 0.0
-            else sample_token(logits, temperature=temperature, top_k=top_k, top_p=top_p)
+            else sample_token(
+                logits,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                presence_penalty=presence_penalty,
+                previous_tokens=generated,
+                rng=rng,
+            )
         )
         yield token_id
+        generated.append(token_id)
         if token_id == tokenizer.eos_token_id:
             break
         logits = runner.decode(token_id)
