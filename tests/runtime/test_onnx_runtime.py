@@ -1761,6 +1761,7 @@ def test_qwen_stateful_prefill_and_decode(device):
             expected.append(token_id)
             logits = runner.decode(token_id)
         assert runner.generate_greedy([0, 1], max_new_tokens=3, eos_token_id=-1) == expected
+        assert runner.generate_greedy([0, 1], max_new_tokens=3, eos_token_id=-1) == expected
 
         prompt = [0, 1, 2, 3, 0]
         reference = runner.prefill(prompt).numpy()[:, -1:, :]

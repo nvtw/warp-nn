@@ -465,6 +465,8 @@ class Qwen3OnnxRunner:
         self._greedy_argmax_kernels = _get_greedy_argmax_kernels(1024, 128)
         self._decode_graph = None
         self._decode_graph_outputs = None
+        self._generation_graph = None
+        self._generation_graph_eos = None
         self._past: dict[str, wp.array] = {}
         self.sequence_length = 0
 
@@ -646,19 +648,25 @@ class Qwen3OnnxRunner:
         wp.launch_tiled(
             self._greedy_argmax_kernels[2], dim=1, inputs=sample_inputs, block_dim=128, device=self.runtime._device
         )
-        wp.capture_begin(device=self.runtime._device)
-        try:
-            outputs = self._decode_runtime(self._decode_inputs)
-            self._launch_greedy_partials(outputs["logits"])
-            wp.launch_tiled(
-                self._greedy_argmax_kernels[2], dim=1, inputs=sample_inputs, block_dim=128, device=self.runtime._device
-            )
-            graph = wp.capture_end(device=self.runtime._device)
-        except Exception:
-            wp.capture_end(device=self.runtime._device)
-            raise
+        if max_new_tokens > 1 and (self._generation_graph is None or self._generation_graph_eos != eos_token_id):
+            wp.capture_begin(device=self.runtime._device)
+            try:
+                outputs = self._decode_runtime(self._decode_inputs)
+                self._launch_greedy_partials(outputs["logits"])
+                wp.launch_tiled(
+                    self._greedy_argmax_kernels[2],
+                    dim=1,
+                    inputs=sample_inputs,
+                    block_dim=128,
+                    device=self.runtime._device,
+                )
+                self._generation_graph = wp.capture_end(device=self.runtime._device)
+                self._generation_graph_eos = eos_token_id
+            except Exception:
+                wp.capture_end(device=self.runtime._device)
+                raise
         for _ in range(max_new_tokens - 1):
-            wp.capture_launch(graph)
+            wp.capture_launch(self._generation_graph)
         generated = self._generated_ids.numpy()[:max_new_tokens].tolist()
         if eos_token_id in generated:
             generated = generated[: generated.index(eos_token_id) + 1]
