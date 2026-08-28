@@ -14,12 +14,15 @@
 # limitations under the License.
 
 from warp_nn.runtime.onnx_runtime import OnnxRuntime
+from warp_nn.runtime.openai_server import ChatCompletions, OpenAIHTTPServer
 from warp_nn.runtime.qwen3 import Qwen3OnnxRunner, Qwen3Tokenizer, parse_qwen_tool_calls, sample_token
 from warp_nn.runtime.qwen35 import Qwen35Runner
 
 
 __all__ = [
     "OnnxRuntime",
+    "ChatCompletions",
+    "OpenAIHTTPServer",
     "Qwen3OnnxRunner",
     "Qwen35Runner",
     "Qwen3Tokenizer",
