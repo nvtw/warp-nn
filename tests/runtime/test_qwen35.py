@@ -8,7 +8,7 @@ import json
 import numpy as np
 
 from tests.utilities import is_device_available, write_safetensors
-from warp_nn.runtime.qwen35 import Qwen35Runner, _weight_names
+from warp_nn.runtime.qwen35 import Qwen35Runner, _validate_config, _weight_names
 
 
 def _bfloat16_bytes(values: np.ndarray) -> bytes:
@@ -97,6 +97,46 @@ def _write_tiny_qwen35(path):
     path.mkdir()
     (path / "config.json").write_text(json.dumps({"text_config": config}), encoding="utf-8")
     write_safetensors(path / "model.safetensors", tensors)
+
+
+def test_qwen38_text_metadata_compatibility():
+    config = {
+        "model_type": "qwen3_5_text",
+        "hidden_size": 5120,
+        "intermediate_size": 17408,
+        "vocab_size": 248320,
+        "num_hidden_layers": 64,
+        "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 16,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 4,
+        "head_dim": 256,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 48,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "max_position_embeddings": 262144,
+        "rms_norm_eps": 1.0e-6,
+        "attention_bias": False,
+        "hidden_act": "silu",
+        "attn_output_gate": True,
+        "output_gate_type": "swish",
+        "rope_parameters": {
+            "rope_type": "default",
+            "rope_theta": 10000000.0,
+            "partial_rotary_factor": 0.25,
+        },
+    }
+
+    _validate_config(config)
+    names = _weight_names(config)
+    assert len(names) == 851
+    assert "model.language_model.layers.62.linear_attn.in_proj_qkv.weight" in names
+    assert "model.language_model.layers.63.self_attn.q_proj.weight" in names
+
+    config["rope_parameters"] = {**config["rope_parameters"], "rope_type": "yarn", "factor": 4.0}
+    with pytest.raises(ValueError, match="default Qwen rotary"):
+        _validate_config(config)
 
 
 @pytest.mark.parametrize("use_cublas", [False, True])

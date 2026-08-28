@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Native text-only runner for Qwen 3.5 Hugging Face checkpoints."""
+"""Native text-only runner for Qwen 3.5-family Hugging Face checkpoints."""
 
 from __future__ import annotations
 
@@ -119,6 +119,10 @@ def _validate_config(config: dict) -> None:
         raise ValueError("Qwen 3.5 query heads must be divisible by KV heads")
     if config.get("attention_bias", False) or config.get("hidden_act", "silu") != "silu":
         raise ValueError("Only bias-free SiLU Qwen 3.5 text models are supported")
+    if not config.get("attn_output_gate", True) or config.get("output_gate_type", "swish") != "swish":
+        raise ValueError("Only swish-gated Qwen attention output is supported")
+    if config["rope_parameters"].get("rope_type", "default") != "default":
+        raise ValueError("Only default Qwen rotary embeddings are supported")
 
 
 class _Qwen35Plan:
@@ -488,7 +492,7 @@ class _Qwen35Plan:
 
 
 class Qwen35Runner:
-    """Run an official Qwen 3.5 safetensors checkpoint entirely with Warp."""
+    """Run a Qwen 3.5-family text checkpoint entirely with Warp."""
 
     def __init__(
         self,
