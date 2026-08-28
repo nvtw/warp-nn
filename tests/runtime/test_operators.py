@@ -16,12 +16,13 @@ from warp_nn.runtime.kernels import (
     _get_greedy_argmax_kernels,
     _get_linear_attention_kernel,
     _prepare_gated_delta_kernel,
+    _relu2_kernel,
     _reorder_heads_kernel,
     _sigmoid_gate_kernel,
     _unpack_gated_heads_kernel,
     _update_conv_rows_state_kernel,
 )
-from warp_nn.runtime.operators import Operation, execute_operations, plan_linear
+from warp_nn.runtime.operators import Operation, execute_operations, plan_linear, plan_rms_norm
 
 
 @pytest.mark.parametrize(("device", "rows"), [("cpu", 3), ("cuda:0", 3), ("cuda:0", 32)])
@@ -73,7 +74,7 @@ def test_gated_rms_norm_bfloat16():
     rng = np.random.default_rng(19)
     x = wp.array(rng.normal(size=(3, 8)).astype(np.float32), dtype=wp.bfloat16, device="cuda:0")
     gate = wp.array(rng.normal(size=(3, 8)).astype(np.float32), dtype=wp.bfloat16, device="cuda:0")
-    scale = wp.array(rng.normal(size=8).astype(np.float32), dtype=wp.bfloat16, device="cuda:0")
+    scale = wp.array(rng.normal(size=(1, 8)).astype(np.float32), dtype=wp.bfloat16, device="cuda:0")
     output = wp.empty_like(x)
     tile_width, kernel = _get_gated_rms_norm_kernel(8, wp.bfloat16)
 
@@ -269,6 +270,8 @@ def test_gated_delta_preparation_and_row_causal_conv():
     x = wp.array(x_np, device="cpu")
     weight = wp.array(weight_np, device="cpu")
     state = wp.array(state_np, device="cpu")
+    bias_np = np.array([0.1, -0.2, 0.3], dtype=np.float32)
+    bias = wp.array(bias_np, device="cpu")
     output = wp.empty_like(x)
     a = wp.array(np.array([[0.1, -0.2], [0.3, 0.4]], dtype=np.float32), device="cpu")
     b = wp.array(np.array([[-0.5, 0.2], [0.7, -0.1]], dtype=np.float32), device="cpu")
@@ -277,7 +280,12 @@ def test_gated_delta_preparation_and_row_causal_conv():
     decay = wp.empty((rows, heads), dtype=wp.float32, device="cpu")
     beta = wp.empty_like(decay)
 
-    wp.launch(_causal_conv_rows_kernel, dim=(rows, channels), inputs=[x, weight, state, output], device="cpu")
+    wp.launch(
+        _causal_conv_rows_kernel,
+        dim=(rows, channels),
+        inputs=[x, weight, bias, state, output, True],
+        device="cpu",
+    )
     wp.launch(_update_conv_rows_state_kernel, dim=channels, inputs=[x, state], device="cpu")
     wp.launch(_prepare_gated_delta_kernel, dim=(rows, heads), inputs=[a, b, a_log, dt_bias, decay, beta], device="cpu")
 
@@ -285,7 +293,7 @@ def test_gated_delta_preparation_and_row_causal_conv():
     expected_conv = np.empty_like(x_np)
     for row in range(rows):
         for channel in range(channels):
-            total = padded[row : row + kernel_size, channel] @ weight_np[channel, 0]
+            total = padded[row : row + kernel_size, channel] @ weight_np[channel, 0] + bias_np[channel]
             expected_conv[row, channel] = total / (1.0 + np.exp(-total))
     np.testing.assert_allclose(output.numpy(), expected_conv, atol=1.0e-6)
     np.testing.assert_array_equal(state.numpy(), padded[-(kernel_size - 1) :].T)
@@ -294,3 +302,51 @@ def test_gated_delta_preparation_and_row_causal_conv():
     expected_decay = -np.exp(a_log.numpy()) * np.logaddexp(0.0, a_np + dt_bias.numpy())
     np.testing.assert_allclose(beta.numpy(), expected_beta, atol=1.0e-6)
     np.testing.assert_allclose(decay.numpy(), expected_decay, atol=1.0e-6)
+
+
+def test_grouped_gated_rms_norm_and_relu2():
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(25)
+    groups, width = 2, 4
+    x_np = rng.normal(size=(3 * groups, width)).astype(np.float32)
+    gate_np = rng.normal(size=x_np.shape).astype(np.float32)
+    scale_np = rng.normal(size=(groups, width)).astype(np.float32)
+    x = wp.array(x_np, dtype=wp.bfloat16, device="cuda:0")
+    gate = wp.array(gate_np, dtype=wp.bfloat16, device="cuda:0")
+    scale = wp.array(scale_np, dtype=wp.bfloat16, device="cuda:0")
+    normalized = wp.empty_like(x)
+    relu2 = wp.empty_like(x)
+    tile_width, kernel = _get_gated_rms_norm_kernel(width, wp.bfloat16)
+
+    wp.launch_tiled(kernel, dim=x.shape[0], inputs=[x, gate, scale, normalized, 1.0e-5], block_dim=tile_width)
+    wp.launch(_relu2_kernel, dim=x.shape, inputs=[x, relu2])
+
+    x_rounded = x.numpy().astype(np.float32)
+    gate_rounded = gate.numpy().astype(np.float32)
+    expected = x_rounded / np.sqrt(np.mean(x_rounded**2, axis=1, keepdims=True) + 1.0e-5)
+    expected *= scale.numpy()[np.arange(x.shape[0]) % groups]
+    expected *= gate_rounded / (1.0 + np.exp(-gate_rounded))
+    np.testing.assert_allclose(normalized.numpy(), expected, atol=0.04, rtol=0.02)
+    np.testing.assert_allclose(relu2.numpy(), np.maximum(x_rounded, 0.0) ** 2, atol=0.03, rtol=0.02)
+
+
+def test_rms_norm_accepts_float32_scale():
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(29)
+    x_np = rng.normal(size=(3, 8)).astype(np.float32)
+    scale_np = rng.normal(size=8).astype(np.float32)
+    tensors = {
+        "x": wp.array(x_np, dtype=wp.bfloat16, device="cuda:0"),
+        "scale": wp.array(scale_np, dtype=wp.float32, device="cuda:0"),
+    }
+    shapes = {name: tuple(value.shape) for name, value in tensors.items()}
+    operation = Operation("SimplifiedLayerNormalization", ["x", "scale"], ["output"], {"epsilon": 1.0e-5})
+    plan_rms_norm(operation, tensors, shapes, wp.get_device("cuda:0"))
+
+    execute_operations([operation], tensors, shapes, wp.get_device("cuda:0"))
+
+    x_rounded = tensors["x"].numpy().astype(np.float32)
+    expected = x_rounded * scale_np / np.sqrt(np.mean(x_rounded**2, axis=1, keepdims=True) + 1.0e-5)
+    np.testing.assert_allclose(tensors["output"].numpy(), expected, atol=0.04, rtol=0.02)

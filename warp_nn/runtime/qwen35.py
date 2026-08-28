@@ -311,8 +311,10 @@ class _Qwen35Plan:
             inputs=[
                 qkv,
                 self.runner.weights[f"model.language_model.layers.{index}.linear_attn.conv1d.weight"],
+                self.runner.zero_bias,
                 self.runner.conv_states[index],
                 layer["conv"],
+                False,
             ],
             device=self.device,
         )
@@ -385,7 +387,9 @@ class _Qwen35Plan:
             inputs=[
                 layer["core"].reshape((-1, self.runner.linear_value_size)),
                 self.tensors[layer["z"].outputs[0]].reshape((-1, self.runner.linear_value_size)),
-                self.runner.weights[f"model.language_model.layers.{index}.linear_attn.norm.weight"],
+                self.runner.weights[f"model.language_model.layers.{index}.linear_attn.norm.weight"].reshape(
+                    (1, self.runner.linear_value_size)
+                ),
                 layer["gated"].reshape((-1, self.runner.linear_value_size)),
                 self.runner.epsilon,
             ],
@@ -544,6 +548,7 @@ class Qwen35Runner:
         self.dtype = self.weights["model.language_model.embed_tokens.weight"].dtype
         if self.dtype not in (wp.float16, wp.bfloat16):
             raise TypeError("Qwen 3.5 activations require FP16 or BF16 weights")
+        self.zero_bias = wp.zeros(1, dtype=self.dtype, device=self.device)
         self.cublas = try_create_cublas() if use_cublas and self.device.is_cuda else None
         self.sequence_end = wp.zeros(1, dtype=wp.int32, device=self.device)
         self.conv_states = {}

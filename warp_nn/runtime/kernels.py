@@ -829,11 +829,16 @@ def _causal_conv_state_inplace_kernel(x: wp.array3d[Any], state: wp.array3d[Any]
 
 @wp.kernel(enable_backward=False, module="unique")
 def _causal_conv_rows_kernel(
-    x: wp.array2d[Any], weight: wp.array3d[Any], state: wp.array2d[Any], output: wp.array2d[Any]
+    x: wp.array2d[Any],
+    weight: wp.array3d[Any],
+    bias: wp.array1d[Any],
+    state: wp.array2d[Any],
+    output: wp.array2d[Any],
+    has_bias: bool,
 ):
-    """Apply SiLU depthwise causal convolution to row-major token data."""
+    """Apply optionally biased SiLU causal convolution to row-major tokens."""
     token, channel = wp.tid()
-    total = wp.float32(0.0)
+    total = wp.float32(bias[channel]) if has_bias else wp.float32(0.0)
     for kernel_index in range(weight.shape[2]):
         source_token = token + kernel_index - state.shape[1]
         value = (
@@ -886,11 +891,12 @@ def _get_dequantize_nbits_kernel(bits: int, block_size: int, dtype: type):
     return _dequantize_nbits_kernel_cache[key]
 
 
-def _create_rms_norm_kernels(tile_width: int, dtype: type):
+def _create_rms_norm_kernels(tile_width: int, dtype: type, scale_dtype: type):
     """Build RMSNorm and residual-RMSNorm kernels for ``tile_width``.
     Tiles zero-pad widths that are not exact multiples."""
     TILE_WIDTH = tile_width
     DTYPE = dtype
+    SCALE_DTYPE = scale_dtype
 
     @wp.func
     def square(value: dtype):
@@ -907,17 +913,21 @@ def _create_rms_norm_kernels(tile_width: int, dtype: type):
         return dtype(wp.float32(value) + wp.float32(skip))
 
     @wp.func
-    def normalize(value: dtype, scale: dtype, inverse_rms: float, scale_offset: float):
-        return dtype(wp.float32(value) * (wp.float32(scale) + scale_offset) * inverse_rms)
+    def normalize(value: dtype, scale: SCALE_DTYPE, inverse_rms: float, scale_offset: float):
+        return dtype(wp.float32(value) * (wp.float32(SCALE_DTYPE(scale)) + scale_offset) * inverse_rms)
 
     @wp.func
-    def skip_normalize(value: dtype, skip: dtype, scale: dtype, inverse_rms: float, scale_offset: float):
-        return dtype((wp.float32(value) + wp.float32(skip)) * (wp.float32(scale) + scale_offset) * inverse_rms)
+    def skip_normalize(value: dtype, skip: dtype, scale: SCALE_DTYPE, inverse_rms: float, scale_offset: float):
+        return dtype(
+            (wp.float32(value) + wp.float32(skip))
+            * (wp.float32(SCALE_DTYPE(scale)) + scale_offset)
+            * inverse_rms
+        )
 
     @wp.kernel(enable_backward=False, module="unique")
     def rms_norm(
         x: wp.array2d(dtype=DTYPE),
-        scale: wp.array1d(dtype=DTYPE),
+        scale: wp.array1d(dtype=SCALE_DTYPE),
         output: wp.array2d(dtype=DTYPE),
         epsilon: float,
         scale_offset: float,
@@ -925,6 +935,7 @@ def _create_rms_norm_kernels(tile_width: int, dtype: type):
         """Apply row-wise RMS normalization."""
         row = wp.tid()
         typed_zero = DTYPE(0.0)
+        scale_zero = SCALE_DTYPE(0.0)
         partials = wp.tile_zeros(shape=(TILE_WIDTH,), dtype=wp.float32)
         for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
             values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(tile_index * TILE_WIDTH,))
@@ -933,6 +944,7 @@ def _create_rms_norm_kernels(tile_width: int, dtype: type):
             wp.tile_extract(wp.tile_sum(partials), 0) / wp.float32(x.shape[1])
             + wp.float32(epsilon)
             + wp.float32(typed_zero)
+            + wp.float32(scale_zero)
         )
         for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
             offset = tile_index * TILE_WIDTH
@@ -946,7 +958,7 @@ def _create_rms_norm_kernels(tile_width: int, dtype: type):
     def skip_rms_norm(
         x: wp.array2d(dtype=DTYPE),
         skip: wp.array2d(dtype=DTYPE),
-        scale: wp.array1d(dtype=DTYPE),
+        scale: wp.array1d(dtype=SCALE_DTYPE),
         output: wp.array2d(dtype=DTYPE),
         residual: wp.array2d(dtype=DTYPE),
         epsilon: float,
@@ -955,6 +967,7 @@ def _create_rms_norm_kernels(tile_width: int, dtype: type):
         """Add a residual, store it, and apply row-wise RMS normalization."""
         row = wp.tid()
         typed_zero = DTYPE(0.0)
+        scale_zero = SCALE_DTYPE(0.0)
         partials = wp.tile_zeros(shape=(TILE_WIDTH,), dtype=wp.float32)
         for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
             offset = tile_index * TILE_WIDTH
@@ -966,6 +979,7 @@ def _create_rms_norm_kernels(tile_width: int, dtype: type):
             wp.tile_extract(wp.tile_sum(partials), 0) / wp.float32(x.shape[1])
             + wp.float32(epsilon)
             + wp.float32(typed_zero)
+            + wp.float32(scale_zero)
         )
         for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
             offset = tile_index * TILE_WIDTH
@@ -981,10 +995,10 @@ def _create_rms_norm_kernels(tile_width: int, dtype: type):
 _rms_norm_kernel_cache = {}
 
 
-def _get_rms_norm_kernels(width: int, dtype: type):
+def _get_rms_norm_kernels(width: int, dtype: type, scale_dtype: type | None = None):
     """Return cached RMSNorm kernels and the padded tile width."""
     tile_width = min(512, max(32, 1 << (width - 1).bit_length()))
-    key = (tile_width, dtype)
+    key = (tile_width, dtype, scale_dtype or dtype)
     if key not in _rms_norm_kernel_cache:
         _rms_norm_kernel_cache[key] = _create_rms_norm_kernels(*key)
     return tile_width, _rms_norm_kernel_cache[key]
@@ -1010,12 +1024,13 @@ def _create_gated_rms_norm_kernel(tile_width: int, dtype: type):
     def kernel(
         x: wp.array2d(dtype=DTYPE),
         gate: wp.array2d(dtype=DTYPE),
-        scale: wp.array1d(dtype=DTYPE),
+        scale: wp.array2d(dtype=DTYPE),
         output: wp.array2d(dtype=DTYPE),
         epsilon: float,
     ):
         """Normalize each row, then multiply by its SiLU gate."""
         row = wp.tid()
+        scale_row = row % scale.shape[0]
         typed_zero = DTYPE(0.0)
         partials = wp.tile_zeros(shape=(TILE_WIDTH,), dtype=wp.float32)
         for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
@@ -1031,7 +1046,7 @@ def _create_gated_rms_norm_kernel(tile_width: int, dtype: type):
             offset = tile_index * TILE_WIDTH
             values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
             gates = wp.tile_load(gate[row], shape=(TILE_WIDTH,), offset=(offset,))
-            scales = wp.tile_load(scale, shape=(TILE_WIDTH,), offset=(offset,))
+            scales = wp.tile_load(scale[scale_row], shape=(TILE_WIDTH,), offset=(offset,))
             wp.tile_store(
                 output[row], wp.tile_map(normalize_gate, values, gates, scales, inverse_rms), offset=(offset,)
             )
@@ -1045,6 +1060,14 @@ def _get_gated_rms_norm_kernel(width: int, dtype: type):
     """Return a cached recurrent gated-RMSNorm kernel and tile width."""
     tile_width = min(512, max(32, 1 << (width - 1).bit_length()))
     return tile_width, _create_gated_rms_norm_kernel(tile_width, dtype)
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _relu2_kernel(x: wp.array2d[Any], output: wp.array2d[Any]):
+    """Apply squared ReLU elementwise."""
+    row, column = wp.tid()
+    value = wp.max(wp.float32(x[row, column]), wp.float32(0.0))
+    output[row, column] = x.dtype(value * value)
 
 
 def _create_lp_normalization_kernel(tile_width: int, dtype: type):

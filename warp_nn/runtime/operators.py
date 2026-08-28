@@ -115,13 +115,18 @@ def _plan_rms_norm_buffers(op, x_name, scale_name, tensors, shapes, device, dtyp
     shape = shapes[x_name]
     rows, width = int(np.prod(shape[:-1])), shape[-1]
     dtype = dtype or tensors[x_name].dtype
-    if dtype not in (wp.float16, wp.bfloat16) or tensors[scale_name].dtype != dtype or shapes[scale_name] != (width,):
+    scale_dtype = tensors[scale_name].dtype
+    if dtype not in (wp.float16, wp.bfloat16) or scale_dtype not in (
+        wp.float16,
+        wp.bfloat16,
+        wp.float32,
+    ) or shapes[scale_name] != (width,):
         raise ValueError("RMSNorm requires a matching width-sized scale")
     output = wp.empty(shape, dtype=dtype, device=device)
     tensors[op.outputs[0]] = output
     shapes[op.outputs[0]] = shape
     op.attrs.update({"_rows": rows, "_width": width, "_output_2d": output.reshape((rows, width))})
-    op.attrs["_tile_width"], op.attrs["_rms_norm_kernels"] = _get_rms_norm_kernels(width, dtype)
+    op.attrs["_tile_width"], op.attrs["_rms_norm_kernels"] = _get_rms_norm_kernels(width, dtype, scale_dtype)
 
 
 def plan_rms_norm(op: Operation, tensors: dict[str, wp.array], shapes: dict[str, tuple[int, ...]], device, dtype=None):
