@@ -12,6 +12,8 @@ import subprocess
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 
+from warp_nn.runtime.sandbox import is_sandbox_available, run_sandboxed
+
 
 _SKIP_DIRECTORIES = {".git", ".hg", ".svn", ".venv", "__pycache__", "node_modules"}
 _MAX_OUTPUT = 64 * 1024
@@ -33,10 +35,10 @@ def _schema(name, description, properties, required=()):
     }
 
 
-TOOL_SCHEMAS = (
+FILE_TOOL_SCHEMAS = (
     _schema(
         "read_file",
-        "Read numbered lines from a UTF-8 text file in the workspace.",
+        "Read numbered lines from a UTF-8 text file in the trusted folder.",
         {
             "path": {"type": "string"},
             "line_start": {"type": "integer", "minimum": 1},
@@ -46,7 +48,7 @@ TOOL_SCHEMAS = (
     ),
     _schema(
         "list_files",
-        "List workspace files.",
+        "List files in the trusted folder.",
         {
             "path": {"type": "string", "default": "."},
             "pattern": {"type": "string", "default": "*"},
@@ -56,7 +58,7 @@ TOOL_SCHEMAS = (
     ),
     _schema(
         "search_files",
-        "Find a literal string in workspace text files.",
+        "Find a literal string in trusted-folder text files.",
         {
             "query": {"type": "string"},
             "path": {"type": "string", "default": "."},
@@ -68,13 +70,13 @@ TOOL_SCHEMAS = (
     ),
     _schema(
         "write_file",
-        "Create or replace a UTF-8 text file in the workspace.",
+        "Create or replace a UTF-8 text file in the trusted folder.",
         {"path": {"type": "string"}, "content": {"type": "string"}},
         ("path", "content"),
     ),
     _schema(
         "edit_file",
-        "Replace one exact text occurrence in a workspace file.",
+        "Replace one exact text occurrence in a trusted-folder file.",
         {
             "path": {"type": "string"},
             "old_text": {"type": "string"},
@@ -82,25 +84,29 @@ TOOL_SCHEMAS = (
         },
         ("path", "old_text", "new_text"),
     ),
-    _schema(
-        "run_command",
-        "Run a shell command in the workspace and return its output.",
-        {
-            "command": {"type": "string"},
-            "timeout": {"type": "number", "minimum": 0.1, "maximum": 300},
-        },
-        ("command",),
-    ),
+)
+
+COMMAND_TOOL_SCHEMA = _schema(
+    "run_command",
+    "Run a shell command with writes confined to the trusted folder.",
+    {
+        "command": {"type": "string"},
+        "timeout": {"type": "number", "minimum": 0.1, "maximum": 300},
+    },
+    ("command",),
 )
 
 
 class CodingTools:
-    """Execute common coding tools relative to one workspace root."""
+    """Execute coding tools within one trusted folder."""
 
-    schemas = TOOL_SCHEMAS
-
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, shell: str = "sandbox"):
+        if shell not in ("sandbox", "unsafe", "none"):
+            raise ValueError("shell must be 'sandbox', 'unsafe', or 'none'")
         self.root = Path(root).resolve()
+        self.shell = shell
+        self.shell_available = shell == "unsafe" or (shell == "sandbox" and is_sandbox_available())
+        self.schemas = FILE_TOOL_SCHEMAS + ((COMMAND_TOOL_SCHEMA,) if self.shell_available else ())
         self._rg = shutil.which("rg")
 
     def execute(self, name: str, arguments: Mapping[str, object]) -> str:
@@ -111,8 +117,9 @@ class CodingTools:
             "search_files": self._search,
             "write_file": self._write,
             "edit_file": self._edit,
-            "run_command": self._command,
         }
+        if self.shell_available:
+            methods["run_command"] = self._command
         try:
             method = methods.get(name)
             if method is None:
@@ -128,7 +135,7 @@ class CodingTools:
         try:
             path.relative_to(self.root)
         except ValueError as error:
-            raise ValueError("path is outside the workspace") from error
+            raise ValueError("path is outside the trusted folder") from error
         return path
 
     def _walk(self, path: Path, recursive: bool = True) -> Iterator[Path]:
@@ -240,14 +247,17 @@ class CodingTools:
         if not isinstance(command, str) or not command:
             raise ValueError("command must be a non-empty string")
         timeout = min(300.0, max(0.1, float(timeout)))
-        result = subprocess.run(
-            command,
-            cwd=self.root,
-            shell=True,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=timeout,
-        )
+        if self.shell == "sandbox":
+            result = run_sandboxed(command, self.root, timeout)
+        else:
+            result = subprocess.run(
+                command,
+                cwd=self.root,
+                shell=True,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=timeout,
+            )
         output = (result.stdout + result.stderr).strip()
         return f"Exit code: {result.returncode}\n{output}".rstrip()

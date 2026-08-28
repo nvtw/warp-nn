@@ -49,8 +49,7 @@ def _generate(runner, tokenizer, logits, limit, temperature, cached_ids, tool_ma
 
 
 def _show_tool_result(result):
-    visible = result if len(result) <= 4000 else result[:4000] + "\n... (console output truncated)"
-    print(visible)
+    print(result)
 
 
 def main():
@@ -67,9 +66,10 @@ def main():
         "--coding-agent",
         "--tools",
         action="store_true",
-        help="Enable workspace file and unsandboxed shell tools",
+        help="Enable file and available sandboxed-shell tools",
     )
-    parser.add_argument("--workspace", type=Path, default=Path.cwd(), help="Root for coding tools")
+    parser.add_argument("--trusted-folder", type=Path, default=Path.cwd(), help="Root allowed for coding tools")
+    parser.add_argument("--unsafe-shell", action="store_true", help="Allow shell commands without containment")
     args = parser.parse_args()
 
     tokenizer = Qwen3Tokenizer(args.model_dir)
@@ -86,12 +86,19 @@ def main():
         system = "You are a coding agent. Inspect relevant files, make focused changes, and verify your work."
     messages = [] if system is None else [{"role": "system", "content": system}]
     cached_ids = []
-    coding_tools = CodingTools(args.workspace) if args.coding_agent else None
+    if args.unsafe_shell and not args.coding_agent:
+        parser.error("--unsafe-shell requires --tools")
+    shell = "unsafe" if args.unsafe_shell else "sandbox"
+    coding_tools = CodingTools(args.trusted_folder, shell=shell) if args.coding_agent else None
 
     print("Enter /clear to forget the conversation or /exit to quit.")
     print("The first response may spend a few minutes compiling Warp kernels with no GPU activity.")
     if coding_tools:
-        print(f"Coding tools enabled in {coding_tools.root}. Shell commands are not sandboxed.")
+        print(f"Coding tools confined to trusted folder {coding_tools.root}.")
+        if coding_tools.shell == "unsafe":
+            print("Warning: shell commands are unsandboxed and can modify files outside that folder.")
+        elif not coding_tools.shell_available:
+            print("Sandboxed shell unavailable on this host; command execution is disabled.")
     while True:
         try:
             prompt = input("You: ").strip()
