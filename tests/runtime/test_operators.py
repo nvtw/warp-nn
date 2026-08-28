@@ -317,16 +317,16 @@ def test_grouped_gated_rms_norm_and_relu2():
     scale = wp.array(scale_np, dtype=wp.bfloat16, device="cuda:0")
     normalized = wp.empty_like(x)
     relu2 = wp.empty_like(x)
-    tile_width, kernel = _get_gated_rms_norm_kernel(width, wp.bfloat16)
+    tile_width, kernel = _get_gated_rms_norm_kernel(width, wp.bfloat16, False)
 
     wp.launch_tiled(kernel, dim=x.shape[0], inputs=[x, gate, scale, normalized, 1.0e-5], block_dim=tile_width)
     wp.launch(_relu2_kernel, dim=x.shape, inputs=[x, relu2])
 
     x_rounded = x.numpy().astype(np.float32)
     gate_rounded = gate.numpy().astype(np.float32)
-    expected = x_rounded / np.sqrt(np.mean(x_rounded**2, axis=1, keepdims=True) + 1.0e-5)
+    gated = x_rounded * gate_rounded / (1.0 + np.exp(-gate_rounded))
+    expected = gated / np.sqrt(np.mean(gated**2, axis=1, keepdims=True) + 1.0e-5)
     expected *= scale.numpy()[np.arange(x.shape[0]) % groups]
-    expected *= gate_rounded / (1.0 + np.exp(-gate_rounded))
     np.testing.assert_allclose(normalized.numpy(), expected, atol=0.04, rtol=0.02)
     np.testing.assert_allclose(relu2.numpy(), np.maximum(x_rounded, 0.0) ** 2, atol=0.03, rtol=0.02)
 

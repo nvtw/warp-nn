@@ -1004,10 +1004,14 @@ def _get_rms_norm_kernels(width: int, dtype: type, scale_dtype: type | None = No
     return tile_width, _rms_norm_kernel_cache[key]
 
 
-def _create_gated_rms_norm_kernel(tile_width: int, dtype: type):
+def _create_gated_rms_norm_kernel(
+    tile_width: int, dtype: type, scale_dtype: type, norm_before_gate: bool
+):
     """Build fused RMSNorm-times-SiLU gating for recurrent attention."""
     TILE_WIDTH = tile_width
     DTYPE = dtype
+    SCALE_DTYPE = scale_dtype
+    NORM_BEFORE_GATE = norm_before_gate
 
     @wp.func
     def square(value: dtype):
@@ -1015,16 +1019,28 @@ def _create_gated_rms_norm_kernel(tile_width: int, dtype: type):
         return value_fp32 * value_fp32
 
     @wp.func
-    def normalize_gate(value: dtype, gate: dtype, scale: dtype, inverse_rms: float):
+    def gated_square(value: dtype, gate: dtype):
+        gate_fp32 = wp.float32(gate)
+        gated = wp.float32(dtype(value)) * gate_fp32 / (wp.float32(1.0) + wp.exp(-gate_fp32))
+        return gated * gated
+
+    @wp.func
+    def normalize_gate(value: dtype, gate: dtype, scale: scale_dtype, inverse_rms: float):
         gate_fp32 = wp.float32(gate)
         silu = gate_fp32 / (wp.float32(1.0) + wp.exp(-gate_fp32))
-        return dtype(wp.float32(value) * wp.float32(scale) * inverse_rms * silu)
+        return dtype(wp.float32(value) * wp.float32(scale_dtype(scale)) * inverse_rms * silu)
+
+    @wp.func
+    def gate_normalize(value: dtype, gate: dtype, scale: scale_dtype, inverse_rms: float):
+        gate_fp32 = wp.float32(gate)
+        silu = gate_fp32 / (wp.float32(1.0) + wp.exp(-gate_fp32))
+        return dtype(wp.float32(value) * silu * wp.float32(scale_dtype(scale)) * inverse_rms)
 
     @wp.kernel(enable_backward=False, module="unique")
     def kernel(
         x: wp.array2d(dtype=DTYPE),
         gate: wp.array2d(dtype=DTYPE),
-        scale: wp.array2d(dtype=DTYPE),
+        scale: wp.array2d(dtype=SCALE_DTYPE),
         output: wp.array2d(dtype=DTYPE),
         epsilon: float,
     ):
@@ -1032,34 +1048,46 @@ def _create_gated_rms_norm_kernel(tile_width: int, dtype: type):
         row = wp.tid()
         scale_row = row % scale.shape[0]
         typed_zero = DTYPE(0.0)
+        scale_zero = SCALE_DTYPE(0.0)
         partials = wp.tile_zeros(shape=(TILE_WIDTH,), dtype=wp.float32)
         for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
             offset = tile_index * TILE_WIDTH
             values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
-            partials += wp.tile_map(square, values)
+            if NORM_BEFORE_GATE:
+                partials += wp.tile_map(square, values)
+            else:
+                gates = wp.tile_load(gate[row], shape=(TILE_WIDTH,), offset=(offset,))
+                partials += wp.tile_map(gated_square, values, gates)
         inverse_rms = wp.float32(1.0) / wp.sqrt(
             wp.tile_extract(wp.tile_sum(partials), 0) / wp.float32(x.shape[1])
             + wp.float32(epsilon)
             + wp.float32(typed_zero)
+            + wp.float32(scale_zero)
         )
         for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
             offset = tile_index * TILE_WIDTH
             values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
             gates = wp.tile_load(gate[row], shape=(TILE_WIDTH,), offset=(offset,))
             scales = wp.tile_load(scale[scale_row], shape=(TILE_WIDTH,), offset=(offset,))
-            wp.tile_store(
-                output[row], wp.tile_map(normalize_gate, values, gates, scales, inverse_rms), offset=(offset,)
-            )
+            if NORM_BEFORE_GATE:
+                normalized = wp.tile_map(normalize_gate, values, gates, scales, inverse_rms)
+            else:
+                normalized = wp.tile_map(gate_normalize, values, gates, scales, inverse_rms)
+            wp.tile_store(output[row], normalized, offset=(offset,))
 
     kernel.module.options["enable_backward"] = False
     return kernel
 
 
 @lru_cache(maxsize=None)
-def _get_gated_rms_norm_kernel(width: int, dtype: type):
+def _get_gated_rms_norm_kernel(
+    width: int, dtype: type, norm_before_gate: bool = True, scale_dtype: type | None = None
+):
     """Return a cached recurrent gated-RMSNorm kernel and tile width."""
     tile_width = min(512, max(32, 1 << (width - 1).bit_length()))
-    return tile_width, _create_gated_rms_norm_kernel(tile_width, dtype)
+    return tile_width, _create_gated_rms_norm_kernel(
+        tile_width, dtype, scale_dtype or dtype, norm_before_gate
+    )
 
 
 @wp.kernel(enable_backward=False, module="unique")
