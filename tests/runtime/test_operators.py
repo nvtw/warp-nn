@@ -481,7 +481,8 @@ def test_head_layout_cache_and_bfloat16_argmax():
 
 
 @pytest.mark.parametrize("tiled_value_heads", [False, True])
-def test_mixed_state_linear_attention_bfloat16(tiled_value_heads):
+@pytest.mark.parametrize("scalar_gated_delta", [False, True])
+def test_mixed_state_linear_attention_bfloat16(tiled_value_heads, scalar_gated_delta):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
     rng = np.random.default_rng(23)
@@ -515,7 +516,13 @@ def test_mixed_state_linear_attention_bfloat16(tiled_value_heads):
     )
     output = wp.empty((rows, value_heads * width), dtype=wp.bfloat16, device="cuda:0")
     present = wp.empty_like(past)
-    kernel = _get_linear_attention_kernel(width, width, wp.bfloat16, wp.float32)
+    kernel = _get_linear_attention_kernel(
+        width,
+        width,
+        wp.bfloat16,
+        wp.float32,
+        scalar_gated_delta=scalar_gated_delta,
+    )
 
     wp.launch_tiled(
         kernel,

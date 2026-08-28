@@ -410,6 +410,7 @@ class _Qwen35Plan:
             self.runner.linear_value_size,
             self.dtype,
             wp.float32,
+            scalar_gated_delta=True,
         )
         scale_dtype = self.runner.weights[attn + "norm.weight"].dtype
         layer["gated_block"], layer["gated_kernel"] = _get_gated_rms_norm_kernel(

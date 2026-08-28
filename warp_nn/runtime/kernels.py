@@ -1452,7 +1452,11 @@ def _linear_attention_value_blocks(value_size: int) -> int:
 
 
 def _create_linear_attention_kernel(
-    key_size: int, value_size: int, dtype: type, state_dtype: type
+    key_size: int,
+    value_size: int,
+    dtype: type,
+    state_dtype: type,
+    scalar_gated_delta: bool,
 ):
     """Build recurrent linear attention for fixed key and value widths.
     Value channels are processed in tiles of at most 32."""
@@ -1462,6 +1466,9 @@ def _create_linear_attention_kernel(
     VALUE_BLOCKS = _linear_attention_value_blocks(value_size)
     DTYPE = dtype
     STATE_DTYPE = state_dtype
+    SCALAR_GATED_DELTA = scalar_gated_delta
+    if SCALAR_GATED_DELTA and STATE_DTYPE != wp.float32:
+        raise ValueError("the scalar gated-delta path requires float32 state")
 
     @wp.func
     def exp_value(value: state_dtype):
@@ -1518,6 +1525,67 @@ def _create_linear_attention_kernel(
 
         for token in range(sequence_length):
             token_row = batch * sequence_length + token
+            if SCALAR_GATED_DELTA:
+                key_row = wp.tile_map(
+                    to_state,
+                    wp.tile_load(
+                        key,
+                        shape=(1, KEY_SIZE),
+                        offset=(token_row, key_head * KEY_SIZE),
+                    ),
+                )
+                value_row = wp.tile_map(
+                    to_state,
+                    wp.tile_load(
+                        value,
+                        shape=(1, VALUE_TILE),
+                        offset=(token_row, value_head * VALUE_SIZE + value_offset),
+                    ),
+                )
+                query_head = (
+                    key_head * query_heads / key_heads
+                    if tiled_value_heads
+                    else value_head * query_heads / value_heads
+                )
+                query_row = wp.tile_map(
+                    to_state,
+                    wp.tile_load(
+                        query,
+                        shape=(1, KEY_SIZE),
+                        offset=(token_row, query_head * KEY_SIZE),
+                    ),
+                )
+                decay_value = STATE_DTYPE(
+                    wp.exp(wp.float32(decay[token_row, value_head]))
+                )
+                beta_value = STATE_DTYPE(beta[token_row, value_head])
+                probes = wp.tile_zeros(shape=(2, KEY_SIZE), dtype=STATE_DTYPE)
+                wp.tile_assign(probes, key_row, offset=(0, 0))
+                wp.tile_assign(probes, query_row, offset=(1, 0))
+                projections = wp.tile_zeros(shape=(2, VALUE_TILE), dtype=STATE_DTYPE)
+                wp.tile_matmul(probes, state, projections)
+                retrieved_unscaled = wp.tile_view(
+                    projections, offset=(0, 0), shape=(1, VALUE_TILE)
+                )
+                query_unscaled = wp.tile_view(
+                    projections, offset=(1, 0), shape=(1, VALUE_TILE)
+                )
+                delta = beta_value * (value_row - decay_value * retrieved_unscaled)
+                query_key = wp.tile_extract(wp.tile_sum(query_row * key_row), 0)
+                wp.tile_matmul(
+                    wp.tile_transpose(key_row),
+                    delta,
+                    state,
+                    alpha=STATE_DTYPE(1.0),
+                    beta=decay_value,
+                )
+                result = decay_value * query_unscaled + query_key * delta
+                wp.tile_store(
+                    output,
+                    wp.tile_map(to_output, STATE_DTYPE(scale) * result),
+                    offset=(token_row, value_head * VALUE_SIZE + value_offset),
+                )
+                continue
             if needs_decay:
                 if decay_per_key:
                     decay_row = wp.tile_load(
@@ -1610,10 +1678,14 @@ _linear_attention_kernel_cache = {}
 
 
 def _get_linear_attention_kernel(
-    key_size: int, value_size: int, dtype: type, state_dtype: type | None = None
+    key_size: int,
+    value_size: int,
+    dtype: type,
+    state_dtype: type | None = None,
+    scalar_gated_delta: bool = False,
 ):
     """Return a cached recurrent linear-attention kernel."""
-    key = (key_size, value_size, dtype, state_dtype or dtype)
+    key = (key_size, value_size, dtype, state_dtype or dtype, scalar_gated_delta)
     if key not in _linear_attention_kernel_cache:
         _linear_attention_kernel_cache[key] = _create_linear_attention_kernel(*key)
     return _linear_attention_kernel_cache[key]
