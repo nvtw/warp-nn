@@ -323,7 +323,7 @@ class Qwen3OnnxRunner:
         prefill_chunk_size: int | None = None,
         use_cublas: bool = True,
     ):
-        self.runtime = OnnxRuntime(path, device=device, use_cublas=use_cublas)
+        self.runtime = OnnxRuntime(path, device=device, use_cublas=use_cublas, _defer_preallocation=True)
         self._past_names = [name for name in self.runtime.input_names if name.startswith("past_key_values.")]
         self._present_for_past = {
             name: f"present.{name.split('.')[1]}.{name.split('.')[2]}" for name in self._past_names
@@ -414,7 +414,7 @@ class Qwen3OnnxRunner:
             raise ValueError("Qwen3OnnxRunner: token_ids must not be empty")
         if current_length >= self.cache_capacity:
             raise ValueError("Qwen3OnnxRunner: prompt must leave room for at least one decoded token")
-        if self._chunk_runtime is not None and current_length > self.prefill_chunk_size:
+        if self._chunk_runtime is not None and current_length >= self.prefill_chunk_size:
             return self._prefill_chunked(token_ids)
         shapes = {"input_ids": (1, current_length), "attention_mask": (1, current_length)}
         if "position_ids" in self.runtime.input_names:

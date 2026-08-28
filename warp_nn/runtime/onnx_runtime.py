@@ -73,6 +73,7 @@ from typing import Any
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
+from threading import Thread
 
 import numpy as np
 import warp as wp
@@ -1444,6 +1445,12 @@ def _external_initializer_view(onnx, initializer, base_dir: Path, mappings: dict
     return np.ndarray(shape, dtype=dtype, buffer=mapping, offset=offset)
 
 
+def _release_external_mappings(mappings: list[np.memmap], uploads_complete: wp.Event | None) -> None:
+    if uploads_complete is not None:
+        wp.synchronize_event(uploads_complete)
+    mappings.clear()
+
+
 class OnnxRuntime:
     """Lightweight ONNX inference engine for graph-capturable MLP policies.
 
@@ -1478,10 +1485,12 @@ class OnnxRuntime:
         input_shapes: dict[str, tuple[int, ...]] | None = None,
         requires_grad: bool = False,
         use_cublas: bool = True,
+        _defer_preallocation: bool = False,
     ):
-        self._device = parse_device(device)
         self._requires_grad = requires_grad
 
+        device_thread = Thread(target=wp.init)
+        device_thread.start()
         onnx, numpy_helper = _require_onnx()
         model_path = Path(path)
         model = onnx.load(model_path, load_external_data=False)
@@ -1492,6 +1501,8 @@ class OnnxRuntime:
             # domain, where the ONNX checker cannot resolve its schema.
             if "No Op registered for SimplifiedLayerNormalization" not in str(exc):
                 raise ValueError(f"OnnxRuntime: invalid ONNX model: {exc}") from exc
+        device_thread.join()
+        self._device = parse_device(device)
         graph = model.graph
 
         self._tensors: dict[str, wp.array] = {}
@@ -1515,7 +1526,15 @@ class OnnxRuntime:
             self._shapes[init.name] = tuple(arr_np.shape)
             self._dtypes[init.name] = tensor.dtype
         arr_np = None
-        external_mappings.clear()
+        if external_mappings:
+            uploads_complete = wp.record_event() if self._device.is_cuda else None
+            mapping_refs = list(external_mappings.values())
+            external_mappings.clear()
+            Thread(
+                target=_release_external_mappings,
+                args=(mapping_refs, uploads_complete),
+                daemon=True,
+            ).start()
 
         initializer_names = {init.name for init in graph.initializer}
         self._initializer_names = initializer_names
@@ -1607,7 +1626,8 @@ class OnnxRuntime:
 
         self._cublas = try_create_cublas() if use_cublas and self._device.is_cuda else None
         self._matmul_scratch = {}
-        self._preallocate_buffers()
+        if not _defer_preallocation:
+            self._preallocate_buffers()
 
     def resize_inputs(self, input_shapes: dict[str, tuple[int, ...]], share_kv_cache: bool = False) -> None:
         """Rebuild shape-dependent buffers while retaining loaded initializers."""

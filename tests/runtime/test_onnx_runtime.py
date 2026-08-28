@@ -1764,6 +1764,8 @@ def test_qwen_stateful_prefill_and_decode(device):
         prompt = [0, 1, 2, 3, 0]
         reference = runner.prefill(prompt).numpy()[:, -1:, :]
         chunked = Qwen3OnnxRunner(str(path), device=device, cache_capacity=cache_length, prefill_chunk_size=2)
+        exact_chunk = chunked.prefill([0, 1]).numpy()
+        np.testing.assert_allclose(exact_chunk, runner.prefill([0, 1]).numpy(), rtol=1.0e-3, atol=1.0e-3)
         chunked_logits = chunked.prefill(prompt).numpy()
         assert chunked.sequence_length == len(prompt)
         np.testing.assert_allclose(chunked_logits[:, -1:, :], reference, rtol=1.0e-3, atol=1.0e-3)
