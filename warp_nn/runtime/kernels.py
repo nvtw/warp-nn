@@ -127,7 +127,7 @@ def _get_linear_vector_kernel(dtype: type):
 
 
 def _create_linear_packed_vector_kernel(dtype: type):
-    """Build a vec4-loaded single-token projection with one output per warp."""
+    """Build a vec4-loaded single-token projection with two outputs per warp."""
     DTYPE = dtype
     VTYPE = wp.vec4h if dtype == wp.float16 else wp.types.vector(4, wp.bfloat16)
     SUBGROUP = 32
@@ -140,16 +140,22 @@ def _create_linear_packed_vector_kernel(dtype: type):
     ):
         thread = wp.tid()
         lane = thread % SUBGROUP
-        column = thread / SUBGROUP
-        total = wp.float32(0.0)
+        column = (thread / SUBGROUP) * 2
+        total0 = wp.float32(0.0)
+        total1 = wp.float32(0.0)
         for inner in range(lane, x.shape[1], SUBGROUP):
             activation = VTYPE(x[0, inner])
-            weights = VTYPE(weight[column, inner])
+            weights0 = VTYPE(weight[column, inner])
+            weights1 = VTYPE(weight[column + 1, inner])
             for component in range(4):
-                total += wp.float32(activation[component]) * wp.float32(weights[component])
-        total = subgroup_sum(total, SUBGROUP)
+                value = wp.float32(activation[component])
+                total0 += value * wp.float32(weights0[component])
+                total1 += value * wp.float32(weights1[component])
+        total0 = subgroup_sum(total0, SUBGROUP)
+        total1 = subgroup_sum(total1, SUBGROUP)
         if lane == 0:
-            output[0, column] = DTYPE(total)
+            output[0, column] = DTYPE(total0)
+            output[0, column + 1] = DTYPE(total1)
 
     kernel.module.options["enable_backward"] = False
     return kernel, VTYPE

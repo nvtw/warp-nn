@@ -77,7 +77,7 @@ def test_single_token_linear_uses_graph_captured_packed_warp(dtype):
         pytest.skip("CUDA is not available")
     rng = np.random.default_rng(18)
     x_np = rng.normal(0.0, 0.1, (1, 68)).astype(np.float32)
-    weight_np = rng.normal(0.0, 0.1, (41, 68)).astype(np.float32)
+    weight_np = rng.normal(0.0, 0.1, (42, 68)).astype(np.float32)
     tensors = {
         "x": wp.array(x_np, dtype=dtype, device="cuda:0"),
         "weight": wp.array(weight_np, dtype=dtype, device="cuda:0"),
