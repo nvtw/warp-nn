@@ -5,9 +5,52 @@
 
 import argparse
 import codecs
+import json
 from pathlib import Path
 
 from warp_nn.runtime import Qwen3OnnxRunner, Qwen3Tokenizer, Qwen35Runner, sample_token
+from warp_nn.runtime.chat import split_tool_prefix
+from warp_nn.runtime.coding_tools import CodingTools
+
+
+def _generate(runner, tokenizer, logits, limit, temperature, cached_ids, tool_marker=None):
+    generated = []
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    pending = ""
+    tool_started = False
+    for _ in range(limit):
+        token_id = runner.sample_greedy(logits) if temperature <= 0.0 else sample_token(logits, temperature=temperature)
+        generated.append(token_id)
+        if token_id == tokenizer.eos_token_id:
+            break
+        text = decoder.decode(tokenizer.token_bytes(token_id, skip_special_tokens=True))
+        if tool_started:
+            pending += text
+        elif tool_marker:
+            text, pending, tool_started = split_tool_prefix(pending + text, tool_marker)
+            print(text, end="", flush=True)
+        else:
+            print(text, end="", flush=True)
+        logits = runner.decode(token_id)
+        cached_ids.append(token_id)
+    tail = decoder.decode(b"", final=True)
+    if tool_started:
+        pending += tail
+    elif tool_marker:
+        text, pending, tool_started = split_tool_prefix(pending + tail, tool_marker)
+        print(text, end="", flush=True)
+    else:
+        print(tail, end="", flush=True)
+    response = tokenizer.decode(generated, skip_special_tokens=True)
+    text, calls = tokenizer.parse_tool_calls(response) if tool_marker else (response, [])
+    if pending and not calls:
+        print(pending, end="", flush=True)
+    return generated, text, calls
+
+
+def _show_tool_result(result):
+    visible = result if len(result) <= 4000 else result[:4000] + "\n... (console output truncated)"
+    print(visible)
 
 
 def main():
@@ -20,6 +63,13 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--thinking", action="store_true", help="Enable Qwen3 thinking mode")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--coding-agent",
+        "--tools",
+        action="store_true",
+        help="Enable workspace file and unsandboxed shell tools",
+    )
+    parser.add_argument("--workspace", type=Path, default=Path.cwd(), help="Root for coding tools")
     args = parser.parse_args()
 
     tokenizer = Qwen3Tokenizer(args.model_dir)
@@ -31,11 +81,17 @@ def main():
         cache_capacity=args.cache_capacity,
         prefill_chunk_size=args.prefill_chunk_size,
     )
-    messages = [] if args.system is None else [{"role": "system", "content": args.system}]
+    system = args.system
+    if args.coding_agent and system is None:
+        system = "You are a coding agent. Inspect relevant files, make focused changes, and verify your work."
+    messages = [] if system is None else [{"role": "system", "content": system}]
     cached_ids = []
+    coding_tools = CodingTools(args.workspace) if args.coding_agent else None
 
     print("Enter /clear to forget the conversation or /exit to quit.")
     print("The first response may spend a few minutes compiling Warp kernels with no GPU activity.")
+    if coding_tools:
+        print(f"Coding tools enabled in {coding_tools.root}. Shell commands are not sandboxed.")
     while True:
         try:
             prompt = input("You: ").strip()
@@ -47,45 +103,60 @@ def main():
         if prompt == "/exit":
             break
         if prompt == "/clear":
-            messages = [] if args.system is None else [{"role": "system", "content": args.system}]
+            messages = [] if system is None else [{"role": "system", "content": system}]
             cached_ids.clear()
             print("History cleared.")
             continue
 
         messages.append({"role": "user", "content": prompt})
-        token_ids = tokenizer.encode_chat(messages, enable_thinking=args.thinking)
-        if len(token_ids) >= args.cache_capacity:
-            messages.pop()
-            print("The conversation no longer fits in the KV cache; use /clear or a larger --cache-capacity.")
-            continue
-
-        print("Qwen: ", end="", flush=True)
-        if cached_ids and token_ids[: len(cached_ids)] == cached_ids:
-            logits = runner.append(token_ids[len(cached_ids) :])
-        else:
-            logits = runner.prefill(token_ids)
-        cached_ids = list(token_ids)
-        generated = []
-        decoder = codecs.getincrementaldecoder("utf-8")("replace")
-        generation_limit = min(args.max_new_tokens, args.cache_capacity - len(token_ids))
-        for _ in range(generation_limit):
-            token_id = (
-                runner.sample_greedy(logits)
-                if args.temperature <= 0.0
-                else sample_token(logits, temperature=args.temperature)
+        for tool_round in range(8):
+            token_ids = tokenizer.encode_chat(
+                messages,
+                enable_thinking=args.thinking,
+                tools=coding_tools.schemas if coding_tools else None,
             )
-            generated.append(token_id)
-            if token_id == tokenizer.eos_token_id:
+            if len(token_ids) >= args.cache_capacity:
+                if tool_round == 0:
+                    messages.pop()
+                print("The conversation no longer fits in the KV cache; use /clear or a larger --cache-capacity.")
                 break
-            print(decoder.decode(tokenizer.token_bytes(token_id, skip_special_tokens=True)), end="", flush=True)
-            logits = runner.decode(token_id)
-            cached_ids.append(token_id)
-
-        print(decoder.decode(b"", final=True))
-        if not generated or generated[-1] != tokenizer.eos_token_id:
-            print(f"[Stopped at the {generation_limit}-token limit; use --max-new-tokens or /clear.]")
-        response = tokenizer.decode(generated, skip_special_tokens=True)
-        messages.append({"role": "assistant", "content": response})
+            print("Qwen: ", end="", flush=True)
+            if cached_ids and token_ids[: len(cached_ids)] == cached_ids:
+                logits = runner.append(token_ids[len(cached_ids) :])
+            else:
+                logits = runner.prefill(token_ids)
+            cached_ids = list(token_ids)
+            generation_limit = min(args.max_new_tokens, args.cache_capacity - len(token_ids))
+            generated, response, calls = _generate(
+                runner,
+                tokenizer,
+                logits,
+                generation_limit,
+                args.temperature,
+                cached_ids,
+                tokenizer.tool_call_start if coding_tools else None,
+            )
+            print()
+            if not generated or generated[-1] != tokenizer.eos_token_id:
+                print(f"[Stopped at the {generation_limit}-token limit; use --max-new-tokens or /clear.]")
+            if not calls:
+                messages.append({"role": "assistant", "content": response})
+                break
+            tool_calls = []
+            for index, call in enumerate(calls):
+                call_id = f"call_{tool_round}_{index}"
+                arguments = json.dumps(call["arguments"], ensure_ascii=False, separators=(",", ":"))
+                tool_calls.append(
+                    {"id": call_id, "type": "function", "function": {"name": call["name"], "arguments": arguments}}
+                )
+            messages.append({"role": "assistant", "content": response or None, "tool_calls": tool_calls})
+            for call, tool_call in zip(calls, tool_calls):
+                print(f"[tool] {call['name']}({json.dumps(call['arguments'], ensure_ascii=False)})")
+                result = coding_tools.execute(call["name"], call["arguments"])
+                _show_tool_result(result)
+                messages.append({"role": "tool", "tool_call_id": tool_call["id"], "content": result})
+            if tool_round == 7:
+                print("[Stopped after 8 tool rounds.]")
 
 
 if __name__ == "__main__":

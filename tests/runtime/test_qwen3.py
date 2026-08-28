@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
+from examples.qwen3_onnx_chat import _generate
 from warp_nn.runtime import Qwen3Tokenizer, parse_qwen_tool_calls, sample_token
 from warp_nn.runtime.qwen3 import _BYTE_ENCODER
 
@@ -109,3 +110,37 @@ def test_qwen_tool_template_and_parser(tmp_path):
     )
     assert text == "I will inspect it."
     assert calls == [{"name": "read", "arguments": {"path": "README.md"}}]
+
+
+def test_console_generation_streams_text_and_hides_tool_markup(capsys):
+    class Runner:
+        def sample_greedy(self, logits):
+            return logits
+
+        def decode(self, token_id):
+            return {1: 2, 2: 0}[token_id]
+
+    class Tokenizer:
+        eos_token_id = 0
+
+        pieces = {
+            1: b"Checking. <tool_",
+            2: b"call>\n<function=read_file>\n<parameter=path>\nREADME.md\n</parameter>\n</function>\n</tool_call>",
+        }
+
+        def token_bytes(self, token_id, skip_special_tokens=False):
+            return self.pieces.get(token_id, b"")
+
+        def decode(self, token_ids, skip_special_tokens=False):
+            return b"".join(self.pieces.get(token_id, b"") for token_id in token_ids).decode()
+
+        def parse_tool_calls(self, text):
+            return parse_qwen_tool_calls(text)
+
+    cached_ids = []
+    generated, text, calls = _generate(Runner(), Tokenizer(), 1, 4, 0.0, cached_ids, "<tool_call>")
+    assert capsys.readouterr().out == "Checking. "
+    assert generated == [1, 2, 0]
+    assert cached_ids == [1, 2]
+    assert text == "Checking."
+    assert calls == [{"name": "read_file", "arguments": {"path": "README.md"}}]

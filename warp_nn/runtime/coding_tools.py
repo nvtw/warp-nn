@@ -46,7 +46,7 @@ TOOL_SCHEMAS = (
     ),
     _schema(
         "list_files",
-        "List workspace files and directories.",
+        "List workspace files.",
         {
             "path": {"type": "string", "default": "."},
             "pattern": {"type": "string", "default": "*"},
@@ -227,8 +227,8 @@ class CodingTools:
 
     def _edit(self, path, old_text, new_text):
         path = self._path(path)
-        if not isinstance(old_text, str) or not isinstance(new_text, str) or not old_text:
-            raise ValueError("old_text and new_text must be non-empty strings")
+        if not isinstance(old_text, str) or not old_text or not isinstance(new_text, str):
+            raise ValueError("old_text must be non-empty and new_text must be a string")
         content = path.read_text(encoding="utf-8")
         count = content.count(old_text)
         if count != 1:
