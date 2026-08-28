@@ -25,7 +25,7 @@ import warp as wp
 
 from warp_nn.modules.layers._common import tile_transposed_gemm_2d
 from warp_nn.runtime._cuda import dp4a, expand_int4x4_high, expand_int4x4_low, subgroup_sum, warp_max_broadcast
-from warp_nn.runtime._cuda_mma import get_mma_16x16
+from warp_nn.runtime._cuda_mma import get_mma_16x64
 from warp_nn.utils.config import get_kernel_config
 
 
@@ -177,30 +177,40 @@ def _get_linear_packed_vector_kernel(dtype: type):
     return _create_linear_packed_vector_kernel(dtype)
 
 
-def _create_linear_mma_kernel(dtype: type):
-    """Build the SM80 16-row FP16/BF16 projection wrapper."""
+def _create_linear_mma_kernels(dtype: type):
+    """Build SM80 split-K projection and combination wrappers."""
     DTYPE = dtype
-    mma = get_mma_16x16(dtype)
+    mma = get_mma_16x64(dtype)
 
     @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
-    def kernel(
+    def project(
         x: wp.array(dtype=DTYPE),
         weight: wp.array(dtype=DTYPE),
-        output: wp.array(dtype=DTYPE),
+        output: wp.array(dtype=wp.float32),
         columns: int,
         inner: int,
+        splits: int,
     ):
         typed_zero = DTYPE(0.0)
-        wp.static(mma)(x, weight, output, wp.tid(), columns, inner)
+        wp.static(mma)(x, weight, output, wp.tid(), columns, inner, splits)
 
-    kernel.module.options["enable_backward"] = False
-    return kernel
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def combine(partials: wp.array(dtype=wp.float32), output: wp.array(dtype=DTYPE), output_size: int, splits: int):
+        index = wp.tid()
+        value = wp.float32(0.0)
+        for split in range(splits):
+            value += partials[split * output_size + index]
+        output[index] = DTYPE(value)
+
+    project.module.options["enable_backward"] = False
+    combine.module.options["enable_backward"] = False
+    return project, combine
 
 
 @lru_cache(maxsize=None)
-def _get_linear_mma_kernel(dtype: type):
-    """Return the SM80 16-row projection kernel."""
-    return _create_linear_mma_kernel(dtype)
+def _get_linear_mma_kernels(dtype: type):
+    """Return the SM80 split-K projection and epilogue kernels."""
+    return _create_linear_mma_kernels(dtype)
 
 
 def _create_linear_tiled_kernel(dtype: type, tile_m: int):

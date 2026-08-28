@@ -9,23 +9,32 @@ import warp as wp
 from tests.utilities import is_device_available
 from warp_nn.runtime._cublas import try_create_cublas
 from warp_nn.runtime.kernels import (
-    _append_head_cache_kernel,
     _append_circular_head_cache_kernel,
+    _append_head_cache_kernel,
     _causal_conv_rows_kernel,
     _get_gated_rms_norm_kernel,
     _get_gqa_attention_kernel,
     _get_greedy_argmax_kernels,
     _get_linear_attention_kernel,
+    _logit_softcap_kernel,
     _prepare_gated_delta_kernel,
     _relu2_kernel,
     _reorder_heads_kernel,
-    _sigmoid_gate_kernel,
-    _logit_softcap_kernel,
     _scale_kernel,
+    _sigmoid_gate_kernel,
     _unpack_gated_heads_kernel,
     _update_conv_rows_state_kernel,
 )
-from warp_nn.runtime.operators import Operation, execute_operations, plan_linear, plan_rms_norm
+from warp_nn.runtime.operators import Operation, _prefer_linear_mma, execute_operations, plan_linear, plan_rms_norm
+
+
+def test_linear_mma_selection_is_conservative_with_cublas():
+    assert _prefer_linear_mma(False, 80, 64, 128)
+    assert _prefer_linear_mma(True, 86, 4096, 4096)
+    assert not _prefer_linear_mma(True, 86, 1024, 1024)
+    assert _prefer_linear_mma(True, 86, 12288, 4096)
+    assert not _prefer_linear_mma(True, 86, 16384, 4096)
+    assert not _prefer_linear_mma(True, 89, 4096, 4096)
 
 
 @pytest.mark.parametrize(("device", "rows"), [("cpu", 3), ("cuda:0", 3), ("cuda:0", 32)])
@@ -100,8 +109,8 @@ def test_16_row_linear_fallback_uses_graph_captured_mma(dtype):
     if not is_device_available("cuda:0") or wp.get_device("cuda:0").arch < 80:
         pytest.skip("SM80 CUDA device is not available")
     rng = np.random.default_rng(20)
-    x_np = rng.normal(0.0, 0.1, (16, 64)).astype(np.float32)
-    weight_np = rng.normal(0.0, 0.1, (48, 64)).astype(np.float32)
+    x_np = rng.normal(0.0, 0.1, (16, 128)).astype(np.float32)
+    weight_np = rng.normal(0.0, 0.1, (64, 128)).astype(np.float32)
     tensors = {
         "x": wp.array(x_np, dtype=dtype, device="cuda:0"),
         "weight": wp.array(weight_np, dtype=dtype, device="cuda:0"),

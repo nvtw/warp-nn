@@ -16,7 +16,7 @@ from warp_nn.runtime.kernels import (
     _GEMM_CONFIG,
     _GEMM_TRANSB_TILED_KERNEL,
     _gather_block_quantized_int8_kernel,
-    _get_linear_mma_kernel,
+    _get_linear_mma_kernels,
     _get_linear_packed_vector_kernel,
     _get_linear_tiled_kernel,
     _get_linear_vector_kernel,
@@ -38,6 +38,11 @@ class Operation:
     inputs: list[str]
     outputs: list[str]
     attrs: dict[str, Any] = field(default_factory=dict)
+
+
+def _prefer_linear_mma(has_cublas: bool, arch: int, columns: int, inner: int) -> bool:
+    """Use MMA as a fallback, or past its measured SM86 cuBLAS crossover."""
+    return not has_cublas or (arch == 86 and inner >= 4096 and columns <= 3 * inner)
 
 
 def execute_operations(
@@ -66,15 +71,29 @@ def _exec_linear(op, tensors, shapes, device):
             device=device,
         )
     elif op.attrs.get("_mma"):
+        splits = op.attrs["_mma_splits"]
         wp.launch(
-            op.attrs["_kernel"],
-            dim=(op.attrs["_columns"] // 16) * 32,
+            op.attrs["_mma_kernels"][0],
+            dim=(op.attrs["_columns"] // 64) * splits * 128,
             inputs=[
                 op.attrs["_mma_x"],
                 op.attrs["_mma_weight"],
-                op.attrs["_mma_output"],
+                op.attrs["_mma_partials"],
                 op.attrs["_columns"],
                 op.attrs["_inner"],
+                splits,
+            ],
+            block_dim=128,
+            device=device,
+        )
+        wp.launch(
+            op.attrs["_mma_kernels"][1],
+            dim=op.attrs["_rows"] * op.attrs["_columns"],
+            inputs=[
+                op.attrs["_mma_partials"],
+                op.attrs["_mma_output"],
+                op.attrs["_rows"] * op.attrs["_columns"],
+                splits,
             ],
             block_dim=256,
             device=device,
@@ -156,21 +175,25 @@ def plan_linear(op: Operation, tensors: dict[str, wp.array], shapes: dict[str, t
         )
     elif (
         device.is_cuda
-        and cublas is None
+        and _prefer_linear_mma(cublas is not None, device.arch, columns, inner)
         and device.arch >= 80
         and rows == 16
-        and columns % 16 == 0
-        and inner % 32 == 0
+        and columns % 64 == 0
+        and inner % 128 == 0
         and dtype in (wp.float16, wp.bfloat16)
         and x.is_contiguous
         and weight.is_contiguous
         and x.ptr % 16 == 0
         and weight.ptr % 16 == 0
     ):
-        op.attrs["_kernel"] = _get_linear_mma_kernel(dtype)
+        split_limit = min(4, max(1, 16384 // columns))
+        splits = 1 << (split_limit.bit_length() - 1)
+        op.attrs["_mma_kernels"] = _get_linear_mma_kernels(dtype)
         op.attrs["_mma"] = True
+        op.attrs["_mma_splits"] = splits
         op.attrs["_mma_x"] = x.flatten()
         op.attrs["_mma_weight"] = weight.flatten()
+        op.attrs["_mma_partials"] = wp.empty(splits * rows * columns, dtype=wp.float32, device=device)
         op.attrs["_mma_output"] = output.flatten()
     elif cublas is not None and device.is_cuda and dtype in (wp.float16, wp.bfloat16):
         op.attrs["_cublas"] = cublas
@@ -187,11 +210,16 @@ def _plan_rms_norm_buffers(op, x_name, scale_name, tensors, shapes, device, dtyp
     rows, width = int(np.prod(shape[:-1])), shape[-1]
     dtype = dtype or tensors[x_name].dtype
     scale_dtype = tensors[scale_name].dtype
-    if dtype not in (wp.float16, wp.bfloat16) or scale_dtype not in (
-        wp.float16,
-        wp.bfloat16,
-        wp.float32,
-    ) or shapes[scale_name] != (width,):
+    if (
+        dtype not in (wp.float16, wp.bfloat16)
+        or scale_dtype
+        not in (
+            wp.float16,
+            wp.bfloat16,
+            wp.float32,
+        )
+        or shapes[scale_name] != (width,)
+    ):
         raise ValueError("RMSNorm requires a matching width-sized scale")
     output = wp.empty(shape, dtype=dtype, device=device)
     tensors[op.outputs[0]] = output
