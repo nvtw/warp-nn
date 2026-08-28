@@ -844,6 +844,54 @@ def _causal_conv_state_inplace_kernel(x: wp.array3d[Any], state: wp.array3d[Any]
             state[batch, channel, state_index] = x[batch, channel, source_index - state.shape[2]]
 
 
+@wp.kernel(enable_backward=False)
+def _causal_conv_rows_kernel(
+    x: wp.array2d[Any], weight: wp.array3d[Any], state: wp.array2d[Any], output: wp.array2d[Any]
+):
+    """Apply SiLU depthwise causal convolution to row-major token data."""
+    token, channel = wp.tid()
+    total = wp.float32(0.0)
+    for kernel_index in range(weight.shape[2]):
+        source_token = token + kernel_index - state.shape[1]
+        value = (
+            wp.float32(state[channel, source_token + state.shape[1]])
+            if source_token < 0
+            else wp.float32(x[source_token, channel])
+        )
+        total += value * wp.float32(weight[channel, 0, kernel_index])
+    output[token, channel] = x.dtype(total / (wp.float32(1.0) + wp.exp(-total)))
+
+
+@wp.kernel(enable_backward=False)
+def _update_conv_rows_state_kernel(x: wp.array2d[Any], state: wp.array2d[Any]):
+    """Advance a row-major causal-convolution state in place."""
+    channel = wp.tid()
+    for state_index in range(state.shape[1]):
+        source = x.shape[0] + state_index
+        if source < state.shape[1]:
+            state[channel, state_index] = state[channel, source]
+        else:
+            state[channel, state_index] = x[source - state.shape[1], channel]
+
+
+@wp.kernel(enable_backward=False)
+def _prepare_gated_delta_kernel(
+    a: wp.array2d[Any],
+    b: wp.array2d[Any],
+    a_log: wp.array1d[Any],
+    dt_bias: wp.array1d[Any],
+    decay: wp.array2d[wp.float32],
+    beta: wp.array2d[wp.float32],
+):
+    """Compute FP32 decay and beta controls for gated-delta attention."""
+    row, head = wp.tid()
+    b_value = wp.float32(b[row, head])
+    beta[row, head] = wp.float32(1.0) / (wp.float32(1.0) + wp.exp(-b_value))
+    dt = wp.float32(a[row, head]) + wp.float32(dt_bias[head])
+    softplus = wp.max(dt, wp.float32(0.0)) + wp.log(wp.float32(1.0) + wp.exp(-wp.abs(dt)))
+    decay[row, head] = -wp.exp(wp.float32(a_log[head])) * softplus
+
+
 _dequantize_nbits_kernel_cache = {}
 
 
@@ -876,12 +924,12 @@ def _create_rms_norm_kernels(tile_width: int, dtype: type):
         return dtype(wp.float32(value) + wp.float32(skip))
 
     @wp.func
-    def normalize(value: dtype, scale: dtype, inverse_rms: float):
-        return dtype(wp.float32(value) * wp.float32(scale) * inverse_rms)
+    def normalize(value: dtype, scale: dtype, inverse_rms: float, scale_offset: float):
+        return dtype(wp.float32(value) * (wp.float32(scale) + scale_offset) * inverse_rms)
 
     @wp.func
-    def skip_normalize(value: dtype, skip: dtype, scale: dtype, inverse_rms: float):
-        return dtype((wp.float32(value) + wp.float32(skip)) * wp.float32(scale) * inverse_rms)
+    def skip_normalize(value: dtype, skip: dtype, scale: dtype, inverse_rms: float, scale_offset: float):
+        return dtype((wp.float32(value) + wp.float32(skip)) * (wp.float32(scale) + scale_offset) * inverse_rms)
 
     @wp.kernel(enable_backward=False, module="unique")
     def rms_norm(
@@ -889,6 +937,7 @@ def _create_rms_norm_kernels(tile_width: int, dtype: type):
         scale: wp.array1d(dtype=DTYPE),
         output: wp.array2d(dtype=DTYPE),
         epsilon: float,
+        scale_offset: float,
     ):
         """Apply row-wise RMS normalization."""
         row = wp.tid()
@@ -906,7 +955,9 @@ def _create_rms_norm_kernels(tile_width: int, dtype: type):
             offset = tile_index * TILE_WIDTH
             values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
             scales = wp.tile_load(scale, shape=(TILE_WIDTH,), offset=(offset,))
-            wp.tile_store(output[row], wp.tile_map(normalize, values, scales, inverse_rms), offset=(offset,))
+            wp.tile_store(
+                output[row], wp.tile_map(normalize, values, scales, inverse_rms, scale_offset), offset=(offset,)
+            )
 
     @wp.kernel(enable_backward=False, module="unique")
     def skip_rms_norm(
@@ -916,6 +967,7 @@ def _create_rms_norm_kernels(tile_width: int, dtype: type):
         output: wp.array2d(dtype=DTYPE),
         residual: wp.array2d(dtype=DTYPE),
         epsilon: float,
+        scale_offset: float,
     ):
         """Add a residual, store it, and apply row-wise RMS normalization."""
         row = wp.tid()
@@ -937,7 +989,7 @@ def _create_rms_norm_kernels(tile_width: int, dtype: type):
             values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
             skips = wp.tile_load(skip[row], shape=(TILE_WIDTH,), offset=(offset,))
             scales = wp.tile_load(scale, shape=(TILE_WIDTH,), offset=(offset,))
-            normalized = wp.tile_map(skip_normalize, values, skips, scales, inverse_rms)
+            normalized = wp.tile_map(skip_normalize, values, skips, scales, inverse_rms, scale_offset)
             wp.tile_store(output[row], normalized, offset=(offset,))
 
     return rms_norm, skip_rms_norm
@@ -955,6 +1007,63 @@ def _get_rms_norm_kernels(width: int, dtype: type):
     return tile_width, _rms_norm_kernel_cache[key]
 
 
+def _create_gated_rms_norm_kernel(tile_width: int, dtype: type):
+    """Build fused RMSNorm-times-SiLU gating for recurrent attention."""
+    TILE_WIDTH = tile_width
+    DTYPE = dtype
+
+    @wp.func
+    def square(value: dtype):
+        value_fp32 = wp.float32(dtype(value))
+        return value_fp32 * value_fp32
+
+    @wp.func
+    def normalize_gate(value: dtype, gate: dtype, scale: dtype, inverse_rms: float):
+        gate_fp32 = wp.float32(gate)
+        silu = gate_fp32 / (wp.float32(1.0) + wp.exp(-gate_fp32))
+        return dtype(wp.float32(value) * wp.float32(scale) * inverse_rms * silu)
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def kernel(
+        x: wp.array2d(dtype=DTYPE),
+        gate: wp.array2d(dtype=DTYPE),
+        scale: wp.array1d(dtype=DTYPE),
+        output: wp.array2d(dtype=DTYPE),
+        epsilon: float,
+    ):
+        """Normalize each row, then multiply by its SiLU gate."""
+        row = wp.tid()
+        typed_zero = DTYPE(0.0)
+        partials = wp.tile_zeros(shape=(TILE_WIDTH,), dtype=wp.float32)
+        for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
+            offset = tile_index * TILE_WIDTH
+            values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
+            partials += wp.tile_map(square, values)
+        inverse_rms = wp.float32(1.0) / wp.sqrt(
+            wp.tile_extract(wp.tile_sum(partials), 0) / wp.float32(x.shape[1])
+            + wp.float32(epsilon)
+            + wp.float32(typed_zero)
+        )
+        for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
+            offset = tile_index * TILE_WIDTH
+            values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
+            gates = wp.tile_load(gate[row], shape=(TILE_WIDTH,), offset=(offset,))
+            scales = wp.tile_load(scale, shape=(TILE_WIDTH,), offset=(offset,))
+            wp.tile_store(
+                output[row], wp.tile_map(normalize_gate, values, gates, scales, inverse_rms), offset=(offset,)
+            )
+
+    kernel.module.options["enable_backward"] = False
+    return kernel
+
+
+@lru_cache(maxsize=None)
+def _get_gated_rms_norm_kernel(width: int, dtype: type):
+    """Return a cached recurrent gated-RMSNorm kernel and tile width."""
+    tile_width = min(512, max(32, 1 << (width - 1).bit_length()))
+    return tile_width, _create_gated_rms_norm_kernel(tile_width, dtype)
+
+
 def _create_lp_normalization_kernel(tile_width: int, dtype: type):
     """Build row-wise L2 normalization using ``tile_width`` lanes."""
     TILE_WIDTH = tile_width
@@ -970,7 +1079,7 @@ def _create_lp_normalization_kernel(tile_width: int, dtype: type):
         return dtype(wp.float32(value) * inverse_norm)
 
     @wp.kernel(enable_backward=False, module="unique")
-    def kernel(x: wp.array2d(dtype=DTYPE), output: wp.array2d(dtype=DTYPE)):
+    def kernel(x: wp.array2d(dtype=DTYPE), output: wp.array2d(dtype=DTYPE), epsilon: float):
         """Normalize each row to unit L2 norm."""
         row = wp.tid()
         typed_zero = DTYPE(0.0)
@@ -978,7 +1087,7 @@ def _create_lp_normalization_kernel(tile_width: int, dtype: type):
         for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
             values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(tile_index * TILE_WIDTH,))
             partials += wp.tile_map(square, values)
-        norm = wp.sqrt(wp.tile_extract(wp.tile_sum(partials), 0) + wp.float32(typed_zero))
+        norm = wp.sqrt(wp.tile_extract(wp.tile_sum(partials), 0) + wp.float32(epsilon) + wp.float32(typed_zero))
         inverse_norm = wp.float32(1.0) / wp.max(norm, wp.float32(1.0e-12))
         for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
             offset = tile_index * TILE_WIDTH
@@ -1020,7 +1129,7 @@ def _get_reduce_sum_rows_kernel(width: int, dtype: type):
     return tile_width, kernel
 
 
-def _create_linear_attention_kernel(key_size: int, value_size: int, dtype: type):
+def _create_linear_attention_kernel(key_size: int, value_size: int, dtype: type, state_dtype: type):
     """Build recurrent linear attention for fixed key and value widths.
     Value channels are processed in tiles of at most 64."""
     KEY_SIZE = key_size
@@ -1028,21 +1137,30 @@ def _create_linear_attention_kernel(key_size: int, value_size: int, dtype: type)
     VALUE_TILE = min(64, value_size & -value_size)
     VALUE_BLOCKS = VALUE_SIZE // VALUE_TILE
     DTYPE = dtype
+    STATE_DTYPE = state_dtype
 
     @wp.func
-    def exp_value(value: dtype):
-        return dtype(wp.exp(wp.float32(value)))
+    def exp_value(value: state_dtype):
+        return state_dtype(wp.exp(wp.float32(value)))
+
+    @wp.func
+    def to_state(value: dtype):
+        return state_dtype(wp.float32(dtype(value)))
+
+    @wp.func
+    def to_output(value: state_dtype):
+        return dtype(wp.float32(state_dtype(value)))
 
     @wp.kernel(enable_backward=False, module="unique")
     def kernel(
         query: wp.array2d(dtype=DTYPE),
         key: wp.array2d(dtype=DTYPE),
         value: wp.array2d(dtype=DTYPE),
-        past: wp.array2d(dtype=DTYPE),
-        decay: wp.array2d(dtype=DTYPE),
-        beta: wp.array2d(dtype=DTYPE),
+        past: wp.array2d(dtype=STATE_DTYPE),
+        decay: wp.array2d(dtype=STATE_DTYPE),
+        beta: wp.array2d(dtype=STATE_DTYPE),
         output: wp.array2d(dtype=DTYPE),
-        present: wp.array2d(dtype=DTYPE),
+        present: wp.array2d(dtype=STATE_DTYPE),
         sequence_length: int,
         query_heads: int,
         key_heads: int,
@@ -1055,6 +1173,7 @@ def _create_linear_attention_kernel(key_size: int, value_size: int, dtype: type)
     ):
         """Update recurrent attention state and emit the current sequence."""
         item = wp.tid()
+        typed_zero = DTYPE(0.0)
         value_block = item % VALUE_BLOCKS
         state_item = item / VALUE_BLOCKS
         batch = state_item / value_heads
@@ -1072,19 +1191,24 @@ def _create_linear_attention_kernel(key_size: int, value_size: int, dtype: type)
                     decay_column = wp.tile_transpose(wp.tile_map(exp_value, decay_row))
                     state *= wp.tile_broadcast(decay_column, shape=(KEY_SIZE, VALUE_TILE))
                 else:
-                    state *= DTYPE(wp.exp(wp.float32(decay[token_row, value_head])))
+                    state *= STATE_DTYPE(wp.exp(wp.float32(decay[token_row, value_head])))
 
-            key_row = wp.tile_load(key, shape=(1, KEY_SIZE), offset=(token_row, key_head * KEY_SIZE))
-            value_row = wp.tile_load(
-                value,
-                shape=(1, VALUE_TILE),
-                offset=(token_row, value_head * VALUE_SIZE + value_offset),
+            key_row = wp.tile_map(
+                to_state, wp.tile_load(key, shape=(1, KEY_SIZE), offset=(token_row, key_head * KEY_SIZE))
+            )
+            value_row = wp.tile_map(
+                to_state,
+                wp.tile_load(
+                    value,
+                    shape=(1, VALUE_TILE),
+                    offset=(token_row, value_head * VALUE_SIZE + value_offset),
+                ),
             )
             if needs_beta:
-                retrieved = wp.tile_zeros(shape=(1, VALUE_TILE), dtype=DTYPE)
+                retrieved = wp.tile_zeros(shape=(1, VALUE_TILE), dtype=STATE_DTYPE)
                 wp.tile_matmul(key_row, state, retrieved)
                 beta_value = beta[token_row, value_head] if beta_per_head else beta[token_row, 0]
-                delta = DTYPE(beta_value) * (value_row - retrieved)
+                delta = STATE_DTYPE(beta_value) * (value_row - retrieved)
             else:
                 delta = value_row
             wp.tile_matmul(wp.tile_transpose(key_row), delta, state)
@@ -1093,36 +1217,43 @@ def _create_linear_attention_kernel(key_size: int, value_size: int, dtype: type)
                 heads_per_group = query_heads / value_heads
                 for group in range(heads_per_group):
                     query_head = value_head * heads_per_group + group
-                    query_row = wp.tile_load(query, shape=(1, KEY_SIZE), offset=(token_row, query_head * KEY_SIZE))
-                    result = wp.tile_zeros(shape=(1, VALUE_TILE), dtype=DTYPE)
+                    query_row = wp.tile_map(
+                        to_state,
+                        wp.tile_load(query, shape=(1, KEY_SIZE), offset=(token_row, query_head * KEY_SIZE)),
+                    )
+                    result = wp.tile_zeros(shape=(1, VALUE_TILE), dtype=STATE_DTYPE)
                     wp.tile_matmul(query_row, state, result)
                     wp.tile_store(
                         output,
-                        DTYPE(scale) * result,
+                        wp.tile_map(to_output, STATE_DTYPE(scale) * result),
                         offset=(token_row, query_head * VALUE_SIZE + value_offset),
                     )
             else:
                 query_head = value_head * query_heads / value_heads
-                query_row = wp.tile_load(query, shape=(1, KEY_SIZE), offset=(token_row, query_head * KEY_SIZE))
-                result = wp.tile_zeros(shape=(1, VALUE_TILE), dtype=DTYPE)
+                query_row = wp.tile_map(
+                    to_state,
+                    wp.tile_load(query, shape=(1, KEY_SIZE), offset=(token_row, query_head * KEY_SIZE)),
+                )
+                result = wp.tile_zeros(shape=(1, VALUE_TILE), dtype=STATE_DTYPE)
                 wp.tile_matmul(query_row, state, result)
                 wp.tile_store(
                     output,
-                    DTYPE(scale) * result,
+                    wp.tile_map(to_output, STATE_DTYPE(scale) * result),
                     offset=(token_row, value_head * VALUE_SIZE + value_offset),
                 )
 
         wp.tile_store(present, state, offset=(state_offset, value_offset))
 
+    kernel.module.options["enable_backward"] = False
     return kernel
 
 
 _linear_attention_kernel_cache = {}
 
 
-def _get_linear_attention_kernel(key_size: int, value_size: int, dtype: type):
+def _get_linear_attention_kernel(key_size: int, value_size: int, dtype: type, state_dtype: type | None = None):
     """Return a cached recurrent linear-attention kernel."""
-    key = (key_size, value_size, dtype)
+    key = (key_size, value_size, dtype, state_dtype or dtype)
     if key not in _linear_attention_kernel_cache:
         _linear_attention_kernel_cache[key] = _create_linear_attention_kernel(*key)
     return _linear_attention_kernel_cache[key]

@@ -247,6 +247,7 @@ def _exec_lp_normalization(op, tensors, shapes, device):
         inputs=[
             tensors[op.inputs[0]].reshape((rows, width)),
             tensors[op.outputs[0]].reshape((rows, width)),
+            float(op.attrs.get("_epsilon", 0.0)),
         ],
         block_dim=op.attrs["_tile_width"],
         device=device,
@@ -566,6 +567,7 @@ def _exec_simplified_layer_normalization(op, tensors, shapes, device):
             tensors[op.inputs[1]],
             op.attrs["_output_2d"],
             float(op.attrs.get("epsilon", 1.0e-5)),
+            float(op.attrs.get("_scale_offset", 0.0)),
         ],
         block_dim=op.attrs["_tile_width"],
         device=device,
@@ -584,6 +586,7 @@ def _exec_skip_simplified_layer_normalization(op, tensors, shapes, device):
             op.attrs["_output_2d"],
             op.attrs["_residual_2d"],
             float(op.attrs.get("epsilon", 1.0e-5)),
+            float(op.attrs.get("_scale_offset", 0.0)),
         ],
         block_dim=op.attrs["_tile_width"],
         device=device,
