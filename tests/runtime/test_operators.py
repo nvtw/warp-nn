@@ -9,11 +9,16 @@ import warp as wp
 from tests.utilities import is_device_available
 from warp_nn.runtime._cublas import try_create_cublas
 from warp_nn.runtime.kernels import (
+    _append_head_cache_kernel,
     _causal_conv_rows_kernel,
     _get_gated_rms_norm_kernel,
     _get_gqa_attention_kernel,
+    _get_greedy_argmax_kernels,
     _get_linear_attention_kernel,
     _prepare_gated_delta_kernel,
+    _reorder_heads_kernel,
+    _sigmoid_gate_kernel,
+    _unpack_gated_heads_kernel,
     _update_conv_rows_state_kernel,
 )
 from warp_nn.runtime.operators import Operation, execute_operations, plan_linear
@@ -124,6 +129,74 @@ def test_group_query_attention_bfloat16():
             weights /= weights.sum()
             expected[token, head * head_size : (head + 1) * head_size] = weights @ value_np[0, : token + 1]
     np.testing.assert_allclose(output.numpy(), expected, atol=0.04, rtol=0.02)
+
+
+def test_head_layout_cache_and_bfloat16_argmax():
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    rows, heads, head_size, capacity = 2, 2, 2, 5
+    packed_np = np.arange(rows * heads * head_size * 2, dtype=np.float32).reshape(rows, -1)
+    packed = wp.array(packed_np, dtype=wp.bfloat16, device="cuda:0")
+    values = wp.empty((heads * rows, head_size), dtype=wp.bfloat16, device="cuda:0")
+    gate = wp.empty((rows, heads * head_size), dtype=wp.bfloat16, device="cuda:0")
+    reordered = wp.empty_like(values)
+    gated = wp.empty_like(gate)
+    positions = wp.array(np.array([[1, 3]], dtype=np.int64), device="cuda:0")
+    cache = wp.zeros((heads * capacity, head_size), dtype=wp.bfloat16, device="cuda:0")
+
+    wp.launch(
+        _unpack_gated_heads_kernel,
+        dim=(rows, heads, head_size),
+        inputs=[packed, values, gate, head_size],
+        device="cuda:0",
+    )
+    row_major = wp.array(packed_np[:, : heads * head_size], dtype=wp.bfloat16, device="cuda:0")
+    wp.launch(
+        _reorder_heads_kernel,
+        dim=(rows, heads, head_size),
+        inputs=[row_major, reordered, head_size],
+        device="cuda:0",
+    )
+    wp.launch(
+        _append_head_cache_kernel,
+        dim=(heads, rows, head_size),
+        inputs=[reordered, positions, cache, heads, head_size],
+        device="cuda:0",
+    )
+    wp.launch(_sigmoid_gate_kernel, dim=gate.shape, inputs=[gate, gate, gated], device="cuda:0")
+
+    expected_values = np.empty((heads, rows, head_size), dtype=np.float32)
+    expected_gate = np.empty((rows, heads, head_size), dtype=np.float32)
+    for row in range(rows):
+        per_head = packed_np[row].reshape(heads, 2, head_size)
+        expected_values[:, row] = per_head[:, 0]
+        expected_gate[row] = per_head[:, 1]
+    np.testing.assert_array_equal(values.numpy(), expected_values.reshape(-1, head_size))
+    np.testing.assert_array_equal(gate.numpy(), expected_gate.reshape(rows, -1))
+    expected_reordered = packed_np[:, : heads * head_size].reshape(rows, heads, head_size).transpose(1, 0, 2)
+    np.testing.assert_array_equal(reordered.numpy(), expected_reordered.reshape(-1, head_size))
+    cache_np = cache.numpy().reshape(heads, capacity, head_size)
+    np.testing.assert_array_equal(cache_np[:, [1, 3]], expected_reordered)
+    expected_gated = expected_gate.reshape(rows, -1)
+    expected_gated = expected_gated / (1.0 + np.exp(-expected_gated))
+    np.testing.assert_allclose(gated.numpy(), expected_gated, atol=0.04)
+
+    logits_np = np.arange(34, dtype=np.float32).reshape(1, 2, 17)
+    logits_np[0, -1, 7] = 100.0
+    logits = wp.array(logits_np, dtype=wp.bfloat16, device="cuda:0")
+    partial_values = wp.empty(4, dtype=wp.float32, device="cuda:0")
+    partial_tokens = wp.empty(4, dtype=wp.int32, device="cuda:0")
+    token = wp.empty(1, dtype=wp.int32, device="cuda:0")
+    partial, final, _ = _get_greedy_argmax_kernels(32, 4, wp.bfloat16)
+    wp.launch_tiled(
+        partial,
+        dim=4,
+        inputs=[logits, partial_values, partial_tokens],
+        block_dim=32,
+        device="cuda:0",
+    )
+    wp.launch_tiled(final, dim=1, inputs=[partial_values, partial_tokens, token, 17], block_dim=32, device="cuda:0")
+    assert token.numpy()[0] == 7
 
 
 def test_mixed_state_linear_attention_bfloat16():

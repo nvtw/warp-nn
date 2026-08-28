@@ -450,6 +450,40 @@ def _gather_rows_kernel(data: wp.array2d[Any], indices: wp.array2d[wp.int64], ou
 
 
 @wp.kernel(enable_backward=False)
+def _reorder_heads_kernel(x: wp.array2d[Any], output: wp.array2d[Any], head_size: int):
+    """Reorder row-major packed heads into head-major rows."""
+    row, head, column = wp.tid()
+    output[head * x.shape[0] + row, column] = x[row, head * head_size + column]
+
+
+@wp.kernel(enable_backward=False)
+def _unpack_gated_heads_kernel(x: wp.array2d[Any], values: wp.array2d[Any], gate: wp.array2d[Any], head_size: int):
+    """Split per-head value/gate pairs and reorder values head-major."""
+    row, head, column = wp.tid()
+    offset = head * head_size * 2
+    values[head * x.shape[0] + row, column] = x[row, offset + column]
+    gate[row, head * head_size + column] = x[row, offset + head_size + column]
+
+
+@wp.kernel(enable_backward=False)
+def _append_head_cache_kernel(
+    x: wp.array2d[Any], positions: wp.array2d[wp.int64], cache: wp.array2d[Any], heads: int, head_size: int
+):
+    """Append head-major token rows at their device-side positions."""
+    head, row, column = wp.tid()
+    capacity = cache.shape[0] / heads
+    cache[head * capacity + wp.int32(positions[0, row]), column] = x[head * positions.shape[1] + row, column]
+
+
+@wp.kernel(enable_backward=False)
+def _sigmoid_gate_kernel(x: wp.array2d[Any], gate: wp.array2d[Any], output: wp.array2d[Any]):
+    """Multiply activations by a sigmoid gate."""
+    row, column = wp.tid()
+    gate_value = wp.float32(gate[row, column])
+    output[row, column] = x.dtype(wp.float32(x[row, column]) / (wp.float32(1.0) + wp.exp(-gate_value)))
+
+
+@wp.kernel(enable_backward=False)
 def _gather_single_index_kernel(
     data: wp.array1d[Any], output: wp.array1d[Any], index: int, axis_size: int, stride: int
 ):
@@ -1446,6 +1480,26 @@ def _set_decode_token(
     position_ids[0, 0] = wp.int64(position)
 
 
+@wp.kernel(enable_backward=False)
+def _stage_token_position(
+    input_ids: wp.array2d[wp.int64],
+    position_ids: wp.array2d[wp.int64],
+    sequence_end: wp.array1d[wp.int32],
+    token_id: int,
+    position: int,
+):
+    """Stage one token, its position, and the inclusive sequence end."""
+    input_ids[0, 0] = wp.int64(token_id)
+    position_ids[0, 0] = wp.int64(position)
+    sequence_end[0] = wp.int32(position)
+
+
+@wp.kernel(enable_backward=False)
+def _set_sequence_end(sequence_end: wp.array1d[wp.int32], position: int):
+    """Update the inclusive device-side sequence end."""
+    sequence_end[0] = wp.int32(position)
+
+
 @wp.kernel
 def _initialize_generation_state(
     position: wp.array1d[wp.int32],
@@ -1460,31 +1514,32 @@ def _initialize_generation_state(
 
 
 @lru_cache(maxsize=None)
-def _get_greedy_argmax_kernels(tile_width: int, partial_count: int):
+def _get_greedy_argmax_kernels(tile_width: int, partial_count: int, dtype: type = wp.float16):
     """Build hierarchical greedy argmax kernels.
     ``tile_width`` scans logits; ``partial_count`` sizes the final reduction."""
     TILE_WIDTH = tile_width
     PARTIAL_COUNT = partial_count
+    DTYPE = dtype
 
     @wp.func
     def add_offset(index: wp.int32, offset: wp.int32):
         return index + offset
 
     @wp.func
-    def mask_logit(value: wp.float16, index: wp.int32, vocabulary: wp.int32):
-        return wp.float32(value) if index < vocabulary else wp.float32(-3.402823466e38)
+    def mask_logit(value: DTYPE, index: wp.int32, vocabulary: wp.int32):
+        return wp.float32(DTYPE(value)) if index < vocabulary else wp.float32(-3.402823466e38)
 
     @wp.func
     def matching_token(value: wp.float32, token: wp.int32, maximum: wp.float32, vocabulary: wp.int32):
         return token if value == maximum else vocabulary
 
     @wp.kernel(enable_backward=False, module="unique")
-    def partial_argmax(logits: wp.array3d[wp.float16], values: wp.array1d[wp.float32], tokens: wp.array1d[wp.int32]):
+    def partial_argmax(logits: wp.array3d(dtype=DTYPE), values: wp.array1d[wp.float32], tokens: wp.array1d[wp.int32]):
         """Find one deterministic argmax candidate per vocabulary partition."""
         partial = wp.tid()
         vocabulary = logits.shape[2]
         tile_count = (vocabulary + TILE_WIDTH - 1) / TILE_WIDTH
-        best_value = wp.float32(-3.402823466e38)
+        best_value = wp.float32(-3.402823466e38) + wp.float32(DTYPE(0.0))
         best_token = vocabulary
         local_indices = wp.tile_arange(0, TILE_WIDTH, dtype=wp.int32)
         for tile_id in range(partial, tile_count, PARTIAL_COUNT):
