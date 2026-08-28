@@ -33,6 +33,7 @@ _DTYPES = {
     "BF16": (wp.bfloat16, 2),
     "F32": (wp.float32, 4),
     "F64": (wp.float64, 8),
+    "F8_E4M3": (wp.uint8, 1),
 }
 
 
@@ -45,6 +46,7 @@ class SafeTensorMetadata:
     shape: tuple[int, ...]
     offset: int
     nbytes: int
+    format: str
 
 
 def _read_header(path: Path) -> tuple[int, dict]:
@@ -116,7 +118,8 @@ class SafeTensorArchive:
             for name in names:
                 try:
                     entry = header[name]
-                    dtype, itemsize = _DTYPES[entry["dtype"]]
+                    format = entry["dtype"]
+                    dtype, itemsize = _DTYPES[format]
                     shape = tuple(int(dim) for dim in entry["shape"])
                     begin, end = (int(offset) for offset in entry["data_offsets"])
                 except (KeyError, TypeError, ValueError) as exc:
@@ -130,6 +133,7 @@ class SafeTensorArchive:
                     shape=shape,
                     offset=data_start + begin,
                     nbytes=end - begin,
+                    format=format,
                 )
 
     @property

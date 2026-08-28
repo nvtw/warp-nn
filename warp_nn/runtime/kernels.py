@@ -443,6 +443,25 @@ def _gather_block_quantized_int8_kernel(
     )
 
 
+@wp.kernel(enable_backward=False)
+def _dequantize_e4m3_kernel(
+    packed: wp.array1d[wp.uint8], scale: wp.array1d[Any], output: wp.array1d[Any]
+):
+    """Convert finite E4M3 values to ``output.dtype`` and apply one scale."""
+    index = wp.tid()
+    bits = wp.int32(packed[index])
+    exponent = (bits >> 3) & 15
+    mantissa = bits & 7
+    magnitude = wp.float32(mantissa) * wp.float32(0.001953125)
+    if exponent != 0:
+        magnitude = (wp.float32(1.0) + wp.float32(mantissa) * wp.float32(0.125)) * wp.pow(
+            wp.float32(2.0), wp.float32(exponent - 7)
+        )
+    if bits & 128:
+        magnitude = -magnitude
+    output[index] = output.dtype(magnitude * wp.float32(scale[0]))
+
+
 @wp.kernel(module="unique")
 def _gather_rows_kernel(data: wp.array2d[Any], indices: wp.array2d[wp.int64], output: wp.array3d[Any]):
     """Gather matrix rows for batched token indices."""
