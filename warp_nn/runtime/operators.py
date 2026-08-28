@@ -74,7 +74,12 @@ def _exec_linear(op, tensors, shapes, device):
         )
         wp.launch(
             op.attrs["_q8_kernel"],
-            dim=op.attrs["_rows"] * op.attrs["_columns"] * 8,
+            dim=(
+                op.attrs["_rows"]
+                * (op.attrs["_columns"] + op.attrs["_q8_outputs_per_group"] - 1)
+                // op.attrs["_q8_outputs_per_group"]
+                * 8
+            ),
             inputs=[
                 op.attrs["_q8_activation_words"],
                 op.attrs["_q8_scales"],
@@ -173,7 +178,13 @@ def plan_linear(
             (rows, blocks), dtype=wp.float32, device=device
         )
         op.attrs["_q8_quantize_kernel"] = _get_quantize_activation_int8_kernel(dtype)
-        op.attrs["_q8_kernel"] = _get_matmul_int8_q8_kernel(8, dtype, True)
+        # Share activation loads only when halving the grid retains two CTAs per SM.
+        grouped_blocks = (rows * ((columns + 1) // 2) * 8 + 127) // 128
+        outputs_per_group = 2 if grouped_blocks >= 2 * device.sm_count else 1
+        op.attrs["_q8_outputs_per_group"] = outputs_per_group
+        op.attrs["_q8_kernel"] = _get_matmul_int8_q8_kernel(
+            8, dtype, True, outputs_per_group
+        )
         return
     if weight.dtype != dtype or dtype not in (
         wp.float16,

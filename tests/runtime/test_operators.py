@@ -18,6 +18,7 @@ from warp_nn.runtime.kernels import (
     _get_gqa_attention_kernel,
     _get_greedy_argmax_kernels,
     _get_grouped_decode_linear_kernel,
+    _get_matmul_int8_q8_kernel,
     _get_linear_attention_kernel,
     _allocate_partitioned_gqa,
     _launch_partitioned_gqa,
@@ -160,6 +161,74 @@ def test_q8_0_linear_operation(rows):
     np.testing.assert_allclose(
         tensors["output"].numpy(), x_bf16 @ dequantized.T, atol=0.3, rtol=0.03
     )
+
+
+def test_q8_grouped_outputs_match_single_output_kernel():
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(29)
+    rows, columns, blocks = 3, 41, 2
+    activation_values = wp.array(
+        rng.integers(-127, 128, (rows, blocks, 32), dtype=np.int8),
+        device="cuda:0",
+    )
+    activation_words = wp.array(
+        ptr=activation_values.ptr,
+        capacity=activation_values.capacity,
+        shape=(rows, blocks, 8),
+        dtype=wp.uint32,
+        device="cuda:0",
+        copy=False,
+    )
+    activation_scales = wp.array(
+        rng.uniform(0.001, 0.02, (rows, blocks)).astype(np.float32),
+        device="cuda:0",
+    )
+    weight_values = wp.array(
+        rng.integers(-127, 128, (columns, blocks, 32), dtype=np.int8),
+        device="cuda:0",
+    )
+    weight_words = wp.array(
+        ptr=weight_values.ptr,
+        capacity=weight_values.capacity,
+        shape=(columns, blocks, 8),
+        dtype=wp.uint32,
+        device="cuda:0",
+        copy=False,
+    )
+    weight_scales = wp.array(
+        rng.uniform(0.001, 0.02, (columns, blocks)).astype(np.float16),
+        device="cuda:0",
+    )
+    single = wp.empty((rows, columns), dtype=wp.bfloat16, device="cuda:0")
+    grouped = wp.empty_like(single)
+    wp.launch(
+        _get_matmul_int8_q8_kernel(8, wp.bfloat16, True, 1),
+        dim=rows * columns * 8,
+        inputs=[
+            activation_words,
+            activation_scales,
+            weight_words,
+            weight_scales,
+            single,
+        ],
+        block_dim=128,
+        device="cuda:0",
+    )
+    wp.launch(
+        _get_matmul_int8_q8_kernel(8, wp.bfloat16, True, 2),
+        dim=rows * ((columns + 1) // 2) * 8,
+        inputs=[
+            activation_words,
+            activation_scales,
+            weight_words,
+            weight_scales,
+            grouped,
+        ],
+        block_dim=128,
+        device="cuda:0",
+    )
+    np.testing.assert_array_equal(grouped.numpy(), single.numpy())
 
 
 def test_gated_rms_norm_bfloat16():

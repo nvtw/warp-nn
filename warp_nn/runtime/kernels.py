@@ -787,13 +787,19 @@ def _matmul_int4_q8_kernel(
 
 @lru_cache(maxsize=None)
 def _get_matmul_int8_q8_kernel(
-    reduction_width: int, dtype: type = wp.float16, signed_weights: bool = False
+    reduction_width: int,
+    dtype: type = wp.float16,
+    signed_weights: bool = False,
+    outputs_per_group: int = 1,
 ):
     """Build a block-scaled INT8 matrix-vector kernel."""
+    if outputs_per_group not in (1, 2):
+        raise ValueError("Q8 output grouping must be 1 or 2")
     REDUCTION_WIDTH = reduction_width
     WORDS_PER_LANE = 8 // reduction_width
     DTYPE = dtype
     SIGNED_WEIGHTS = signed_weights
+    OUTPUTS_PER_GROUP = outputs_per_group
 
     @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
     def kernel(
@@ -807,29 +813,35 @@ def _get_matmul_int8_q8_kernel(
         thread = wp.tid()
         lane = thread % REDUCTION_WIDTH
         item = thread / REDUCTION_WIDTH
-        row = item / weights.shape[0]
-        column = item % weights.shape[0]
-        total = wp.float32(0.0)
+        groups = (weights.shape[0] + OUTPUTS_PER_GROUP - 1) / OUTPUTS_PER_GROUP
+        row = item / groups
+        column_0 = (item % groups) * OUTPUTS_PER_GROUP
+        totals = wp.vec2f(0.0, 0.0)
         for block in range(weights.shape[1]):
-            block_total = 0
+            activation_scale = activation_scales[row, block]
             for group in range(WORDS_PER_LANE):
                 word = lane + group * REDUCTION_WIDTH
                 packed_activation = wp.int32(activations[row, block, word])
-                if wp.static(SIGNED_WEIGHTS):
-                    packed_weights = wp.int32(weights[column, block, word])
-                else:
-                    packed_weights = wp.int32(
-                        weights[column, block, word] ^ wp.uint32(0x80808080)
-                    )
-                block_total = dp4a(packed_weights, packed_activation, block_total)
-            total += (
-                wp.float32(block_total)
-                * activation_scales[row, block]
-                * wp.float32(weight_scales[column, block])
-            )
-        total = subgroup_sum(total, REDUCTION_WIDTH)
-        if lane == 0:
-            output[row, column] = DTYPE(total)
+                for output_item in range(OUTPUTS_PER_GROUP):
+                    column = column_0 + output_item
+                    if column < weights.shape[0]:
+                        if wp.static(SIGNED_WEIGHTS):
+                            packed_weights = wp.int32(weights[column, block, word])
+                        else:
+                            packed_weights = wp.int32(
+                                weights[column, block, word] ^ wp.uint32(0x80808080)
+                            )
+                        block_total = dp4a(packed_weights, packed_activation, 0)
+                        totals[output_item] += (
+                            wp.float32(block_total)
+                            * activation_scale
+                            * wp.float32(weight_scales[column, block])
+                        )
+        for output_item in range(OUTPUTS_PER_GROUP):
+            column = column_0 + output_item
+            total = subgroup_sum(totals[output_item], REDUCTION_WIDTH)
+            if lane == 0 and column < weights.shape[0]:
+                output[row, column] = DTYPE(total)
 
     return kernel
 
