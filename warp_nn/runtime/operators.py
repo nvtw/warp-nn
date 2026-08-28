@@ -727,6 +727,7 @@ def _exec_group_query_attention(op, tensors, shapes, device):
             sequence_length,
             total_length,
             float(op.attrs.get("scale", head_size**-0.5)),
+            0,
         ],
         block_dim=op.attrs["_attention_block_dim"],
         device=device,

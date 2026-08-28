@@ -399,6 +399,7 @@ class _NemotronPlan:
                 self.rows,
                 self.runner.cache_capacity,
                 self.runner.attention_head_dim**-0.5,
+                0,
             ],
             block_dim=layer["attention_block"],
             device=self.device,

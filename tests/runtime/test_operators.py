@@ -10,6 +10,7 @@ from tests.utilities import is_device_available
 from warp_nn.runtime._cublas import try_create_cublas
 from warp_nn.runtime.kernels import (
     _append_head_cache_kernel,
+    _append_circular_head_cache_kernel,
     _causal_conv_rows_kernel,
     _get_gated_rms_norm_kernel,
     _get_gqa_attention_kernel,
@@ -19,6 +20,8 @@ from warp_nn.runtime.kernels import (
     _relu2_kernel,
     _reorder_heads_kernel,
     _sigmoid_gate_kernel,
+    _logit_softcap_kernel,
+    _scale_kernel,
     _unpack_gated_heads_kernel,
     _update_conv_rows_state_kernel,
 )
@@ -117,6 +120,7 @@ def test_group_query_attention_bfloat16():
             sequence_length,
             sequence_length,
             head_size**-0.5,
+            0,
         ],
         block_dim=block_dim,
         device="cuda:0",
@@ -130,6 +134,59 @@ def test_group_query_attention_bfloat16():
             weights /= weights.sum()
             expected[token, head * head_size : (head + 1) * head_size] = weights @ value_np[0, : token + 1]
     np.testing.assert_allclose(output.numpy(), expected, atol=0.04, rtol=0.02)
+
+
+def test_circular_window_attention_and_logit_softcap():
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(31)
+    capacity, window, head_size = 4, 3, 8
+    keys = rng.normal(size=(6, head_size)).astype(np.float32)
+    values = rng.normal(size=(6, head_size)).astype(np.float32)
+    key_ring = np.empty((capacity, head_size), dtype=np.float32)
+    value_ring = np.empty_like(key_ring)
+    for position in range(2, 6):
+        key_ring[position % capacity] = keys[position]
+        value_ring[position % capacity] = values[position]
+    query_np = rng.normal(size=(1, head_size)).astype(np.float32)
+    query = wp.array(query_np, dtype=wp.bfloat16, device="cuda:0")
+    key = wp.array(key_ring, dtype=wp.bfloat16, device="cuda:0")
+    value = wp.array(value_ring, dtype=wp.bfloat16, device="cuda:0")
+    lengths = wp.array(np.array([5], dtype=np.int32), device="cuda:0")
+    output = wp.empty((1, head_size), dtype=wp.bfloat16, device="cuda:0")
+    block_dim, kernel = _get_gqa_attention_kernel(head_size, wp.bfloat16)
+
+    wp.launch_tiled(
+        kernel,
+        dim=1,
+        inputs=[query, key, value, lengths, output, 1, 1, 1, capacity, head_size**-0.5, window],
+        block_dim=block_dim,
+        device="cuda:0",
+    )
+    scores = query_np[0] @ keys[3:6].T / np.sqrt(head_size)
+    weights = np.exp(scores - scores.max())
+    expected = weights @ values[3:6] / weights.sum()
+    np.testing.assert_allclose(output.numpy()[0], expected, atol=0.04, rtol=0.02)
+
+    source = wp.array(np.arange(16, dtype=np.float32).reshape(2, 8), dtype=wp.bfloat16, device="cuda:0")
+    positions = wp.array(np.array([[4, 5]], dtype=np.int64), device="cuda:0")
+    cache = wp.zeros((capacity, head_size), dtype=wp.bfloat16, device="cuda:0")
+    wp.launch(
+        _append_circular_head_cache_kernel,
+        dim=(1, 2, head_size),
+        inputs=[source, positions, cache, 1, head_size],
+        device="cuda:0",
+    )
+    np.testing.assert_array_equal(cache.numpy()[:2], source.numpy())
+
+    logits = wp.array(np.array([[[-40.0, 0.0, 40.0]]], dtype=np.float32), dtype=wp.bfloat16, device="cuda:0")
+    capped = wp.empty_like(logits)
+    wp.launch(_logit_softcap_kernel, dim=logits.shape, inputs=[logits, capped, 0.2, 20.0], device="cuda:0")
+    expected_logits = 20.0 * np.tanh(np.array([-40.0, 0.0, 40.0]) * 0.2 / 20.0)
+    np.testing.assert_allclose(capped.numpy()[0, 0], expected_logits, atol=0.03)
+
+    wp.launch(_scale_kernel, dim=(1, 3), inputs=[capped.reshape((1, 3)), capped.reshape((1, 3)), 2.0])
+    np.testing.assert_allclose(capped.numpy()[0, 0], expected_logits * 2.0, atol=0.06)
 
 
 def test_head_layout_cache_and_bfloat16_argmax():

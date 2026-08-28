@@ -496,11 +496,37 @@ def _append_head_cache_kernel(
 
 
 @wp.kernel(enable_backward=False, module="unique")
+def _append_circular_head_cache_kernel(
+    x: wp.array2d[Any], positions: wp.array2d[wp.int64], cache: wp.array2d[Any], heads: int, head_size: int
+):
+    """Append head-major rows to a circular device-side cache."""
+    head, row, column = wp.tid()
+    capacity = cache.shape[0] / heads
+    position = wp.int32(positions[0, row] % wp.int64(capacity))
+    cache[head * capacity + position, column] = x[head * positions.shape[1] + row, column]
+
+
+@wp.kernel(enable_backward=False, module="unique")
 def _sigmoid_gate_kernel(x: wp.array2d[Any], gate: wp.array2d[Any], output: wp.array2d[Any]):
     """Multiply activations by a sigmoid gate."""
     row, column = wp.tid()
     gate_value = wp.float32(gate[row, column])
     output[row, column] = x.dtype(wp.float32(x[row, column]) / (wp.float32(1.0) + wp.exp(-gate_value)))
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _scale_kernel(x: wp.array2d[Any], output: wp.array2d[Any], scale: float):
+    """Multiply an array by one scalar, allowing in-place output."""
+    row, column = wp.tid()
+    output[row, column] = x.dtype(wp.float32(x[row, column]) * wp.float32(scale))
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _logit_softcap_kernel(x: wp.array3d[Any], output: wp.array3d[Any], multiplier: float, cap: float):
+    """Apply ``cap * tanh(x * multiplier / cap)`` to logits."""
+    batch, row, column = wp.tid()
+    value = wp.float32(x[batch, row, column]) * wp.float32(multiplier) / wp.float32(cap)
+    output[batch, row, column] = x.dtype(wp.float32(cap) * wp.tanh(value))
 
 
 @wp.kernel(enable_backward=False)
@@ -1572,21 +1598,24 @@ def _create_gqa_attention_kernel(head_size: int, dtype: type):
         sequence_length: int,
         total_length: int,
         scale: float,
+        window: int,
     ):
-        """Apply causal grouped-query attention over the populated cache."""
+        """Apply causal GQA with an optional circular sliding window."""
         index = wp.tid()
         query_token = index % sequence_length
         head = (index // sequence_length) % query_heads
         batch = index // (sequence_length * query_heads)
         kv_head = head // (query_heads // kv_heads)
         valid_keys = wp.int32(sequence_lengths_minus_one[batch]) - sequence_length + query_token + 2
+        first_key = wp.max(0, valid_keys - window) if window > 0 else 0
         query_row = (batch * query_heads + head) * sequence_length + query_token
         query_values = wp.tile_load(query[query_row], shape=(head_size,))
         accumulator = wp.tile_zeros(shape=(head_size,), dtype=wp.float32)
         maximum = wp.float32(-3.402823466e38) + wp.float32(DTYPE(0.0))
         denominator = wp.float32(0.0)
-        for key_token in range(valid_keys):
-            cache_row = (batch * kv_heads + kv_head) * total_length + key_token
+        for key_token in range(first_key, valid_keys):
+            cache_token = key_token % total_length if window > 0 else key_token
+            cache_row = (batch * kv_heads + kv_head) * total_length + cache_token
             key_values = wp.tile_load(key[cache_row], shape=(head_size,))
             score = wp.tile_extract(wp.tile_sum(wp.tile_map(dot, query_values, key_values)), 0)
             score *= wp.float32(scale)
