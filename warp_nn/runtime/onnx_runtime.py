@@ -627,9 +627,10 @@ def _get_matmul_int8_q8_kernel(reduction_width: int):
                 packed_activation = wp.int32(activations[row, block, word])
                 signed_weights = wp.int32(weights[column, block, word] ^ wp.uint32(0x80808080))
                 block_total = _dp4a(signed_weights, packed_activation, block_total)
-            reduced = _subgroup_sum(wp.float32(block_total), REDUCTION_WIDTH)
-            if lane == 0:
-                total += reduced * activation_scales[row, block] * wp.float32(weight_scales[column, block])
+            total += (
+                wp.float32(block_total) * activation_scales[row, block] * wp.float32(weight_scales[column, block])
+            )
+        total = _subgroup_sum(total, REDUCTION_WIDTH)
         if lane == 0:
             output[row, column] = wp.float16(total)
 
