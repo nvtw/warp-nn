@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Small native CUDA matrix primitives used by Warp kernels."""
+"""Optimized FP16/BF16 linear kernels for decode and 16-row prefill."""
 
 from functools import lru_cache
 
 import warp as wp
+
+from warp_nn.runtime._cuda import subgroup_sum
 
 
 _MMA_16X64 = r"""
@@ -116,7 +118,7 @@ _MMA_16X64 = r"""
 
 
 @lru_cache(maxsize=None)
-def get_mma_16x64(dtype):
+def _get_mma_16x64(dtype):
     """Return the SM80 16x64 MMA primitive for FP16 or BF16 storage."""
     if dtype == wp.float16:
         native_type, ptx_type = "wp::float16", "f16"
@@ -138,3 +140,90 @@ def get_mma_16x64(dtype):
     ): ...
 
     return mma
+
+
+def _create_decode_linear_kernel(dtype: type):
+    """Build the vec4 single-token projection with four outputs per warp."""
+    DTYPE = dtype
+    VTYPE = wp.vec4h if dtype == wp.float16 else wp.types.vector(4, wp.bfloat16)
+    SUBGROUP = 32
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(
+        x: wp.array2d(dtype=VTYPE),
+        weight: wp.array2d(dtype=VTYPE),
+        output: wp.array2d(dtype=DTYPE),
+    ):
+        thread = wp.tid()
+        lane = thread % SUBGROUP
+        column = (thread / SUBGROUP) * 4
+        total0 = wp.float32(0.0)
+        total1 = wp.float32(0.0)
+        total2 = wp.float32(0.0)
+        total3 = wp.float32(0.0)
+        for inner in range(lane, x.shape[1], SUBGROUP):
+            activation = VTYPE(x[0, inner])
+            weights0 = VTYPE(weight[column, inner])
+            weights1 = VTYPE(weight[column + 1, inner])
+            weights2 = VTYPE(weight[column + 2, inner])
+            weights3 = VTYPE(weight[column + 3, inner])
+            for component in range(4):
+                value = wp.float32(activation[component])
+                total0 += value * wp.float32(weights0[component])
+                total1 += value * wp.float32(weights1[component])
+                total2 += value * wp.float32(weights2[component])
+                total3 += value * wp.float32(weights3[component])
+        total0 = subgroup_sum(total0, SUBGROUP)
+        total1 = subgroup_sum(total1, SUBGROUP)
+        total2 = subgroup_sum(total2, SUBGROUP)
+        total3 = subgroup_sum(total3, SUBGROUP)
+        if lane == 0:
+            output[0, column] = DTYPE(total0)
+            output[0, column + 1] = DTYPE(total1)
+            output[0, column + 2] = DTYPE(total2)
+            output[0, column + 3] = DTYPE(total3)
+
+    kernel.module.options["enable_backward"] = False
+    return kernel, VTYPE
+
+
+@lru_cache(maxsize=None)
+def get_decode_linear_kernel(dtype: type):
+    """Return the cached single-token projection kernel and packed dtype."""
+    return _create_decode_linear_kernel(dtype)
+
+
+def _create_prefill_linear_kernels(dtype: type):
+    """Build the adaptive split-K 16-row projection and epilogue."""
+    DTYPE = dtype
+    mma = _get_mma_16x64(dtype)
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def project(
+        x: wp.array(dtype=DTYPE),
+        weight: wp.array(dtype=DTYPE),
+        output: wp.array(dtype=wp.float32),
+        columns: int,
+        inner: int,
+        splits: int,
+    ):
+        typed_zero = DTYPE(0.0)
+        wp.static(mma)(x, weight, output, wp.tid(), columns, inner, splits)
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def combine(partials: wp.array(dtype=wp.float32), output: wp.array(dtype=DTYPE), output_size: int, splits: int):
+        index = wp.tid()
+        value = wp.float32(0.0)
+        for split in range(splits):
+            value += partials[split * output_size + index]
+        output[index] = DTYPE(value)
+
+    project.module.options["enable_backward"] = False
+    combine.module.options["enable_backward"] = False
+    return project, combine
+
+
+@lru_cache(maxsize=None)
+def get_prefill_linear_kernels(dtype: type):
+    """Return the cached 16-row projection and private epilogue kernels."""
+    return _create_prefill_linear_kernels(dtype)

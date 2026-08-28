@@ -16,8 +16,6 @@ from warp_nn.runtime.kernels import (
     _GEMM_CONFIG,
     _GEMM_TRANSB_TILED_KERNEL,
     _gather_block_quantized_int8_kernel,
-    _get_linear_mma_kernels,
-    _get_linear_packed_vector_kernel,
     _get_linear_tiled_kernel,
     _get_linear_vector_kernel,
     _get_rms_norm_kernels,
@@ -27,6 +25,7 @@ from warp_nn.runtime.kernels import (
     _linear_kernel,
     _quantize_activation_int8_kernel,
 )
+from warp_nn.runtime.linear_kernels import get_decode_linear_kernel, get_prefill_linear_kernels
 from warp_nn.utils.ops import resolve_dim
 
 
@@ -40,9 +39,11 @@ class Operation:
     attrs: dict[str, Any] = field(default_factory=dict)
 
 
-def _prefer_linear_mma(has_cublas: bool, arch: int, columns: int, inner: int) -> bool:
-    """Use MMA as a fallback, or past its measured SM86 cuBLAS crossover."""
-    return not has_cublas or (arch == 86 and inner >= 4096 and columns <= 3 * inner)
+def _prefer_optimized_linear(has_cublas: bool, arch: int, columns: int, inner: int) -> bool:
+    """Use Warp as a fallback, or inside its measured SM86 cuBLAS envelope."""
+    smaller = min(columns, inner)
+    larger = max(columns, inner)
+    return not has_cublas or (arch == 86 and smaller >= 4096 and larger <= 3 * smaller)
 
 
 def execute_operations(
@@ -148,6 +149,7 @@ def plan_linear(op: Operation, tensors: dict[str, wp.array], shapes: dict[str, t
     weight = tensors[op.inputs[1]]
     if (
         device.is_cuda
+        and _prefer_optimized_linear(cublas is not None, device.arch, columns, inner)
         and rows == 1
         and columns % 4 == 0
         and inner % 4 == 0
@@ -157,7 +159,7 @@ def plan_linear(op: Operation, tensors: dict[str, wp.array], shapes: dict[str, t
         and x.ptr % 8 == 0
         and weight.ptr % 8 == 0
     ):
-        op.attrs["_kernel"], vector_type = _get_linear_packed_vector_kernel(dtype)
+        op.attrs["_kernel"], vector_type = get_decode_linear_kernel(dtype)
         op.attrs["_packed_vector"] = True
         op.attrs["_packed_x"] = wp.array(
             ptr=tensors[op.inputs[0]].ptr,
@@ -175,7 +177,7 @@ def plan_linear(op: Operation, tensors: dict[str, wp.array], shapes: dict[str, t
         )
     elif (
         device.is_cuda
-        and _prefer_linear_mma(cublas is not None, device.arch, columns, inner)
+        and _prefer_optimized_linear(cublas is not None, device.arch, columns, inner)
         and device.arch >= 80
         and rows == 16
         and columns % 64 == 0
@@ -188,7 +190,7 @@ def plan_linear(op: Operation, tensors: dict[str, wp.array], shapes: dict[str, t
     ):
         split_limit = min(4, max(1, 16384 // columns))
         splits = 1 << (split_limit.bit_length() - 1)
-        op.attrs["_mma_kernels"] = _get_linear_mma_kernels(dtype)
+        op.attrs["_mma_kernels"] = get_prefill_linear_kernels(dtype)
         op.attrs["_mma"] = True
         op.attrs["_mma_splits"] = splits
         op.attrs["_mma_x"] = x.flatten()

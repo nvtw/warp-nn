@@ -25,16 +25,22 @@ from warp_nn.runtime.kernels import (
     _unpack_gated_heads_kernel,
     _update_conv_rows_state_kernel,
 )
-from warp_nn.runtime.operators import Operation, _prefer_linear_mma, execute_operations, plan_linear, plan_rms_norm
+from warp_nn.runtime.operators import (
+    Operation,
+    _prefer_optimized_linear,
+    execute_operations,
+    plan_linear,
+    plan_rms_norm,
+)
 
 
-def test_linear_mma_selection_is_conservative_with_cublas():
-    assert _prefer_linear_mma(False, 80, 64, 128)
-    assert _prefer_linear_mma(True, 86, 4096, 4096)
-    assert not _prefer_linear_mma(True, 86, 1024, 1024)
-    assert _prefer_linear_mma(True, 86, 12288, 4096)
-    assert not _prefer_linear_mma(True, 86, 16384, 4096)
-    assert not _prefer_linear_mma(True, 89, 4096, 4096)
+def test_optimized_linear_selection_is_conservative_with_cublas():
+    assert _prefer_optimized_linear(False, 80, 64, 128)
+    assert _prefer_optimized_linear(True, 86, 4096, 4096)
+    assert not _prefer_optimized_linear(True, 86, 1024, 1024)
+    assert _prefer_optimized_linear(True, 86, 12288, 4096)
+    assert not _prefer_optimized_linear(True, 86, 16384, 4096)
+    assert not _prefer_optimized_linear(True, 89, 4096, 4096)
 
 
 @pytest.mark.parametrize(("device", "rows"), [("cpu", 3), ("cuda:0", 3), ("cuda:0", 32)])
@@ -93,7 +99,7 @@ def test_single_token_linear_uses_graph_captured_packed_warp(dtype):
     }
     shapes = {name: tuple(value.shape) for name, value in tensors.items()}
     operation = Operation("Linear", ["x", "weight"], ["output"])
-    plan_linear(operation, tensors, shapes, wp.get_device("cuda:0"), cublas=try_create_cublas())
+    plan_linear(operation, tensors, shapes, wp.get_device("cuda:0"))
 
     assert operation.attrs["_packed_vector"]
     with wp.ScopedCapture("cuda:0") as capture:
