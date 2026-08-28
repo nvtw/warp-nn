@@ -7,7 +7,50 @@ from functools import lru_cache
 
 import warp as wp
 
-from warp_nn.runtime._cuda import subgroup_sum
+
+_DECODE_LINEAR = r"""
+#if defined(__CUDA_ARCH__)
+    const int lane = tid & 31;
+    const int column = (tid >> 5) * 4;
+    const NATIVE_TYPE* xp = x.data;
+    const NATIVE_TYPE* wp = weight.data;
+    float total0 = 0.0f, total1 = 0.0f, total2 = 0.0f, total3 = 0.0f;
+
+    for (int k = lane * 8; k < inner; k += 256) {
+        uint4 av = *reinterpret_cast<const uint4*>(xp + k);
+        uint4 w0v = *reinterpret_cast<const uint4*>(wp + column * inner + k);
+        uint4 w1v = *reinterpret_cast<const uint4*>(wp + (column + 1) * inner + k);
+        uint4 w2v = *reinterpret_cast<const uint4*>(wp + (column + 2) * inner + k);
+        uint4 w3v = *reinterpret_cast<const uint4*>(wp + (column + 3) * inner + k);
+        const NATIVE_TYPE* a = reinterpret_cast<const NATIVE_TYPE*>(&av);
+        const NATIVE_TYPE* w0 = reinterpret_cast<const NATIVE_TYPE*>(&w0v);
+        const NATIVE_TYPE* w1 = reinterpret_cast<const NATIVE_TYPE*>(&w1v);
+        const NATIVE_TYPE* w2 = reinterpret_cast<const NATIVE_TYPE*>(&w2v);
+        const NATIVE_TYPE* w3 = reinterpret_cast<const NATIVE_TYPE*>(&w3v);
+        #pragma unroll
+        for (int component = 0; component < 8; ++component) {
+            float value = float(a[component]);
+            total0 = fmaf(value, float(w0[component]), total0);
+            total1 = fmaf(value, float(w1[component]), total1);
+            total2 = fmaf(value, float(w2[component]), total2);
+            total3 = fmaf(value, float(w3[component]), total3);
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset; offset >>= 1) {
+        total0 += __shfl_down_sync(0xffffffffu, total0, offset);
+        total1 += __shfl_down_sync(0xffffffffu, total1, offset);
+        total2 += __shfl_down_sync(0xffffffffu, total2, offset);
+        total3 += __shfl_down_sync(0xffffffffu, total3, offset);
+    }
+    if (lane == 0) {
+        output.data[column] = NATIVE_TYPE(total0);
+        output.data[column + 1] = NATIVE_TYPE(total1);
+        output.data[column + 2] = NATIVE_TYPE(total2);
+        output.data[column + 3] = NATIVE_TYPE(total3);
+    }
+#endif
+"""
 
 
 _MMA_16X64 = r"""
@@ -143,53 +186,44 @@ def _get_mma_16x64(dtype):
 
 
 def _create_decode_linear_kernel(dtype: type):
-    """Build the vec4 single-token projection with four outputs per warp."""
+    """Build the vec8 single-token projection with four outputs per warp."""
     DTYPE = dtype
-    VTYPE = wp.vec4h if dtype == wp.float16 else wp.types.vector(4, wp.bfloat16)
-    SUBGROUP = 32
+    if dtype == wp.float16:
+        native_type = "wp::float16"
+    elif dtype == wp.bfloat16:
+        native_type = "wp::bfloat16"
+    else:
+        raise TypeError("Decode projection requires FP16 or BF16")
+    snippet = _DECODE_LINEAR.replace("NATIVE_TYPE", native_type)
+
+    @wp.func_native(snippet)
+    def project(
+        x: wp.array[DTYPE],
+        weight: wp.array[DTYPE],
+        output: wp.array[DTYPE],
+        tid: int,
+        columns: int,
+        inner: int,
+    ): ...
 
     @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
     def kernel(
-        x: wp.array2d(dtype=VTYPE),
-        weight: wp.array2d(dtype=VTYPE),
-        output: wp.array2d(dtype=DTYPE),
+        x: wp.array(dtype=DTYPE),
+        weight: wp.array(dtype=DTYPE),
+        output: wp.array(dtype=DTYPE),
+        columns: int,
+        inner: int,
     ):
-        thread = wp.tid()
-        lane = thread % SUBGROUP
-        column = (thread / SUBGROUP) * 4
-        total0 = wp.float32(0.0)
-        total1 = wp.float32(0.0)
-        total2 = wp.float32(0.0)
-        total3 = wp.float32(0.0)
-        for inner in range(lane, x.shape[1], SUBGROUP):
-            activation = VTYPE(x[0, inner])
-            weights0 = VTYPE(weight[column, inner])
-            weights1 = VTYPE(weight[column + 1, inner])
-            weights2 = VTYPE(weight[column + 2, inner])
-            weights3 = VTYPE(weight[column + 3, inner])
-            for component in range(4):
-                value = wp.float32(activation[component])
-                total0 += value * wp.float32(weights0[component])
-                total1 += value * wp.float32(weights1[component])
-                total2 += value * wp.float32(weights2[component])
-                total3 += value * wp.float32(weights3[component])
-        total0 = subgroup_sum(total0, SUBGROUP)
-        total1 = subgroup_sum(total1, SUBGROUP)
-        total2 = subgroup_sum(total2, SUBGROUP)
-        total3 = subgroup_sum(total3, SUBGROUP)
-        if lane == 0:
-            output[0, column] = DTYPE(total0)
-            output[0, column + 1] = DTYPE(total1)
-            output[0, column + 2] = DTYPE(total2)
-            output[0, column + 3] = DTYPE(total3)
+        typed_zero = DTYPE(0.0)
+        wp.static(project)(x, weight, output, wp.tid(), columns, inner)
 
     kernel.module.options["enable_backward"] = False
-    return kernel, VTYPE
+    return kernel
 
 
 @lru_cache(maxsize=None)
 def get_decode_linear_kernel(dtype: type):
-    """Return the cached single-token projection kernel and packed dtype."""
+    """Return the cached single-token projection kernel."""
     return _create_decode_linear_kernel(dtype)
 
 
