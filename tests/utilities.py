@@ -15,14 +15,30 @@
 
 from typing import Literal
 
+import json
 import math
 import os
+import struct
+from pathlib import Path
 import torch
 
 import numpy as np
 import warp as wp
 
 from warp_nn.utils import logger
+
+
+def write_safetensors(path: Path, tensors: dict[str, tuple[str, tuple[int, ...], bytes]]) -> None:
+    """Write the small safetensors fixtures used by runtime tests."""
+    header = {}
+    data = bytearray()
+    for name, (dtype, shape, payload) in tensors.items():
+        begin = len(data)
+        data.extend(payload)
+        header[name] = {"dtype": dtype, "shape": shape, "data_offsets": [begin, len(data)]}
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    encoded += b" " * ((-len(encoded)) % 8)
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + data)
 
 
 def is_device_available(device: str) -> bool:

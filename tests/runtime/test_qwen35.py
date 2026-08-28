@@ -1,0 +1,117 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import pytest
+
+import json
+
+import numpy as np
+
+from tests.utilities import is_device_available, write_safetensors
+from warp_nn.runtime.qwen35 import Qwen35Runner, _weight_names
+
+
+def _bfloat16_bytes(values: np.ndarray) -> bytes:
+    values = np.asarray(values, dtype=np.float32)
+    bits = values.view(np.uint32)
+    rounded = bits + np.uint32(0x7FFF) + ((bits >> 16) & 1)
+    return (rounded >> 16).astype(np.uint16).tobytes()
+
+
+def _write_tiny_qwen35(path):
+    config = {
+        "model_type": "qwen3_5_text",
+        "hidden_size": 8,
+        "intermediate_size": 12,
+        "vocab_size": 16,
+        "num_hidden_layers": 2,
+        "layer_types": ["linear_attention", "full_attention"],
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 4,
+        "linear_num_key_heads": 1,
+        "linear_num_value_heads": 2,
+        "linear_key_head_dim": 4,
+        "linear_value_head_dim": 4,
+        "linear_conv_kernel_dim": 3,
+        "max_position_embeddings": 32,
+        "rms_norm_eps": 1.0e-6,
+        "attention_bias": False,
+        "hidden_act": "silu",
+        "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.5},
+    }
+    rng = np.random.default_rng(97)
+    shapes = {
+        "model.language_model.embed_tokens.weight": (16, 8),
+        "model.language_model.norm.weight": (8,),
+        "lm_head.weight": (16, 8),
+    }
+    for index in range(2):
+        prefix = f"model.language_model.layers.{index}."
+        shapes.update(
+            {
+                prefix + "input_layernorm.weight": (8,),
+                prefix + "post_attention_layernorm.weight": (8,),
+                prefix + "mlp.gate_proj.weight": (12, 8),
+                prefix + "mlp.up_proj.weight": (12, 8),
+                prefix + "mlp.down_proj.weight": (8, 12),
+            }
+        )
+    linear = "model.language_model.layers.0.linear_attn."
+    shapes.update(
+        {
+            linear + "in_proj_qkv.weight": (16, 8),
+            linear + "in_proj_z.weight": (8, 8),
+            linear + "in_proj_a.weight": (2, 8),
+            linear + "in_proj_b.weight": (2, 8),
+            linear + "conv1d.weight": (16, 1, 3),
+            linear + "A_log": (2,),
+            linear + "dt_bias": (2,),
+            linear + "norm.weight": (4,),
+            linear + "out_proj.weight": (8, 8),
+        }
+    )
+    attention = "model.language_model.layers.1.self_attn."
+    shapes.update(
+        {
+            attention + "q_proj.weight": (16, 8),
+            attention + "k_proj.weight": (4, 8),
+            attention + "v_proj.weight": (4, 8),
+            attention + "q_norm.weight": (4,),
+            attention + "k_norm.weight": (4,),
+            attention + "o_proj.weight": (8, 8),
+        }
+    )
+    tensors = {}
+    for name in _weight_names(config):
+        shape = shapes[name]
+        if name.endswith("layernorm.weight") or name.endswith("q_norm.weight") or name.endswith("k_norm.weight"):
+            values = np.zeros(shape, dtype=np.float32)
+        elif name.endswith("linear_attn.norm.weight"):
+            values = np.ones(shape, dtype=np.float32)
+        elif name.endswith("A_log"):
+            values = np.zeros(shape, dtype=np.float32)
+        else:
+            values = rng.normal(0.0, 0.08, shape).astype(np.float32)
+        tensors[name] = ("BF16", shape, _bfloat16_bytes(values))
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps({"text_config": config}), encoding="utf-8")
+    write_safetensors(path / "model.safetensors", tensors)
+
+
+def test_qwen35_native_prefill_decode_and_graph_replay(tmp_path):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    model_path = tmp_path / "tiny-qwen35"
+    _write_tiny_qwen35(model_path)
+    runner = Qwen35Runner(model_path, device="cuda:0", cache_capacity=8, prefill_chunk_size=2, use_cublas=False)
+
+    first = runner.prefill([1, 2, 3]).numpy()
+    assert first.shape == (1, 1, 16)
+    assert np.isfinite(first).all()
+    decoded = runner.decode(4).numpy()
+    assert decoded.shape == (1, 1, 16)
+    assert np.isfinite(decoded).all()
+    replayed = runner.prefill([1, 2, 3])
+    np.testing.assert_allclose(replayed.numpy(), first, atol=2.0e-2, rtol=2.0e-2)
+    assert 0 <= runner.sample_greedy(replayed) < 16
