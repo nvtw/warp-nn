@@ -547,6 +547,38 @@ def _expand_int4x4(value: wp.uint32) -> wp.int32:
     )
 
 
+@wp.func_native(
+    """
+    unsigned packed = (unsigned)value;
+#if defined(__CUDA_ARCH__)
+    unsigned duplicated = __byte_perm(packed, 0, 0x1100);
+#else
+    unsigned byte0 = packed & 0xff;
+    unsigned byte1 = (packed >> 8) & 0xff;
+    unsigned duplicated = byte0 | (byte0 << 8) | (byte1 << 16) | (byte1 << 24);
+#endif
+    return (int)((duplicated & 0x000f000f) | ((duplicated & 0xf000f000) >> 4));
+    """
+)
+def _expand_int4x4_low_native(value: int) -> int: ...
+
+
+@wp.func_native(
+    """
+    unsigned packed = (unsigned)value;
+#if defined(__CUDA_ARCH__)
+    unsigned duplicated = __byte_perm(packed, 0, 0x3322);
+#else
+    unsigned byte2 = (packed >> 16) & 0xff;
+    unsigned byte3 = packed >> 24;
+    unsigned duplicated = byte2 | (byte2 << 8) | (byte3 << 16) | (byte3 << 24);
+#endif
+    return (int)((duplicated & 0x000f000f) | ((duplicated & 0xf000f000) >> 4));
+    """
+)
+def _expand_int4x4_high_native(value: int) -> int: ...
+
+
 @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
 def _matmul_int4_q8_kernel(
     activations: wp.array3d[wp.uint32],
@@ -565,8 +597,8 @@ def _matmul_int4_q8_kernel(
         packed_weights = weights[column, block, lane]
         packed_activation_0 = wp.int32(activations[row, block, lane * 2])
         packed_activation_1 = wp.int32(activations[row, block, lane * 2 + 1])
-        block_total = _dp4a(_expand_int4x4(packed_weights), packed_activation_0, 0)
-        block_total = _dp4a(_expand_int4x4(packed_weights >> wp.uint32(16)), packed_activation_1, block_total)
+        block_total = _dp4a(_expand_int4x4_low_native(wp.int32(packed_weights)), packed_activation_0, 0)
+        block_total = _dp4a(_expand_int4x4_high_native(wp.int32(packed_weights)), packed_activation_1, block_total)
         activation_sum = _dp4a(0x01010101, packed_activation_0, 0)
         activation_sum = _dp4a(0x01010101, packed_activation_1, activation_sum)
         block_total -= 8 * activation_sum
