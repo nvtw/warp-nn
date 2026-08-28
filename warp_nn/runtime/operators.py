@@ -18,6 +18,7 @@ from warp_nn.runtime.kernels import (
     _GEMM_CONFIG,
     _GEMM_TRANSB_TILED_KERNEL,
     _gather_block_quantized_int8_kernel,
+    _get_grouped_decode_linear_kernel,
     _get_linear_tiled_kernel,
     _get_linear_vector_kernel,
     _get_matmul_int8_q8_kernel,
@@ -98,7 +99,15 @@ def _exec_linear(op, tensors, shapes, device):
             2 if x.dtype == wp.float16 else 14,
         )
     elif device.is_cuda:
-        if op.attrs.get("_vector_kernel"):
+        if op.attrs.get("_grouped_decode_kernel"):
+            wp.launch(
+                op.attrs["_kernel"],
+                dim=(weight.shape[0] // 8) * 32,
+                inputs=[x, weight, output, op.attrs["_inner"]],
+                block_dim=128,
+                device=device,
+            )
+        elif op.attrs.get("_vector_kernel"):
             wp.launch_tiled(
                 op.attrs["_kernel"],
                 dim=x.shape[0] * weight.shape[0],
@@ -138,7 +147,8 @@ def plan_linear(
         raise ValueError(
             f"Linear has incompatible shapes {(rows, inner)} and {(columns, weight_inner)}"
         )
-    dtype = tensors[op.inputs[0]].dtype
+    activation = tensors[op.inputs[0]]
+    dtype = activation.dtype
     weight = tensors[op.inputs[1]]
     if isinstance(weight, BlockQuantizedTensor):
         if not device.is_cuda or dtype not in (wp.float16, wp.bfloat16):
@@ -175,7 +185,24 @@ def plan_linear(
     tensors[op.outputs[0]] = output
     shapes[op.outputs[0]] = output.shape
     op.attrs.update({"_rows": rows, "_columns": columns, "_inner": inner})
-    if cublas is not None and device.is_cuda and dtype in (wp.float16, wp.bfloat16):
+    grouped_decode = (
+        device.is_cuda
+        and rows == 1
+        and dtype in (wp.float16, wp.bfloat16)
+        and columns % 8 == 0
+        and inner % 8 == 0
+        and (columns + 31) // 32 >= device.sm_count
+        and activation.is_contiguous
+        and weight.is_contiguous
+        and output.is_contiguous
+        and activation.ptr % 16 == 0
+        and weight.ptr % 16 == 0
+        and output.ptr % 16 == 0
+    )
+    if grouped_decode:
+        op.attrs["_kernel"] = _get_grouped_decode_linear_kernel(dtype)
+        op.attrs["_grouped_decode_kernel"] = True
+    elif cublas is not None and device.is_cuda and dtype in (wp.float16, wp.bfloat16):
         op.attrs["_cublas"] = cublas
     elif device.is_cuda:
         if rows < 8:

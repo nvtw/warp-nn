@@ -16,6 +16,7 @@ from warp_nn.runtime.kernels import (
     _get_gated_rms_norm_kernel,
     _get_gqa_attention_kernel,
     _get_greedy_argmax_kernels,
+    _get_grouped_decode_linear_kernel,
     _get_linear_attention_kernel,
     _allocate_partitioned_gqa,
     _launch_partitioned_gqa,
@@ -59,6 +60,27 @@ def test_linear_operation(device, rows):
     np.testing.assert_allclose(
         tensors["output"].numpy(), x_np @ weight_np.T, atol=0.2, rtol=0.02
     )
+
+
+@pytest.mark.parametrize("dtype", [wp.float16, wp.bfloat16])
+def test_grouped_decode_linear_kernel(dtype):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(29)
+    columns, inner = 40, 64
+    x_np = rng.normal(size=(1, inner)).astype(np.float32)
+    weight_np = rng.normal(size=(columns, inner)).astype(np.float32)
+    x = wp.array(x_np, dtype=dtype, device="cuda:0")
+    weight = wp.array(weight_np, dtype=dtype, device="cuda:0")
+    output = wp.empty((1, columns), dtype=dtype, device="cuda:0")
+    wp.launch(
+        _get_grouped_decode_linear_kernel(dtype),
+        dim=(columns // 8) * 32,
+        inputs=[x, weight, output, inner],
+        block_dim=128,
+        device="cuda:0",
+    )
+    np.testing.assert_allclose(output.numpy(), x_np @ weight_np.T, atol=0.2, rtol=0.02)
 
 
 def test_linear_operation_cublas():
