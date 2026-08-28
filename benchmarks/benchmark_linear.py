@@ -36,22 +36,27 @@ def _projection(rows, columns, inner, dtype, device, stream, cublas=None, force_
     return capture.graph, tensors
 
 
-def _measure(graph, device, stream, iterations):
-    with wp.ScopedStream(stream):
-        for _ in range(5):
+def _measure_pair(graphs, device, streams, iterations):
+    for _ in range(10):
+        for graph, stream in zip(graphs, streams):
             wp.capture_launch(graph, stream=stream)
-        wp.synchronize_stream(stream)
-        start = wp.Event(device, enable_timing=True)
-        end = wp.Event(device, enable_timing=True)
-        samples = []
-        for _ in range(5):
-            wp.record_event(start)
-            for _ in range(iterations):
-                wp.capture_launch(graph, stream=stream)
-            wp.record_event(end)
-            wp.synchronize_event(end)
-            samples.append(wp.get_event_elapsed_time(start, end) / iterations)
-    return statistics.median(samples)
+    wp.synchronize_device(device)
+
+    samples = ([], [])
+    for sample in range(6):
+        order = (0, 1) if sample % 2 == 0 else (1, 0)
+        for index in order:
+            graph, stream = graphs[index], streams[index]
+            with wp.ScopedStream(stream):
+                start = wp.Event(device, enable_timing=True)
+                end = wp.Event(device, enable_timing=True)
+                wp.record_event(start)
+                for _ in range(iterations):
+                    wp.capture_launch(graph, stream=stream)
+                wp.record_event(end)
+                wp.synchronize_event(end)
+                samples[index].append(wp.get_event_elapsed_time(start, end) / iterations)
+    return tuple(statistics.median(values) for values in samples)
 
 
 def _randomize(tensor_sets, rows, columns, inner, dtype, device):
@@ -76,8 +81,7 @@ def _benchmark(rows, columns, inner, dtype_name, iterations, device, streams, cu
     wp.capture_launch(warp_graph, stream=warp_stream)
     wp.capture_launch(cublas_graph, stream=cublas_stream)
     wp.synchronize_device(device)
-    warp_ms = _measure(warp_graph, device, warp_stream, iterations)
-    cublas_ms = _measure(cublas_graph, device, cublas_stream, iterations)
+    warp_ms, cublas_ms = _measure_pair((warp_graph, cublas_graph), device, streams, iterations)
     expected = warp_tensors["x"].numpy().astype(np.float32) @ warp_tensors["weight"].numpy().astype(np.float32).T
     np.testing.assert_allclose(warp_tensors["output"].numpy(), expected, rtol=2.0e-2, atol=2.0e-2)
     np.testing.assert_allclose(cublas_tensors["output"].numpy(), expected, rtol=2.0e-2, atol=2.0e-2)
