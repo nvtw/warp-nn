@@ -255,7 +255,7 @@ def _transpose_0213_kernel(x: wp.array4d[Any], output: wp.array4d[Any]):
     output[i, j, k, l] = x[i, k, j, l]
 
 
-@wp.kernel(enable_backward=False)
+@wp.kernel(enable_backward=False, module="unique")
 def _split_last_axis_kernel(
     x: wp.array2d[Any],
     output: wp.array2d[Any],
@@ -289,7 +289,7 @@ def _where_broadcast_kernel(
     )
 
 
-@wp.kernel(enable_backward=False)
+@wp.kernel(enable_backward=False, module="unique")
 def _rotary_embedding_kernel(
     x: wp.array4d[Any],
     position_ids: wp.array2d[wp.int64],
@@ -442,21 +442,21 @@ def _gather_block_quantized_int8_kernel(
     )
 
 
-@wp.kernel
+@wp.kernel(module="unique")
 def _gather_rows_kernel(data: wp.array2d[Any], indices: wp.array2d[wp.int64], output: wp.array3d[Any]):
     """Gather matrix rows for batched token indices."""
     batch, sequence, column = wp.tid()
     output[batch, sequence, column] = data[indices[batch, sequence], column]
 
 
-@wp.kernel(enable_backward=False)
+@wp.kernel(enable_backward=False, module="unique")
 def _reorder_heads_kernel(x: wp.array2d[Any], output: wp.array2d[Any], head_size: int):
     """Reorder row-major packed heads into head-major rows."""
     row, head, column = wp.tid()
     output[head * x.shape[0] + row, column] = x[row, head * head_size + column]
 
 
-@wp.kernel(enable_backward=False)
+@wp.kernel(enable_backward=False, module="unique")
 def _unpack_gated_heads_kernel(x: wp.array2d[Any], values: wp.array2d[Any], gate: wp.array2d[Any], head_size: int):
     """Split per-head value/gate pairs and reorder values head-major."""
     row, head, column = wp.tid()
@@ -465,7 +465,7 @@ def _unpack_gated_heads_kernel(x: wp.array2d[Any], values: wp.array2d[Any], gate
     gate[row, head * head_size + column] = x[row, offset + head_size + column]
 
 
-@wp.kernel(enable_backward=False)
+@wp.kernel(enable_backward=False, module="unique")
 def _append_head_cache_kernel(
     x: wp.array2d[Any], positions: wp.array2d[wp.int64], cache: wp.array2d[Any], heads: int, head_size: int
 ):
@@ -475,7 +475,7 @@ def _append_head_cache_kernel(
     cache[head * capacity + wp.int32(positions[0, row]), column] = x[head * positions.shape[1] + row, column]
 
 
-@wp.kernel(enable_backward=False)
+@wp.kernel(enable_backward=False, module="unique")
 def _sigmoid_gate_kernel(x: wp.array2d[Any], gate: wp.array2d[Any], output: wp.array2d[Any]):
     """Multiply activations by a sigmoid gate."""
     row, column = wp.tid()
@@ -878,7 +878,7 @@ def _causal_conv_state_inplace_kernel(x: wp.array3d[Any], state: wp.array3d[Any]
             state[batch, channel, state_index] = x[batch, channel, source_index - state.shape[2]]
 
 
-@wp.kernel(enable_backward=False)
+@wp.kernel(enable_backward=False, module="unique")
 def _causal_conv_rows_kernel(
     x: wp.array2d[Any], weight: wp.array3d[Any], state: wp.array2d[Any], output: wp.array2d[Any]
 ):
@@ -896,7 +896,7 @@ def _causal_conv_rows_kernel(
     output[token, channel] = x.dtype(total / (wp.float32(1.0) + wp.exp(-total)))
 
 
-@wp.kernel(enable_backward=False)
+@wp.kernel(enable_backward=False, module="unique")
 def _update_conv_rows_state_kernel(x: wp.array2d[Any], state: wp.array2d[Any]):
     """Advance a row-major causal-convolution state in place."""
     channel = wp.tid()
@@ -908,7 +908,7 @@ def _update_conv_rows_state_kernel(x: wp.array2d[Any], state: wp.array2d[Any]):
             state[channel, state_index] = x[source - state.shape[1], channel]
 
 
-@wp.kernel(enable_backward=False)
+@wp.kernel(enable_backward=False, module="unique")
 def _prepare_gated_delta_kernel(
     a: wp.array2d[Any],
     b: wp.array2d[Any],
@@ -1296,7 +1296,7 @@ def _get_linear_attention_kernel(key_size: int, value_size: int, dtype: type, st
 def _create_swiglu_kernel(dtype: type):
     """Build a fused SiLU-gate-times-up-projection kernel."""
 
-    @wp.kernel(enable_backward=False)
+    @wp.kernel(enable_backward=False, module="unique")
     def kernel(
         gate: wp.array2d(dtype=dtype),
         up: wp.array2d(dtype=dtype),
@@ -1480,7 +1480,7 @@ def _set_decode_token(
     position_ids[0, 0] = wp.int64(position)
 
 
-@wp.kernel(enable_backward=False)
+@wp.kernel(enable_backward=False, module="unique")
 def _stage_token_position(
     input_ids: wp.array2d[wp.int64],
     position_ids: wp.array2d[wp.int64],
@@ -1494,7 +1494,7 @@ def _stage_token_position(
     sequence_end[0] = wp.int32(position)
 
 
-@wp.kernel(enable_backward=False)
+@wp.kernel(enable_backward=False, module="unique")
 def _set_sequence_end(sequence_end: wp.array1d[wp.int32], position: int):
     """Update the inclusive device-side sequence end."""
     sequence_end[0] = wp.int32(position)
