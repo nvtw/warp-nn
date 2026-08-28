@@ -436,25 +436,14 @@ class Qwen3OnnxRunner:
         }
         if "position_ids" in self.runtime.input_names:
             self._decode_inputs["position_ids"] = self._decode_position_ids
-        self._chunk_runtime = None
+        self._chunk_runtimes = {}
+        self._chunk_input_ids = {}
+        self._chunk_position_ids = {}
+        self._chunk_inputs = {}
         if prefill_chunk_size is not None:
-            self._chunk_input_ids = wp.zeros((1, prefill_chunk_size), dtype=wp.int64, device=self.runtime._device)
-            self._chunk_position_ids = wp.zeros((1, prefill_chunk_size), dtype=wp.int64, device=self.runtime._device)
-            chunk_shapes = {
-                "input_ids": (1, prefill_chunk_size),
-                "attention_mask": (1, self.cache_capacity),
-                **{name: tuple(cache.shape) for name, cache in self._cache.items()},
-            }
-            if "position_ids" in self.runtime.input_names:
-                chunk_shapes["position_ids"] = (1, prefill_chunk_size)
-            self._chunk_runtime = self.runtime._fork(chunk_shapes, share_kv_cache=True)
-            self._chunk_inputs = {
-                "input_ids": self._chunk_input_ids,
-                "attention_mask": self._decode_attention_mask,
-                **self._cache,
-            }
-            if "position_ids" in self.runtime.input_names:
-                self._chunk_inputs["position_ids"] = self._chunk_position_ids
+            chunk_sizes = (prefill_chunk_size, 4) if prefill_chunk_size > 4 else (prefill_chunk_size,)
+            for chunk_size in chunk_sizes:
+                self._add_chunk_runtime(chunk_size)
         self._decode_position = wp.zeros(1, dtype=wp.int32, device=self.runtime._device)
         self._generated_count = wp.zeros(1, dtype=wp.int32, device=self.runtime._device)
         self._generated_ids = wp.zeros(self.cache_capacity, dtype=wp.int64, device=self.runtime._device)
@@ -485,7 +474,7 @@ class Qwen3OnnxRunner:
             raise ValueError("Qwen3OnnxRunner: token_ids must not be empty")
         if current_length >= self.cache_capacity:
             raise ValueError("Qwen3OnnxRunner: prompt must leave room for at least one decoded token")
-        if self._chunk_runtime is not None and current_length >= self.prefill_chunk_size:
+        if self._chunk_runtimes and current_length >= min(self._chunk_runtimes):
             return self._prefill_chunked(token_ids)
         shapes = {"input_ids": (1, current_length), "attention_mask": (1, current_length)}
         if "position_ids" in self.runtime.input_names:
@@ -539,31 +528,51 @@ class Qwen3OnnxRunner:
         if self.sequence_length + len(token_ids) > self.cache_capacity:
             raise ValueError("Qwen3OnnxRunner: appended tokens exceed the KV-cache capacity")
 
-        chunk_size = self.prefill_chunk_size or len(token_ids) + 1
-        full_length = len(token_ids) // chunk_size * chunk_size
         outputs = None
         consumed = 0
-        for start in range(0, full_length, chunk_size):
-            position = self.sequence_length
-            end = position + chunk_size
-            self._chunk_input_ids.assign(np.asarray(token_ids[start : start + chunk_size], dtype=np.int64)[None, :])
-            if "position_ids" in self.runtime.input_names:
-                self._chunk_position_ids.assign(np.arange(position, end, dtype=np.int64)[None, :])
-            wp.launch(
-                _initialize_attention_mask,
-                dim=self.cache_capacity,
-                inputs=[self._decode_attention_mask, end],
-                device=self.runtime._device,
-            )
-            outputs = self._chunk_runtime(self._chunk_inputs)
-            self.sequence_length = end
-            consumed += chunk_size
+        for chunk_size in sorted(self._chunk_runtimes, reverse=True):
+            chunk_count = (len(token_ids) - consumed) // chunk_size
+            for _ in range(chunk_count):
+                position = self.sequence_length
+                end = position + chunk_size
+                chunk = token_ids[consumed : consumed + chunk_size]
+                self._chunk_input_ids[chunk_size].assign(np.asarray(chunk, dtype=np.int64)[None, :])
+                if "position_ids" in self.runtime.input_names:
+                    self._chunk_position_ids[chunk_size].assign(np.arange(position, end, dtype=np.int64)[None, :])
+                wp.launch(
+                    _initialize_attention_mask,
+                    dim=self.cache_capacity,
+                    inputs=[self._decode_attention_mask, end],
+                    device=self.runtime._device,
+                )
+                outputs = self._chunk_runtimes[chunk_size](self._chunk_inputs[chunk_size])
+                self.sequence_length = end
+                consumed += chunk_size
 
         logits = outputs["logits"] if outputs is not None else None
         for token_id in token_ids[consumed:]:
             logits = self.decode(token_id)
         self._past = dict(self._cache)
         return logits
+
+    def _add_chunk_runtime(self, chunk_size: int) -> None:
+        """Allocate one fixed-row prefill plan sharing the KV cache."""
+        input_ids = wp.zeros((1, chunk_size), dtype=wp.int64, device=self.runtime._device)
+        position_ids = wp.zeros((1, chunk_size), dtype=wp.int64, device=self.runtime._device)
+        shapes = {
+            "input_ids": (1, chunk_size),
+            "attention_mask": (1, self.cache_capacity),
+            **{name: tuple(cache.shape) for name, cache in self._cache.items()},
+        }
+        if "position_ids" in self.runtime.input_names:
+            shapes["position_ids"] = (1, chunk_size)
+        self._chunk_runtimes[chunk_size] = self.runtime._fork(shapes, share_kv_cache=True)
+        inputs = {"input_ids": input_ids, "attention_mask": self._decode_attention_mask, **self._cache}
+        if "position_ids" in self.runtime.input_names:
+            inputs["position_ids"] = position_ids
+        self._chunk_input_ids[chunk_size] = input_ids
+        self._chunk_position_ids[chunk_size] = position_ids
+        self._chunk_inputs[chunk_size] = inputs
 
     def decode(self, token_id: int) -> wp.array:
         """Append one token and return its logits."""
