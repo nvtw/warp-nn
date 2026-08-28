@@ -99,12 +99,13 @@ def _write_tiny_qwen35(path):
     write_safetensors(path / "model.safetensors", tensors)
 
 
-def test_qwen35_native_prefill_decode_and_graph_replay(tmp_path):
+@pytest.mark.parametrize("use_cublas", [False, True])
+def test_qwen35_native_prefill_decode_and_graph_replay(tmp_path, use_cublas):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
     model_path = tmp_path / "tiny-qwen35"
     _write_tiny_qwen35(model_path)
-    runner = Qwen35Runner(model_path, device="cuda:0", cache_capacity=8, prefill_chunk_size=2, use_cublas=False)
+    runner = Qwen35Runner(model_path, device="cuda:0", cache_capacity=8, prefill_chunk_size=2, use_cublas=use_cublas)
 
     first = runner.prefill([1, 2, 3]).numpy()
     assert first.shape == (1, 1, 16)
