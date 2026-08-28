@@ -437,7 +437,7 @@ class _Qwen35Plan:
                         self.device,
                         partitions,
                     )
-                    for partitions in (256, 1024)
+                    for partitions in (256,)
                 }
                 self.attention_partitions = 256
             layer["partitioned_attention"] = self.partitioned_attention
@@ -907,7 +907,7 @@ class Qwen35Runner:
             ],
             device=self.device,
         )
-        partitions = 1024 if position >= 131_072 else 256
+        partitions = 256
         self._decode_plan.attention_partitions = partitions
         logits = self._run(self._decode_plan, partitions)
         self.sequence_length += 1

@@ -258,13 +258,16 @@ def test_circular_window_attention_and_logit_softcap():
 
 
 @pytest.mark.parametrize(
-    ("length", "capacity", "window"), [(1, 1, 0), (13, 16, 0), (19, 8, 5)]
+    ("query_heads", "kv_heads", "length", "capacity", "window"),
+    [(4, 2, 1, 1, 0), (4, 2, 13, 16, 0), (6, 1, 19, 20, 0), (4, 2, 19, 8, 5)],
 )
-def test_partitioned_decode_attention_matches_serial(length, capacity, window):
+def test_partitioned_decode_attention_matches_serial(
+    query_heads, kv_heads, length, capacity, window
+):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
     rng = np.random.default_rng(41)
-    query_heads, kv_heads, head_size = 4, 2, 8
+    head_size = 32
     query = wp.array(
         rng.normal(size=(query_heads, head_size)).astype(np.float32),
         dtype=wp.bfloat16,

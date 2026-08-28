@@ -1935,19 +1935,38 @@ def _create_gqa_attention_kernel(head_size: int, dtype: type):
 def _create_partitioned_gqa_attention_kernels(
     head_size: int, dtype: type, partitions: int
 ):
-    """Build parallel decode attention and its stable partial-softmax reduction."""
+    """Build blockwise parallel decode attention and its softmax reduction."""
     DTYPE = dtype
     PARTITIONS = partitions
+    GROUP = 4
+    KEY_TILE = 32
 
     @wp.func
-    def dot(left: DTYPE, right: DTYPE):
-        return wp.float32(DTYPE(left)) * wp.float32(right)
+    def maximum_value(left: wp.float32, right: wp.float32):
+        return wp.max(left, right)
 
     @wp.func
-    def accumulate(
-        total: wp.float32, value: DTYPE, old_scale: wp.float32, weight: wp.float32
+    def scale_and_mask_score(
+        score: wp.float32,
+        key_offset: wp.int32,
+        valid_keys: wp.int32,
+        scale: wp.float32,
     ):
-        return total * old_scale + wp.float32(DTYPE(value)) * weight
+        return (
+            score * scale
+            if key_offset < valid_keys
+            else wp.float32(-3.402823466e38)
+        )
+
+    @wp.func
+    def exp_difference(value: wp.float32, maximum: wp.float32):
+        return wp.exp(value - maximum)
+
+    @wp.func
+    def circular_cache_index(
+        offset: wp.int32, key_start: wp.int32, length: wp.int32, base: wp.int32
+    ):
+        return (offset + key_start) % length + base
 
     @wp.func
     def scale_value(value: wp.float32, scale: wp.float32):
@@ -1976,19 +1995,15 @@ def _create_partitioned_gqa_attention_kernels(
         partition = item % PARTITIONS
         group_item = item / PARTITIONS
         queries_per_kv = query_heads / kv_heads
-        groups_per_kv = (queries_per_kv + 1) / 2
+        groups_per_kv = (queries_per_kv + GROUP - 1) / GROUP
         groups_per_batch = kv_heads * groups_per_kv
         batch = group_item / groups_per_batch
         group = group_item % groups_per_batch
         kv_head = group / groups_per_kv
-        pair = group % groups_per_kv
-        head_0 = kv_head * queries_per_kv + pair * 2
-        head_1 = wp.min(head_0 + 1, (kv_head + 1) * queries_per_kv - 1)
-        has_second = head_1 != head_0
+        subgroup = group % groups_per_kv
+        head_0 = kv_head * queries_per_kv + subgroup * GROUP
+        valid_heads = wp.min(GROUP, (kv_head + 1) * queries_per_kv - head_0)
         head_item_0 = batch * query_heads + head_0
-        head_item_1 = batch * query_heads + head_1
-        partial_item_0 = head_item_0 * PARTITIONS + partition
-        partial_item_1 = head_item_1 * PARTITIONS + partition
 
         valid_keys = wp.int32(sequence_lengths_minus_one[batch]) + 1
         first_key = wp.max(0, valid_keys - window) if window > 0 else 0
@@ -1997,51 +2012,112 @@ def _create_partitioned_gqa_attention_kernels(
         partition_start = first_key + partition * keys_per_partition
         partition_end = wp.min(valid_keys, partition_start + keys_per_partition)
 
-        query_0 = wp.tile_load(query[head_item_0], shape=(head_size,))
-        query_1 = wp.tile_load(query[head_item_1], shape=(head_size,))
-        accumulator_0 = wp.tile_zeros(shape=(head_size,), dtype=wp.float32)
-        accumulator_1 = wp.tile_zeros(shape=(head_size,), dtype=wp.float32)
-        maximum_0 = wp.float32(-3.402823466e38) + wp.float32(DTYPE(0.0))
-        maximum_1 = maximum_0
-        denominator_0 = wp.float32(0.0)
-        denominator_1 = wp.float32(0.0)
-        for key_token in range(partition_start, partition_end):
-            cache_token = key_token % total_length if window > 0 else key_token
-            cache_row = (batch * kv_heads + kv_head) * total_length + cache_token
-            key_values = wp.tile_load(key[cache_row], shape=(head_size,))
-            value_values = wp.tile_load(value[cache_row], shape=(head_size,))
+        queries = wp.tile_load(
+            query, shape=(GROUP, head_size), offset=(head_item_0, 0)
+        )
+        accumulator = wp.tile_zeros(
+            shape=(GROUP, head_size), dtype=wp.float32
+        )
+        maximum = wp.tile_full(
+            shape=(GROUP,),
+            value=wp.float32(-3.402823466e38) + wp.float32(DTYPE(0.0)),
+            dtype=wp.float32,
+        )
+        denominator = wp.tile_zeros(shape=(GROUP,), dtype=wp.float32)
+        key_offsets = wp.tile_arange(KEY_TILE, dtype=wp.int32)
+        key_offset_group = wp.tile_broadcast(
+            wp.tile_reshape(key_offsets, shape=(1, KEY_TILE)),
+            shape=(GROUP, KEY_TILE),
+        )
 
-            score_0 = wp.tile_extract(
-                wp.tile_sum(wp.tile_map(dot, query_0, key_values)), 0
-            ) * wp.float32(scale)
-            new_maximum_0 = wp.max(maximum_0, score_0)
-            old_scale_0 = wp.exp(maximum_0 - new_maximum_0)
-            weight_0 = wp.exp(score_0 - new_maximum_0)
-            denominator_0 = denominator_0 * old_scale_0 + weight_0
-            accumulator_0 = wp.tile_map(
-                accumulate, accumulator_0, value_values, old_scale_0, weight_0
+        for key_start in range(partition_start, partition_end, KEY_TILE):
+            valid_tile_keys = wp.min(KEY_TILE, partition_end - key_start)
+            cache_base = (batch * kv_heads + kv_head) * total_length
+            cache_row = cache_base + key_start
+            cache_indices = wp.tile_map(
+                circular_cache_index, key_offsets, key_start, total_length, cache_base
             )
-            maximum_0 = new_maximum_0
-
-            score_1 = wp.tile_extract(
-                wp.tile_sum(wp.tile_map(dot, query_1, key_values)), 0
-            ) * wp.float32(scale)
-            new_maximum_1 = wp.max(maximum_1, score_1)
-            old_scale_1 = wp.exp(maximum_1 - new_maximum_1)
-            weight_1 = wp.exp(score_1 - new_maximum_1)
-            denominator_1 = denominator_1 * old_scale_1 + weight_1
-            accumulator_1 = wp.tile_map(
-                accumulate, accumulator_1, value_values, old_scale_1, weight_1
+            if window > 0:
+                key_values = wp.tile_load_indexed(
+                    key,
+                    indices=cache_indices,
+                    shape=(KEY_TILE, head_size),
+                    offset=(0, 0),
+                    axis=0,
+                )
+            else:
+                key_values = wp.tile_load(
+                    key,
+                    shape=(KEY_TILE, head_size),
+                    offset=(cache_row, 0),
+                )
+            scores = wp.tile_zeros(
+                shape=(GROUP, KEY_TILE), dtype=wp.float32
             )
-            maximum_1 = new_maximum_1
+            wp.tile_matmul(queries, wp.tile_transpose(key_values), scores)
+            scores = wp.tile_map(
+                scale_and_mask_score,
+                scores,
+                key_offset_group,
+                valid_tile_keys,
+                wp.float32(scale),
+            )
+            block_maximum = wp.tile_reduce(maximum_value, scores, axis=1)
+            new_maximum = wp.tile_map(maximum_value, maximum, block_maximum)
+            old_scale = wp.tile_map(exp_difference, maximum, new_maximum)
+            maximum_group = wp.tile_broadcast(
+                wp.tile_reshape(new_maximum, shape=(GROUP, 1)),
+                shape=(GROUP, KEY_TILE),
+            )
+            probabilities = wp.tile_map(
+                exp_difference, scores, maximum_group
+            )
+            denominator = (
+                denominator * old_scale + wp.tile_sum(probabilities, axis=1)
+            )
+            old_scale_group = wp.tile_broadcast(
+                wp.tile_reshape(old_scale, shape=(GROUP, 1)),
+                shape=(GROUP, head_size),
+            )
+            typed_probabilities = wp.tile_astype(probabilities, dtype=DTYPE)
+            if window > 0:
+                value_values = wp.tile_load_indexed(
+                    value,
+                    indices=cache_indices,
+                    shape=(KEY_TILE, head_size),
+                    offset=(0, 0),
+                    axis=0,
+                )
+            else:
+                value_values = wp.tile_load(
+                    value,
+                    shape=(KEY_TILE, head_size),
+                    offset=(cache_row, 0),
+                )
+            contribution = wp.tile_zeros(
+                shape=(GROUP, head_size), dtype=wp.float32
+            )
+            wp.tile_matmul(typed_probabilities, value_values, contribution)
+            accumulator = accumulator * old_scale_group + contribution
+            maximum = new_maximum
 
-        partial_maximum[partial_item_0] = maximum_0
-        partial_denominator[partial_item_0] = denominator_0
-        wp.tile_store(partial_output[partial_item_0], accumulator_0)
-        if has_second:
-            partial_maximum[partial_item_1] = maximum_1
-            partial_denominator[partial_item_1] = denominator_1
-            wp.tile_store(partial_output[partial_item_1], accumulator_1)
+        for member in range(GROUP):
+            if member < valid_heads:
+                partial_item = (
+                    (head_item_0 + member) * PARTITIONS + partition
+                )
+                partial_maximum[partial_item] = wp.tile_extract(maximum, member)
+                partial_denominator[partial_item] = wp.tile_extract(
+                    denominator, member
+                )
+                accumulator_row = wp.tile_view(
+                    accumulator,
+                    offset=(member, 0),
+                    shape=(1, head_size),
+                )
+                wp.tile_store(
+                    partial_output, accumulator_row, offset=(partial_item, 0)
+                )
 
     @wp.kernel(enable_backward=False, module="unique")
     def reduce(
@@ -2075,9 +2151,10 @@ def _create_partitioned_gqa_attention_kernels(
         )
 
     partial.module.options["enable_backward"] = False
+    partial.module.mark_modified()
     reduce.module.options["enable_backward"] = False
+    reduce.module.mark_modified()
     return partial, reduce
-
 
 _gqa_attention_kernel_cache = {}
 _partitioned_gqa_attention_kernel_cache = {}
@@ -2147,7 +2224,7 @@ def _launch_partitioned_gqa(
         partial_output,
     ) = workspace
     queries_per_kv = query_heads // kv_heads
-    groups_per_batch = kv_heads * ((queries_per_kv + 1) // 2)
+    groups_per_batch = kv_heads * ((queries_per_kv + 3) // 4)
     batches = query.shape[0] // query_heads
     wp.launch_tiled(
         kernels[0],

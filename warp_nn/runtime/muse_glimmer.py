@@ -764,7 +764,7 @@ class _MusePlan:
                         self.device,
                         partitions,
                     )
-                    for partitions in (256, 1024)
+                    for partitions in (256,)
                 }
                 self.attention_partitions = 256
             layer["partitioned_attention"] = self.partitioned_attention
