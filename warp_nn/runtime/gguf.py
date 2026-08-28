@@ -47,15 +47,24 @@ def find_gguf_files(path: str | Path) -> tuple[Path, ...]:
     if path.is_dir():
         first_files = sorted(directory.glob("*-00001-of-*.gguf"))
         if not first_files:
-            first_files = [item for item in sorted(directory.glob("*.gguf")) if "mmproj" not in item.name.lower()]
+            first_files = [
+                item
+                for item in sorted(directory.glob("*.gguf"))
+                if "mmproj" not in item.name.lower()
+            ]
         if len(first_files) != 1:
-            raise FileNotFoundError(f"Expected one GGUF model in '{directory}', found {len(first_files)}")
+            raise FileNotFoundError(
+                f"Expected one GGUF model in '{directory}', found {len(first_files)}"
+            )
         path = first_files[0]
     match = re.fullmatch(r"(.+)-(\d{5})-of-(\d{5})\.gguf", path.name)
     if match is None:
         return (path,)
     count = int(match.group(3))
-    return tuple(directory / f"{match.group(1)}-{index:05d}-of-{count:05d}.gguf" for index in range(1, count + 1))
+    return tuple(
+        directory / f"{match.group(1)}-{index:05d}-of-{count:05d}.gguf"
+        for index in range(1, count + 1)
+    )
 
 
 def gguf_tokenizer_data(metadata: Mapping[str, object]) -> dict:
@@ -78,7 +87,11 @@ def gguf_tokenizer_data(metadata: Mapping[str, object]) -> dict:
     return {
         "normalizer": None,
         "added_tokens": added,
-        "model": {"type": "BPE", "vocab": dict(zip(tokens, range(len(tokens)))), "merges": merges},
+        "model": {
+            "type": "BPE",
+            "vocab": dict(zip(tokens, range(len(tokens)))),
+            "merges": merges,
+        },
         "generation_config": {
             "eos_token_id": list(dict.fromkeys(end_ids)),
             "pad_token_id": int(metadata["tokenizer.ggml.padding_token_id"]),
@@ -115,10 +128,14 @@ class _Reader:
 
     def read(self, size: int, what: str) -> bytes:
         if size < 0 or size > self.remaining:
-            raise ValueError(f"GGUF file '{self.path}' is truncated while reading {what}")
+            raise ValueError(
+                f"GGUF file '{self.path}' is truncated while reading {what}"
+            )
         value = self.stream.read(size)
         if len(value) != size:
-            raise ValueError(f"GGUF file '{self.path}' is truncated while reading {what}")
+            raise ValueError(
+                f"GGUF file '{self.path}' is truncated while reading {what}"
+            )
         return value
 
     def unpack(self, format: str, what: str):
@@ -129,14 +146,18 @@ class _Reader:
         try:
             return self.read(length, what).decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise ValueError(f"GGUF file '{self.path}' has invalid UTF-8 in {what}") from exc
+            raise ValueError(
+                f"GGUF file '{self.path}' has invalid UTF-8 in {what}"
+            ) from exc
 
     def value(self, value_type: int, what: str, *, in_array: bool = False):
         if value_type in _VALUE_FORMATS:
             value = self.unpack(_VALUE_FORMATS[value_type], what)
             if value_type == 7:
                 if value not in (0, 1):
-                    raise ValueError(f"GGUF file '{self.path}' has an invalid boolean in {what}")
+                    raise ValueError(
+                        f"GGUF file '{self.path}' has an invalid boolean in {what}"
+                    )
                 return bool(value)
             return value
         if value_type == _STRING:
@@ -144,12 +165,21 @@ class _Reader:
         if value_type == _ARRAY and not in_array:
             element_type = self.unpack("<I", f"{what} element type")
             if element_type == _ARRAY or element_type not in (*_VALUE_FORMATS, _STRING):
-                raise ValueError(f"GGUF file '{self.path}' has an unsupported array type {element_type} in {what}")
+                raise ValueError(
+                    f"GGUF file '{self.path}' has an unsupported array type {element_type} in {what}"
+                )
             count = self.unpack("<Q", f"{what} length")
             if count > self.remaining:
-                raise ValueError(f"GGUF file '{self.path}' has an invalid array length in {what}")
-            return tuple(self.value(element_type, f"{what}[{index}]", in_array=True) for index in range(count))
-        raise ValueError(f"GGUF file '{self.path}' has an unsupported metadata type {value_type} in {what}")
+                raise ValueError(
+                    f"GGUF file '{self.path}' has an invalid array length in {what}"
+                )
+            return tuple(
+                self.value(element_type, f"{what}[{index}]", in_array=True)
+                for index in range(count)
+            )
+        raise ValueError(
+            f"GGUF file '{self.path}' has an unsupported metadata type {value_type} in {what}"
+        )
 
 
 def _release_mapping(resources, event: wp.Event | None) -> None:
@@ -174,8 +204,13 @@ class GGUFArchive:
             expected = len(archives)
             if expected > 1:
                 for index, archive in enumerate(archives):
-                    if archive.metadata.get("split.count") != expected or archive.metadata.get("split.no") != index:
-                        raise ValueError("GGUF shards are missing, duplicated, or out of order")
+                    if (
+                        archive.metadata.get("split.count") != expected
+                        or archive.metadata.get("split.no") != index
+                    ):
+                        raise ValueError(
+                            "GGUF shards are missing, duplicated, or out of order"
+                        )
             self.path = archives[0].path
             self.paths = tuple(archive.path for archive in archives)
             self.version = archives[0].version
@@ -188,12 +223,16 @@ class GGUFArchive:
             for archive in archives:
                 for name in archive.names:
                     if name in self._tensors:
-                        raise ValueError(f"Split GGUF archive has duplicate tensor '{name}'")
+                        raise ValueError(
+                            f"Split GGUF archive has duplicate tensor '{name}'"
+                        )
                     self._tensors[name] = archive.tensor(name)
                     self._tensor_archives[name] = archive
             total = self.metadata.get("split.tensors.count")
             if total is not None and total != len(self._tensors):
-                raise ValueError(f"Split GGUF archive has {len(self._tensors)} of {total} tensors")
+                raise ValueError(
+                    f"Split GGUF archive has {len(self._tensors)} of {total} tensors"
+                )
             return
 
         self.path = Path(path).resolve()
@@ -209,7 +248,9 @@ class GGUFArchive:
                 raise ValueError(f"File '{self.path}' does not have GGUF magic")
             self.version = reader.unpack("<I", "version")
             if self.version not in (2, 3):
-                raise ValueError(f"GGUF file '{self.path}' has unsupported version {self.version}")
+                raise ValueError(
+                    f"GGUF file '{self.path}' has unsupported version {self.version}"
+                )
             tensor_count = reader.unpack("<Q", "tensor count")
             metadata_count = reader.unpack("<Q", "metadata count")
             if tensor_count > reader.remaining or metadata_count > reader.remaining:
@@ -219,7 +260,9 @@ class GGUFArchive:
             for _ in range(metadata_count):
                 key = reader.string("metadata key")
                 if key in self.metadata:
-                    raise ValueError(f"GGUF file '{self.path}' has duplicate metadata key '{key}'")
+                    raise ValueError(
+                        f"GGUF file '{self.path}' has duplicate metadata key '{key}'"
+                    )
                 value_type = reader.unpack("<I", f"metadata type for '{key}'")
                 self.metadata[key] = reader.value(value_type, f"metadata '{key}'")
 
@@ -228,30 +271,49 @@ class GGUFArchive:
             for _ in range(tensor_count):
                 name = reader.string("tensor name")
                 if name in seen:
-                    raise ValueError(f"GGUF file '{self.path}' has duplicate tensor '{name}'")
+                    raise ValueError(
+                        f"GGUF file '{self.path}' has duplicate tensor '{name}'"
+                    )
                 seen.add(name)
                 dimensions = reader.unpack("<I", f"dimension count for tensor '{name}'")
                 if dimensions > 4:
-                    raise ValueError(f"GGUF tensor '{name}' has invalid dimension count {dimensions}")
-                gguf_shape = tuple(reader.unpack("<Q", f"dimension for tensor '{name}'") for _ in range(dimensions))
+                    raise ValueError(
+                        f"GGUF tensor '{name}' has invalid dimension count {dimensions}"
+                    )
+                gguf_shape = tuple(
+                    reader.unpack("<Q", f"dimension for tensor '{name}'")
+                    for _ in range(dimensions)
+                )
                 tensor_type = reader.unpack("<I", f"type for tensor '{name}'")
                 relative_offset = reader.unpack("<Q", f"offset for tensor '{name}'")
                 descriptors.append((name, gguf_shape, tensor_type, relative_offset))
 
             alignment = self.metadata.get("general.alignment", 32)
-            if type(alignment) is not int or alignment <= 0 or alignment & (alignment - 1):
-                raise ValueError(f"GGUF file '{self.path}' has invalid general.alignment")
+            if (
+                type(alignment) is not int
+                or alignment <= 0
+                or alignment & (alignment - 1)
+            ):
+                raise ValueError(
+                    f"GGUF file '{self.path}' has invalid general.alignment"
+                )
             self.alignment = alignment
-            self.data_offset = (reader.position + alignment - 1) // alignment * alignment
+            self.data_offset = (
+                (reader.position + alignment - 1) // alignment * alignment
+            )
             if self.data_offset > size:
-                raise ValueError(f"GGUF file '{self.path}' has no complete tensor data section")
+                raise ValueError(
+                    f"GGUF file '{self.path}' has no complete tensor data section"
+                )
 
         self._tensors: dict[str, GGUFTensorMetadata] = {}
         for name, gguf_shape, tensor_type, relative_offset in descriptors:
             try:
                 dtype, itemsize, format = _TENSOR_TYPES[tensor_type]
             except KeyError as exc:
-                raise ValueError(f"GGUF tensor '{name}' has unsupported type {tensor_type}") from exc
+                raise ValueError(
+                    f"GGUF tensor '{name}' has unsupported type {tensor_type}"
+                ) from exc
             if relative_offset % self.alignment:
                 raise ValueError(f"GGUF tensor '{name}' has an unaligned data offset")
             shape = tuple(reversed(gguf_shape))
@@ -260,7 +322,9 @@ class GGUFArchive:
             nbytes = elements * itemsize
             if offset > size or nbytes > size - offset:
                 raise ValueError(f"GGUF tensor '{name}' has an invalid data range")
-            self._tensors[name] = GGUFTensorMetadata(dtype, shape, offset, nbytes, format)
+            self._tensors[name] = GGUFTensorMetadata(
+                dtype, shape, offset, nbytes, format
+            )
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -269,7 +333,9 @@ class GGUFArchive:
     def tensor(self, name: str) -> GGUFTensorMetadata:
         return self._tensors[name]
 
-    def load(self, device=None, names: Iterable[str] | None = None) -> dict[str, wp.array]:
+    def load(
+        self, device=None, names: Iterable[str] | None = None
+    ) -> dict[str, wp.array]:
         """Upload selected tensors and release the file mapping after copies finish."""
         device = wp.get_device(device)
         selected = self.names if names is None else tuple(names)
@@ -295,7 +361,9 @@ class GGUFArchive:
         host_views = []
         for name in selected:
             info = self._tensors[name]
-            raw = np.ndarray((info.nbytes,), dtype=np.uint8, buffer=mapping, offset=info.offset)
+            raw = np.ndarray(
+                (info.nbytes,), dtype=np.uint8, buffer=mapping, offset=info.offset
+            )
             host = wp.array(
                 ptr=raw.ctypes.data,
                 dtype=info.dtype,
@@ -313,7 +381,9 @@ class GGUFArchive:
         if event is None:
             _release_mapping(resources, None)
         else:
-            Thread(target=_release_mapping, args=(resources, event), daemon=True).start()
+            Thread(
+                target=_release_mapping, args=(resources, event), daemon=True
+            ).start()
         return output
 
 

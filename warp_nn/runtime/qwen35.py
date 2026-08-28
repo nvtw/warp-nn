@@ -49,7 +49,11 @@ from warp_nn.utils.device import parse_device
 
 
 def _weight_names(config: dict) -> list[str]:
-    names = ["model.language_model.embed_tokens.weight", "model.language_model.norm.weight", "lm_head.weight"]
+    names = [
+        "model.language_model.embed_tokens.weight",
+        "model.language_model.norm.weight",
+        "lm_head.weight",
+    ]
     for index, layer_type in enumerate(config["layer_types"]):
         prefix = f"model.language_model.layers.{index}."
         names.extend(
@@ -94,7 +98,6 @@ def _weight_names(config: dict) -> list[str]:
     return names
 
 
-
 def _gguf_weight_map(config: dict) -> dict[str, str]:
     names = {
         "model.language_model.embed_tokens.weight": "token_embd.weight",
@@ -130,7 +133,12 @@ def _gguf_weight_map(config: dict) -> dict[str, str]:
     for index, layer_type in enumerate(config["layer_types"]):
         prefix = f"model.language_model.layers.{index}."
         suffixes = common | (linear if layer_type == "linear_attention" else attention)
-        names.update({prefix + target: f"blk.{index}.{source}" for target, source in suffixes.items()})
+        names.update(
+            {
+                prefix + target: f"blk.{index}.{source}"
+                for target, source in suffixes.items()
+            }
+        )
     return names
 
 
@@ -160,9 +168,15 @@ def _validate_config(config: dict) -> None:
         raise ValueError("Qwen 3.5 layer_types does not match num_hidden_layers")
     if int(config["num_attention_heads"]) % int(config["num_key_value_heads"]):
         raise ValueError("Qwen 3.5 query heads must be divisible by KV heads")
-    if config.get("attention_bias", False) or config.get("hidden_act", "silu") != "silu":
+    if (
+        config.get("attention_bias", False)
+        or config.get("hidden_act", "silu") != "silu"
+    ):
         raise ValueError("Only bias-free SiLU Qwen 3.5 text models are supported")
-    if not config.get("attn_output_gate", True) or config.get("output_gate_type", "swish") != "swish":
+    if (
+        not config.get("attn_output_gate", True)
+        or config.get("output_gate_type", "swish") != "swish"
+    ):
         raise ValueError("Only swish-gated Qwen attention output is supported")
     if config["rope_parameters"].get("rope_type", "default") != "default":
         raise ValueError("Only default Qwen rotary embeddings are supported")
@@ -181,7 +195,9 @@ class _Qwen35Plan:
         self.shapes = {name: tuple(value.shape) for name, value in self.tensors.items()}
         self.input_ids = wp.zeros((1, rows), dtype=wp.int64, device=self.device)
         self.position_ids = wp.zeros((1, rows), dtype=wp.int64, device=self.device)
-        self.embedding = wp.empty((1, rows, runner.hidden_size), dtype=self.dtype, device=self.device)
+        self.embedding = wp.empty(
+            (1, rows, runner.hidden_size), dtype=self.dtype, device=self.device
+        )
         self.tensors["hidden.0"] = self.embedding.reshape((rows, runner.hidden_size))
         self.shapes["hidden.0"] = (rows, runner.hidden_size)
         self.layers = []
@@ -190,7 +206,9 @@ class _Qwen35Plan:
 
     def _linear(self, name: str, x: str, weight: str) -> Operation:
         op = Operation("Linear", [x, weight], [name])
-        plan_linear(op, self.tensors, self.shapes, self.device, cublas=self.runner.cublas)
+        plan_linear(
+            op, self.tensors, self.shapes, self.device, cublas=self.runner.cublas
+        )
         op.attrs["_sequence"] = (op,)
         return op
 
@@ -199,18 +217,26 @@ class _Qwen35Plan:
             "SimplifiedLayerNormalization",
             [x, scale],
             [name],
-            {"epsilon": self.runner.epsilon, "_scale_offset": float(self.runner.centered_norm_scales)},
+            {
+                "epsilon": self.runner.epsilon,
+                "_scale_offset": float(self.runner.centered_norm_scales),
+            },
         )
         plan_rms_norm(op, self.tensors, self.shapes, self.device)
         op.attrs["_sequence"] = (op,)
         return op
 
-    def _residual_rms(self, name: str, x: str, residual: str, scale: str, residual_name: str) -> Operation:
+    def _residual_rms(
+        self, name: str, x: str, residual: str, scale: str, residual_name: str
+    ) -> Operation:
         op = Operation(
             "SkipSimplifiedLayerNormalization",
             [x, residual, scale],
             [name, "", "", residual_name],
-            {"epsilon": self.runner.epsilon, "_scale_offset": float(self.runner.centered_norm_scales)},
+            {
+                "epsilon": self.runner.epsilon,
+                "_scale_offset": float(self.runner.centered_norm_scales),
+            },
         )
         plan_residual_rms_norm(op, self.tensors, self.shapes, self.device)
         op.attrs["_sequence"] = (op,)
@@ -240,34 +266,58 @@ class _Qwen35Plan:
             mlp_input = f"layer.{index}.mlp_input"
             residual = f"layer.{index}.attention_residual"
             layer["post_norm"] = self._residual_rms(
-                mlp_input, token_output, hidden_name, prefix + "post_attention_layernorm.weight", residual
+                mlp_input,
+                token_output,
+                hidden_name,
+                prefix + "post_attention_layernorm.weight",
+                residual,
             )
-            layer["mlp_gate"] = self._linear(f"layer.{index}.mlp_gate", mlp_input, prefix + "mlp.gate_proj.weight")
-            layer["mlp_up"] = self._linear(f"layer.{index}.mlp_up", mlp_input, prefix + "mlp.up_proj.weight")
+            layer["mlp_gate"] = self._linear(
+                f"layer.{index}.mlp_gate", mlp_input, prefix + "mlp.gate_proj.weight"
+            )
+            layer["mlp_up"] = self._linear(
+                f"layer.{index}.mlp_up", mlp_input, prefix + "mlp.up_proj.weight"
+            )
             layer["swiglu"] = self._swiglu(
-                f"layer.{index}.mlp_hidden", layer["mlp_gate"].outputs[0], layer["mlp_up"].outputs[0]
+                f"layer.{index}.mlp_hidden",
+                layer["mlp_gate"].outputs[0],
+                layer["mlp_up"].outputs[0],
             )
             layer["down"] = self._linear(
-                f"layer.{index}.mlp_output", layer["swiglu"].outputs[0], prefix + "mlp.down_proj.weight"
+                f"layer.{index}.mlp_output",
+                layer["swiglu"].outputs[0],
+                prefix + "mlp.down_proj.weight",
             )
             if index + 1 < len(self.config["layer_types"]):
-                next_scale = f"model.language_model.layers.{index + 1}.input_layernorm.weight"
+                next_scale = (
+                    f"model.language_model.layers.{index + 1}.input_layernorm.weight"
+                )
                 normalized_name = f"layer.{index + 1}.input"
             else:
                 next_scale = "model.language_model.norm.weight"
                 normalized_name = "final.normalized"
             hidden_name = f"hidden.{index + 1}"
             layer["next_norm"] = self._residual_rms(
-                normalized_name, layer["down"].outputs[0], residual, next_scale, hidden_name
+                normalized_name,
+                layer["down"].outputs[0],
+                residual,
+                next_scale,
+                hidden_name,
             )
             self.layers.append(layer)
 
         self.lm_head = self._linear("logits", normalized_name, "lm_head.weight")
-        self.logits = self.tensors["logits"].reshape((1, self.rows, self.config["vocab_size"]))
+        self.logits = self.tensors["logits"].reshape(
+            (1, self.rows, self.config["vocab_size"])
+        )
 
-    def _build_linear_attention(self, layer: dict, index: int, prefix: str, x: str) -> None:
+    def _build_linear_attention(
+        self, layer: dict, index: int, prefix: str, x: str
+    ) -> None:
         attn = prefix + "linear_attn."
-        layer["qkv"] = self._linear(f"layer.{index}.qkv", x, attn + "in_proj_qkv.weight")
+        layer["qkv"] = self._linear(
+            f"layer.{index}.qkv", x, attn + "in_proj_qkv.weight"
+        )
         layer["z"] = self._linear(f"layer.{index}.z", x, attn + "in_proj_z.weight")
         layer["a"] = self._linear(f"layer.{index}.a", x, attn + "in_proj_a.weight")
         layer["b"] = self._linear(f"layer.{index}.b", x, attn + "in_proj_b.weight")
@@ -275,18 +325,25 @@ class _Qwen35Plan:
             self.runner.linear_key_heads * self.runner.linear_key_size * 2
             + self.runner.linear_value_heads * self.runner.linear_value_size
         )
-        layer["conv"] = wp.empty((self.rows, conv_dim), dtype=self.dtype, device=self.device)
+        layer["conv"] = wp.empty(
+            (self.rows, conv_dim), dtype=self.dtype, device=self.device
+        )
         widths = (
             self.runner.linear_key_heads * self.runner.linear_key_size,
             self.runner.linear_key_heads * self.runner.linear_key_size,
             self.runner.linear_value_heads * self.runner.linear_value_size,
         )
         layer["q"], layer["k"], layer["v"] = (
-            wp.empty((self.rows, width), dtype=self.dtype, device=self.device) for width in widths
+            wp.empty((self.rows, width), dtype=self.dtype, device=self.device)
+            for width in widths
         )
         layer["q_norm"] = wp.empty_like(layer["q"])
         layer["k_norm"] = wp.empty_like(layer["k"])
-        layer["decay"] = wp.empty((self.rows, self.runner.linear_value_heads), dtype=wp.float32, device=self.device)
+        layer["decay"] = wp.empty(
+            (self.rows, self.runner.linear_value_heads),
+            dtype=wp.float32,
+            device=self.device,
+        )
         layer["beta"] = wp.empty_like(layer["decay"])
         layer["core"] = wp.empty(
             (self.rows, self.runner.linear_value_heads * self.runner.linear_value_size),
@@ -294,9 +351,14 @@ class _Qwen35Plan:
             device=self.device,
         )
         layer["gated"] = wp.empty_like(layer["core"])
-        layer["lp_block"], layer["lp_kernel"] = _get_lp_normalization_kernel(self.runner.linear_key_size, self.dtype)
+        layer["lp_block"], layer["lp_kernel"] = _get_lp_normalization_kernel(
+            self.runner.linear_key_size, self.dtype
+        )
         layer["attention_kernel"] = _get_linear_attention_kernel(
-            self.runner.linear_key_size, self.runner.linear_value_size, self.dtype, wp.float32
+            self.runner.linear_key_size,
+            self.runner.linear_value_size,
+            self.dtype,
+            wp.float32,
         )
         scale_dtype = self.runner.weights[attn + "norm.weight"].dtype
         layer["gated_block"], layer["gated_kernel"] = _get_gated_rms_norm_kernel(
@@ -307,34 +369,58 @@ class _Qwen35Plan:
         self.tensors[f"layer.{index}.gated"] = layer["gated"].reshape(
             (self.rows, self.runner.linear_value_heads * self.runner.linear_value_size)
         )
-        self.shapes[f"layer.{index}.gated"] = tuple(self.tensors[f"layer.{index}.gated"].shape)
+        self.shapes[f"layer.{index}.gated"] = tuple(
+            self.tensors[f"layer.{index}.gated"].shape
+        )
         layer["output"] = self._linear(
-            f"layer.{index}.attention_output", f"layer.{index}.gated", attn + "out_proj.weight"
+            f"layer.{index}.attention_output",
+            f"layer.{index}.gated",
+            attn + "out_proj.weight",
         )
 
-    def _build_full_attention(self, layer: dict, index: int, prefix: str, x: str) -> None:
+    def _build_full_attention(
+        self, layer: dict, index: int, prefix: str, x: str
+    ) -> None:
         attn = prefix + "self_attn."
         attention_width = self.runner.query_heads * self.runner.head_size
-        layer["q_proj"] = self._linear(f"layer.{index}.q_projected", x, attn + "q_proj.weight")
-        layer["k_proj"] = self._linear(f"layer.{index}.k_projected", x, attn + "k_proj.weight")
-        layer["v_proj"] = self._linear(f"layer.{index}.v_projected", x, attn + "v_proj.weight")
-        layer["q"] = wp.empty(
-            (self.runner.query_heads * self.rows, self.runner.head_size), dtype=self.dtype, device=self.device
+        layer["q_proj"] = self._linear(
+            f"layer.{index}.q_projected", x, attn + "q_proj.weight"
         )
-        layer["attention_gate"] = wp.empty((self.rows, attention_width), dtype=self.dtype, device=self.device)
+        layer["k_proj"] = self._linear(
+            f"layer.{index}.k_projected", x, attn + "k_proj.weight"
+        )
+        layer["v_proj"] = self._linear(
+            f"layer.{index}.v_projected", x, attn + "v_proj.weight"
+        )
+        layer["q"] = wp.empty(
+            (self.runner.query_heads * self.rows, self.runner.head_size),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        layer["attention_gate"] = wp.empty(
+            (self.rows, attention_width), dtype=self.dtype, device=self.device
+        )
         layer["k"] = wp.empty(
-            (self.runner.kv_heads * self.rows, self.runner.head_size), dtype=self.dtype, device=self.device
+            (self.runner.kv_heads * self.rows, self.runner.head_size),
+            dtype=self.dtype,
+            device=self.device,
         )
         layer["v"] = wp.empty_like(layer["k"])
         self.tensors[f"layer.{index}.q"] = layer["q"]
         self.shapes[f"layer.{index}.q"] = tuple(layer["q"].shape)
         self.tensors[f"layer.{index}.k"] = layer["k"]
         self.shapes[f"layer.{index}.k"] = tuple(layer["k"].shape)
-        layer["q_norm"] = self._rms(f"layer.{index}.q_norm", f"layer.{index}.q", attn + "q_norm.weight")
-        layer["k_norm"] = self._rms(f"layer.{index}.k_norm", f"layer.{index}.k", attn + "k_norm.weight")
+        layer["q_norm"] = self._rms(
+            f"layer.{index}.q_norm", f"layer.{index}.q", attn + "q_norm.weight"
+        )
+        layer["k_norm"] = self._rms(
+            f"layer.{index}.k_norm", f"layer.{index}.k", attn + "k_norm.weight"
+        )
         layer["q_rotated"] = wp.empty_like(layer["q"])
         layer["k_rotated"] = wp.empty_like(layer["k"])
-        layer["core"] = wp.empty((self.rows, attention_width), dtype=self.dtype, device=self.device)
+        layer["core"] = wp.empty(
+            (self.rows, attention_width), dtype=self.dtype, device=self.device
+        )
         layer["gated"] = wp.empty_like(layer["core"])
         layer["attention_block"], layer["attention_kernel"] = _get_gqa_attention_kernel(
             self.runner.head_size, self.dtype
@@ -342,11 +428,15 @@ class _Qwen35Plan:
         self.tensors[f"layer.{index}.gated"] = layer["gated"]
         self.shapes[f"layer.{index}.gated"] = tuple(layer["gated"].shape)
         layer["output"] = self._linear(
-            f"layer.{index}.attention_output", f"layer.{index}.gated", attn + "o_proj.weight"
+            f"layer.{index}.attention_output",
+            f"layer.{index}.gated",
+            attn + "o_proj.weight",
         )
 
     def _execute_op(self, op: Operation) -> None:
-        execute_operations(op.attrs["_sequence"], self.tensors, self.shapes, self.device)
+        execute_operations(
+            op.attrs["_sequence"], self.tensors, self.shapes, self.device
+        )
 
     def _execute_linear_attention(self, layer: dict, index: int) -> None:
         for name in ("qkv", "z", "a", "b"):
@@ -357,7 +447,9 @@ class _Qwen35Plan:
             dim=layer["conv"].shape,
             inputs=[
                 qkv,
-                self.runner.weights[f"model.language_model.layers.{index}.linear_attn.conv1d.weight"],
+                self.runner.weights[
+                    f"model.language_model.layers.{index}.linear_attn.conv1d.weight"
+                ],
                 self.runner.zero_bias,
                 self.runner.conv_states[index],
                 layer["conv"],
@@ -368,7 +460,10 @@ class _Qwen35Plan:
         offset = 0
         for output in (layer["q"], layer["k"], layer["v"]):
             wp.launch(
-                _split_last_axis_kernel, dim=output.shape, inputs=[layer["conv"], output, offset], device=self.device
+                _split_last_axis_kernel,
+                dim=output.shape,
+                inputs=[layer["conv"], output, offset],
+                device=self.device,
             )
             offset += output.shape[1]
         wp.launch(
@@ -377,7 +472,10 @@ class _Qwen35Plan:
             inputs=[qkv, self.runner.conv_states[index]],
             device=self.device,
         )
-        for source, output in ((layer["q"], layer["q_norm"]), (layer["k"], layer["k_norm"])):
+        for source, output in (
+            (layer["q"], layer["q_norm"]),
+            (layer["k"], layer["k_norm"]),
+        ):
             wp.launch_tiled(
                 layer["lp_kernel"],
                 dim=self.rows * self.runner.linear_key_heads,
@@ -395,8 +493,12 @@ class _Qwen35Plan:
             inputs=[
                 self.tensors[layer["a"].outputs[0]],
                 self.tensors[layer["b"].outputs[0]],
-                self.runner.weights[f"model.language_model.layers.{index}.linear_attn.A_log"],
-                self.runner.weights[f"model.language_model.layers.{index}.linear_attn.dt_bias"],
+                self.runner.weights[
+                    f"model.language_model.layers.{index}.linear_attn.A_log"
+                ],
+                self.runner.weights[
+                    f"model.language_model.layers.{index}.linear_attn.dt_bias"
+                ],
                 self.runner.ssm_a_is_decay,
                 layer["decay"],
                 layer["beta"],
@@ -436,10 +538,12 @@ class _Qwen35Plan:
             dim=self.rows * self.runner.linear_value_heads,
             inputs=[
                 layer["core"].reshape((-1, self.runner.linear_value_size)),
-                self.tensors[layer["z"].outputs[0]].reshape((-1, self.runner.linear_value_size)),
-                self.runner.weights[f"model.language_model.layers.{index}.linear_attn.norm.weight"].reshape(
-                    (1, self.runner.linear_value_size)
+                self.tensors[layer["z"].outputs[0]].reshape(
+                    (-1, self.runner.linear_value_size)
                 ),
+                self.runner.weights[
+                    f"model.language_model.layers.{index}.linear_attn.norm.weight"
+                ].reshape((1, self.runner.linear_value_size)),
                 layer["gated"].reshape((-1, self.runner.linear_value_size)),
                 self.runner.epsilon,
             ],
@@ -468,17 +572,31 @@ class _Qwen35Plan:
             (layer["v_proj"], layer["v"], False),
         ):
             wp.launch(
-                _reorder_interleaved_heads_kernel if interleaved else _reorder_heads_kernel,
+                _reorder_interleaved_heads_kernel
+                if interleaved
+                else _reorder_heads_kernel,
                 dim=(self.rows, self.runner.kv_heads, self.runner.head_size),
-                inputs=[self.tensors[projected.outputs[0]], output, self.runner.head_size],
+                inputs=[
+                    self.tensors[projected.outputs[0]],
+                    output,
+                    self.runner.head_size,
+                ],
                 device=self.device,
             )
         self._execute_op(layer["q_norm"])
         self._execute_op(layer["k_norm"])
         rotary = _rotary_embedding_kernel_for_dtype(self.dtype)
         for source, output, heads in (
-            (self.tensors[layer["q_norm"].outputs[0]], layer["q_rotated"], self.runner.query_heads),
-            (self.tensors[layer["k_norm"].outputs[0]], layer["k_rotated"], self.runner.kv_heads),
+            (
+                self.tensors[layer["q_norm"].outputs[0]],
+                layer["q_rotated"],
+                self.runner.query_heads,
+            ),
+            (
+                self.tensors[layer["k_norm"].outputs[0]],
+                layer["k_rotated"],
+                self.runner.kv_heads,
+            ),
         ):
             wp.launch(
                 rotary,
@@ -496,11 +614,20 @@ class _Qwen35Plan:
                 device=self.device,
             )
         key_cache, value_cache = self.runner.kv_caches[index]
-        for source, cache in ((layer["k_rotated"], key_cache), (layer["v"], value_cache)):
+        for source, cache in (
+            (layer["k_rotated"], key_cache),
+            (layer["v"], value_cache),
+        ):
             wp.launch(
                 _append_head_cache_kernel,
                 dim=(self.runner.kv_heads, self.rows, self.runner.head_size),
-                inputs=[source, self.position_ids, cache, self.runner.kv_heads, self.runner.head_size],
+                inputs=[
+                    source,
+                    self.position_ids,
+                    cache,
+                    self.runner.kv_heads,
+                    self.runner.head_size,
+                ],
                 device=self.device,
             )
         wp.launch_tiled(
@@ -535,7 +662,11 @@ class _Qwen35Plan:
         wp.launch(
             _gather_rows_kernel,
             dim=self.embedding.shape,
-            inputs=[self.runner.weights["model.language_model.embed_tokens.weight"], self.input_ids, self.embedding],
+            inputs=[
+                self.runner.weights["model.language_model.embed_tokens.weight"],
+                self.input_ids,
+                self.embedding,
+            ],
             device=self.device,
         )
         self._execute_op(self.first_norm)
@@ -544,7 +675,14 @@ class _Qwen35Plan:
                 self._execute_linear_attention(layer, index)
             else:
                 self._execute_full_attention(layer, index)
-            for name in ("post_norm", "mlp_gate", "mlp_up", "swiglu", "down", "next_norm"):
+            for name in (
+                "post_norm",
+                "mlp_gate",
+                "mlp_up",
+                "swiglu",
+                "down",
+                "next_norm",
+            ):
                 self._execute_op(layer[name])
         self._execute_op(self.lm_head)
         return self.logits
@@ -582,7 +720,9 @@ class Qwen35Runner:
         self.linear_value_size = int(self.config["linear_value_head_dim"])
         self.epsilon = float(self.config["rms_norm_eps"])
         rope = self.config["rope_parameters"]
-        self.rotary_dim = int(self.head_size * float(rope.get("partial_rotary_factor", 1.0)))
+        self.rotary_dim = int(
+            self.head_size * float(rope.get("partial_rotary_factor", 1.0))
+        )
         if self.rotary_dim <= 0 or self.rotary_dim % 2:
             raise ValueError("Qwen 3.5 rotary dimension must be positive and even")
 
@@ -605,7 +745,9 @@ class Qwen35Runner:
             raise ValueError(f"Qwen 3.5 checkpoint is missing {sorted(missing)[:5]}")
         required_bytes = sum(archive.metadata(name).nbytes for name in names)
         full_layers = self.config["layer_types"].count("full_attention")
-        required_bytes += full_layers * 2 * self.kv_heads * self.cache_capacity * self.head_size * 2
+        required_bytes += (
+            full_layers * 2 * self.kv_heads * self.cache_capacity * self.head_size * 2
+        )
         if self.device.is_cuda and required_bytes > self.device.free_memory * 0.95:
             raise MemoryError(
                 f"Qwen 3.5 needs at least {required_bytes / 2**30:.1f} GiB for selected weights and KV cache; "
@@ -615,25 +757,39 @@ class Qwen35Runner:
         if self.gguf_layout:
             for index, layer_type in enumerate(self.config["layer_types"]):
                 if layer_type == "linear_attention":
-                    name = f"model.language_model.layers.{index}.linear_attn.conv1d.weight"
+                    name = (
+                        f"model.language_model.layers.{index}.linear_attn.conv1d.weight"
+                    )
                     weight = self.weights[name]
-                    self.weights[name] = weight.reshape((weight.shape[0], 1, weight.shape[1]))
+                    self.weights[name] = weight.reshape(
+                        (weight.shape[0], 1, weight.shape[1])
+                    )
         self.dtype = self.weights["model.language_model.embed_tokens.weight"].dtype
         if self.dtype not in (wp.float16, wp.bfloat16):
             raise TypeError("Qwen 3.5 activations require FP16 or BF16 weights")
         self.zero_bias = wp.zeros(1, dtype=self.dtype, device=self.device)
-        self.cublas = try_create_cublas() if use_cublas and self.device.is_cuda else None
+        self.cublas = (
+            try_create_cublas() if use_cublas and self.device.is_cuda else None
+        )
         self.sequence_end = wp.zeros(1, dtype=wp.int32, device=self.device)
         self.conv_states = {}
         self.recurrent_states = {}
         self.kv_caches = {}
-        conv_dim = self.linear_key_heads * self.linear_key_size * 2 + self.linear_value_heads * self.linear_value_size
+        conv_dim = (
+            self.linear_key_heads * self.linear_key_size * 2
+            + self.linear_value_heads * self.linear_value_size
+        )
         conv_state_width = int(self.config["linear_conv_kernel_dim"]) - 1
         for index, layer_type in enumerate(self.config["layer_types"]):
             if layer_type == "linear_attention":
-                self.conv_states[index] = wp.zeros((conv_dim, conv_state_width), dtype=self.dtype, device=self.device)
+                self.conv_states[index] = wp.zeros(
+                    (conv_dim, conv_state_width), dtype=self.dtype, device=self.device
+                )
                 self.recurrent_states[index] = wp.zeros(
-                    (self.linear_value_heads * self.linear_key_size, self.linear_value_size),
+                    (
+                        self.linear_value_heads * self.linear_key_size,
+                        self.linear_value_size,
+                    ),
                     dtype=wp.float32,
                     device=self.device,
                 )
@@ -653,10 +809,14 @@ class Qwen35Runner:
         self.sin_cache = wp.array(np.sin(angles), dtype=self.dtype, device=self.device)
         self._decode_plan = _Qwen35Plan(self, 1)
         self._chunk_plan = _Qwen35Plan(self, self.prefill_chunk_size)
-        self._sample_partial_values = wp.empty(128, dtype=wp.float32, device=self.device)
+        self._sample_partial_values = wp.empty(
+            128, dtype=wp.float32, device=self.device
+        )
         self._sample_partial_tokens = wp.empty(128, dtype=wp.int32, device=self.device)
         self._sampled_token = wp.empty(1, dtype=wp.int32, device=self.device)
-        self._sampled_token_host = wp.empty(1, dtype=wp.int32, device="cpu", pinned=self.device.is_cuda)
+        self._sampled_token_host = wp.empty(
+            1, dtype=wp.int32, device="cpu", pinned=self.device.is_cuda
+        )
         self._sampled_token_host_view = self._sampled_token_host.numpy()
         self._greedy_argmax_kernels = _get_greedy_argmax_kernels(1024, 128, self.dtype)
         self.sequence_length = 0
@@ -692,7 +852,13 @@ class Qwen35Runner:
         wp.launch(
             _stage_token_position,
             dim=1,
-            inputs=[self._decode_plan.input_ids, self._decode_plan.position_ids, self.sequence_end, token_id, position],
+            inputs=[
+                self._decode_plan.input_ids,
+                self._decode_plan.position_ids,
+                self.sequence_end,
+                token_id,
+                position,
+            ],
             device=self.device,
         )
         logits = self._run(self._decode_plan)
@@ -714,8 +880,15 @@ class Qwen35Runner:
         plan = self._plan_for_rows(rows)
         end = self.sequence_length + rows
         plan.input_ids.assign(np.asarray(token_ids, dtype=np.int64)[None, :])
-        plan.position_ids.assign(np.arange(self.sequence_length, end, dtype=np.int64)[None, :])
-        wp.launch(_set_sequence_end, dim=1, inputs=[self.sequence_end, end - 1], device=self.device)
+        plan.position_ids.assign(
+            np.arange(self.sequence_length, end, dtype=np.int64)[None, :]
+        )
+        wp.launch(
+            _set_sequence_end,
+            dim=1,
+            inputs=[self.sequence_end, end - 1],
+            device=self.device,
+        )
         logits = self._run(plan)
         self.sequence_length = end
         return logits
@@ -741,7 +914,9 @@ class Qwen35Runner:
         """Reset state, process a prompt, and return its final logits."""
         self.reset()
         if len(token_ids) >= self.cache_capacity:
-            raise ValueError("Qwen35Runner prompt must leave room for one decoded token")
+            raise ValueError(
+                "Qwen35Runner prompt must leave room for one decoded token"
+            )
         return self._append(token_ids)
 
     def append(self, token_ids: Sequence[int]) -> wp.array:
@@ -760,7 +935,11 @@ class Qwen35Runner:
 
     def sample_greedy(self, logits: wp.array) -> int:
         """Select the largest logit while transferring only its token ID."""
-        if logits.device != self.device or logits.dtype != self.dtype or logits.ndim != 3:
+        if (
+            logits.device != self.device
+            or logits.dtype != self.dtype
+            or logits.ndim != 3
+        ):
             raise TypeError("Qwen35Runner.sample_greedy expects runner logits")
         wp.launch_tiled(
             self._greedy_argmax_kernels[0],
@@ -772,7 +951,12 @@ class Qwen35Runner:
         wp.launch_tiled(
             self._greedy_argmax_kernels[1],
             dim=1,
-            inputs=[self._sample_partial_values, self._sample_partial_tokens, self._sampled_token, logits.shape[2]],
+            inputs=[
+                self._sample_partial_values,
+                self._sample_partial_tokens,
+                self._sampled_token,
+                logits.shape[2],
+            ],
             block_dim=128,
             device=self.device,
         )

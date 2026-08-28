@@ -38,7 +38,11 @@ def _write_tiny_qwen35(path):
         "rms_norm_eps": 1.0e-6,
         "attention_bias": False,
         "hidden_act": "silu",
-        "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.5},
+        "rope_parameters": {
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.5,
+        },
     }
     rng = np.random.default_rng(97)
     shapes = {
@@ -85,7 +89,11 @@ def _write_tiny_qwen35(path):
     tensors = {}
     for name in _weight_names(config):
         shape = shapes[name]
-        if name.endswith("layernorm.weight") or name.endswith("q_norm.weight") or name.endswith("k_norm.weight"):
+        if (
+            name.endswith("layernorm.weight")
+            or name.endswith("q_norm.weight")
+            or name.endswith("k_norm.weight")
+        ):
             values = np.zeros(shape, dtype=np.float32)
         elif name.endswith("linear_attn.norm.weight"):
             values = np.ones(shape, dtype=np.float32)
@@ -95,7 +103,9 @@ def _write_tiny_qwen35(path):
             values = rng.normal(0.0, 0.08, shape).astype(np.float32)
         tensors[name] = ("BF16", shape, _bfloat16_bytes(values))
     path.mkdir()
-    (path / "config.json").write_text(json.dumps({"text_config": config}), encoding="utf-8")
+    (path / "config.json").write_text(
+        json.dumps({"text_config": config}), encoding="utf-8"
+    )
     write_safetensors(path / "model.safetensors", tensors)
 
 
@@ -106,7 +116,13 @@ def test_qwen38_text_metadata_compatibility():
         "intermediate_size": 17408,
         "vocab_size": 248320,
         "num_hidden_layers": 64,
-        "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 16,
+        "layer_types": [
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+        ]
+        * 16,
         "num_attention_heads": 24,
         "num_key_value_heads": 4,
         "head_dim": 256,
@@ -134,7 +150,11 @@ def test_qwen38_text_metadata_compatibility():
     assert "model.language_model.layers.62.linear_attn.in_proj_qkv.weight" in names
     assert "model.language_model.layers.63.self_attn.q_proj.weight" in names
 
-    config["rope_parameters"] = {**config["rope_parameters"], "rope_type": "yarn", "factor": 4.0}
+    config["rope_parameters"] = {
+        **config["rope_parameters"],
+        "rope_type": "yarn",
+        "factor": 4.0,
+    }
     with pytest.raises(ValueError, match="default Qwen rotary"):
         _validate_config(config)
 
@@ -145,7 +165,13 @@ def test_qwen35_native_prefill_decode_and_graph_replay(tmp_path, use_cublas):
         pytest.skip("CUDA is not available")
     model_path = tmp_path / "tiny-qwen35"
     _write_tiny_qwen35(model_path)
-    runner = Qwen35Runner(model_path, device="cuda:0", cache_capacity=8, prefill_chunk_size=4, use_cublas=use_cublas)
+    runner = Qwen35Runner(
+        model_path,
+        device="cuda:0",
+        cache_capacity=8,
+        prefill_chunk_size=4,
+        use_cublas=use_cublas,
+    )
 
     first = runner.prefill([1, 2, 3]).numpy()
     assert set(runner._chunk_plans) == {2, 4}

@@ -24,7 +24,13 @@ from functools import lru_cache
 import warp as wp
 
 from warp_nn.modules.layers._common import tile_transposed_gemm_2d
-from warp_nn.runtime._cuda import dp4a, expand_int4x4_high, expand_int4x4_low, subgroup_sum, warp_max_broadcast
+from warp_nn.runtime._cuda import (
+    dp4a,
+    expand_int4x4_high,
+    expand_int4x4_low,
+    subgroup_sum,
+    warp_max_broadcast,
+)
 from warp_nn.utils.config import get_kernel_config
 
 
@@ -72,8 +78,12 @@ def _create_gemm_transb_tiled_kernel(config):
         shape_t = (wp.static(config.tile_2d[1]), wp.static(config.tile_2d[0]))
         shape_b = (wp.static(config.tile_2d[1]), 1)
         offset_b = (j * wp.static(config.tile_2d[1]), 0)
-        tiled_bias = wp.tile_broadcast(wp.tile_load(bias, shape=shape_b, offset=offset_b), shape=shape_t)
-        wp.tile_store(C, wp.tile_transpose(alpha * out + beta * tiled_bias), offset=offset)
+        tiled_bias = wp.tile_broadcast(
+            wp.tile_load(bias, shape=shape_b, offset=offset_b), shape=shape_t
+        )
+        wp.tile_store(
+            C, wp.tile_transpose(alpha * out + beta * tiled_bias), offset=offset
+        )
 
     return kernel
 
@@ -83,7 +93,9 @@ _GEMM_TRANSB_TILED_KERNEL = _create_gemm_transb_tiled_kernel(_GEMM_CONFIG)
 
 
 @wp.kernel
-def _linear_kernel(x: wp.array2d[Any], weight: wp.array2d[Any], output: wp.array2d[Any]):
+def _linear_kernel(
+    x: wp.array2d[Any], weight: wp.array2d[Any], output: wp.array2d[Any]
+):
     """Compute the fallback dense projection ``output = x @ weight.T``."""
     row, column = wp.tid()
     total = wp.float32(0.0)
@@ -102,7 +114,11 @@ def _create_linear_vector_kernel(dtype: type):
         return wp.float32(DTYPE(left)) * wp.float32(right)
 
     @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
-    def kernel(x: wp.array2d(dtype=DTYPE), weight: wp.array2d(dtype=DTYPE), output: wp.array2d(dtype=DTYPE)):
+    def kernel(
+        x: wp.array2d(dtype=DTYPE),
+        weight: wp.array2d(dtype=DTYPE),
+        output: wp.array2d(dtype=DTYPE),
+    ):
         """Project small row batches with one reduction tile per output."""
         item = wp.tid()
         row = item / weight.shape[0]
@@ -111,7 +127,9 @@ def _create_linear_vector_kernel(dtype: type):
         for inner_tile in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
             offset = inner_tile * TILE_WIDTH
             activations = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
-            weights = wp.tile_load(weight[column], shape=(TILE_WIDTH,), offset=(offset,))
+            weights = wp.tile_load(
+                weight[column], shape=(TILE_WIDTH,), offset=(offset,)
+            )
             partials += wp.tile_map(multiply, activations, weights)
         output[row, column] = DTYPE(wp.tile_extract(wp.tile_sum(partials), 0))
 
@@ -137,15 +155,25 @@ def _create_linear_tiled_kernel(dtype: type, tile_m: int):
         return DTYPE(value)
 
     @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
-    def kernel(x: wp.array2d(dtype=DTYPE), weight: wp.array2d(dtype=DTYPE), output: wp.array2d(dtype=DTYPE)):
+    def kernel(
+        x: wp.array2d(dtype=DTYPE),
+        weight: wp.array2d(dtype=DTYPE),
+        output: wp.array2d(dtype=DTYPE),
+    ):
         """Compute a tiled ``output = x @ weight.T`` projection."""
         tile_row, tile_column = wp.tid()
         typed_zero = DTYPE(0.0)
         accumulator = wp.tile_zeros(shape=(TILE_M, TILE_N), dtype=wp.float32)
         for inner_tile in range((x.shape[1] + TILE_K - 1) / TILE_K):
             inner_offset = inner_tile * TILE_K
-            activations = wp.tile_load(x, shape=(TILE_M, TILE_K), offset=(tile_row * TILE_M, inner_offset))
-            weights = wp.tile_load(weight, shape=(TILE_N, TILE_K), offset=(tile_column * TILE_N, inner_offset))
+            activations = wp.tile_load(
+                x, shape=(TILE_M, TILE_K), offset=(tile_row * TILE_M, inner_offset)
+            )
+            weights = wp.tile_load(
+                weight,
+                shape=(TILE_N, TILE_K),
+                offset=(tile_column * TILE_N, inner_offset),
+            )
             wp.tile_matmul(activations, wp.tile_transpose(weights), accumulator)
         wp.tile_store(
             output,
@@ -173,7 +201,9 @@ def _elu_kernel(
     """Apply ELU elementwise; ``alpha`` controls the negative branch."""
     i, j = wp.tid()
     v = x[i, j]
-    y[i, j] = wp.where(v >= x.dtype(0.0), v, x.dtype(alpha) * (wp.exp(v) - x.dtype(1.0)))
+    y[i, j] = wp.where(
+        v >= x.dtype(0.0), v, x.dtype(alpha) * (wp.exp(v) - x.dtype(1.0))
+    )
 
 
 @wp.kernel
@@ -192,7 +222,10 @@ def _unary_kernel(x: wp.array2d[Any], operation: int, y: wp.array2d[Any]):
         y[i, j] = x.dtype(wp.float32(1.0) / (wp.float32(1.0) + wp.exp(-value_fp32)))
     else:
         value_fp32 = wp.float32(value)
-        y[i, j] = x.dtype(wp.max(value_fp32, wp.float32(0.0)) + wp.log(wp.float32(1.0) + wp.exp(-wp.abs(value_fp32))))
+        y[i, j] = x.dtype(
+            wp.max(value_fp32, wp.float32(0.0))
+            + wp.log(wp.float32(1.0) + wp.exp(-wp.abs(value_fp32)))
+        )
 
 
 @wp.kernel
@@ -317,11 +350,16 @@ def _rotary_embedding_kernel(
         cache_column = column % half
         partner = column + half if column < half else column - half
         sign = wp.float32(-1.0) if column < half else wp.float32(1.0)
-    position = position_ids[0, 0] + wp.int64(sequence) if position_offset else position_ids[batch, sequence]
+    position = (
+        position_ids[0, 0] + wp.int64(sequence)
+        if position_offset
+        else position_ids[batch, sequence]
+    )
     value = wp.float32(x[batch, head, sequence, column])
     rotated = sign * wp.float32(x[batch, head, sequence, partner])
     output[batch, head, sequence, column] = x.dtype(
-        value * wp.float32(cos_cache[position, cache_column]) + rotated * wp.float32(sin_cache[position, cache_column])
+        value * wp.float32(cos_cache[position, cache_column])
+        + rotated * wp.float32(sin_cache[position, cache_column])
     )
 
 
@@ -338,7 +376,9 @@ def _batch_normalization_kernel(
 ):
     """Apply inference batch normalization with optional ReLU fusion."""
     row, column = wp.tid()
-    unit = (x[row, column] - mean[column]) / wp.sqrt(variance[column] + x.dtype(epsilon))
+    unit = (x[row, column] - mean[column]) / wp.sqrt(
+        variance[column] + x.dtype(epsilon)
+    )
     value = unit * scale[column] + bias[column]
     y[row, column] = wp.where(relu, wp.max(value, x.dtype(0.0)), value)
 
@@ -363,7 +403,9 @@ def _create_rms_normalization_kernel(width: int):
         values = wp.tile_load(x, shape=(1, wp.static(width)), offset=(row, 0))
         sum_squares = wp.tile_sum(values * values)
         epsilon_tile = wp.tile_load(epsilon, shape=(1,), offset=(0,))
-        inverse_rms = wp.tile_map(_inverse_sqrt, sum_squares / x.dtype(wp.static(width)) + epsilon_tile)
+        inverse_rms = wp.tile_map(
+            _inverse_sqrt, sum_squares / x.dtype(wp.static(width)) + epsilon_tile
+        )
         inverse_rms = wp.tile_broadcast(inverse_rms, shape=(1, wp.static(width)))
         scales = wp.tile_broadcast(
             wp.tile_load(scale, shape=(wp.static(width),), offset=(0,)),
@@ -409,10 +451,26 @@ def _lstm_cell_update_kernel(
     """Apply LSTM gates and update hidden and cell state."""
     b, h = wp.tid()
 
-    s_i = gates[b, 0 * hidden_size + h] + Bx[0 * hidden_size + h] + Bh[0 * hidden_size + h]
-    s_o = gates[b, 1 * hidden_size + h] + Bx[1 * hidden_size + h] + Bh[1 * hidden_size + h]
-    s_f = gates[b, 2 * hidden_size + h] + Bx[2 * hidden_size + h] + Bh[2 * hidden_size + h]
-    s_c = gates[b, 3 * hidden_size + h] + Bx[3 * hidden_size + h] + Bh[3 * hidden_size + h]
+    s_i = (
+        gates[b, 0 * hidden_size + h]
+        + Bx[0 * hidden_size + h]
+        + Bh[0 * hidden_size + h]
+    )
+    s_o = (
+        gates[b, 1 * hidden_size + h]
+        + Bx[1 * hidden_size + h]
+        + Bh[1 * hidden_size + h]
+    )
+    s_f = (
+        gates[b, 2 * hidden_size + h]
+        + Bx[2 * hidden_size + h]
+        + Bh[2 * hidden_size + h]
+    )
+    s_c = (
+        gates[b, 3 * hidden_size + h]
+        + Bx[3 * hidden_size + h]
+        + Bh[3 * hidden_size + h]
+    )
 
     one = gates.dtype(1.0)
     g_i = one / (one + wp.exp(-s_i))
@@ -439,12 +497,15 @@ def _gather_block_quantized_int8_kernel(
     row = indices[batch, sequence]
     block = column / block_size
     output[batch, sequence, column] = wp.float16(
-        (wp.float32(data[row, column]) - wp.float32(zero_points[row, block])) * wp.float32(scales[row, block])
+        (wp.float32(data[row, column]) - wp.float32(zero_points[row, block]))
+        * wp.float32(scales[row, block])
     )
 
 
 @wp.kernel(enable_backward=False)
-def _dequantize_e4m3_kernel(packed: wp.array1d[wp.uint8], scale: wp.array1d[Any], output: wp.array1d[Any]):
+def _dequantize_e4m3_kernel(
+    packed: wp.array1d[wp.uint8], scale: wp.array1d[Any], output: wp.array1d[Any]
+):
     """Convert finite E4M3 values to ``output.dtype`` and apply one scale."""
     index = wp.tid()
     bits = wp.int32(packed[index])
@@ -452,16 +513,18 @@ def _dequantize_e4m3_kernel(packed: wp.array1d[wp.uint8], scale: wp.array1d[Any]
     mantissa = bits & 7
     magnitude = wp.float32(mantissa) * wp.float32(0.001953125)
     if exponent != 0:
-        magnitude = (wp.float32(1.0) + wp.float32(mantissa) * wp.float32(0.125)) * wp.pow(
-            wp.float32(2.0), wp.float32(exponent - 7)
-        )
+        magnitude = (
+            wp.float32(1.0) + wp.float32(mantissa) * wp.float32(0.125)
+        ) * wp.pow(wp.float32(2.0), wp.float32(exponent - 7))
     if bits & 128:
         magnitude = -magnitude
     output[index] = output.dtype(magnitude * wp.float32(scale[0]))
 
 
 @wp.kernel(module="unique")
-def _gather_rows_kernel(data: wp.array2d[Any], indices: wp.array2d[wp.int64], output: wp.array3d[Any]):
+def _gather_rows_kernel(
+    data: wp.array2d[Any], indices: wp.array2d[wp.int64], output: wp.array3d[Any]
+):
     """Gather matrix rows for batched token indices."""
     batch, sequence, column = wp.tid()
     output[batch, sequence, column] = data[indices[batch, sequence], column]
@@ -475,7 +538,9 @@ def _reorder_heads_kernel(x: wp.array2d[Any], output: wp.array2d[Any], head_size
 
 
 @wp.kernel(enable_backward=False, module="unique")
-def _reorder_interleaved_heads_kernel(x: wp.array2d[Any], output: wp.array2d[Any], head_size: int):
+def _reorder_interleaved_heads_kernel(
+    x: wp.array2d[Any], output: wp.array2d[Any], head_size: int
+):
     """Reorder GGUF interleaved-RoPE heads into split-half head-major rows."""
     row, head, column = wp.tid()
     half = head_size / 2
@@ -502,31 +567,47 @@ def _unpack_gated_heads_kernel(
 
 @wp.kernel(enable_backward=False, module="unique")
 def _append_head_cache_kernel(
-    x: wp.array2d[Any], positions: wp.array2d[wp.int64], cache: wp.array2d[Any], heads: int, head_size: int
+    x: wp.array2d[Any],
+    positions: wp.array2d[wp.int64],
+    cache: wp.array2d[Any],
+    heads: int,
+    head_size: int,
 ):
     """Append head-major token rows at their device-side positions."""
     head, row, column = wp.tid()
     capacity = cache.shape[0] / heads
-    cache[head * capacity + wp.int32(positions[0, row]), column] = x[head * positions.shape[1] + row, column]
+    cache[head * capacity + wp.int32(positions[0, row]), column] = x[
+        head * positions.shape[1] + row, column
+    ]
 
 
 @wp.kernel(enable_backward=False, module="unique")
 def _append_circular_head_cache_kernel(
-    x: wp.array2d[Any], positions: wp.array2d[wp.int64], cache: wp.array2d[Any], heads: int, head_size: int
+    x: wp.array2d[Any],
+    positions: wp.array2d[wp.int64],
+    cache: wp.array2d[Any],
+    heads: int,
+    head_size: int,
 ):
     """Append head-major rows to a circular device-side cache."""
     head, row, column = wp.tid()
     capacity = cache.shape[0] / heads
     position = wp.int32(positions[0, row] % wp.int64(capacity))
-    cache[head * capacity + position, column] = x[head * positions.shape[1] + row, column]
+    cache[head * capacity + position, column] = x[
+        head * positions.shape[1] + row, column
+    ]
 
 
 @wp.kernel(enable_backward=False, module="unique")
-def _sigmoid_gate_kernel(x: wp.array2d[Any], gate: wp.array2d[Any], output: wp.array2d[Any]):
+def _sigmoid_gate_kernel(
+    x: wp.array2d[Any], gate: wp.array2d[Any], output: wp.array2d[Any]
+):
     """Multiply activations by a sigmoid gate."""
     row, column = wp.tid()
     gate_value = wp.float32(gate[row, column])
-    output[row, column] = x.dtype(wp.float32(x[row, column]) / (wp.float32(1.0) + wp.exp(-gate_value)))
+    output[row, column] = x.dtype(
+        wp.float32(x[row, column]) / (wp.float32(1.0) + wp.exp(-gate_value))
+    )
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -537,7 +618,9 @@ def _scale_kernel(x: wp.array2d[Any], output: wp.array2d[Any], scale: float):
 
 
 @wp.kernel(enable_backward=False, module="unique")
-def _logit_softcap_kernel(x: wp.array3d[Any], output: wp.array3d[Any], multiplier: float, cap: float):
+def _logit_softcap_kernel(
+    x: wp.array3d[Any], output: wp.array3d[Any], multiplier: float, cap: float
+):
     """Apply ``cap * tanh(x * multiplier / cap)`` to logits."""
     batch, row, column = wp.tid()
     value = wp.float32(x[batch, row, column]) * wp.float32(multiplier) / wp.float32(cap)
@@ -546,7 +629,11 @@ def _logit_softcap_kernel(x: wp.array3d[Any], output: wp.array3d[Any], multiplie
 
 @wp.kernel(enable_backward=False)
 def _gather_single_index_kernel(
-    data: wp.array1d[Any], output: wp.array1d[Any], index: int, axis_size: int, stride: int
+    data: wp.array1d[Any],
+    output: wp.array1d[Any],
+    index: int,
+    axis_size: int,
+    stride: int,
 ):
     """Gather one index along a flattened axis with the given ``stride``."""
     output_index = wp.tid()
@@ -604,12 +691,22 @@ def _matmul_int4_q8_kernel(
         packed_weights = weights[column, block, lane]
         packed_activation_0 = wp.int32(activations[row, block, lane * 2])
         packed_activation_1 = wp.int32(activations[row, block, lane * 2 + 1])
-        block_total = dp4a(expand_int4x4_low(wp.int32(packed_weights)), packed_activation_0, 0)
-        block_total = dp4a(expand_int4x4_high(wp.int32(packed_weights)), packed_activation_1, block_total)
+        block_total = dp4a(
+            expand_int4x4_low(wp.int32(packed_weights)), packed_activation_0, 0
+        )
+        block_total = dp4a(
+            expand_int4x4_high(wp.int32(packed_weights)),
+            packed_activation_1,
+            block_total,
+        )
         activation_sum = dp4a(0x01010101, packed_activation_0, 0)
         activation_sum = dp4a(0x01010101, packed_activation_1, activation_sum)
         block_total -= 8 * activation_sum
-        total += wp.float32(block_total) * activation_scales[row, block] * wp.float32(weight_scales[column, block])
+        total += (
+            wp.float32(block_total)
+            * activation_scales[row, block]
+            * wp.float32(weight_scales[column, block])
+        )
     total = subgroup_sum(total, 4)
     if lane == 0:
         output[row, column] = wp.float16(total)
@@ -641,9 +738,15 @@ def _get_matmul_int8_q8_kernel(reduction_width: int):
             for group in range(WORDS_PER_LANE):
                 word = lane + group * REDUCTION_WIDTH
                 packed_activation = wp.int32(activations[row, block, word])
-                signed_weights = wp.int32(weights[column, block, word] ^ wp.uint32(0x80808080))
+                signed_weights = wp.int32(
+                    weights[column, block, word] ^ wp.uint32(0x80808080)
+                )
                 block_total = dp4a(signed_weights, packed_activation, block_total)
-            total += wp.float32(block_total) * activation_scales[row, block] * wp.float32(weight_scales[column, block])
+            total += (
+                wp.float32(block_total)
+                * activation_scales[row, block]
+                * wp.float32(weight_scales[column, block])
+            )
         total = subgroup_sum(total, REDUCTION_WIDTH)
         if lane == 0:
             output[row, column] = wp.float16(total)
@@ -692,14 +795,26 @@ def _get_matmul_int4_tile_gemm_kernel(tile_m: int, tile_n: int, blocks_per_tile:
         total = wp.tile_zeros(shape=(tile_m, tile_n), dtype=wp.float32)
         even_columns = wp.tile_arange(0, packed_width, dtype=wp.int32) * 2
         odd_columns = wp.tile_map(add_one, even_columns)
-        scale_indices = wp.tile_map(scale_index, wp.tile_arange(0, packed_width, dtype=wp.int32))
-        for block_tile in range((scales.shape[1] + blocks_per_tile - 1) / blocks_per_tile):
+        scale_indices = wp.tile_map(
+            scale_index, wp.tile_arange(0, packed_width, dtype=wp.int32)
+        )
+        for block_tile in range(
+            (scales.shape[1] + blocks_per_tile - 1) / blocks_per_tile
+        ):
             activation = wp.tile_load(
-                activations, shape=(tile_m, activation_width), offset=(row, block_tile * activation_width)
+                activations,
+                shape=(tile_m, activation_width),
+                offset=(row, block_tile * activation_width),
             )
-            packed = wp.tile_load(weights, shape=(tile_n, packed_width), offset=(column, block_tile * packed_width))
+            packed = wp.tile_load(
+                weights,
+                shape=(tile_n, packed_width),
+                offset=(column, block_tile * packed_width),
+            )
             block_scales = wp.tile_load(
-                scales, shape=(tile_n, blocks_per_tile), offset=(column, block_tile * blocks_per_tile)
+                scales,
+                shape=(tile_n, blocks_per_tile),
+                offset=(column, block_tile * blocks_per_tile),
             )
             scale = block_scales[:, scale_indices]
             low = wp.tile_transpose(wp.tile_map(dequantize_low, packed, scale))
@@ -711,14 +826,18 @@ def _get_matmul_int4_tile_gemm_kernel(tile_m: int, tile_n: int, blocks_per_tile:
     return kernel
 
 
-def _nbits_reduction_width(bits: int, packed_block_size: int, warp_reduction: bool) -> int:
+def _nbits_reduction_width(
+    bits: int, packed_block_size: int, warp_reduction: bool
+) -> int:
     if not warp_reduction:
         return 1
     width = 1 << (packed_block_size - 1).bit_length()
     return min(32, width // 2 if bits == 8 and width > 1 else width)
 
 
-def _create_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_reduction: bool):
+def _create_matmul_nbits_kernel(
+    bits: int, block_size: int, dtype: type, warp_reduction: bool
+):
     """Build generic packed N-bit matmul for the given quantization block.
     ``warp_reduction`` enables a subgroup reduction on CUDA."""
     values_per_byte = 8 // bits
@@ -748,18 +867,22 @@ def _create_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_re
             zero = 1 << (bits - 1)
             if has_zero_points:
                 packed_zero = wp.int32(zero_points[column, block / values_per_byte])
-                zero = (packed_zero >> ((block % values_per_byte) * bits)) & ((1 << bits) - 1)
+                zero = (packed_zero >> ((block % values_per_byte) * bits)) & (
+                    (1 << bits) - 1
+                )
             block_total = wp.float32(0.0)
             for group in range(loads_per_lane):
                 packed_offset = lane + group * load_stride
                 if packed_offset < packed_block_size:
                     packed = wp.int32(weights[column, block, packed_offset])
-                    activation_offset = block * block_size + packed_offset * values_per_byte
+                    activation_offset = (
+                        block * block_size + packed_offset * values_per_byte
+                    )
                     for value_index in range(values_per_byte):
                         quantized = (packed >> (value_index * bits)) & ((1 << bits) - 1)
-                        block_total += wp.float32(activations[row, activation_offset + value_index]) * wp.float32(
-                            quantized - zero
-                        )
+                        block_total += wp.float32(
+                            activations[row, activation_offset + value_index]
+                        ) * wp.float32(quantized - zero)
             total += block_total * wp.float32(scales[column, block])
 
         if warp_reduction:
@@ -771,11 +894,15 @@ def _create_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_re
 
 
 @lru_cache(maxsize=None)
-def _get_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_reduction: bool):
+def _get_matmul_nbits_kernel(
+    bits: int, block_size: int, dtype: type, warp_reduction: bool
+):
     """Return the reduction width and cached generic N-bit matmul kernel."""
     packed_block_size = block_size * bits // 8
     reduction_width = _nbits_reduction_width(bits, packed_block_size, warp_reduction)
-    return reduction_width, _create_matmul_nbits_kernel(bits, block_size, dtype, warp_reduction)
+    return reduction_width, _create_matmul_nbits_kernel(
+        bits, block_size, dtype, warp_reduction
+    )
 
 
 def _create_dequantize_nbits_kernel(bits: int, block_size: int, dtype: type):
@@ -799,12 +926,16 @@ def _create_dequantize_nbits_kernel(bits: int, block_size: int, dtype: type):
         zero = 1 << (bits - 1)
         if has_zero_points:
             packed_zero = wp.int32(zero_points[column, block / values_per_byte])
-            zero = (packed_zero >> ((block % values_per_byte) * bits)) & ((1 << bits) - 1)
+            zero = (packed_zero >> ((block % values_per_byte) * bits)) & (
+                (1 << bits) - 1
+            )
         scale = wp.float32(scales[column, block])
         output_offset = block * block_size + packed_offset * values_per_byte
         for value_index in range(values_per_byte):
             quantized = (packed >> (value_index * bits)) & ((1 << bits) - 1)
-            output[column, output_offset + value_index] = dtype(wp.float32(quantized - zero) * scale)
+            output[column, output_offset + value_index] = dtype(
+                wp.float32(quantized - zero) * scale
+            )
 
     return kernel
 
@@ -830,7 +961,9 @@ def _causal_conv_1d_kernel(
         input_index = position + kernel_index - (kernel_size - 1)
         input_value = wp.float32(0.0)
         if input_index < 0:
-            input_value = wp.float32(past[batch, channel, input_index + kernel_size - 1])
+            input_value = wp.float32(
+                past[batch, channel, input_index + kernel_size - 1]
+            )
         else:
             input_value = wp.float32(x[batch, channel, input_index])
         value += input_value * wp.float32(weight[channel, 0, kernel_index])
@@ -852,7 +985,9 @@ def _causal_conv_state_kernel(
     if source_index < past.shape[2]:
         present[batch, channel, state_index] = past[batch, channel, source_index]
     else:
-        present[batch, channel, state_index] = x[batch, channel, source_index - past.shape[2]]
+        present[batch, channel, state_index] = x[
+            batch, channel, source_index - past.shape[2]
+        ]
 
 
 @wp.kernel(enable_backward=False)
@@ -865,7 +1000,9 @@ def _causal_conv_state_inplace_kernel(x: wp.array3d[Any], state: wp.array3d[Any]
         if source_index < state.shape[2]:
             state[batch, channel, state_index] = state[batch, channel, source_index]
         else:
-            state[batch, channel, state_index] = x[batch, channel, source_index - state.shape[2]]
+            state[batch, channel, state_index] = x[
+                batch, channel, source_index - state.shape[2]
+            ]
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -918,7 +1055,9 @@ def _prepare_gated_delta_kernel(
     b_value = wp.float32(b[row, head])
     beta[row, head] = wp.float32(1.0) / (wp.float32(1.0) + wp.exp(-b_value))
     dt = wp.float32(a[row, head]) + wp.float32(dt_bias[head])
-    softplus = wp.max(dt, wp.float32(0.0)) + wp.log(wp.float32(1.0) + wp.exp(-wp.abs(dt)))
+    softplus = wp.max(dt, wp.float32(0.0)) + wp.log(
+        wp.float32(1.0) + wp.exp(-wp.abs(dt))
+    )
     a_value = wp.float32(a_log[head])
     decay[row, head] = (a_value if a_is_decay else -wp.exp(a_value)) * softplus
 
@@ -956,13 +1095,27 @@ def _create_rms_norm_kernels(tile_width: int, dtype: type, scale_dtype: type):
         return dtype(wp.float32(value) + wp.float32(skip))
 
     @wp.func
-    def normalize(value: dtype, scale: SCALE_DTYPE, inverse_rms: float, scale_offset: float):
-        return dtype(wp.float32(value) * (wp.float32(SCALE_DTYPE(scale)) + scale_offset) * inverse_rms)
+    def normalize(
+        value: dtype, scale: SCALE_DTYPE, inverse_rms: float, scale_offset: float
+    ):
+        return dtype(
+            wp.float32(value)
+            * (wp.float32(SCALE_DTYPE(scale)) + scale_offset)
+            * inverse_rms
+        )
 
     @wp.func
-    def skip_normalize(value: dtype, skip: dtype, scale: SCALE_DTYPE, inverse_rms: float, scale_offset: float):
+    def skip_normalize(
+        value: dtype,
+        skip: dtype,
+        scale: SCALE_DTYPE,
+        inverse_rms: float,
+        scale_offset: float,
+    ):
         return dtype(
-            (wp.float32(value) + wp.float32(skip)) * (wp.float32(SCALE_DTYPE(scale)) + scale_offset) * inverse_rms
+            (wp.float32(value) + wp.float32(skip))
+            * (wp.float32(SCALE_DTYPE(scale)) + scale_offset)
+            * inverse_rms
         )
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -979,7 +1132,9 @@ def _create_rms_norm_kernels(tile_width: int, dtype: type, scale_dtype: type):
         scale_zero = SCALE_DTYPE(0.0)
         partials = wp.tile_zeros(shape=(TILE_WIDTH,), dtype=wp.float32)
         for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
-            values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(tile_index * TILE_WIDTH,))
+            values = wp.tile_load(
+                x[row], shape=(TILE_WIDTH,), offset=(tile_index * TILE_WIDTH,)
+            )
             partials += wp.tile_map(square, values)
         inverse_rms = wp.float32(1.0) / wp.sqrt(
             wp.tile_extract(wp.tile_sum(partials), 0) / wp.float32(x.shape[1])
@@ -992,7 +1147,9 @@ def _create_rms_norm_kernels(tile_width: int, dtype: type, scale_dtype: type):
             values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
             scales = wp.tile_load(scale, shape=(TILE_WIDTH,), offset=(offset,))
             wp.tile_store(
-                output[row], wp.tile_map(normalize, values, scales, inverse_rms, scale_offset), offset=(offset,)
+                output[row],
+                wp.tile_map(normalize, values, scales, inverse_rms, scale_offset),
+                offset=(offset,),
             )
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -1015,7 +1172,9 @@ def _create_rms_norm_kernels(tile_width: int, dtype: type, scale_dtype: type):
             values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
             skips = wp.tile_load(skip[row], shape=(TILE_WIDTH,), offset=(offset,))
             partials += wp.tile_map(skip_square, values, skips)
-            wp.tile_store(residual[row], wp.tile_map(add, values, skips), offset=(offset,))
+            wp.tile_store(
+                residual[row], wp.tile_map(add, values, skips), offset=(offset,)
+            )
         inverse_rms = wp.float32(1.0) / wp.sqrt(
             wp.tile_extract(wp.tile_sum(partials), 0) / wp.float32(x.shape[1])
             + wp.float32(epsilon)
@@ -1027,7 +1186,9 @@ def _create_rms_norm_kernels(tile_width: int, dtype: type, scale_dtype: type):
             values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
             skips = wp.tile_load(skip[row], shape=(TILE_WIDTH,), offset=(offset,))
             scales = wp.tile_load(scale, shape=(TILE_WIDTH,), offset=(offset,))
-            normalized = wp.tile_map(skip_normalize, values, skips, scales, inverse_rms, scale_offset)
+            normalized = wp.tile_map(
+                skip_normalize, values, skips, scales, inverse_rms, scale_offset
+            )
             wp.tile_store(output[row], normalized, offset=(offset,))
 
     return rms_norm, skip_rms_norm
@@ -1045,7 +1206,9 @@ def _get_rms_norm_kernels(width: int, dtype: type, scale_dtype: type | None = No
     return tile_width, _rms_norm_kernel_cache[key]
 
 
-def _create_gated_rms_norm_kernel(tile_width: int, dtype: type, scale_dtype: type, norm_before_gate: bool):
+def _create_gated_rms_norm_kernel(
+    tile_width: int, dtype: type, scale_dtype: type, norm_before_gate: bool
+):
     """Build fused RMSNorm-times-SiLU gating for recurrent attention."""
     TILE_WIDTH = tile_width
     DTYPE = dtype
@@ -1060,20 +1223,32 @@ def _create_gated_rms_norm_kernel(tile_width: int, dtype: type, scale_dtype: typ
     @wp.func
     def gated_square(value: dtype, gate: dtype):
         gate_fp32 = wp.float32(gate)
-        gated = wp.float32(dtype(value)) * gate_fp32 / (wp.float32(1.0) + wp.exp(-gate_fp32))
+        gated = (
+            wp.float32(dtype(value))
+            * gate_fp32
+            / (wp.float32(1.0) + wp.exp(-gate_fp32))
+        )
         return gated * gated
 
     @wp.func
-    def normalize_gate(value: dtype, gate: dtype, scale: scale_dtype, inverse_rms: float):
+    def normalize_gate(
+        value: dtype, gate: dtype, scale: scale_dtype, inverse_rms: float
+    ):
         gate_fp32 = wp.float32(gate)
         silu = gate_fp32 / (wp.float32(1.0) + wp.exp(-gate_fp32))
-        return dtype(wp.float32(value) * wp.float32(scale_dtype(scale)) * inverse_rms * silu)
+        return dtype(
+            wp.float32(value) * wp.float32(scale_dtype(scale)) * inverse_rms * silu
+        )
 
     @wp.func
-    def gate_normalize(value: dtype, gate: dtype, scale: scale_dtype, inverse_rms: float):
+    def gate_normalize(
+        value: dtype, gate: dtype, scale: scale_dtype, inverse_rms: float
+    ):
         gate_fp32 = wp.float32(gate)
         silu = gate_fp32 / (wp.float32(1.0) + wp.exp(-gate_fp32))
-        return dtype(wp.float32(value) * silu * wp.float32(scale_dtype(scale)) * inverse_rms)
+        return dtype(
+            wp.float32(value) * silu * wp.float32(scale_dtype(scale)) * inverse_rms
+        )
 
     @wp.kernel(enable_backward=False, module="unique")
     def kernel(
@@ -1107,11 +1282,17 @@ def _create_gated_rms_norm_kernel(tile_width: int, dtype: type, scale_dtype: typ
             offset = tile_index * TILE_WIDTH
             values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
             gates = wp.tile_load(gate[row], shape=(TILE_WIDTH,), offset=(offset,))
-            scales = wp.tile_load(scale[scale_row], shape=(TILE_WIDTH,), offset=(offset,))
+            scales = wp.tile_load(
+                scale[scale_row], shape=(TILE_WIDTH,), offset=(offset,)
+            )
             if NORM_BEFORE_GATE:
-                normalized = wp.tile_map(normalize_gate, values, gates, scales, inverse_rms)
+                normalized = wp.tile_map(
+                    normalize_gate, values, gates, scales, inverse_rms
+                )
             else:
-                normalized = wp.tile_map(gate_normalize, values, gates, scales, inverse_rms)
+                normalized = wp.tile_map(
+                    gate_normalize, values, gates, scales, inverse_rms
+                )
             wp.tile_store(output[row], normalized, offset=(offset,))
 
     kernel.module.options["enable_backward"] = False
@@ -1119,10 +1300,17 @@ def _create_gated_rms_norm_kernel(tile_width: int, dtype: type, scale_dtype: typ
 
 
 @lru_cache(maxsize=None)
-def _get_gated_rms_norm_kernel(width: int, dtype: type, norm_before_gate: bool = True, scale_dtype: type | None = None):
+def _get_gated_rms_norm_kernel(
+    width: int,
+    dtype: type,
+    norm_before_gate: bool = True,
+    scale_dtype: type | None = None,
+):
     """Return a cached recurrent gated-RMSNorm kernel and tile width."""
     tile_width = min(512, max(32, 1 << (width - 1).bit_length()))
-    return tile_width, _create_gated_rms_norm_kernel(tile_width, dtype, scale_dtype or dtype, norm_before_gate)
+    return tile_width, _create_gated_rms_norm_kernel(
+        tile_width, dtype, scale_dtype or dtype, norm_before_gate
+    )
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -1148,20 +1336,32 @@ def _create_lp_normalization_kernel(tile_width: int, dtype: type):
         return dtype(wp.float32(value) * inverse_norm)
 
     @wp.kernel(enable_backward=False, module="unique")
-    def kernel(x: wp.array2d(dtype=DTYPE), output: wp.array2d(dtype=DTYPE), epsilon: float):
+    def kernel(
+        x: wp.array2d(dtype=DTYPE), output: wp.array2d(dtype=DTYPE), epsilon: float
+    ):
         """Normalize each row to unit L2 norm."""
         row = wp.tid()
         typed_zero = DTYPE(0.0)
         partials = wp.tile_zeros(shape=(TILE_WIDTH,), dtype=wp.float32)
         for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
-            values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(tile_index * TILE_WIDTH,))
+            values = wp.tile_load(
+                x[row], shape=(TILE_WIDTH,), offset=(tile_index * TILE_WIDTH,)
+            )
             partials += wp.tile_map(square, values)
-        norm = wp.sqrt(wp.tile_extract(wp.tile_sum(partials), 0) + wp.float32(epsilon) + wp.float32(typed_zero))
+        norm = wp.sqrt(
+            wp.tile_extract(wp.tile_sum(partials), 0)
+            + wp.float32(epsilon)
+            + wp.float32(typed_zero)
+        )
         inverse_norm = wp.float32(1.0) / wp.max(norm, wp.float32(1.0e-12))
         for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
             offset = tile_index * TILE_WIDTH
             values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
-            wp.tile_store(output[row], wp.tile_map(normalize, values, inverse_norm), offset=(offset,))
+            wp.tile_store(
+                output[row],
+                wp.tile_map(normalize, values, inverse_norm),
+                offset=(offset,),
+            )
 
     return kernel
 
@@ -1203,7 +1403,9 @@ def _linear_attention_value_blocks(value_size: int) -> int:
     return value_size // min(32, value_size & -value_size)
 
 
-def _create_linear_attention_kernel(key_size: int, value_size: int, dtype: type, state_dtype: type):
+def _create_linear_attention_kernel(
+    key_size: int, value_size: int, dtype: type, state_dtype: type
+):
     """Build recurrent linear attention for fixed key and value widths.
     Value channels are processed in tiles of at most 32."""
     KEY_SIZE = key_size
@@ -1255,23 +1457,40 @@ def _create_linear_attention_kernel(key_size: int, value_size: int, dtype: type,
         value_head = state_item % value_heads
         # HF groups value heads below each key head. Some checkpoint formats
         # transpose those two head axes for contiguous tiled execution.
-        key_head = value_head % key_heads if tiled_value_heads else value_head * key_heads / value_heads
+        key_head = (
+            value_head % key_heads
+            if tiled_value_heads
+            else value_head * key_heads / value_heads
+        )
         state_offset = state_item * KEY_SIZE
         value_offset = value_block * VALUE_TILE
-        state = wp.tile_load(past, shape=(KEY_SIZE, VALUE_TILE), offset=(state_offset, value_offset))
+        state = wp.tile_load(
+            past, shape=(KEY_SIZE, VALUE_TILE), offset=(state_offset, value_offset)
+        )
 
         for token in range(sequence_length):
             token_row = batch * sequence_length + token
             if needs_decay:
                 if decay_per_key:
-                    decay_row = wp.tile_load(decay, shape=(1, KEY_SIZE), offset=(token_row, value_head * KEY_SIZE))
+                    decay_row = wp.tile_load(
+                        decay,
+                        shape=(1, KEY_SIZE),
+                        offset=(token_row, value_head * KEY_SIZE),
+                    )
                     decay_column = wp.tile_transpose(wp.tile_map(exp_value, decay_row))
-                    state *= wp.tile_broadcast(decay_column, shape=(KEY_SIZE, VALUE_TILE))
+                    state *= wp.tile_broadcast(
+                        decay_column, shape=(KEY_SIZE, VALUE_TILE)
+                    )
                 else:
-                    state *= STATE_DTYPE(wp.exp(wp.float32(decay[token_row, value_head])))
+                    state *= STATE_DTYPE(
+                        wp.exp(wp.float32(decay[token_row, value_head]))
+                    )
 
             key_row = wp.tile_map(
-                to_state, wp.tile_load(key, shape=(1, KEY_SIZE), offset=(token_row, key_head * KEY_SIZE))
+                to_state,
+                wp.tile_load(
+                    key, shape=(1, KEY_SIZE), offset=(token_row, key_head * KEY_SIZE)
+                ),
             )
             value_row = wp.tile_map(
                 to_state,
@@ -1284,7 +1503,9 @@ def _create_linear_attention_kernel(key_size: int, value_size: int, dtype: type,
             if needs_beta:
                 retrieved = wp.tile_zeros(shape=(1, VALUE_TILE), dtype=STATE_DTYPE)
                 wp.tile_matmul(key_row, state, retrieved)
-                beta_value = beta[token_row, value_head] if beta_per_head else beta[token_row, 0]
+                beta_value = (
+                    beta[token_row, value_head] if beta_per_head else beta[token_row, 0]
+                )
                 delta = STATE_DTYPE(beta_value) * (value_row - retrieved)
             else:
                 delta = value_row
@@ -1296,7 +1517,11 @@ def _create_linear_attention_kernel(key_size: int, value_size: int, dtype: type,
                     query_head = value_head * heads_per_group + group
                     query_row = wp.tile_map(
                         to_state,
-                        wp.tile_load(query, shape=(1, KEY_SIZE), offset=(token_row, query_head * KEY_SIZE)),
+                        wp.tile_load(
+                            query,
+                            shape=(1, KEY_SIZE),
+                            offset=(token_row, query_head * KEY_SIZE),
+                        ),
                     )
                     result = wp.tile_zeros(shape=(1, VALUE_TILE), dtype=STATE_DTYPE)
                     wp.tile_matmul(query_row, state, result)
@@ -1307,11 +1532,17 @@ def _create_linear_attention_kernel(key_size: int, value_size: int, dtype: type,
                     )
             else:
                 query_head = (
-                    key_head * query_heads / key_heads if tiled_value_heads else value_head * query_heads / value_heads
+                    key_head * query_heads / key_heads
+                    if tiled_value_heads
+                    else value_head * query_heads / value_heads
                 )
                 query_row = wp.tile_map(
                     to_state,
-                    wp.tile_load(query, shape=(1, KEY_SIZE), offset=(token_row, query_head * KEY_SIZE)),
+                    wp.tile_load(
+                        query,
+                        shape=(1, KEY_SIZE),
+                        offset=(token_row, query_head * KEY_SIZE),
+                    ),
                 )
                 result = wp.tile_zeros(shape=(1, VALUE_TILE), dtype=STATE_DTYPE)
                 wp.tile_matmul(query_row, state, result)
@@ -1330,7 +1561,9 @@ def _create_linear_attention_kernel(key_size: int, value_size: int, dtype: type,
 _linear_attention_kernel_cache = {}
 
 
-def _get_linear_attention_kernel(key_size: int, value_size: int, dtype: type, state_dtype: type | None = None):
+def _get_linear_attention_kernel(
+    key_size: int, value_size: int, dtype: type, state_dtype: type | None = None
+):
     """Return a cached recurrent linear-attention kernel."""
     key = (key_size, value_size, dtype, state_dtype or dtype)
     if key not in _linear_attention_kernel_cache:
@@ -1338,7 +1571,9 @@ def _get_linear_attention_kernel(key_size: int, value_size: int, dtype: type, st
     return _linear_attention_kernel_cache[key]
 
 
-def _create_mamba2_decode_kernel(head_dim: int, state_size: int, heads_per_group: int, dtype: type):
+def _create_mamba2_decode_kernel(
+    head_dim: int, state_size: int, heads_per_group: int, dtype: type
+):
     """Build one-token Mamba-2 selective-state update and projection."""
     HEAD_DIM = head_dim
     STATE_TILE = max(32, 1 << (state_size - 1).bit_length())
@@ -1350,7 +1585,9 @@ def _create_mamba2_decode_kernel(head_dim: int, state_size: int, heads_per_group
         return wp.float32(dtype(value))
 
     @wp.func
-    def update_state(value: wp.float32, b: wp.float32, decay: wp.float32, source: wp.float32):
+    def update_state(
+        value: wp.float32, b: wp.float32, decay: wp.float32, source: wp.float32
+    ):
         return value * decay + b * source
 
     @wp.func
@@ -1388,22 +1625,30 @@ def _create_mamba2_decode_kernel(head_dim: int, state_size: int, heads_per_group
         c_values = wp.tile_map(to_float, wp.tile_load(c[group], shape=(STATE_TILE,)))
         values = wp.tile_map(update_state, values, b_values, decay, source)
         wp.tile_store(state[state_row], values)
-        projected = wp.tile_extract(wp.tile_sum(wp.tile_map(multiply, values, c_values)), 0)
-        output[head, channel] = DTYPE(projected + d[head] * wp.float32(x[head, channel]))
+        projected = wp.tile_extract(
+            wp.tile_sum(wp.tile_map(multiply, values, c_values)), 0
+        )
+        output[head, channel] = DTYPE(
+            projected + d[head] * wp.float32(x[head, channel])
+        )
 
     kernel.module.options["enable_backward"] = False
     return STATE_TILE, kernel
 
 
 @lru_cache(maxsize=None)
-def _get_mamba2_decode_kernel(head_dim: int, state_size: int, heads_per_group: int, dtype: type):
+def _get_mamba2_decode_kernel(
+    head_dim: int, state_size: int, heads_per_group: int, dtype: type
+):
     """Return the cached one-token Mamba-2 kernel and reduction width."""
     if min(head_dim, state_size, heads_per_group) <= 0:
         raise ValueError("Mamba-2 dimensions must be positive")
     return _create_mamba2_decode_kernel(head_dim, state_size, heads_per_group, dtype)
 
 
-def _create_mamba2_prefill_kernel(head_dim: int, state_size: int, heads_per_group: int, dtype: type):
+def _create_mamba2_prefill_kernel(
+    head_dim: int, state_size: int, heads_per_group: int, dtype: type
+):
     """Build chunked Mamba-2 prefill with state kept on-chip."""
     HEAD_DIM = head_dim
     STATE_SIZE = state_size
@@ -1459,19 +1704,27 @@ def _create_mamba2_prefill_kernel(head_dim: int, state_size: int, heads_per_grou
 
             x_row = wp.tile_map(
                 to_float,
-                wp.tile_load(x, shape=(1, CHANNEL_TILE), offset=(token, head * HEAD_DIM + channel_offset)),
+                wp.tile_load(
+                    x,
+                    shape=(1, CHANNEL_TILE),
+                    offset=(token, head * HEAD_DIM + channel_offset),
+                ),
             )
             b_column = wp.tile_transpose(
                 wp.tile_map(
                     to_float,
-                    wp.tile_load(b, shape=(1, STATE_SIZE), offset=(token, group * STATE_SIZE)),
+                    wp.tile_load(
+                        b, shape=(1, STATE_SIZE), offset=(token, group * STATE_SIZE)
+                    ),
                 )
             )
             wp.tile_matmul(b_column, step * x_row, values)
 
             c_row = wp.tile_map(
                 to_float,
-                wp.tile_load(c, shape=(1, STATE_SIZE), offset=(token, group * STATE_SIZE)),
+                wp.tile_load(
+                    c, shape=(1, STATE_SIZE), offset=(token, group * STATE_SIZE)
+                ),
             )
             projected = wp.tile_zeros(shape=(1, CHANNEL_TILE), dtype=wp.float32)
             wp.tile_matmul(c_row, values, projected)
@@ -1488,7 +1741,9 @@ def _create_mamba2_prefill_kernel(head_dim: int, state_size: int, heads_per_grou
 
 
 @lru_cache(maxsize=None)
-def _get_mamba2_prefill_kernel(head_dim: int, state_size: int, heads_per_group: int, dtype: type):
+def _get_mamba2_prefill_kernel(
+    head_dim: int, state_size: int, heads_per_group: int, dtype: type
+):
     """Return cached prefill, channel blocks per head, and block width."""
     if min(head_dim, state_size, heads_per_group) <= 0:
         raise ValueError("Mamba-2 dimensions must be positive")
@@ -1566,12 +1821,16 @@ def _gqa_prepare_fp16_kernel(
         current = wp.float32(query[batch, token, offset + column])
         if do_rotary:
             cache_column = column % (head_size // 2)
-            paired_column = column + head_size // 2 if column < head_size // 2 else column - head_size // 2
+            paired_column = (
+                column + head_size // 2
+                if column < head_size // 2
+                else column - head_size // 2
+            )
             sign = wp.float32(-1.0) if column < head_size // 2 else wp.float32(1.0)
             paired = wp.float32(query[batch, token, offset + paired_column])
-            current = current * wp.float32(cos_cache[position, cache_column]) + sign * paired * wp.float32(
-                sin_cache[position, cache_column]
-            )
+            current = current * wp.float32(
+                cos_cache[position, cache_column]
+            ) + sign * paired * wp.float32(sin_cache[position, cache_column])
         rotated_query[batch, head, token, column] = wp.float16(current)
 
     if head < kv_heads:
@@ -1579,14 +1838,20 @@ def _gqa_prepare_fp16_kernel(
         current = wp.float32(key[batch, token, offset + column])
         if do_rotary:
             cache_column = column % (head_size // 2)
-            paired_column = column + head_size // 2 if column < head_size // 2 else column - head_size // 2
+            paired_column = (
+                column + head_size // 2
+                if column < head_size // 2
+                else column - head_size // 2
+            )
             sign = wp.float32(-1.0) if column < head_size // 2 else wp.float32(1.0)
             paired = wp.float32(key[batch, token, offset + paired_column])
-            current = current * wp.float32(cos_cache[position, cache_column]) + sign * paired * wp.float32(
-                sin_cache[position, cache_column]
-            )
+            current = current * wp.float32(
+                cos_cache[position, cache_column]
+            ) + sign * paired * wp.float32(sin_cache[position, cache_column])
         present_key[batch, head, cache_token, column] = wp.float16(current)
-        present_value[batch, head, cache_token, column] = value[batch, token, offset + column]
+        present_value[batch, head, cache_token, column] = value[
+            batch, token, offset + column
+        ]
 
 
 def _create_gqa_attention_kernel(head_size: int, dtype: type):
@@ -1598,7 +1863,9 @@ def _create_gqa_attention_kernel(head_size: int, dtype: type):
         return wp.float32(DTYPE(left)) * wp.float32(right)
 
     @wp.func
-    def accumulate(total: wp.float32, value: DTYPE, old_scale: wp.float32, weight: wp.float32):
+    def accumulate(
+        total: wp.float32, value: DTYPE, old_scale: wp.float32, weight: wp.float32
+    ):
         return total * old_scale + wp.float32(DTYPE(value)) * weight
 
     @wp.func
@@ -1625,7 +1892,12 @@ def _create_gqa_attention_kernel(head_size: int, dtype: type):
         head = (index // sequence_length) % query_heads
         batch = index // (sequence_length * query_heads)
         kv_head = head // (query_heads // kv_heads)
-        valid_keys = wp.int32(sequence_lengths_minus_one[batch]) - sequence_length + query_token + 2
+        valid_keys = (
+            wp.int32(sequence_lengths_minus_one[batch])
+            - sequence_length
+            + query_token
+            + 2
+        )
         first_key = wp.max(0, valid_keys - window) if window > 0 else 0
         query_row = (batch * query_heads + head) * sequence_length + query_token
         query_values = wp.tile_load(query[query_row], shape=(head_size,))
@@ -1636,17 +1908,25 @@ def _create_gqa_attention_kernel(head_size: int, dtype: type):
             cache_token = key_token % total_length if window > 0 else key_token
             cache_row = (batch * kv_heads + kv_head) * total_length + cache_token
             key_values = wp.tile_load(key[cache_row], shape=(head_size,))
-            score = wp.tile_extract(wp.tile_sum(wp.tile_map(dot, query_values, key_values)), 0)
+            score = wp.tile_extract(
+                wp.tile_sum(wp.tile_map(dot, query_values, key_values)), 0
+            )
             score *= wp.float32(scale)
             new_maximum = wp.max(maximum, score)
             old_scale = wp.exp(maximum - new_maximum)
             weight = wp.exp(score - new_maximum)
             denominator = denominator * old_scale + weight
             value_values = wp.tile_load(value[cache_row], shape=(head_size,))
-            accumulator = wp.tile_map(accumulate, accumulator, value_values, old_scale, weight)
+            accumulator = wp.tile_map(
+                accumulate, accumulator, value_values, old_scale, weight
+            )
             maximum = new_maximum
         normalized = wp.tile_map(normalize, accumulator, denominator)
-        wp.tile_store(output[batch * sequence_length + query_token], normalized, offset=(head * head_size,))
+        wp.tile_store(
+            output[batch * sequence_length + query_token],
+            normalized,
+            offset=(head * head_size,),
+        )
 
     kernel.module.options["enable_backward"] = False
     return kernel
@@ -1719,7 +1999,9 @@ def _initialize_generation_state(
 
 
 @lru_cache(maxsize=None)
-def _get_greedy_argmax_kernels(tile_width: int, partial_count: int, dtype: type = wp.float16):
+def _get_greedy_argmax_kernels(
+    tile_width: int, partial_count: int, dtype: type = wp.float16
+):
     """Build hierarchical greedy argmax kernels.
     ``tile_width`` scans logits; ``partial_count`` sizes the final reduction."""
     TILE_WIDTH = tile_width
@@ -1732,14 +2014,24 @@ def _get_greedy_argmax_kernels(tile_width: int, partial_count: int, dtype: type 
 
     @wp.func
     def mask_logit(value: DTYPE, index: wp.int32, vocabulary: wp.int32):
-        return wp.float32(DTYPE(value)) if index < vocabulary else wp.float32(-3.402823466e38)
+        return (
+            wp.float32(DTYPE(value))
+            if index < vocabulary
+            else wp.float32(-3.402823466e38)
+        )
 
     @wp.func
-    def matching_token(value: wp.float32, token: wp.int32, maximum: wp.float32, vocabulary: wp.int32):
+    def matching_token(
+        value: wp.float32, token: wp.int32, maximum: wp.float32, vocabulary: wp.int32
+    ):
         return token if value == maximum else vocabulary
 
     @wp.kernel(enable_backward=False, module="unique")
-    def partial_argmax(logits: wp.array3d(dtype=DTYPE), values: wp.array1d[wp.float32], tokens: wp.array1d[wp.int32]):
+    def partial_argmax(
+        logits: wp.array3d(dtype=DTYPE),
+        values: wp.array1d[wp.float32],
+        tokens: wp.array1d[wp.int32],
+    ):
         """Find one deterministic argmax candidate per vocabulary partition."""
         partial = wp.tid()
         vocabulary = logits.shape[2]
@@ -1752,7 +2044,9 @@ def _get_greedy_argmax_kernels(tile_width: int, partial_count: int, dtype: type 
             indices = wp.tile_map(add_offset, local_indices, offset)
             tile = wp.tile_map(
                 mask_logit,
-                wp.tile_load(logits[0, logits.shape[1] - 1], shape=TILE_WIDTH, offset=offset),
+                wp.tile_load(
+                    logits[0, logits.shape[1] - 1], shape=TILE_WIDTH, offset=offset
+                ),
                 indices,
                 vocabulary,
             )
@@ -1762,16 +2056,28 @@ def _get_greedy_argmax_kernels(tile_width: int, partial_count: int, dtype: type 
             if value > best_value or (value == best_value and token < best_token):
                 best_value = value
                 best_token = token
-        wp.tile_store(values, wp.tile_full(shape=1, value=best_value, dtype=wp.float32), offset=partial)
-        wp.tile_store(tokens, wp.tile_full(shape=1, value=best_token, dtype=wp.int32), offset=partial)
+        wp.tile_store(
+            values,
+            wp.tile_full(shape=1, value=best_value, dtype=wp.float32),
+            offset=partial,
+        )
+        wp.tile_store(
+            tokens,
+            wp.tile_full(shape=1, value=best_token, dtype=wp.int32),
+            offset=partial,
+        )
 
     @wp.func
-    def select_token(values: wp.array1d[wp.float32], tokens: wp.array1d[wp.int32], vocabulary: int):
+    def select_token(
+        values: wp.array1d[wp.float32], tokens: wp.array1d[wp.int32], vocabulary: int
+    ):
         value_tile = wp.tile_load(values, shape=PARTIAL_COUNT)
         token_tile = wp.tile_load(tokens, shape=PARTIAL_COUNT)
         maximum_index = wp.tile_extract(wp.tile_argmax(value_tile), 0)
         maximum = wp.tile_extract(value_tile, maximum_index)
-        candidates = wp.tile_map(matching_token, value_tile, token_tile, maximum, vocabulary)
+        candidates = wp.tile_map(
+            matching_token, value_tile, token_tile, maximum, vocabulary
+        )
         winner = wp.tile_extract(wp.tile_argmin(candidates), 0)
         return wp.tile_extract(token_tile, winner)
 
@@ -1783,7 +2089,12 @@ def _get_greedy_argmax_kernels(tile_width: int, partial_count: int, dtype: type 
         vocabulary: int,
     ):
         """Reduce partial candidates and store the winning token."""
-        wp.tile_store(output, wp.tile_full(shape=1, value=select_token(values, tokens, vocabulary), dtype=wp.int32))
+        wp.tile_store(
+            output,
+            wp.tile_full(
+                shape=1, value=select_token(values, tokens, vocabulary), dtype=wp.int32
+            ),
+        )
 
     @wp.kernel(enable_backward=False, module="unique")
     def advance_generation(
@@ -1828,7 +2139,10 @@ def _kernel_for_dtype(kernel, dtype: type, *parameter_types: type | tuple[int]):
     """Return one cached specialization of a generic same-dtype kernel."""
     key = (kernel, dtype, parameter_types)
     if key not in _KERNEL_OVERLOADS:
-        signature = [_array_type(dtype, item[0]) if isinstance(item, tuple) else item for item in parameter_types]
+        signature = [
+            _array_type(dtype, item[0]) if isinstance(item, tuple) else item
+            for item in parameter_types
+        ]
         _KERNEL_OVERLOADS[key] = wp.overload(kernel, signature)
     return _KERNEL_OVERLOADS[key]
 
@@ -1848,7 +2162,12 @@ def _where_kernel_for_dtype(dtype: type):
     if key not in _KERNEL_OVERLOADS:
         _KERNEL_OVERLOADS[key] = wp.overload(
             _where_broadcast_kernel,
-            [wp.array2d(dtype=wp.bool), wp.array2d(dtype=dtype), wp.array2d(dtype=dtype), wp.array2d(dtype=dtype)],
+            [
+                wp.array2d(dtype=wp.bool),
+                wp.array2d(dtype=dtype),
+                wp.array2d(dtype=dtype),
+                wp.array2d(dtype=dtype),
+            ],
         )
     return _KERNEL_OVERLOADS[key]
 

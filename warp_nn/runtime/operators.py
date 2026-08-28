@@ -39,14 +39,19 @@ class Operation:
 
 
 def execute_operations(
-    operations: Iterable[Operation], tensors: dict[str, wp.array], shapes: dict[str, tuple[int, ...]], device
+    operations: Iterable[Operation],
+    tensors: dict[str, wp.array],
+    shapes: dict[str, tuple[int, ...]],
+    device,
 ) -> None:
     """Launch a preplanned operation sequence on the current Warp stream."""
     for operation in operations:
         try:
             dispatch = _OP_DISPATCH[operation.op_type]
         except KeyError as exc:
-            raise NotImplementedError(f"Unsupported operation '{operation.op_type}'") from exc
+            raise NotImplementedError(
+                f"Unsupported operation '{operation.op_type}'"
+            ) from exc
         dispatch(operation, tensors, shapes, device)
 
 
@@ -79,23 +84,40 @@ def _exec_linear(op, tensors, shapes, device):
             tile_m, tile_n = op.attrs["_tile_shape"]
             wp.launch_tiled(
                 op.attrs["_kernel"],
-                dim=((x.shape[0] + tile_m - 1) // tile_m, (weight.shape[0] + tile_n - 1) // tile_n),
+                dim=(
+                    (x.shape[0] + tile_m - 1) // tile_m,
+                    (weight.shape[0] + tile_n - 1) // tile_n,
+                ),
                 inputs=[x, weight, output],
                 block_dim=128,
                 device=device,
             )
     else:
-        wp.launch(_linear_kernel, dim=output.shape, inputs=[x, weight, output], device=device)
+        wp.launch(
+            _linear_kernel, dim=output.shape, inputs=[x, weight, output], device=device
+        )
 
 
-def plan_linear(op: Operation, tensors: dict[str, wp.array], shapes: dict[str, tuple[int, ...]], device, cublas=None):
+def plan_linear(
+    op: Operation,
+    tensors: dict[str, wp.array],
+    shapes: dict[str, tuple[int, ...]],
+    device,
+    cublas=None,
+):
     """Allocate and specialize a dense projection operation."""
     rows, inner = shapes[op.inputs[0]]
     columns, weight_inner = shapes[op.inputs[1]]
     if weight_inner != inner:
-        raise ValueError(f"Linear has incompatible shapes {(rows, inner)} and {(columns, weight_inner)}")
+        raise ValueError(
+            f"Linear has incompatible shapes {(rows, inner)} and {(columns, weight_inner)}"
+        )
     dtype = tensors[op.inputs[0]].dtype
-    if tensors[op.inputs[1]].dtype != dtype or dtype not in (wp.float16, wp.bfloat16, wp.float32):
+    if tensors[op.inputs[1]].dtype != dtype or dtype not in (
+        wp.float16,
+        wp.bfloat16,
+        wp.float32,
+    ):
         raise TypeError("Linear requires matching FP16, BF16, or FP32 inputs")
     output = wp.empty((rows, columns), dtype=dtype, device=device)
     tensors[op.outputs[0]] = output
@@ -108,7 +130,9 @@ def plan_linear(op: Operation, tensors: dict[str, wp.array], shapes: dict[str, t
             op.attrs["_kernel"] = _get_linear_vector_kernel(dtype)
             op.attrs["_vector_kernel"] = True
         else:
-            op.attrs["_kernel"], op.attrs["_tile_shape"] = _get_linear_tiled_kernel(dtype, rows)
+            op.attrs["_kernel"], op.attrs["_tile_shape"] = _get_linear_tiled_kernel(
+                dtype, rows
+            )
 
 
 def _plan_rms_norm_buffers(op, x_name, scale_name, tensors, shapes, device, dtype):
@@ -116,26 +140,47 @@ def _plan_rms_norm_buffers(op, x_name, scale_name, tensors, shapes, device, dtyp
     rows, width = int(np.prod(shape[:-1])), shape[-1]
     dtype = dtype or tensors[x_name].dtype
     scale_dtype = tensors[scale_name].dtype
-    if dtype not in (wp.float16, wp.bfloat16) or scale_dtype not in (
-        wp.float16,
-        wp.bfloat16,
-        wp.float32,
-    ) or shapes[scale_name] != (width,):
+    if (
+        dtype not in (wp.float16, wp.bfloat16)
+        or scale_dtype
+        not in (
+            wp.float16,
+            wp.bfloat16,
+            wp.float32,
+        )
+        or shapes[scale_name] != (width,)
+    ):
         raise ValueError("RMSNorm requires a matching width-sized scale")
     output = wp.empty(shape, dtype=dtype, device=device)
     tensors[op.outputs[0]] = output
     shapes[op.outputs[0]] = shape
-    op.attrs.update({"_rows": rows, "_width": width, "_output_2d": output.reshape((rows, width))})
-    op.attrs["_tile_width"], op.attrs["_rms_norm_kernels"] = _get_rms_norm_kernels(width, dtype, scale_dtype)
+    op.attrs.update(
+        {"_rows": rows, "_width": width, "_output_2d": output.reshape((rows, width))}
+    )
+    op.attrs["_tile_width"], op.attrs["_rms_norm_kernels"] = _get_rms_norm_kernels(
+        width, dtype, scale_dtype
+    )
 
 
-def plan_rms_norm(op: Operation, tensors: dict[str, wp.array], shapes: dict[str, tuple[int, ...]], device, dtype=None):
+def plan_rms_norm(
+    op: Operation,
+    tensors: dict[str, wp.array],
+    shapes: dict[str, tuple[int, ...]],
+    device,
+    dtype=None,
+):
     """Allocate and specialize last-axis RMS normalization."""
-    _plan_rms_norm_buffers(op, op.inputs[0], op.inputs[1], tensors, shapes, device, dtype)
+    _plan_rms_norm_buffers(
+        op, op.inputs[0], op.inputs[1], tensors, shapes, device, dtype
+    )
 
 
 def plan_residual_rms_norm(
-    op: Operation, tensors: dict[str, wp.array], shapes: dict[str, tuple[int, ...]], device, dtype=None
+    op: Operation,
+    tensors: dict[str, wp.array],
+    shapes: dict[str, tuple[int, ...]],
+    device,
+    dtype=None,
 ):
     """Allocate and specialize fused residual addition and RMSNorm."""
     shape = shapes[op.inputs[0]]
@@ -145,21 +190,33 @@ def plan_residual_rms_norm(
         and tensors[op.inputs[1]].dtype != tensors[op.inputs[0]].dtype
     ):
         raise ValueError("ResidualRMSNorm requires matching activation shapes")
-    _plan_rms_norm_buffers(op, op.inputs[0], op.inputs[2], tensors, shapes, device, dtype)
-    residual = wp.empty(shape, dtype=dtype or tensors[op.inputs[0]].dtype, device=device)
+    _plan_rms_norm_buffers(
+        op, op.inputs[0], op.inputs[2], tensors, shapes, device, dtype
+    )
+    residual = wp.empty(
+        shape, dtype=dtype or tensors[op.inputs[0]].dtype, device=device
+    )
     if len(op.outputs) > 3 and op.outputs[3]:
         tensors[op.outputs[3]] = residual
         shapes[op.outputs[3]] = shape
     op.attrs["_residual_2d"] = residual.reshape((op.attrs["_rows"], op.attrs["_width"]))
 
 
-def plan_swiglu(op: Operation, tensors: dict[str, wp.array], shapes: dict[str, tuple[int, ...]], device, dtype=None):
+def plan_swiglu(
+    op: Operation,
+    tensors: dict[str, wp.array],
+    shapes: dict[str, tuple[int, ...]],
+    device,
+    dtype=None,
+):
     """Allocate and specialize fused SiLU-gate multiplication."""
     shape = shapes[op.inputs[0]]
     if shapes[op.inputs[1]] != shape:
         raise ValueError("SwiGLU requires matching activation shapes")
     dtype = dtype or tensors[op.inputs[0]].dtype
-    if (op.inputs[1] in tensors and tensors[op.inputs[1]].dtype != dtype) or dtype not in (wp.float16, wp.bfloat16):
+    if (
+        op.inputs[1] in tensors and tensors[op.inputs[1]].dtype != dtype
+    ) or dtype not in (wp.float16, wp.bfloat16):
         raise TypeError("SwiGLU requires matching FP16 or BF16 inputs")
     output = wp.empty(shape, dtype=dtype, device=device)
     tensors[op.outputs[0]] = output
@@ -202,11 +259,18 @@ def _exec_elu(op, tensors, shapes, device):
     alpha = float(op.attrs.get("alpha", 1.0))
     out = tensors[op.outputs[0]]
     shape = op.attrs["_shape_2d"]
-    wp.launch(op.attrs["_kernel"], dim=shape, inputs=[x.reshape(shape), out.reshape(shape), alpha], device=device)
+    wp.launch(
+        op.attrs["_kernel"],
+        dim=shape,
+        inputs=[x.reshape(shape), out.reshape(shape), alpha],
+        device=device,
+    )
 
 
 def _exec_unary(op, tensors, shapes, device):
-    operation = {"Relu": 0, "Tanh": 1, "Sqrt": 2, "Sigmoid": 3, "Softplus": 4}[op.op_type]
+    operation = {"Relu": 0, "Tanh": 1, "Sqrt": 2, "Sigmoid": 3, "Softplus": 4}[
+        op.op_type
+    ]
     shape_2d = op.attrs["_shape_2d"]
     wp.launch(
         op.attrs["_kernel"],
@@ -293,7 +357,10 @@ def _exec_cast(op, tensors, shapes, device):
     wp.launch(
         op.attrs["_kernel"],
         dim=size,
-        inputs=[tensors[op.inputs[0]].reshape((size,)), tensors[op.outputs[0]].reshape((size,))],
+        inputs=[
+            tensors[op.inputs[0]].reshape((size,)),
+            tensors[op.outputs[0]].reshape((size,)),
+        ],
         device=device,
     )
 
@@ -482,7 +549,13 @@ def _exec_matmul_nbits(op, tensors, shapes, device):
         wp.launch(
             op.attrs["_dequantize_kernel"],
             dim=(N, weights.shape[1] * weights.shape[2]),
-            inputs=[weights, tensors[op.inputs[2]], zero_points, dequantized, has_zero_points],
+            inputs=[
+                weights,
+                tensors[op.inputs[2]],
+                zero_points,
+                dequantized,
+                has_zero_points,
+            ],
             device=device,
         )
         op.attrs["_cublas"].gemm(
@@ -595,14 +668,24 @@ def _exec_linear_attention(op, tensors, shapes, device):
         op.attrs["_kernel"],
         dim=batch * value_heads * op.attrs["_value_blocks"],
         inputs=[
-            tensors[op.inputs[0]].reshape((batch * sequence_length, query_heads * key_size)),
-            tensors[op.inputs[1]].reshape((batch * sequence_length, key_heads * key_size)),
-            tensors[op.inputs[2]].reshape((batch * sequence_length, value_heads * value_size)),
+            tensors[op.inputs[0]].reshape(
+                (batch * sequence_length, query_heads * key_size)
+            ),
+            tensors[op.inputs[1]].reshape(
+                (batch * sequence_length, key_heads * key_size)
+            ),
+            tensors[op.inputs[2]].reshape(
+                (batch * sequence_length, value_heads * value_size)
+            ),
             past.reshape((batch * value_heads * key_size, value_size)),
             decay.reshape((int(np.prod(decay.shape[:-1])), decay.shape[-1])),
             beta.reshape((int(np.prod(beta.shape[:-1])), beta.shape[-1])),
-            tensors[op.outputs[0]].reshape((batch * sequence_length, max(query_heads, value_heads) * value_size)),
-            tensors[op.outputs[1]].reshape((batch * value_heads * key_size, value_size)),
+            tensors[op.outputs[0]].reshape(
+                (batch * sequence_length, max(query_heads, value_heads) * value_size)
+            ),
+            tensors[op.outputs[1]].reshape(
+                (batch * value_heads * key_size, value_size)
+            ),
             sequence_length,
             query_heads,
             key_heads,
@@ -688,7 +771,12 @@ def _exec_group_query_attention(op, tensors, shapes, device):
         wp.launch(
             _gqa_copy_past_fp16_kernel,
             dim=(batch, kv_heads, past_length, head_size),
-            inputs=[tensors[op.inputs[3]], tensors[op.inputs[4]], present_key, present_value],
+            inputs=[
+                tensors[op.inputs[3]],
+                tensors[op.inputs[4]],
+                present_key,
+                present_value,
+            ],
             device=device,
         )
     wp.launch(
@@ -718,11 +806,15 @@ def _exec_group_query_attention(op, tensors, shapes, device):
         op.attrs["_attention_kernel"],
         dim=batch * query_heads * sequence_length,
         inputs=[
-            op.attrs["_rotated_query"].reshape((batch * query_heads * sequence_length, head_size)),
+            op.attrs["_rotated_query"].reshape(
+                (batch * query_heads * sequence_length, head_size)
+            ),
             present_key.reshape((batch * kv_heads * total_length, head_size)),
             present_value.reshape((batch * kv_heads * total_length, head_size)),
             tensors[op.inputs[5]],
-            tensors[op.outputs[0]].reshape((batch * sequence_length, query_heads * head_size)),
+            tensors[op.outputs[0]].reshape(
+                (batch * sequence_length, query_heads * head_size)
+            ),
             query_heads,
             kv_heads,
             sequence_length,
@@ -759,13 +851,17 @@ def _exec_lstm(op, tensors, shapes, device):
         h_prev = tensors[op.inputs[5]].reshape((batch, hidden_size))
     else:
         if "h_prev_zero" not in cache:
-            cache["h_prev_zero"] = wp.zeros((batch, hidden_size), dtype=cache["dtype"], device=device)
+            cache["h_prev_zero"] = wp.zeros(
+                (batch, hidden_size), dtype=cache["dtype"], device=device
+            )
         h_prev = cache["h_prev_zero"]
     if len(op.inputs) > 6 and op.inputs[6] and op.inputs[6] in tensors:
         c_prev = tensors[op.inputs[6]].reshape((batch, hidden_size))
     else:
         if "c_prev_zero" not in cache:
-            cache["c_prev_zero"] = wp.zeros((batch, hidden_size), dtype=cache["dtype"], device=device)
+            cache["c_prev_zero"] = wp.zeros(
+                (batch, hidden_size), dtype=cache["dtype"], device=device
+            )
         c_prev = cache["c_prev_zero"]
 
     gates = cache["gates"]
