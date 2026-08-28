@@ -10,6 +10,7 @@ from warp_nn.runtime import ChatCompletions, OpenAIHTTPServer, parse_qwen_tool_c
 
 class _Tokenizer:
     eos_token_id = 0
+    tool_call_start = "<tool_call>"
 
     def __init__(self, text):
         self.text = text
@@ -110,3 +111,31 @@ def test_chat_completions_returns_structured_tool_call():
     assert choice["message"]["content"] is None
     function = choice["message"]["tool_calls"][0]["function"]
     assert function == {"name": "read", "arguments": '{"path":"README.md"}'}
+
+
+def test_chat_completions_streams_structured_tool_call():
+    server, thread, _ = _serve(
+        "Checking. <tool_call>\n<function=read>\n<parameter=path>\nREADME.md\n</parameter>\n</function>\n</tool_call>"
+    )
+    try:
+        body, _ = _request(
+            server,
+            {
+                "model": "warp-qwen",
+                "messages": [{"role": "user", "content": "Read it"}],
+                "tools": [{"type": "function", "function": {"name": "read", "parameters": {}}}],
+                "stream": True,
+            },
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+    events = [line[6:] for line in body.decode().splitlines() if line.startswith("data: ")][:-1]
+    chunks = [json.loads(event) for event in events]
+    assert "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks) == "Checking. "
+    tool_delta = next(chunk for chunk in chunks if chunk["choices"][0]["delta"].get("tool_calls"))
+    tool_call = tool_delta["choices"][0]["delta"]["tool_calls"][0]
+    assert tool_call["index"] == 0
+    assert tool_call["function"] == {"name": "read", "arguments": '{"path":"README.md"}'}
+    assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"

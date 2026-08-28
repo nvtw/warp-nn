@@ -13,6 +13,7 @@ import numpy as np
 
 class Tokenizer(Protocol):
     eos_token_id: int
+    tool_call_start: str | None
 
     def encode_chat(
         self,

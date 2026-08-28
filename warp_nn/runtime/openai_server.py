@@ -58,6 +58,16 @@ def _messages(value: object) -> list[dict[str, object]]:
     return result
 
 
+def _split_tool_prefix(text: str, marker: str) -> tuple[str, str, bool]:
+    start = text.find(marker)
+    if start >= 0:
+        return text[:start], text[start:], True
+    keep = min(len(text), len(marker) - 1)
+    while keep and not marker.startswith(text[-keep:]):
+        keep -= 1
+    return (text[:-keep], text[-keep:], False) if keep else (text, "", False)
+
+
 class ChatCompletions:
     """Translate OpenAI chat requests to a shared text-generation runner."""
 
@@ -117,7 +127,9 @@ class ChatCompletions:
         created = int(time.time())
         generated = []
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
-        buffered = bool(tools)
+        tool_marker = self.tokenizer.tool_call_start if tools else None
+        pending = ""
+        tool_started = bool(tools) and not tool_marker
 
         response_started = False
         with self.lock:
@@ -136,11 +148,25 @@ class ChatCompletions:
                 if token_id == self.tokenizer.eos_token_id:
                     break
                 text = decoder.decode(self.tokenizer.token_bytes(token_id, skip_special_tokens=True))
-                if emit is not None and text and not buffered:
-                    emit(self._chunk(completion_id, created, {"content": text}))
+                if emit is not None and text:
+                    if tool_started:
+                        pending += text
+                    elif tool_marker:
+                        text, pending, tool_started = _split_tool_prefix(pending + text, tool_marker)
+                        if text:
+                            emit(self._chunk(completion_id, created, {"content": text}))
+                    else:
+                        emit(self._chunk(completion_id, created, {"content": text}))
         tail = decoder.decode(b"", final=True)
-        if emit is not None and tail and not buffered:
-            emit(self._chunk(completion_id, created, {"content": tail}))
+        if emit is not None and tail:
+            if tool_started:
+                pending += tail
+            elif tool_marker:
+                text, pending, tool_started = _split_tool_prefix(pending + tail, tool_marker)
+                if text:
+                    emit(self._chunk(completion_id, created, {"content": text}))
+            else:
+                emit(self._chunk(completion_id, created, {"content": tail}))
 
         text = self.tokenizer.decode(generated, skip_special_tokens=True)
         text, tool_calls = self.tokenizer.parse_tool_calls(text)
@@ -166,13 +192,13 @@ class ChatCompletions:
             "total_tokens": len(prompt_ids) + len(generated),
         }
         if emit is not None:
-            if buffered:
-                delta = {key: value for key, value in message.items() if key != "role"}
-                if "tool_calls" in delta:
-                    delta["tool_calls"] = [
-                        {"index": index, **tool_call} for index, tool_call in enumerate(delta["tool_calls"])
-                    ]
-                emit(self._chunk(completion_id, created, delta))
+            if tool_calls:
+                stream_calls = [
+                    {"index": index, **tool_call} for index, tool_call in enumerate(message["tool_calls"])
+                ]
+                emit(self._chunk(completion_id, created, {"tool_calls": stream_calls}))
+            elif pending:
+                emit(self._chunk(completion_id, created, {"content": pending}))
             emit(self._chunk(completion_id, created, {}, finish_reason))
         return {
             "id": completion_id,

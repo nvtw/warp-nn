@@ -134,6 +134,8 @@ def _pretokenize(text: str):
 class Qwen3Tokenizer:
     """Dependency-free ByteLevel-BPE tokenizer for Qwen3 tokenizer JSON files."""
 
+    tool_call_start = "<tool_call>"
+
     def __init__(self, path: str | Path):
         path = Path(path)
         if path.is_dir():
