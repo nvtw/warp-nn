@@ -15,131 +15,13 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 
+from warp_nn.runtime.kernels import (
+    _get_greedy_argmax_kernels,
+    _initialize_attention_mask,
+    _initialize_generation_state,
+    _set_decode_token,
+)
 from warp_nn.runtime.onnx_runtime import OnnxRuntime
-
-
-@wp.kernel
-def _initialize_attention_mask(mask: wp.array2d[wp.int64], length: int):
-    index = wp.tid()
-    mask[0, index] = wp.int64(1) if index < length else wp.int64(0)
-
-
-@wp.kernel
-def _set_decode_token(
-    input_ids: wp.array2d[wp.int64],
-    attention_mask: wp.array2d[wp.int64],
-    position_ids: wp.array2d[wp.int64],
-    token_id: int,
-    position: int,
-):
-    input_ids[0, 0] = wp.int64(token_id)
-    attention_mask[0, position] = wp.int64(1)
-    position_ids[0, 0] = wp.int64(position)
-
-
-@wp.kernel
-def _initialize_generation_state(
-    position: wp.array1d[wp.int32],
-    generated_count: wp.array1d[wp.int32],
-    finished: wp.array1d[wp.int32],
-    prompt_length: int,
-):
-    position[0] = wp.int32(prompt_length)
-    generated_count[0] = wp.int32(0)
-    finished[0] = wp.int32(0)
-
-
-@lru_cache(maxsize=None)
-def _get_greedy_argmax_kernels(tile_width: int, partial_count: int):
-    TILE_WIDTH = tile_width
-    PARTIAL_COUNT = partial_count
-
-    @wp.func
-    def add_offset(index: wp.int32, offset: wp.int32):
-        return index + offset
-
-    @wp.func
-    def mask_logit(value: wp.float16, index: wp.int32, vocabulary: wp.int32):
-        return wp.float32(value) if index < vocabulary else wp.float32(-3.402823466e38)
-
-    @wp.func
-    def matching_token(value: wp.float32, token: wp.int32, maximum: wp.float32, vocabulary: wp.int32):
-        return token if value == maximum else vocabulary
-
-    @wp.kernel(enable_backward=False, module="unique")
-    def partial_argmax(logits: wp.array3d[wp.float16], values: wp.array1d[wp.float32], tokens: wp.array1d[wp.int32]):
-        partial = wp.tid()
-        vocabulary = logits.shape[2]
-        tile_count = (vocabulary + TILE_WIDTH - 1) / TILE_WIDTH
-        best_value = wp.float32(-3.402823466e38)
-        best_token = vocabulary
-        local_indices = wp.tile_arange(0, TILE_WIDTH, dtype=wp.int32)
-        for tile_id in range(partial, tile_count, PARTIAL_COUNT):
-            offset = tile_id * TILE_WIDTH
-            indices = wp.tile_map(add_offset, local_indices, offset)
-            tile = wp.tile_map(
-                mask_logit,
-                wp.tile_load(logits[0, logits.shape[1] - 1], shape=TILE_WIDTH, offset=offset),
-                indices,
-                vocabulary,
-            )
-            local_token = wp.tile_extract(wp.tile_argmax(tile), 0)
-            value = wp.tile_extract(tile, local_token)
-            token = offset + local_token
-            if value > best_value or (value == best_value and token < best_token):
-                best_value = value
-                best_token = token
-        wp.tile_store(values, wp.tile_full(shape=1, value=best_value, dtype=wp.float32), offset=partial)
-        wp.tile_store(tokens, wp.tile_full(shape=1, value=best_token, dtype=wp.int32), offset=partial)
-
-    @wp.func
-    def select_token(values: wp.array1d[wp.float32], tokens: wp.array1d[wp.int32], vocabulary: int):
-        value_tile = wp.tile_load(values, shape=PARTIAL_COUNT)
-        token_tile = wp.tile_load(tokens, shape=PARTIAL_COUNT)
-        maximum_index = wp.tile_extract(wp.tile_argmax(value_tile), 0)
-        maximum = wp.tile_extract(value_tile, maximum_index)
-        candidates = wp.tile_map(matching_token, value_tile, token_tile, maximum, vocabulary)
-        winner = wp.tile_extract(wp.tile_argmin(candidates), 0)
-        return wp.tile_extract(token_tile, winner)
-
-    @wp.kernel(enable_backward=False, module="unique")
-    def store_token(
-        values: wp.array1d[wp.float32],
-        tokens: wp.array1d[wp.int32],
-        output: wp.array1d[wp.int32],
-        vocabulary: int,
-    ):
-        wp.tile_store(output, wp.tile_full(shape=1, value=select_token(values, tokens, vocabulary), dtype=wp.int32))
-
-    @wp.kernel(enable_backward=False, module="unique")
-    def advance_generation(
-        values: wp.array1d[wp.float32],
-        tokens: wp.array1d[wp.int32],
-        vocabulary: int,
-        input_ids: wp.array2d[wp.int64],
-        attention_mask: wp.array2d[wp.int64],
-        position_ids: wp.array2d[wp.int64],
-        position: wp.array1d[wp.int32],
-        generated_count: wp.array1d[wp.int32],
-        generated_ids: wp.array1d[wp.int64],
-        finished: wp.array1d[wp.int32],
-        eos_token_id: int,
-    ):
-        if finished[0] != 0:
-            return
-        best_token = select_token(values, tokens, vocabulary)
-        count = generated_count[0]
-        generated_ids[count] = wp.int64(best_token)
-        generated_count[0] = count + 1
-        input_ids[0, 0] = wp.int64(best_token)
-        token_position = position[0]
-        attention_mask[0, token_position] = wp.int64(1)
-        position_ids[0, 0] = wp.int64(token_position)
-        position[0] = token_position + 1
-        if best_token == eos_token_id:
-            finished[0] = wp.int32(1)
-
-    return partial_argmax, store_token, advance_generation
 
 
 def _byte_alphabet() -> tuple[dict[int, str], dict[str, int]]:
