@@ -599,6 +599,9 @@ class Qwen35Runner:
 
     def _run(self, plan: _Qwen35Plan) -> wp.array:
         if self.device.is_cuda:
+            if plan.graph is None and not getattr(plan, "_capture_ready", True):
+                plan._capture_ready = True
+                return plan.execute()
             if plan.graph is None:
                 wp.capture_begin(device=self.device)
                 try:
@@ -624,24 +627,42 @@ class Qwen35Runner:
         self.sequence_length += 1
         return logits
 
+    def _plan_for_rows(self, rows: int) -> _Qwen35Plan:
+        plans = getattr(self, "_chunk_plans", None)
+        if plans is None:
+            plans = self._chunk_plans = {self.prefill_chunk_size: self._chunk_plan}
+        plan = plans.get(rows)
+        if plan is None:
+            plan = plans[rows] = type(self._chunk_plan)(self, rows)
+            plan._capture_ready = False
+        return plan
+
+    def _stage_many(self, token_ids: Sequence[int]) -> wp.array:
+        rows = len(token_ids)
+        plan = self._plan_for_rows(rows)
+        end = self.sequence_length + rows
+        plan.input_ids.assign(np.asarray(token_ids, dtype=np.int64)[None, :])
+        plan.position_ids.assign(np.arange(self.sequence_length, end, dtype=np.int64)[None, :])
+        wp.launch(_set_sequence_end, dim=1, inputs=[self.sequence_end, end - 1], device=self.device)
+        logits = self._run(plan)
+        self.sequence_length = end
+        return logits
+
     def _append(self, token_ids: Sequence[int]) -> wp.array:
         if not token_ids:
             raise ValueError("Qwen35Runner requires at least one token")
         if self.sequence_length + len(token_ids) > self.cache_capacity:
             raise ValueError("Qwen35Runner token sequence exceeds cache_capacity")
         logits = None
-        full = len(token_ids) // self.prefill_chunk_size * self.prefill_chunk_size
-        for start in range(0, full, self.prefill_chunk_size):
-            end = self.sequence_length + self.prefill_chunk_size
-            self._chunk_plan.input_ids.assign(
-                np.asarray(token_ids[start : start + self.prefill_chunk_size], dtype=np.int64)[None, :]
-            )
-            self._chunk_plan.position_ids.assign(np.arange(self.sequence_length, end, dtype=np.int64)[None, :])
-            wp.launch(_set_sequence_end, dim=1, inputs=[self.sequence_end, end - 1], device=self.device)
-            logits = self._run(self._chunk_plan)
-            self.sequence_length = end
-        for token_id in token_ids[full:]:
-            logits = self._stage_one(int(token_id))
+        start = 0
+        while start < len(token_ids):
+            remaining = len(token_ids) - start
+            rows = min(self.prefill_chunk_size, 1 << (remaining.bit_length() - 1))
+            if rows == 1:
+                logits = self._stage_one(int(token_ids[start]))
+            else:
+                logits = self._stage_many(token_ids[start : start + rows])
+            start += rows
         return logits
 
     def prefill(self, token_ids: Sequence[int]) -> wp.array:

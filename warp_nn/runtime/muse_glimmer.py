@@ -404,6 +404,10 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
             elif role == "user":
                 output.append(f"<|start|>user<|message|>{content}<|eot|>")
             elif role == "assistant":
+                raw_token_ids = message.get("_raw_token_ids")
+                if isinstance(raw_token_ids, (list, tuple)):
+                    output.append(f"<|start|>assistant{self.decode(raw_token_ids, skip_special_tokens=False)}")
+                    continue
                 reasoning = message.get("reasoning_content")
                 if isinstance(reasoning, str) and reasoning:
                     output.append(f"<|start|>assistant to=self<|message|>{reasoning}<|eom|>")
@@ -425,6 +429,28 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
         if add_generation_prompt:
             output.append("<|start|>assistant")
         return "".join(output)
+
+    def encode_chat(self, messages: Sequence[Mapping[str, object]], **kwargs) -> list[int]:
+        """Format chat while retaining the model's exact generated token sequence."""
+        rendered = self.format_chat(messages, **kwargs)
+        raw_messages = [message for message in messages if isinstance(message.get("_raw_token_ids"), (list, tuple))]
+        if not raw_messages:
+            return self.encode(rendered)
+        encoded = []
+        cursor = 0
+        anchor = "<|start|>assistant"
+        for message in raw_messages:
+            raw_token_ids = message["_raw_token_ids"]
+            raw = self.decode(raw_token_ids, skip_special_tokens=False)
+            start = rendered.find(anchor + raw, cursor)
+            if start < 0:
+                raise ValueError("Muse raw assistant history is inconsistent with the formatted chat")
+            raw_start = start + len(anchor)
+            encoded.extend(self.encode(rendered[cursor:raw_start]))
+            encoded.extend(int(token_id) for token_id in raw_token_ids)
+            cursor = raw_start + len(raw)
+        encoded.extend(self.encode(rendered[cursor:]))
+        return encoded
 
     def decode(self, token_ids: Sequence[int], skip_special_tokens: bool = False) -> str:
         """Decode tokens, reducing generated Muse channels to user/tool content."""

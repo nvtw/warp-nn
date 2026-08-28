@@ -145,9 +145,10 @@ def test_qwen35_native_prefill_decode_and_graph_replay(tmp_path, use_cublas):
         pytest.skip("CUDA is not available")
     model_path = tmp_path / "tiny-qwen35"
     _write_tiny_qwen35(model_path)
-    runner = Qwen35Runner(model_path, device="cuda:0", cache_capacity=8, prefill_chunk_size=2, use_cublas=use_cublas)
+    runner = Qwen35Runner(model_path, device="cuda:0", cache_capacity=8, prefill_chunk_size=4, use_cublas=use_cublas)
 
     first = runner.prefill([1, 2, 3]).numpy()
+    assert set(runner._chunk_plans) == {2, 4}
     assert first.shape == (1, 1, 16)
     assert np.isfinite(first).all()
     decoded = runner.decode(4).numpy()

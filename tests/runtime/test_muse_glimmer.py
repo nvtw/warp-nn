@@ -175,6 +175,27 @@ def test_muse_tokenizer_chat_and_atem_tools(tmp_path):
     assert calls == [{"name": "read_file", "arguments": {"path": "README.md"}}]
     generated = tokenizer.encode(" to=self<|message|>Reason<|eom|><|start|>assistant to=user<|message|>Answer<|eot|>")
     assert tokenizer.decode(generated, skip_special_tokens=True) == "Answer"
+    initial = tokenizer.encode_chat([{"role": "user", "content": "Read it"}], tools=tools)
+    continued = tokenizer.encode_chat(
+        [
+            {"role": "user", "content": "Read it"},
+            {"role": "assistant", "content": "Answer", "_raw_token_ids": generated},
+            {"role": "user", "content": "Again"},
+        ],
+        tools=tools,
+    )
+    assert continued[: len(initial) + len(generated) - 1] == initial + generated[:-1]
+
+    generated_call = tokenizer.encode(
+        ' to=read_file<|message|><atem:function_calls>\n<atem:invoke name="read_file">\n'
+        '<atem:parameter name="path">README.md</atem:parameter>\n</atem:invoke>\n</atem:function_calls><|eot|>'
+    )
+    continued = tokenizer.encode_chat(
+        [{"role": "user", "content": "Read it"}, {"role": "assistant", "_raw_token_ids": generated_call}],
+        tools=tools,
+    )
+    assert continued[: len(initial) + len(generated_call) - 1] == initial + generated_call[:-1]
+
 
     stream = _MuseStreamFilter()
     pieces = (
@@ -192,12 +213,13 @@ def test_muse_glimmer_prefill_decode_ring_cache_and_graph_replay(tmp_path, use_c
     model_path = tmp_path / "tiny-muse"
     _write_tiny_muse(model_path)
     runner = create_text_runner(
-        model_path, device="cuda:0", cache_capacity=8, prefill_chunk_size=2, use_cublas=use_cublas
+        model_path, device="cuda:0", cache_capacity=8, prefill_chunk_size=4, use_cublas=use_cublas
     )
 
     assert isinstance(runner, MuseGlimmerRunner)
-    assert runner.local_cache_capacity == 4
+    assert runner.local_cache_capacity == 6
     first = runner.prefill([1, 2, 3]).numpy()
+    assert set(runner._chunk_plans) == {2, 4}
     assert first.shape == (1, 1, 16)
     assert np.isfinite(first).all()
     assert np.isfinite(runner.decode(4).numpy()).all()

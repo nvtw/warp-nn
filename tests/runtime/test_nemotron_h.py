@@ -125,11 +125,12 @@ def test_nemotron_h_fp8_prefill_decode_and_graph_replay(tmp_path, use_cublas):
     model_path = tmp_path / "tiny-nemotron"
     _write_tiny_nemotron(model_path)
     runner = NemotronHRunner(
-        model_path, device="cuda:0", cache_capacity=8, prefill_chunk_size=2, use_cublas=use_cublas
+        model_path, device="cuda:0", cache_capacity=8, prefill_chunk_size=4, use_cublas=use_cublas
     )
 
     assert runner.weights["backbone.layers.1.mixer.up_proj.weight"].dtype.__name__ == "bfloat16"
     first = runner.prefill([1, 2, 3]).numpy()
+    assert set(runner._chunk_plans) == {2, 4}
     assert first.shape == (1, 1, 16)
     assert np.isfinite(first).all()
     decoded = runner.decode(4).numpy()
