@@ -68,10 +68,10 @@ Example::
 
 from __future__ import annotations
 
-from functools import lru_cache
 from typing import Any
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -565,9 +565,7 @@ def _matmul_int4_q8_kernel(
         packed_activation_0 = wp.int32(activations[row, block, lane * 2])
         packed_activation_1 = wp.int32(activations[row, block, lane * 2 + 1])
         block_total = _dp4a(_expand_int4x4(packed_weights), packed_activation_0, 0)
-        block_total = _dp4a(
-            _expand_int4x4(packed_weights >> wp.uint32(16)), packed_activation_1, block_total
-        )
+        block_total = _dp4a(_expand_int4x4(packed_weights >> wp.uint32(16)), packed_activation_1, block_total)
         activation_sum = _dp4a(0x01010101, packed_activation_0, 0)
         activation_sum = _dp4a(0x01010101, packed_activation_1, activation_sum)
         block_total -= 8 * activation_sum
@@ -601,6 +599,55 @@ def _matmul_int8_q8_kernel(
             total += reduced * activation_scales[row, block] * wp.float32(weight_scales[column, block])
     if lane == 0:
         output[row, column] = wp.float16(total)
+
+
+@lru_cache(maxsize=None)
+def _get_matmul_int4_tile_gemm_kernel(tile_m: int, tile_n: int):
+    packed_block = 16
+
+    @wp.func
+    def dequantize_low(value: wp.uint8, scale: wp.float16):
+        return wp.float16((wp.float32(wp.int32(value) & 15) - 8.0) * wp.float32(scale))
+
+    @wp.func
+    def dequantize_high(value: wp.uint8, scale: wp.float16):
+        return wp.float16((wp.float32(wp.int32(value) >> 4) - 8.0) * wp.float32(scale))
+
+    @wp.func
+    def to_float16(value: wp.float32):
+        return wp.float16(value)
+
+    @wp.func
+    def add_one(value: wp.int32):
+        return value + 1
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def kernel(
+        activations: wp.array2d[wp.float16],
+        weights: wp.array2d[wp.uint8],
+        scales: wp.array2d[wp.float16],
+        output: wp.array2d[wp.float16],
+    ):
+        row_tile, column_tile = wp.tid()
+        row = row_tile * tile_m
+        column = column_tile * tile_n
+        total = wp.tile_zeros(shape=(tile_m, tile_n), dtype=wp.float32)
+        for block in range(scales.shape[1]):
+            activation = wp.tile_load(activations, shape=(tile_m, 32), offset=(row, block * 32))
+            packed = wp.tile_load(weights, shape=(tile_n, packed_block), offset=(column, block * packed_block))
+            scale = wp.tile_broadcast(
+                wp.tile_load(scales, shape=(tile_n, 1), offset=(column, block)),
+                shape=(tile_n, packed_block),
+            )
+            low = wp.tile_transpose(wp.tile_map(dequantize_low, packed, scale))
+            high = wp.tile_transpose(wp.tile_map(dequantize_high, packed, scale))
+            even_columns = wp.tile_arange(0, packed_block, dtype=wp.int32) * 2
+            odd_columns = wp.tile_map(add_one, even_columns)
+            wp.tile_matmul(activation[:, even_columns], low, total)
+            wp.tile_matmul(activation[:, odd_columns], high, total)
+        wp.tile_store(output, wp.tile_map(to_float16, total), offset=(row, column))
+
+    return kernel
 
 
 def _nbits_reduction_width(bits: int, packed_block_size: int, warp_reduction: bool) -> int:
@@ -1448,9 +1495,7 @@ class OnnxRuntime:
             external = onnx.external_data_helper.uses_external_data(init)
             try:
                 arr_np = (
-                    _external_initializer_view(onnx, init, model_path.parent, external_mappings)
-                    if external
-                    else None
+                    _external_initializer_view(onnx, init, model_path.parent, external_mappings) if external else None
                 )
                 if arr_np is None:
                     arr_np = numpy_helper.to_array(init, base_dir=str(model_path.parent))
@@ -2257,6 +2302,12 @@ def _shape_matmul_nbits(op, shapes, dtypes, tensors, device, requires_grad=False
         )
         op.attrs["_q8_kernel"] = _matmul_int4_q8_kernel if bits == 4 else _matmul_int8_q8_kernel
         op.attrs["_q8_width"] = bits
+    if device.is_cuda and rows > 1 and bits == 4 and block_size == 32 and dtype == wp.float16 and not has_zero_points:
+        tile_m = 16
+        tile_n = 32 if rows >= 32 else 16
+        op.attrs["_tile_gemm_kernel"] = _get_matmul_int4_tile_gemm_kernel(tile_m, tile_n)
+        op.attrs["_tile_gemm_dim"] = ((rows + tile_m - 1) // tile_m, (N + tile_n - 1) // tile_n)
+        op.attrs["_tile_gemm_weights"] = tensors[op.inputs[1]].reshape((N, blocks * 16))
 
 
 def _shape_causal_conv_with_state(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -3128,6 +3179,20 @@ def _exec_matmul_nbits(op, tensors, shapes, device):
             K,
             wp.get_stream(device).cuda_stream,
             2 if dtype == wp.float16 else 14,
+        )
+        return
+    if "_tile_gemm_kernel" in op.attrs:
+        wp.launch_tiled(
+            op.attrs["_tile_gemm_kernel"],
+            dim=op.attrs["_tile_gemm_dim"],
+            inputs=[
+                tensors[op.inputs[0]].reshape((op.attrs["_rows"], K)),
+                op.attrs["_tile_gemm_weights"],
+                tensors[op.inputs[2]],
+                op.attrs["_output_2d"],
+            ],
+            block_dim=128,
+            device=device,
         )
         return
     if device.is_cuda:
