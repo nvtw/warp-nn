@@ -1068,7 +1068,7 @@ def test_matmul_nbits(device, bits, batch, sequence, use_cublas, data_type, bloc
         pytest.skip(f"Device '{device}' is not available")
 
     rng = np.random.default_rng(37 + bits)
-    K = 256
+    K = 288 if bits == 4 and block_size == 32 and not has_zero_points else 256
     np_dtype = np.float16 if data_type == TensorProto.FLOAT16 else np.dtype("bfloat16")
     wp_dtype = wp.float16 if data_type == TensorProto.FLOAT16 else wp.bfloat16
     blocks = K // block_size
@@ -1082,7 +1082,12 @@ def test_matmul_nbits(device, bits, batch, sequence, use_cublas, data_type, bloc
     )
     if bits == 4:
         weights = quantized[:, :, 0::2] | (quantized[:, :, 1::2] << 4)
-        zero_points = zero_values[:, 0::2] | (zero_values[:, 1::2] << 4)
+        zero_points = np.zeros((N, (blocks + 1) // 2), dtype=np.uint8)
+        zero_points[:, : blocks // 2] = zero_values[:, : blocks // 2 * 2 : 2] | (
+            zero_values[:, 1 : blocks // 2 * 2 : 2] << 4
+        )
+        if blocks % 2:
+            zero_points[:, -1] = zero_values[:, -1]
     else:
         weights = quantized
         zero_points = zero_values
@@ -1097,9 +1102,7 @@ def test_matmul_nbits(device, bits, batch, sequence, use_cublas, data_type, bloc
         activation_blocks = activations.astype(np.float32).reshape(batch, sequence, blocks, block_size)
         activation_scales = np.max(np.abs(activation_blocks), axis=-1) / 127.0
         activation_scales[activation_scales == 0.0] = 1.0
-        quantized_activations = np.clip(
-            np.rint(activation_blocks / activation_scales[..., None]), -127, 127
-        )
+        quantized_activations = np.clip(np.rint(activation_blocks / activation_scales[..., None]), -127, 127)
         q8_activations = (quantized_activations * activation_scales[..., None]).reshape(activations.shape)
         expected_runtime = (q8_activations @ dequantized.T).astype(np_dtype)
     node_inputs = ["activations", "weights", "scales"]
@@ -1146,7 +1149,7 @@ def test_matmul_nbits(device, bits, batch, sequence, use_cublas, data_type, bloc
         output = runtime(inputs)["output"]
         np.testing.assert_allclose(output.numpy(), expected_runtime, rtol=2.0e-2, atol=2.0e-2)
 
-        if use_cublas and batch * sequence > 1 and runtime._cublas is not None:
+        if batch * sequence > 1 and (not use_cublas or runtime._cublas is not None):
             wp.capture_begin(device=device)
             try:
                 runtime(inputs)

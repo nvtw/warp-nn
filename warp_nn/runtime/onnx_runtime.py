@@ -602,8 +602,9 @@ def _matmul_int8_q8_kernel(
 
 
 @lru_cache(maxsize=None)
-def _get_matmul_int4_tile_gemm_kernel(tile_m: int, tile_n: int):
-    packed_block = 16
+def _get_matmul_int4_tile_gemm_kernel(tile_m: int, tile_n: int, blocks_per_tile: int):
+    packed_width = 16 * blocks_per_tile
+    activation_width = 32 * blocks_per_tile
 
     @wp.func
     def dequantize_low(value: wp.uint8, scale: wp.float16):
@@ -621,6 +622,10 @@ def _get_matmul_int4_tile_gemm_kernel(tile_m: int, tile_n: int):
     def add_one(value: wp.int32):
         return value + 1
 
+    @wp.func
+    def scale_index(value: wp.int32):
+        return value / 16
+
     @wp.kernel(enable_backward=False, module="unique")
     def kernel(
         activations: wp.array2d[wp.float16],
@@ -632,17 +637,20 @@ def _get_matmul_int4_tile_gemm_kernel(tile_m: int, tile_n: int):
         row = row_tile * tile_m
         column = column_tile * tile_n
         total = wp.tile_zeros(shape=(tile_m, tile_n), dtype=wp.float32)
-        for block in range(scales.shape[1]):
-            activation = wp.tile_load(activations, shape=(tile_m, 32), offset=(row, block * 32))
-            packed = wp.tile_load(weights, shape=(tile_n, packed_block), offset=(column, block * packed_block))
-            scale = wp.tile_broadcast(
-                wp.tile_load(scales, shape=(tile_n, 1), offset=(column, block)),
-                shape=(tile_n, packed_block),
+        even_columns = wp.tile_arange(0, packed_width, dtype=wp.int32) * 2
+        odd_columns = wp.tile_map(add_one, even_columns)
+        scale_indices = wp.tile_map(scale_index, wp.tile_arange(0, packed_width, dtype=wp.int32))
+        for block_tile in range((scales.shape[1] + blocks_per_tile - 1) / blocks_per_tile):
+            activation = wp.tile_load(
+                activations, shape=(tile_m, activation_width), offset=(row, block_tile * activation_width)
             )
+            packed = wp.tile_load(weights, shape=(tile_n, packed_width), offset=(column, block_tile * packed_width))
+            block_scales = wp.tile_load(
+                scales, shape=(tile_n, blocks_per_tile), offset=(column, block_tile * blocks_per_tile)
+            )
+            scale = block_scales[:, scale_indices]
             low = wp.tile_transpose(wp.tile_map(dequantize_low, packed, scale))
             high = wp.tile_transpose(wp.tile_map(dequantize_high, packed, scale))
-            even_columns = wp.tile_arange(0, packed_block, dtype=wp.int32) * 2
-            odd_columns = wp.tile_map(add_one, even_columns)
             wp.tile_matmul(activation[:, even_columns], low, total)
             wp.tile_matmul(activation[:, odd_columns], high, total)
         wp.tile_store(output, wp.tile_map(to_float16, total), offset=(row, column))
@@ -2303,9 +2311,9 @@ def _shape_matmul_nbits(op, shapes, dtypes, tensors, device, requires_grad=False
         op.attrs["_q8_kernel"] = _matmul_int4_q8_kernel if bits == 4 else _matmul_int8_q8_kernel
         op.attrs["_q8_width"] = bits
     if device.is_cuda and rows > 1 and bits == 4 and block_size == 32 and dtype == wp.float16 and not has_zero_points:
-        tile_m = 16
+        tile_m = 64 if rows >= 64 else 32 if rows >= 32 else 16
         tile_n = 32 if rows >= 32 else 16
-        op.attrs["_tile_gemm_kernel"] = _get_matmul_int4_tile_gemm_kernel(tile_m, tile_n)
+        op.attrs["_tile_gemm_kernel"] = _get_matmul_int4_tile_gemm_kernel(tile_m, tile_n, 2)
         op.attrs["_tile_gemm_dim"] = ((rows + tile_m - 1) // tile_m, (N + tile_n - 1) // tile_n)
         op.attrs["_tile_gemm_weights"] = tensors[op.inputs[1]].reshape((N, blocks * 16))
 
