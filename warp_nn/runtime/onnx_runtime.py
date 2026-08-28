@@ -2233,6 +2233,7 @@ def _shape_matmul_nbits(op, shapes, dtypes, tensors, device, requires_grad=False
         and rows == 1
         and bits in (4, 8)
         and block_size == 32
+        and N * bits >= 512
         and dtype == wp.float16
         and not has_zero_points
     ):

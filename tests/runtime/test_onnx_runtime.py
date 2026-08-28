@@ -1053,22 +1053,22 @@ def test_rotary_embedding(device):
 @pytest.mark.parametrize("batch,sequence", [(2, 3), (1, 1)])
 @pytest.mark.parametrize("use_cublas", [False, True])
 @pytest.mark.parametrize(
-    "data_type,bits,block_size,has_zero_points",
+    "data_type,bits,block_size,has_zero_points,N",
     [
-        (TensorProto.FLOAT16, 4, 128, True),
-        (TensorProto.FLOAT16, 4, 32, False),
-        (TensorProto.FLOAT16, 8, 128, True),
-        (TensorProto.FLOAT16, 8, 32, False),
-        (TensorProto.BFLOAT16, 4, 32, False),
+        (TensorProto.FLOAT16, 4, 128, True, 5),
+        (TensorProto.FLOAT16, 4, 32, False, 128),
+        (TensorProto.FLOAT16, 8, 128, True, 5),
+        (TensorProto.FLOAT16, 8, 32, False, 128),
+        (TensorProto.BFLOAT16, 4, 32, False, 5),
     ],
 )
 @pytest.mark.parametrize("device", ["cuda"])
-def test_matmul_nbits(device, bits, batch, sequence, use_cublas, data_type, block_size, has_zero_points):
+def test_matmul_nbits(device, bits, batch, sequence, use_cublas, data_type, block_size, has_zero_points, N):
     if not is_device_available(device):
         pytest.skip(f"Device '{device}' is not available")
 
     rng = np.random.default_rng(37 + bits)
-    K, N = 256, 5
+    K = 256
     np_dtype = np.float16 if data_type == TensorProto.FLOAT16 else np.dtype("bfloat16")
     wp_dtype = wp.float16 if data_type == TensorProto.FLOAT16 else wp.bfloat16
     blocks = K // block_size
@@ -1092,6 +1092,16 @@ def test_matmul_nbits(device, bits, batch, sequence, use_cublas, data_type, bloc
         * scales[:, :, None].astype(np.float32)
     ).reshape(N, K)
     expected = (activations.astype(np.float32) @ dequantized.T).astype(np_dtype)
+    expected_runtime = expected
+    if batch * sequence == 1 and data_type == TensorProto.FLOAT16 and block_size == 32 and not has_zero_points:
+        activation_blocks = activations.astype(np.float32).reshape(batch, sequence, blocks, block_size)
+        activation_scales = np.max(np.abs(activation_blocks), axis=-1) / 127.0
+        activation_scales[activation_scales == 0.0] = 1.0
+        quantized_activations = np.clip(
+            np.rint(activation_blocks / activation_scales[..., None]), -127, 127
+        )
+        q8_activations = (quantized_activations * activation_scales[..., None]).reshape(activations.shape)
+        expected_runtime = (q8_activations @ dequantized.T).astype(np_dtype)
     node_inputs = ["activations", "weights", "scales"]
     initializers = [
         numpy_helper.from_array(weights, name="weights"),
@@ -1134,7 +1144,7 @@ def test_matmul_nbits(device, bits, batch, sequence, use_cublas, data_type, bloc
             assert runtime._cublas is None
         inputs = {"activations": wp.array(activations, dtype=wp_dtype, device=device)}
         output = runtime(inputs)["output"]
-        np.testing.assert_allclose(output.numpy(), expected, rtol=2.0e-2, atol=2.0e-2)
+        np.testing.assert_allclose(output.numpy(), expected_runtime, rtol=2.0e-2, atol=2.0e-2)
 
         if use_cublas and batch * sequence > 1 and runtime._cublas is not None:
             wp.capture_begin(device=device)
