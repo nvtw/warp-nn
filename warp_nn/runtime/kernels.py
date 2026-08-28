@@ -1952,11 +1952,7 @@ def _create_partitioned_gqa_attention_kernels(
         valid_keys: wp.int32,
         scale: wp.float32,
     ):
-        return (
-            score * scale
-            if key_offset < valid_keys
-            else wp.float32(-3.402823466e38)
-        )
+        return score * scale if key_offset < valid_keys else wp.float32(-3.402823466e38)
 
     @wp.func
     def exp_difference(value: wp.float32, maximum: wp.float32):
@@ -2012,12 +2008,8 @@ def _create_partitioned_gqa_attention_kernels(
         partition_start = first_key + partition * keys_per_partition
         partition_end = wp.min(valid_keys, partition_start + keys_per_partition)
 
-        queries = wp.tile_load(
-            query, shape=(GROUP, head_size), offset=(head_item_0, 0)
-        )
-        accumulator = wp.tile_zeros(
-            shape=(GROUP, head_size), dtype=wp.float32
-        )
+        queries = wp.tile_load(query, shape=(GROUP, head_size), offset=(head_item_0, 0))
+        accumulator = wp.tile_zeros(shape=(GROUP, head_size), dtype=wp.float32)
         maximum = wp.tile_full(
             shape=(GROUP,),
             value=wp.float32(-3.402823466e38) + wp.float32(DTYPE(0.0)),
@@ -2051,9 +2043,7 @@ def _create_partitioned_gqa_attention_kernels(
                     shape=(KEY_TILE, head_size),
                     offset=(cache_row, 0),
                 )
-            scores = wp.tile_zeros(
-                shape=(GROUP, KEY_TILE), dtype=wp.float32
-            )
+            scores = wp.tile_zeros(shape=(GROUP, KEY_TILE), dtype=wp.float32)
             wp.tile_matmul(queries, wp.tile_transpose(key_values), scores)
             scores = wp.tile_map(
                 scale_and_mask_score,
@@ -2069,12 +2059,8 @@ def _create_partitioned_gqa_attention_kernels(
                 wp.tile_reshape(new_maximum, shape=(GROUP, 1)),
                 shape=(GROUP, KEY_TILE),
             )
-            probabilities = wp.tile_map(
-                exp_difference, scores, maximum_group
-            )
-            denominator = (
-                denominator * old_scale + wp.tile_sum(probabilities, axis=1)
-            )
+            probabilities = wp.tile_map(exp_difference, scores, maximum_group)
+            denominator = denominator * old_scale + wp.tile_sum(probabilities, axis=1)
             old_scale_group = wp.tile_broadcast(
                 wp.tile_reshape(old_scale, shape=(GROUP, 1)),
                 shape=(GROUP, head_size),
@@ -2094,30 +2080,22 @@ def _create_partitioned_gqa_attention_kernels(
                     shape=(KEY_TILE, head_size),
                     offset=(cache_row, 0),
                 )
-            contribution = wp.tile_zeros(
-                shape=(GROUP, head_size), dtype=wp.float32
-            )
+            contribution = wp.tile_zeros(shape=(GROUP, head_size), dtype=wp.float32)
             wp.tile_matmul(typed_probabilities, value_values, contribution)
             accumulator = accumulator * old_scale_group + contribution
             maximum = new_maximum
 
         for member in range(GROUP):
             if member < valid_heads:
-                partial_item = (
-                    (head_item_0 + member) * PARTITIONS + partition
-                )
+                partial_item = (head_item_0 + member) * PARTITIONS + partition
                 partial_maximum[partial_item] = wp.tile_extract(maximum, member)
-                partial_denominator[partial_item] = wp.tile_extract(
-                    denominator, member
-                )
+                partial_denominator[partial_item] = wp.tile_extract(denominator, member)
                 accumulator_row = wp.tile_view(
                     accumulator,
                     offset=(member, 0),
                     shape=(1, head_size),
                 )
-                wp.tile_store(
-                    partial_output, accumulator_row, offset=(partial_item, 0)
-                )
+                wp.tile_store(partial_output, accumulator_row, offset=(partial_item, 0))
 
     @wp.kernel(enable_backward=False, module="unique")
     def reduce(
@@ -2155,6 +2133,7 @@ def _create_partitioned_gqa_attention_kernels(
     reduce.module.options["enable_backward"] = False
     reduce.module.mark_modified()
     return partial, reduce
+
 
 _gqa_attention_kernel_cache = {}
 _partitioned_gqa_attention_kernel_cache = {}
