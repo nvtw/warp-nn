@@ -19,6 +19,7 @@ from warp_nn.runtime.kernels import (
     _append_circular_head_cache_kernel,
     _append_head_cache_kernel,
     _binary_broadcast_kernel,
+    _decode_attention_partitions,
     _gather_rows_kernel,
     _get_gather_q8_0_rows_kernel,
     _get_gqa_attention_kernel,
@@ -757,7 +758,11 @@ class _MusePlan:
             self.runner.head_dim, self.dtype
         )
         if not hasattr(self, "partitioned_attention"):
-            self.attention_partitions = 256 if self.rows == 1 else 16
+            self.attention_partitions = (
+                _decode_attention_partitions(self.runner.head_dim)
+                if self.rows == 1
+                else 16
+            )
             partitions = self.attention_partitions
             self.partitioned_attention = {
                 partitions: _allocate_partitioned_gqa(

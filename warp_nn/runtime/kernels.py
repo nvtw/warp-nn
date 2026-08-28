@@ -40,6 +40,11 @@ from warp_nn.utils.config import get_kernel_config
 # ---------------------------------------------------------------------------
 
 
+def _decode_attention_partitions(head_size: int) -> int:
+    """Choose bounded decode parallelism from attention-head geometry."""
+    return max(64, min(256, int(head_size)))
+
+
 @wp.kernel
 def _gemm_transb_kernel(
     A: wp.array2d[Any],  # (M, K)

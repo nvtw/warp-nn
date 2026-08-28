@@ -13,6 +13,7 @@ from warp_nn.runtime.kernels import (
     _append_head_cache_kernel,
     _append_circular_head_cache_kernel,
     _causal_conv_rows_kernel,
+    _decode_attention_partitions,
     _get_gated_rms_norm_kernel,
     _get_gqa_attention_kernel,
     _get_greedy_argmax_kernels,
@@ -105,6 +106,13 @@ def test_linear_operation_cublas():
     np.testing.assert_allclose(
         tensors["output"].numpy(), x_np @ weight_np.T, atol=0.2, rtol=0.02
     )
+
+
+@pytest.mark.parametrize(
+    "head_size,partitions", [(4, 64), (128, 128), (256, 256), (512, 256)]
+)
+def test_decode_attention_partitions_follow_head_geometry(head_size, partitions):
+    assert _decode_attention_partitions(head_size) == partitions
 
 
 @pytest.mark.parametrize("rows", [1, 3, 32])

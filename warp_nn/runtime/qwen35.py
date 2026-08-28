@@ -23,6 +23,7 @@ from warp_nn.runtime.gguf import (
 from warp_nn.runtime.kernels import (
     _append_head_cache_kernel,
     _causal_conv_rows_kernel,
+    _decode_attention_partitions,
     _gather_rows_kernel,
     _get_gather_q8_0_rows_kernel,
     _get_gated_rms_norm_kernel,
@@ -484,7 +485,11 @@ class _Qwen35Plan:
             self.runner.head_size, self.dtype
         )
         if not hasattr(self, "partitioned_attention"):
-            self.attention_partitions = 256 if self.rows == 1 else 16
+            self.attention_partitions = (
+                _decode_attention_partitions(self.runner.head_size)
+                if self.rows == 1
+                else 16
+            )
             partitions = self.attention_partitions
             self.partitioned_attention = {
                 partitions: _allocate_partitioned_gqa(
@@ -992,8 +997,7 @@ class Qwen35Runner:
             ],
             device=self.device,
         )
-        partitions = 256
-        self._decode_plan.attention_partitions = partitions
+        partitions = getattr(self._decode_plan, "attention_partitions", 256)
         logits = self._run(self._decode_plan, partitions)
         self.sequence_length += 1
         return logits
