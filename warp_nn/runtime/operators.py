@@ -60,9 +60,9 @@ def _exec_linear(op, tensors, shapes, device):
     if op.attrs.get("_packed_vector"):
         wp.launch(
             op.attrs["_kernel"],
-            dim=(weight.shape[0] // 2) * 32,
+            dim=(weight.shape[0] // 4) * 32,
             inputs=[op.attrs["_packed_x"], op.attrs["_packed_weight"], output],
-            block_dim=256,
+            block_dim=128,
             device=device,
         )
     elif op.attrs.get("_mma"):
@@ -130,7 +130,7 @@ def plan_linear(op: Operation, tensors: dict[str, wp.array], shapes: dict[str, t
     if (
         device.is_cuda
         and rows == 1
-        and columns % 2 == 0
+        and columns % 4 == 0
         and inner % 4 == 0
         and dtype in (wp.float16, wp.bfloat16)
         and x.is_contiguous
