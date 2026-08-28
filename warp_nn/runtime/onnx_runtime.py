@@ -2381,8 +2381,8 @@ def _shape_matmul_nbits(op, shapes, dtypes, tensors, device, requires_grad=False
             shape=(N, blocks, bits),
             device=device,
         )
-        op.attrs["_q8_kernel"] = _matmul_int4_q8_kernel if bits == 4 else _get_matmul_int8_q8_kernel(4)
-        op.attrs["_q8_width"] = 4
+        op.attrs["_q8_kernel"] = _matmul_int4_q8_kernel if bits == 4 else _get_matmul_int8_q8_kernel(8)
+        op.attrs["_q8_width"] = bits
     if device.is_cuda and rows > 1 and bits == 4 and block_size == 32 and dtype == wp.float16 and not has_zero_points:
         tile_m = 64 if rows >= 64 else 32 if rows >= 32 else 16
         tile_n = 32 if rows >= 32 else 16
