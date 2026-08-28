@@ -1288,6 +1288,98 @@ def _get_mamba2_decode_kernel(head_dim: int, state_size: int, heads_per_group: i
     return _create_mamba2_decode_kernel(head_dim, state_size, heads_per_group, dtype)
 
 
+def _create_mamba2_prefill_kernel(head_dim: int, state_size: int, heads_per_group: int, dtype: type):
+    """Build chunked Mamba-2 prefill with state kept on-chip."""
+    HEAD_DIM = head_dim
+    STATE_SIZE = state_size
+    CHANNEL_TILE = min(32, HEAD_DIM & -HEAD_DIM)
+    CHANNEL_BLOCKS = HEAD_DIM // CHANNEL_TILE
+    HEADS_PER_GROUP = heads_per_group
+    DTYPE = dtype
+
+    @wp.func
+    def to_float(value: dtype):
+        return wp.float32(dtype(value))
+
+    @wp.func
+    def to_output(value: wp.float32):
+        return dtype(value)
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(
+        x: wp.array2d(dtype=DTYPE),
+        b: wp.array2d(dtype=DTYPE),
+        c: wp.array2d(dtype=DTYPE),
+        dt: wp.array2d(dtype=DTYPE),
+        a_log: wp.array1d[wp.float32],
+        dt_bias: wp.array1d[wp.float32],
+        d: wp.array1d[wp.float32],
+        state: wp.array2d[wp.float32],
+        output: wp.array2d(dtype=DTYPE),
+        sequence_length: int,
+        time_step_min: float,
+        time_step_max: float,
+    ):
+        """Process one sequence chunk and update its persistent FP32 state."""
+        item = wp.tid()
+        typed_zero = DTYPE(0.0)
+        head = item / CHANNEL_BLOCKS
+        channel_offset = (item % CHANNEL_BLOCKS) * CHANNEL_TILE
+        group = head / HEADS_PER_GROUP
+        state_row = head * HEAD_DIM + channel_offset
+        values = wp.tile_transpose(
+            wp.tile_load(
+                state,
+                shape=(CHANNEL_TILE, STATE_SIZE),
+                offset=(state_row, 0),
+                storage="register",
+            )
+        )
+
+        for token in range(sequence_length):
+            step_input = wp.float32(dt[token, head] + typed_zero) + dt_bias[head]
+            step = wp.max(step_input, 0.0) + wp.log(1.0 + wp.exp(-wp.abs(step_input)))
+            step = wp.clamp(step, wp.float32(time_step_min), wp.float32(time_step_max))
+            wp.tile_assign(values, values * wp.exp(-wp.exp(a_log[head]) * step))
+
+            x_row = wp.tile_map(
+                to_float,
+                wp.tile_load(x, shape=(1, CHANNEL_TILE), offset=(token, head * HEAD_DIM + channel_offset)),
+            )
+            b_column = wp.tile_transpose(
+                wp.tile_map(
+                    to_float,
+                    wp.tile_load(b, shape=(1, STATE_SIZE), offset=(token, group * STATE_SIZE)),
+                )
+            )
+            wp.tile_matmul(b_column, step * x_row, values)
+
+            c_row = wp.tile_map(
+                to_float,
+                wp.tile_load(c, shape=(1, STATE_SIZE), offset=(token, group * STATE_SIZE)),
+            )
+            projected = wp.tile_zeros(shape=(1, CHANNEL_TILE), dtype=wp.float32)
+            wp.tile_matmul(c_row, values, projected)
+            wp.tile_store(
+                output,
+                wp.tile_map(to_output, projected + d[head] * x_row),
+                offset=(token, head * HEAD_DIM + channel_offset),
+            )
+
+        wp.tile_store(state, wp.tile_transpose(values), offset=(state_row, 0))
+
+    kernel.module.options["enable_backward"] = False
+    return CHANNEL_BLOCKS, 128, kernel
+
+
+@lru_cache(maxsize=None)
+def _get_mamba2_prefill_kernel(head_dim: int, state_size: int, heads_per_group: int, dtype: type):
+    """Return cached prefill, channel blocks per head, and block width."""
+    if min(head_dim, state_size, heads_per_group) <= 0:
+        raise ValueError("Mamba-2 dimensions must be positive")
+    return _create_mamba2_prefill_kernel(head_dim, state_size, heads_per_group, dtype)
+
+
 def _create_swiglu_kernel(dtype: type):
     """Build a fused SiLU-gate-times-up-projection kernel."""
 
