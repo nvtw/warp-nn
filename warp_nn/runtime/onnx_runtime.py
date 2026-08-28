@@ -251,15 +251,6 @@ def _reduce_mean_rows_kernel(x: wp.array2d[Any], out: wp.array2d[Any]):
 
 
 @wp.kernel(enable_backward=False)
-def _reduce_sum_rows_kernel(x: wp.array2d[Any], out: wp.array1d[Any]):
-    row = wp.tid()
-    total = x.dtype(0)
-    for column in range(x.shape[1]):
-        total += x[row, column]
-    out[row] = total
-
-
-@wp.kernel(enable_backward=False)
 def _reduce_max_1d_kernel(x: wp.array1d[Any], out: wp.array1d[Any]):
     value = x[0]
     for index in range(1, x.shape[0]):
@@ -983,6 +974,24 @@ def _get_lp_normalization_kernel(width: int, dtype: type):
     if key not in _lp_normalization_kernel_cache:
         _lp_normalization_kernel_cache[key] = _create_lp_normalization_kernel(*key)
     return tile_width, _lp_normalization_kernel_cache[key]
+
+
+@lru_cache(maxsize=None)
+def _get_reduce_sum_rows_kernel(width: int, dtype: type):
+    tile_width = min(512, max(32, 1 << (width - 1).bit_length()))
+    TILE_WIDTH = tile_width
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def kernel(x: wp.array2d(dtype=DTYPE), out: wp.array1d(dtype=DTYPE)):
+        row = wp.tid()
+        values = wp.tile_zeros(shape=(TILE_WIDTH,), dtype=DTYPE)
+        for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
+            offset = tile_index * TILE_WIDTH
+            values += wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
+        wp.tile_store(out, wp.tile_sum(values), offset=row)
+
+    return tile_width, kernel
 
 
 def _create_linear_attention_kernel(key_size: int, value_size: int, dtype: type):
@@ -1937,7 +1946,7 @@ def _shape_reduce_sum(op, shapes, dtypes, tensors, device, requires_grad=False):
     tensors[op.outputs[0]] = wp.zeros(out_shape, dtype=dtype, device=device)
     shapes[op.outputs[0]] = out_shape
     dtypes[op.outputs[0]] = dtype
-    op.attrs["_kernel"] = _kernel_for_dtype(_reduce_sum_rows_kernel, dtype, (2,), (1,))
+    op.attrs["_tile_width"], op.attrs["_kernel"] = _get_reduce_sum_rows_kernel(in_shape[1], dtype)
 
 
 def _shape_reduce_max(op, shapes, dtypes, tensors, device, requires_grad=False):
@@ -2994,10 +3003,11 @@ def _exec_reduce_mean(op, tensors, shapes, device):
 
 
 def _exec_reduce_sum(op, tensors, shapes, device):
-    wp.launch(
+    wp.launch_tiled(
         op.attrs["_kernel"],
         dim=shapes[op.inputs[0]][0],
         inputs=[tensors[op.inputs[0]], tensors[op.outputs[0]]],
+        block_dim=op.attrs["_tile_width"],
         device=device,
     )
 
