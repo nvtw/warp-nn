@@ -258,18 +258,25 @@ def test_circular_window_attention_and_logit_softcap():
 
 
 @pytest.mark.parametrize(
-    ("query_heads", "kv_heads", "length", "capacity", "window"),
-    [(4, 2, 1, 1, 0), (4, 2, 13, 16, 0), (6, 1, 19, 20, 0), (4, 2, 19, 8, 5)],
+    ("query_heads", "kv_heads", "length", "capacity", "window", "rows"),
+    [
+        (4, 2, 1, 1, 0, 1),
+        (4, 2, 13, 16, 0, 1),
+        (6, 1, 19, 20, 0, 1),
+        (4, 2, 19, 8, 5, 1),
+        (6, 1, 19, 20, 0, 4),
+        (4, 2, 19, 8, 5, 4),
+    ],
 )
 def test_partitioned_decode_attention_matches_serial(
-    query_heads, kv_heads, length, capacity, window
+    query_heads, kv_heads, length, capacity, window, rows
 ):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
     rng = np.random.default_rng(41)
     head_size = 32
     query = wp.array(
-        rng.normal(size=(query_heads, head_size)).astype(np.float32),
+        rng.normal(size=(query_heads * rows, head_size)).astype(np.float32),
         dtype=wp.bfloat16,
         device="cuda:0",
     )
@@ -286,14 +293,14 @@ def test_partitioned_decode_attention_matches_serial(
     )
     lengths = wp.array(np.array([length - 1], dtype=np.int32), device="cuda:0")
     expected = wp.empty(
-        (1, query_heads * head_size), dtype=wp.bfloat16, device="cuda:0"
+        (rows, query_heads * head_size), dtype=wp.bfloat16, device="cuda:0"
     )
     actual = wp.empty_like(expected)
 
     block_dim, serial = _get_gqa_attention_kernel(head_size, wp.bfloat16)
     wp.launch_tiled(
         serial,
-        dim=query_heads,
+        dim=query_heads * rows,
         inputs=[
             query,
             key,
@@ -302,7 +309,7 @@ def test_partitioned_decode_attention_matches_serial(
             expected,
             query_heads,
             kv_heads,
-            1,
+            rows,
             capacity,
             head_size**-0.5,
             window,
@@ -311,7 +318,9 @@ def test_partitioned_decode_attention_matches_serial(
         device="cuda:0",
     )
 
-    workspace = _allocate_partitioned_gqa(query_heads, head_size, wp.bfloat16, "cuda:0")
+    workspace = _allocate_partitioned_gqa(
+        query_heads, head_size, wp.bfloat16, "cuda:0", rows=rows
+    )
     _launch_partitioned_gqa(
         workspace,
         query,

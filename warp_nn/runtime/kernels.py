@@ -1965,6 +1965,10 @@ def _create_partitioned_gqa_attention_kernels(
         return (offset + key_start) % length + base
 
     @wp.func
+    def strided_index(offset: wp.int32, base: wp.int32, stride: wp.int32):
+        return base + offset * stride
+
+    @wp.func
     def scale_value(value: wp.float32, scale: wp.float32):
         return value * scale
 
@@ -1983,6 +1987,7 @@ def _create_partitioned_gqa_attention_kernels(
         partial_output: wp.array2d[wp.float32],
         query_heads: int,
         kv_heads: int,
+        sequence_length: int,
         total_length: int,
         scale: float,
         window: int,
@@ -1993,22 +1998,42 @@ def _create_partitioned_gqa_attention_kernels(
         queries_per_kv = query_heads / kv_heads
         groups_per_kv = (queries_per_kv + GROUP - 1) / GROUP
         groups_per_batch = kv_heads * groups_per_kv
-        batch = group_item / groups_per_batch
+        sequence_item = group_item / groups_per_batch
+        query_token = sequence_item % sequence_length
+        batch = sequence_item / sequence_length
         group = group_item % groups_per_batch
         kv_head = group / groups_per_kv
         subgroup = group % groups_per_kv
         head_0 = kv_head * queries_per_kv + subgroup * GROUP
         valid_heads = wp.min(GROUP, (kv_head + 1) * queries_per_kv - head_0)
-        head_item_0 = batch * query_heads + head_0
+        query_item_0 = (batch * query_heads + head_0) * sequence_length + query_token
+        output_head_item_0 = (
+            batch * sequence_length + query_token
+        ) * query_heads + head_0
 
-        valid_keys = wp.int32(sequence_lengths_minus_one[batch]) + 1
+        valid_keys = (
+            wp.int32(sequence_lengths_minus_one[batch])
+            - sequence_length
+            + query_token
+            + 2
+        )
         first_key = wp.max(0, valid_keys - window) if window > 0 else 0
         key_count = valid_keys - first_key
         keys_per_partition = (key_count + PARTITIONS - 1) / PARTITIONS
         partition_start = first_key + partition * keys_per_partition
         partition_end = wp.min(valid_keys, partition_start + keys_per_partition)
 
-        queries = wp.tile_load(query, shape=(GROUP, head_size), offset=(head_item_0, 0))
+        query_members = wp.tile_arange(GROUP, dtype=wp.int32)
+        query_indices = wp.tile_map(
+            strided_index, query_members, query_item_0, sequence_length
+        )
+        queries = wp.tile_load_indexed(
+            query,
+            indices=query_indices,
+            shape=(GROUP, head_size),
+            offset=(0, 0),
+            axis=0,
+        )
         accumulator = wp.tile_zeros(shape=(GROUP, head_size), dtype=wp.float32)
         maximum = wp.tile_full(
             shape=(GROUP,),
@@ -2087,7 +2112,7 @@ def _create_partitioned_gqa_attention_kernels(
 
         for member in range(GROUP):
             if member < valid_heads:
-                partial_item = (head_item_0 + member) * PARTITIONS + partition
+                partial_item = (output_head_item_0 + member) * PARTITIONS + partition
                 partial_maximum[partial_item] = wp.tile_extract(maximum, member)
                 partial_denominator[partial_item] = wp.tile_extract(denominator, member)
                 accumulator_row = wp.tile_view(
@@ -2108,7 +2133,7 @@ def _create_partitioned_gqa_attention_kernels(
         head_item = wp.tid()
         typed_zero = DTYPE(0.0)
         head = head_item % query_heads
-        batch = head_item / query_heads
+        output_row = head_item / query_heads
         offset = head_item * PARTITIONS
         maximum = wp.float32(-3.402823466e38) + wp.float32(typed_zero)
         for partition in range(PARTITIONS):
@@ -2123,7 +2148,7 @@ def _create_partitioned_gqa_attention_kernels(
             values = wp.tile_load(partial_output[item], shape=(head_size,))
             accumulator += wp.tile_map(scale_value, values, partial_scale)
         wp.tile_store(
-            output[batch],
+            output[output_row],
             wp.tile_map(normalize, accumulator, denominator),
             offset=(head * head_size,),
         )
@@ -2162,13 +2187,18 @@ def _get_partitioned_gqa_attention_kernels(
 
 
 def _allocate_partitioned_gqa(
-    heads: int, head_size: int, dtype: type, device, partitions: int = 256
+    heads: int,
+    head_size: int,
+    dtype: type,
+    device,
+    partitions: int = 256,
+    rows: int = 1,
 ):
     """Allocate one reusable workspace for partitioned decode attention."""
     block_dim, partitions, kernels = _get_partitioned_gqa_attention_kernels(
         head_size, dtype, partitions
     )
-    items = heads * partitions
+    items = rows * heads * partitions
     return (
         block_dim,
         partitions,
@@ -2204,10 +2234,11 @@ def _launch_partitioned_gqa(
     ) = workspace
     queries_per_kv = query_heads // kv_heads
     groups_per_batch = kv_heads * ((queries_per_kv + 3) // 4)
-    batches = query.shape[0] // query_heads
+    sequence_length = output.shape[0]
+    batches = query.shape[0] // (query_heads * sequence_length)
     wp.launch_tiled(
         kernels[0],
-        dim=batches * groups_per_batch * partitions,
+        dim=batches * sequence_length * groups_per_batch * partitions,
         inputs=[
             query,
             key,
@@ -2218,6 +2249,7 @@ def _launch_partitioned_gqa(
             partial_output,
             query_heads,
             kv_heads,
+            sequence_length,
             total_length,
             scale,
             window,
@@ -2227,7 +2259,7 @@ def _launch_partitioned_gqa(
     )
     wp.launch_tiled(
         kernels[1],
-        dim=query_heads,
+        dim=batches * sequence_length * query_heads,
         inputs=[
             partial_maximum,
             partial_denominator,

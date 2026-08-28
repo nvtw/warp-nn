@@ -754,20 +754,20 @@ class _MusePlan:
         layer["attention_block"], layer["attention_kernel"] = _get_gqa_attention_kernel(
             self.runner.head_dim, self.dtype
         )
-        if self.rows == 1:
-            if not hasattr(self, "partitioned_attention"):
-                self.partitioned_attention = {
-                    partitions: _allocate_partitioned_gqa(
-                        self.runner.query_heads,
-                        self.runner.head_dim,
-                        self.dtype,
-                        self.device,
-                        partitions,
-                    )
-                    for partitions in (256,)
-                }
-                self.attention_partitions = 256
-            layer["partitioned_attention"] = self.partitioned_attention
+        if not hasattr(self, "partitioned_attention"):
+            self.attention_partitions = 256 if self.rows == 1 else 16
+            partitions = self.attention_partitions
+            self.partitioned_attention = {
+                partitions: _allocate_partitioned_gqa(
+                    self.runner.query_heads,
+                    self.runner.head_dim,
+                    self.dtype,
+                    self.device,
+                    partitions,
+                    rows=self.rows,
+                )
+            }
+        layer["partitioned_attention"] = self.partitioned_attention
 
     def _execute_op(self, op: Operation) -> None:
         execute_operations(
