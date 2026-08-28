@@ -11,43 +11,66 @@ import warp as wp
 _DECODE_LINEAR = r"""
 #if defined(__CUDA_ARCH__)
     const int lane = tid & 31;
-    const int column = (tid >> 5) * 4;
+    constexpr int OUTPUTS = 8;
+    const int column = (tid >> 5) * OUTPUTS;
     const NATIVE_TYPE* xp = x.data;
     const NATIVE_TYPE* wp = weight.data;
-    float total0 = 0.0f, total1 = 0.0f, total2 = 0.0f, total3 = 0.0f;
+    float totals[OUTPUTS] = {};
 
     for (int k = lane * 8; k < inner; k += 256) {
         uint4 av = *reinterpret_cast<const uint4*>(xp + k);
-        uint4 w0v = *reinterpret_cast<const uint4*>(wp + column * inner + k);
-        uint4 w1v = *reinterpret_cast<const uint4*>(wp + (column + 1) * inner + k);
-        uint4 w2v = *reinterpret_cast<const uint4*>(wp + (column + 2) * inner + k);
-        uint4 w3v = *reinterpret_cast<const uint4*>(wp + (column + 3) * inner + k);
+        uint4 weights[OUTPUTS];
+        #pragma unroll
+        for (int output = 0; output < OUTPUTS; ++output) {
+            #if NATIVE_BF16
+            weights[output] = __ldcs(reinterpret_cast<const uint4*>(wp + (column + output) * inner + k));
+            #else
+            weights[output] = *reinterpret_cast<const uint4*>(wp + (column + output) * inner + k);
+            #endif
+        }
+        #if NATIVE_BF16
+        const unsigned* a = reinterpret_cast<const unsigned*>(&av);
+        #pragma unroll
+        for (int word = 0; word < 4; ++word) {
+            float value = __uint_as_float(a[word] << 16);
+            #pragma unroll
+            for (int output = 0; output < OUTPUTS; ++output) {
+                unsigned packed = reinterpret_cast<const unsigned*>(&weights[output])[word];
+                totals[output] = fmaf(value, __uint_as_float(packed << 16), totals[output]);
+            }
+            value = __uint_as_float(a[word] & 0xffff0000u);
+            #pragma unroll
+            for (int output = 0; output < OUTPUTS; ++output) {
+                unsigned packed = reinterpret_cast<const unsigned*>(&weights[output])[word];
+                totals[output] = fmaf(value, __uint_as_float(packed & 0xffff0000u), totals[output]);
+            }
+        }
+        #else
         const NATIVE_TYPE* a = reinterpret_cast<const NATIVE_TYPE*>(&av);
-        const NATIVE_TYPE* w0 = reinterpret_cast<const NATIVE_TYPE*>(&w0v);
-        const NATIVE_TYPE* w1 = reinterpret_cast<const NATIVE_TYPE*>(&w1v);
-        const NATIVE_TYPE* w2 = reinterpret_cast<const NATIVE_TYPE*>(&w2v);
-        const NATIVE_TYPE* w3 = reinterpret_cast<const NATIVE_TYPE*>(&w3v);
         #pragma unroll
         for (int component = 0; component < 8; ++component) {
             float value = float(a[component]);
-            total0 = fmaf(value, float(w0[component]), total0);
-            total1 = fmaf(value, float(w1[component]), total1);
-            total2 = fmaf(value, float(w2[component]), total2);
-            total3 = fmaf(value, float(w3[component]), total3);
+            #pragma unroll
+            for (int output = 0; output < OUTPUTS; ++output) {
+                const NATIVE_TYPE* values = reinterpret_cast<const NATIVE_TYPE*>(&weights[output]);
+                totals[output] = fmaf(value, float(values[component]), totals[output]);
+            }
         }
+        #endif
     }
     #pragma unroll
     for (int offset = 16; offset; offset >>= 1) {
-        total0 += __shfl_down_sync(0xffffffffu, total0, offset);
-        total1 += __shfl_down_sync(0xffffffffu, total1, offset);
-        total2 += __shfl_down_sync(0xffffffffu, total2, offset);
-        total3 += __shfl_down_sync(0xffffffffu, total3, offset);
+        #pragma unroll
+        for (int output = 0; output < OUTPUTS; ++output)
+            totals[output] += __shfl_down_sync(0xffffffffu, totals[output], offset);
     }
     if (lane == 0) {
-        output.data[column] = NATIVE_TYPE(total0);
-        output.data[column + 1] = NATIVE_TYPE(total1);
-        output.data[column + 2] = NATIVE_TYPE(total2);
-        output.data[column + 3] = NATIVE_TYPE(total3);
+        uint4 packed;
+        NATIVE_TYPE* values = reinterpret_cast<NATIVE_TYPE*>(&packed);
+        #pragma unroll
+        for (int index = 0; index < OUTPUTS; ++index)
+            values[index] = NATIVE_TYPE(totals[index]);
+        *reinterpret_cast<uint4*>(output.data + column) = packed;
     }
 #endif
 """
@@ -74,19 +97,24 @@ _MMA_16X64 = r"""
     const int split_inner = inner / splits;
     const int k_begin = split * split_inner;
     const int k_end = k_begin + split_inner;
-    for (int item = threadIdx.x; item < 320; item += 128) {
-        bool is_a = item < 64;
-        int local = is_a ? item : item - 64;
+    if (threadIdx.x < 64) {
+        int local = threadIdx.x;
         int row = local >> 2;
         int segment = local & 3;
-        unsigned short* dst = smem + (is_a ? row * LD : A_SIZE + row * LD) + segment * 8;
-        const NATIVE_TYPE* src = is_a ? xp + row * inner + k_begin + segment * 8
-                                      : weightp + (column + row) * inner + k_begin + segment * 8;
+        unsigned short* dst = smem + row * LD + segment * 8;
+        const NATIVE_TYPE* src = xp + row * inner + k_begin + segment * 8;
         unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-        if (is_a)
-            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
-        else
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
+    }
+    #pragma unroll
+    for (int copy = 0; copy < 2; ++copy) {
+        int local = threadIdx.x + copy * 128;
+        int row = local >> 2;
+        int segment = local & 3;
+        unsigned short* dst = smem + A_SIZE + row * LD + segment * 8;
+        const NATIVE_TYPE* src = weightp + (column + row) * inner + k_begin + segment * 8;
+        unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
     }
     asm volatile("cp.async.commit_group;");
     asm volatile("cp.async.wait_group 0;");
@@ -95,19 +123,24 @@ _MMA_16X64 = r"""
     for (int k = k_begin, stage = 0; k < k_end; k += 32, stage ^= 1) {
         if (k + 32 < k_end) {
             unsigned short* next = smem + (stage ^ 1) * STAGE_SIZE;
-            for (int item = threadIdx.x; item < 320; item += 128) {
-                bool is_a = item < 64;
-                int local = is_a ? item : item - 64;
+            if (threadIdx.x < 64) {
+                int local = threadIdx.x;
                 int row = local >> 2;
                 int segment = local & 3;
-                unsigned short* dst = next + (is_a ? row * LD : A_SIZE + row * LD) + segment * 8;
-                const NATIVE_TYPE* src = is_a ? xp + row * inner + k + 32 + segment * 8
-                                              : weightp + (column + row) * inner + k + 32 + segment * 8;
+                unsigned short* dst = next + row * LD + segment * 8;
+                const NATIVE_TYPE* src = xp + row * inner + k + 32 + segment * 8;
                 unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-                if (is_a)
-                    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
-                else
-                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
+            }
+            #pragma unroll
+            for (int copy = 0; copy < 2; ++copy) {
+                int local = threadIdx.x + copy * 128;
+                int row = local >> 2;
+                int segment = local & 3;
+                unsigned short* dst = next + A_SIZE + row * LD + segment * 8;
+                const NATIVE_TYPE* src = weightp + (column + row) * inner + k + 32 + segment * 8;
+                unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
             }
             asm volatile("cp.async.commit_group;");
         }
@@ -186,15 +219,15 @@ def _get_mma_16x64(dtype):
 
 
 def _create_decode_linear_kernel(dtype: type):
-    """Build the vec8 single-token projection with four outputs per warp."""
+    """Build the vec8 single-token projection with eight outputs per warp."""
     DTYPE = dtype
     if dtype == wp.float16:
-        native_type = "wp::float16"
+        native_type, native_bf16 = "wp::float16", "0"
     elif dtype == wp.bfloat16:
-        native_type = "wp::bfloat16"
+        native_type, native_bf16 = "wp::bfloat16", "1"
     else:
         raise TypeError("Decode projection requires FP16 or BF16")
-    snippet = _DECODE_LINEAR.replace("NATIVE_TYPE", native_type)
+    snippet = _DECODE_LINEAR.replace("NATIVE_TYPE", native_type).replace("NATIVE_BF16", native_bf16)
 
     @wp.func_native(snippet)
     def project(

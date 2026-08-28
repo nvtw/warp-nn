@@ -92,7 +92,7 @@ def test_single_token_linear_uses_graph_captured_packed_warp(dtype):
         pytest.skip("CUDA is not available")
     rng = np.random.default_rng(18)
     x_np = rng.normal(0.0, 0.1, (1, 72)).astype(np.float32)
-    weight_np = rng.normal(0.0, 0.1, (44, 72)).astype(np.float32)
+    weight_np = rng.normal(0.0, 0.1, (48, 72)).astype(np.float32)
     tensors = {
         "x": wp.array(x_np, dtype=dtype, device="cuda:0"),
         "weight": wp.array(weight_np, dtype=dtype, device="cuda:0"),
@@ -105,6 +105,9 @@ def test_single_token_linear_uses_graph_captured_packed_warp(dtype):
     with wp.ScopedCapture("cuda:0") as capture:
         execute_operations([operation], tensors, shapes, wp.get_device("cuda:0"))
     wp.capture_launch(capture.graph)
+    first = tensors["output"].numpy()
+    wp.capture_launch(capture.graph)
+    np.testing.assert_array_equal(tensors["output"].numpy(), first)
 
     expected = tensors["x"].numpy().astype(np.float32) @ tensors["weight"].numpy().astype(np.float32).T
     np.testing.assert_allclose(tensors["output"].numpy(), expected, atol=0.02, rtol=0.02)
@@ -129,6 +132,9 @@ def test_16_row_linear_fallback_uses_graph_captured_mma(dtype):
     with wp.ScopedCapture("cuda:0") as capture:
         execute_operations([operation], tensors, shapes, wp.get_device("cuda:0"))
     wp.capture_launch(capture.graph)
+    first = tensors["output"].numpy()
+    wp.capture_launch(capture.graph)
+    np.testing.assert_array_equal(tensors["output"].numpy(), first)
 
     expected = tensors["x"].numpy().astype(np.float32) @ tensors["weight"].numpy().astype(np.float32).T
     np.testing.assert_allclose(tensors["output"].numpy(), expected, atol=0.02, rtol=0.02)

@@ -66,7 +66,7 @@ def _exec_linear(op, tensors, shapes, device):
     if op.attrs.get("_packed_vector"):
         wp.launch(
             op.attrs["_kernel"],
-            dim=(weight.shape[0] // 4) * 32,
+            dim=(weight.shape[0] // 8) * 32,
             inputs=[
                 op.attrs["_packed_x"],
                 op.attrs["_packed_weight"],
@@ -74,7 +74,7 @@ def _exec_linear(op, tensors, shapes, device):
                 op.attrs["_columns"],
                 op.attrs["_inner"],
             ],
-            block_dim=128,
+            block_dim=op.attrs["_decode_block_dim"],
             device=device,
         )
     elif op.attrs.get("_mma"):
@@ -157,7 +157,7 @@ def plan_linear(op: Operation, tensors: dict[str, wp.array], shapes: dict[str, t
         device.is_cuda
         and _prefer_optimized_linear(cublas is not None, device.arch, columns, inner)
         and rows == 1
-        and columns % 4 == 0
+        and columns % 8 == 0
         and inner % 8 == 0
         and dtype in (wp.float16, wp.bfloat16)
         and x.is_contiguous
@@ -167,6 +167,7 @@ def plan_linear(op: Operation, tensors: dict[str, wp.array], shapes: dict[str, t
     ):
         op.attrs["_kernel"] = get_decode_linear_kernel(dtype)
         op.attrs["_packed_vector"] = True
+        op.attrs["_decode_block_dim"] = 32 if inner <= columns else 128
         op.attrs["_packed_x"] = x.flatten()
         op.attrs["_packed_weight"] = weight.flatten()
     elif (
