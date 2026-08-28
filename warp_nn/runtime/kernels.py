@@ -24,6 +24,7 @@ from functools import lru_cache
 import warp as wp
 
 from warp_nn.modules.layers._common import tile_transposed_gemm_2d
+from warp_nn.runtime._cuda import dp4a, expand_int4x4_high, expand_int4x4_low, subgroup_sum, warp_max_broadcast
 from warp_nn.utils.config import get_kernel_config
 
 
@@ -494,45 +495,6 @@ def _gather_single_index_kernel(
     output[output_index] = data[(prefix * axis_size + index) * stride + suffix]
 
 
-@wp.func_native(
-    """
-#if defined(__CUDA_ARCH__)
-    for (int offset = width / 2; offset > 0; offset >>= 1)
-        value += __shfl_down_sync(__activemask(), value, offset, width);
-#endif
-    return value;
-    """
-)
-def _subgroup_sum(value: float, width: int) -> float: ...
-
-
-@wp.func_native(
-    """
-#if defined(__CUDA_ARCH__)
-    for (int offset = 16; offset > 0; offset >>= 1)
-        value = max(value, __shfl_down_sync(__activemask(), value, offset));
-    value = __shfl_sync(__activemask(), value, 0);
-#endif
-    return value;
-    """
-)
-def _warp_max_broadcast(value: float) -> float: ...
-
-
-@wp.func_native(
-    """
-#if defined(__CUDA_ARCH__)
-    return __dp4a(a, b, total);
-#else
-    for (int shift = 0; shift < 32; shift += 8)
-        total += int8_t(a >> shift) * int8_t(b >> shift);
-    return total;
-#endif
-    """
-)
-def _dp4a(a: int, b: int, total: int) -> int: ...
-
-
 @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
 def _quantize_activation_int8_kernel(
     activations: wp.array2d[wp.float16],
@@ -546,7 +508,7 @@ def _quantize_activation_int8_kernel(
     row = (thread / 32) / scales.shape[1]
     column = block * 32 + lane
     value = wp.float32(activations[row, column])
-    maximum = _warp_max_broadcast(wp.abs(value))
+    maximum = warp_max_broadcast(wp.abs(value))
     scale = maximum / 127.0 if maximum > 0.0 else 1.0
     quantized[row, column] = wp.int8(wp.clamp(wp.round(value / scale), -127.0, 127.0))
     if lane == 0:
@@ -561,38 +523,6 @@ def _expand_int4x4(value: wp.uint32) -> wp.int32:
         | ((value & wp.uint32(0x0F00)) << wp.uint32(8))
         | ((value & wp.uint32(0xF000)) << wp.uint32(12))
     )
-
-
-@wp.func_native(
-    """
-    unsigned packed = (unsigned)value;
-#if defined(__CUDA_ARCH__)
-    unsigned duplicated = __byte_perm(packed, 0, 0x1100);
-#else
-    unsigned byte0 = packed & 0xff;
-    unsigned byte1 = (packed >> 8) & 0xff;
-    unsigned duplicated = byte0 | (byte0 << 8) | (byte1 << 16) | (byte1 << 24);
-#endif
-    return (int)((duplicated & 0x000f000f) | ((duplicated & 0xf000f000) >> 4));
-    """
-)
-def _expand_int4x4_low_native(value: int) -> int: ...
-
-
-@wp.func_native(
-    """
-    unsigned packed = (unsigned)value;
-#if defined(__CUDA_ARCH__)
-    unsigned duplicated = __byte_perm(packed, 0, 0x3322);
-#else
-    unsigned byte2 = (packed >> 16) & 0xff;
-    unsigned byte3 = packed >> 24;
-    unsigned duplicated = byte2 | (byte2 << 8) | (byte3 << 16) | (byte3 << 24);
-#endif
-    return (int)((duplicated & 0x000f000f) | ((duplicated & 0xf000f000) >> 4));
-    """
-)
-def _expand_int4x4_high_native(value: int) -> int: ...
 
 
 @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
@@ -614,13 +544,13 @@ def _matmul_int4_q8_kernel(
         packed_weights = weights[column, block, lane]
         packed_activation_0 = wp.int32(activations[row, block, lane * 2])
         packed_activation_1 = wp.int32(activations[row, block, lane * 2 + 1])
-        block_total = _dp4a(_expand_int4x4_low_native(wp.int32(packed_weights)), packed_activation_0, 0)
-        block_total = _dp4a(_expand_int4x4_high_native(wp.int32(packed_weights)), packed_activation_1, block_total)
-        activation_sum = _dp4a(0x01010101, packed_activation_0, 0)
-        activation_sum = _dp4a(0x01010101, packed_activation_1, activation_sum)
+        block_total = dp4a(expand_int4x4_low(wp.int32(packed_weights)), packed_activation_0, 0)
+        block_total = dp4a(expand_int4x4_high(wp.int32(packed_weights)), packed_activation_1, block_total)
+        activation_sum = dp4a(0x01010101, packed_activation_0, 0)
+        activation_sum = dp4a(0x01010101, packed_activation_1, activation_sum)
         block_total -= 8 * activation_sum
         total += wp.float32(block_total) * activation_scales[row, block] * wp.float32(weight_scales[column, block])
-    total = _subgroup_sum(total, 4)
+    total = subgroup_sum(total, 4)
     if lane == 0:
         output[row, column] = wp.float16(total)
 
@@ -652,9 +582,9 @@ def _get_matmul_int8_q8_kernel(reduction_width: int):
                 word = lane + group * REDUCTION_WIDTH
                 packed_activation = wp.int32(activations[row, block, word])
                 signed_weights = wp.int32(weights[column, block, word] ^ wp.uint32(0x80808080))
-                block_total = _dp4a(signed_weights, packed_activation, block_total)
+                block_total = dp4a(signed_weights, packed_activation, block_total)
             total += wp.float32(block_total) * activation_scales[row, block] * wp.float32(weight_scales[column, block])
-        total = _subgroup_sum(total, REDUCTION_WIDTH)
+        total = subgroup_sum(total, REDUCTION_WIDTH)
         if lane == 0:
             output[row, column] = wp.float16(total)
 
@@ -773,7 +703,7 @@ def _create_matmul_nbits_kernel(bits: int, block_size: int, dtype: type, warp_re
             total += block_total * wp.float32(scales[column, block])
 
         if warp_reduction:
-            total = _subgroup_sum(total, reduction_width)
+            total = subgroup_sum(total, reduction_width)
         if lane == 0:
             output[row, column] = dtype(total)
 
