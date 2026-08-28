@@ -14,7 +14,7 @@ from collections.abc import Callable, Mapping, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from warp_nn.runtime.chat import Runner, Tokenizer, generate_tokens
+from warp_nn.runtime.chat import Runner, Tokenizer, generate_tokens, split_tool_prefix
 
 
 class APIError(Exception):
@@ -56,16 +56,6 @@ def _messages(value: object) -> list[dict[str, object]]:
             raise APIError("Only assistant messages may have null content", param=f"messages.{index}.content")
         result.append(item)
     return result
-
-
-def _split_tool_prefix(text: str, marker: str) -> tuple[str, str, bool]:
-    start = text.find(marker)
-    if start >= 0:
-        return text[:start], text[start:], True
-    keep = min(len(text), len(marker) - 1)
-    while keep and not marker.startswith(text[-keep:]):
-        keep -= 1
-    return (text[:-keep], text[-keep:], False) if keep else (text, "", False)
 
 
 class ChatCompletions:
@@ -152,7 +142,7 @@ class ChatCompletions:
                     if tool_started:
                         pending += text
                     elif tool_marker:
-                        text, pending, tool_started = _split_tool_prefix(pending + text, tool_marker)
+                        text, pending, tool_started = split_tool_prefix(pending + text, tool_marker)
                         if text:
                             emit(self._chunk(completion_id, created, {"content": text}))
                     else:
@@ -162,7 +152,7 @@ class ChatCompletions:
             if tool_started:
                 pending += tail
             elif tool_marker:
-                text, pending, tool_started = _split_tool_prefix(pending + tail, tool_marker)
+                text, pending, tool_started = split_tool_prefix(pending + tail, tool_marker)
                 if text:
                     emit(self._chunk(completion_id, created, {"content": text}))
             else:

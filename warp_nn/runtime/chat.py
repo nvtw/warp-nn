@@ -40,6 +40,17 @@ class Runner(Protocol):
     def sample_greedy(self, logits: Any) -> int: ...
 
 
+def split_tool_prefix(text: str, marker: str) -> tuple[str, str, bool]:
+    """Split streamable text from a possible structured tool-call prefix."""
+    start = text.find(marker)
+    if start >= 0:
+        return text[:start], text[start:], True
+    keep = min(len(text), len(marker) - 1)
+    while keep and not marker.startswith(text[-keep:]):
+        keep -= 1
+    return (text[:-keep], text[-keep:], False) if keep else (text, "", False)
+
+
 def sample_token(
     logits: Any,
     temperature: float = 1.0,
