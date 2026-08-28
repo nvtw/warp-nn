@@ -14,7 +14,7 @@ from collections.abc import Callable, Mapping, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from warp_nn.runtime.chat import Runner, Tokenizer, generate_tokens, split_tool_prefix
+from warp_nn.runtime.chat import Runner, Tokenizer, generate_tokens, is_eos_token, split_tool_prefix
 
 
 class APIError(Exception):
@@ -147,7 +147,7 @@ class ChatCompletions:
                     emit(self._chunk(completion_id, created, {"role": "assistant", "content": ""}))
                     response_started = True
                 generated.append(token_id)
-                if token_id == self.tokenizer.eos_token_id:
+                if is_eos_token(self.tokenizer, token_id):
                     break
                 text = decoder.decode(self.tokenizer.token_bytes(token_id, skip_special_tokens=True))
                 if emit is not None and text:
@@ -173,7 +173,7 @@ class ChatCompletions:
         text = self.tokenizer.decode(generated, skip_special_tokens=True)
         text, tool_calls = self.tokenizer.parse_tool_calls(text)
         finish_reason = "tool_calls" if tool_calls else (
-            "stop" if generated and generated[-1] == self.tokenizer.eos_token_id else "length"
+            "stop" if generated and is_eos_token(self.tokenizer, generated[-1]) else "length"
         )
         message: dict[str, object] = {"role": "assistant", "content": text or None}
         if tool_calls:

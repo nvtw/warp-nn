@@ -173,6 +173,15 @@ class Qwen3Tokenizer:
         self._added_pattern = re.compile(f"({alternatives})")
         self.eos_token_id = self._added_tokens["<|im_end|>"]
         self.pad_token_id = self._added_tokens["<|endoftext|>"]
+        generation_path = directory / "generation_config.json"
+        self.generation_config = (
+            json.loads(generation_path.read_text(encoding="utf-8")) if generation_path.is_file() else {}
+        )
+        end_tokens = self.generation_config.get("eos_token_id", self.eos_token_id)
+        end_tokens = end_tokens if isinstance(end_tokens, list) else [end_tokens]
+        self.eos_token_ids = tuple(dict.fromkeys(int(token_id) for token_id in end_tokens))
+        if not self.eos_token_ids:
+            raise ValueError("Qwen3Tokenizer: generation_config has no EOS token")
         template_path = directory / "chat_template.jinja"
         template = template_path.read_text(encoding="utf-8") if template_path.is_file() else ""
         self._tool_dialect = "json" if "args-json-object" in template else "parameters"

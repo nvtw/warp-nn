@@ -71,6 +71,12 @@ def test_qwen_tokenizer_and_chat_template(tmp_path):
     )
     assert tokenizer.decode(tokenizer.encode_chat(messages, enable_thinking=False)) == formatted
 
+    (tmp_path / "generation_config.json").write_text(
+        json.dumps({"eos_token_id": [tokenizer.eos_token_id, tokenizer.pad_token_id]}), encoding="utf-8"
+    )
+    tokenizer = Qwen3Tokenizer(path)
+    assert tokenizer.eos_token_ids == (tokenizer.eos_token_id, tokenizer.pad_token_id)
+
     cached = tokenizer.encode_chat(messages, enable_thinking=False) + tokenizer.encode("Hello")
     messages.extend(
         [

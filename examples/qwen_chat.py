@@ -14,7 +14,7 @@ import threading
 import numpy as np
 
 from warp_nn.runtime import Qwen3OnnxRunner, Qwen3Tokenizer, Qwen35Runner, sample_token
-from warp_nn.runtime.chat import split_tool_prefix
+from warp_nn.runtime.chat import is_eos_token, split_tool_prefix
 from warp_nn.runtime.coding_tools import CodingTools
 
 
@@ -102,7 +102,7 @@ def _generate(
             )
         )
         generated.append(token_id)
-        if token_id == tokenizer.eos_token_id:
+        if is_eos_token(tokenizer, token_id):
             break
         text = decoder.decode(tokenizer.token_bytes(token_id, skip_special_tokens=True))
         if tool_started:
@@ -252,7 +252,7 @@ def main():
                     )
                     print("[Cancelled.]")
                     break
-                if not generated or generated[-1] != tokenizer.eos_token_id:
+                if not generated or not is_eos_token(tokenizer, generated[-1]):
                     print(f"[Stopped at the {generation_limit}-token limit; use --max-new-tokens or /clear.]")
                 if not calls:
                     history_response = tokenizer.generation_prefix(args.thinking) + response

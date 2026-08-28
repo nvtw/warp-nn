@@ -13,6 +13,7 @@ import numpy as np
 
 class Tokenizer(Protocol):
     eos_token_id: int
+    eos_token_ids: tuple[int, ...]
     tool_call_start: str | None
 
     def encode_chat(
@@ -38,6 +39,11 @@ class Runner(Protocol):
     def decode(self, token_id: int) -> Any: ...
 
     def sample_greedy(self, logits: Any) -> int: ...
+
+
+def is_eos_token(tokenizer: Tokenizer, token_id: int) -> bool:
+    """Return whether ``token_id`` is any model-declared end token."""
+    return token_id in getattr(tokenizer, "eos_token_ids", (tokenizer.eos_token_id,))
 
 
 def split_tool_prefix(text: str, marker: str) -> tuple[str, str, bool]:
@@ -118,6 +124,6 @@ def generate_tokens(
         )
         yield token_id
         generated.append(token_id)
-        if token_id == tokenizer.eos_token_id:
+        if is_eos_token(tokenizer, token_id):
             break
         logits = runner.decode(token_id)
