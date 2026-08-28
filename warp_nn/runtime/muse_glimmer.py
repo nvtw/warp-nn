@@ -979,7 +979,7 @@ class MuseGlimmerRunner(Qwen35Runner):
         path = Path(path)
         directory = path if path.is_dir() else path.parent
         config_path = directory / "config.json"
-        if config_path.is_file():
+        if any(directory.glob("*.safetensors")):
             outer_config = json.loads(config_path.read_text(encoding="utf-8"))
             self.config = outer_config.get("text_config", outer_config)
             archive = SafeTensorArchive(directory)

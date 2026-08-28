@@ -18,7 +18,10 @@ def _load_library():
     if sys.platform == "win32":
         cuda_path = os.environ.get("CUDA_PATH")
         if cuda_path:
-            names.extend(str(Path(cuda_path) / "bin" / name) for name in ("cublas64_13.dll", "cublas64_12.dll"))
+            names.extend(
+                str(Path(cuda_path) / "bin" / name)
+                for name in ("cublas64_13.dll", "cublas64_12.dll")
+            )
         names.extend(("cublas64_13.dll", "cublas64_12.dll"))
         loader = ctypes.WinDLL
     else:
@@ -64,21 +67,28 @@ class Cublas:
             ctypes.c_int,
         ]
         self._handle = ctypes.c_void_p()
-        self._check(self._lib.cublasCreate_v2(ctypes.byref(self._handle)), "cublasCreate")
+        self._check(
+            self._lib.cublasCreate_v2(ctypes.byref(self._handle)), "cublasCreate"
+        )
         self._alpha = ctypes.c_float(1.0)
         self._beta = ctypes.c_float(0.0)
+        self._stream = None
 
     @staticmethod
     def _check(status, operation):
         if status:
             raise RuntimeError(f"{operation} failed with cuBLAS status {status}")
 
-    def gemm(self, activations, weights, output, rows, columns, inner, stream, data_type):
+    def gemm(
+        self, activations, weights, output, rows, columns, inner, stream, data_type
+    ):
         """Compute row-major ``activations @ weights.T``."""
-        self._check(
-            self._lib.cublasSetStream_v2(self._handle, ctypes.c_void_p(stream)),
-            "cublasSetStream",
-        )
+        if stream != self._stream:
+            self._check(
+                self._lib.cublasSetStream_v2(self._handle, ctypes.c_void_p(stream)),
+                "cublasSetStream",
+            )
+            self._stream = stream
         self._check(
             self._lib.cublasGemmEx(
                 self._handle,
