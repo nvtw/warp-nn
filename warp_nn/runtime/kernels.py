@@ -1353,31 +1353,29 @@ def _gqa_prepare_fp16_kernel(
         present_value[batch, head, cache_token, column] = value[batch, token, offset + column]
 
 
-@wp.func
-def _gqa_dot_fp16(left: wp.float16, right: wp.float16):
-    return wp.float32(left) * wp.float32(right)
+def _create_gqa_attention_kernel(head_size: int, dtype: type):
+    """Build numerically stable grouped-query attention for one dtype."""
+    DTYPE = dtype
 
+    @wp.func
+    def dot(left: DTYPE, right: DTYPE):
+        return wp.float32(DTYPE(left)) * wp.float32(right)
 
-@wp.func
-def _gqa_accumulate_fp16(total: wp.float32, value: wp.float16, old_scale: wp.float32, weight: wp.float32):
-    return total * old_scale + wp.float32(value) * weight
+    @wp.func
+    def accumulate(total: wp.float32, value: DTYPE, old_scale: wp.float32, weight: wp.float32):
+        return total * old_scale + wp.float32(DTYPE(value)) * weight
 
-
-@wp.func
-def _gqa_normalize_fp16(total: wp.float32, denominator: wp.float32):
-    return wp.float16(total / denominator)
-
-
-def _create_gqa_attention_kernel(head_size: int):
-    """Build numerically stable grouped-query attention for ``head_size``."""
+    @wp.func
+    def normalize(total: wp.float32, denominator: wp.float32):
+        return DTYPE(total / denominator)
 
     @wp.kernel(enable_backward=False, module="unique")
     def kernel(
-        query: wp.array2d[wp.float16],
-        key: wp.array2d[wp.float16],
-        value: wp.array2d[wp.float16],
+        query: wp.array2d(dtype=DTYPE),
+        key: wp.array2d(dtype=DTYPE),
+        value: wp.array2d(dtype=DTYPE),
         sequence_lengths_minus_one: wp.array1d[wp.int32],
-        output: wp.array2d[wp.float16],
+        output: wp.array2d(dtype=DTYPE),
         query_heads: int,
         kv_heads: int,
         sequence_length: int,
@@ -1394,35 +1392,37 @@ def _create_gqa_attention_kernel(head_size: int):
         query_row = (batch * query_heads + head) * sequence_length + query_token
         query_values = wp.tile_load(query[query_row], shape=(head_size,))
         accumulator = wp.tile_zeros(shape=(head_size,), dtype=wp.float32)
-        maximum = wp.float32(-3.402823466e38)
+        maximum = wp.float32(-3.402823466e38) + wp.float32(DTYPE(0.0))
         denominator = wp.float32(0.0)
         for key_token in range(valid_keys):
             cache_row = (batch * kv_heads + kv_head) * total_length + key_token
             key_values = wp.tile_load(key[cache_row], shape=(head_size,))
-            score = wp.tile_extract(wp.tile_sum(wp.tile_map(_gqa_dot_fp16, query_values, key_values)), 0)
+            score = wp.tile_extract(wp.tile_sum(wp.tile_map(dot, query_values, key_values)), 0)
             score *= wp.float32(scale)
             new_maximum = wp.max(maximum, score)
             old_scale = wp.exp(maximum - new_maximum)
             weight = wp.exp(score - new_maximum)
             denominator = denominator * old_scale + weight
             value_values = wp.tile_load(value[cache_row], shape=(head_size,))
-            accumulator = wp.tile_map(_gqa_accumulate_fp16, accumulator, value_values, old_scale, weight)
+            accumulator = wp.tile_map(accumulate, accumulator, value_values, old_scale, weight)
             maximum = new_maximum
-        normalized = wp.tile_map(_gqa_normalize_fp16, accumulator, denominator)
+        normalized = wp.tile_map(normalize, accumulator, denominator)
         wp.tile_store(output[batch * sequence_length + query_token], normalized, offset=(head * head_size,))
 
+    kernel.module.options["enable_backward"] = False
     return kernel
 
 
 _gqa_attention_kernel_cache = {}
 
 
-def _get_gqa_attention_kernel(head_size: int):
+def _get_gqa_attention_kernel(head_size: int, dtype: type = wp.float16):
     """Return cached GQA kernel and a head-sized CUDA block dimension."""
-    if head_size not in _gqa_attention_kernel_cache:
-        _gqa_attention_kernel_cache[head_size] = _create_gqa_attention_kernel(head_size)
+    key = (head_size, dtype)
+    if key not in _gqa_attention_kernel_cache:
+        _gqa_attention_kernel_cache[key] = _create_gqa_attention_kernel(*key)
     block_dim = min(1024, max(32, 1 << (head_size - 1).bit_length()))
-    return block_dim, _gqa_attention_kernel_cache[head_size]
+    return block_dim, _gqa_attention_kernel_cache[key]
 
 
 @wp.kernel

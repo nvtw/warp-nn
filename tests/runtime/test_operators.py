@@ -11,6 +11,7 @@ from warp_nn.runtime._cublas import try_create_cublas
 from warp_nn.runtime.kernels import (
     _causal_conv_rows_kernel,
     _get_gated_rms_norm_kernel,
+    _get_gqa_attention_kernel,
     _get_linear_attention_kernel,
     _prepare_gated_delta_kernel,
     _update_conv_rows_state_kernel,
@@ -78,6 +79,50 @@ def test_gated_rms_norm_bfloat16():
     expected = x_np / np.sqrt(np.mean(x_np * x_np, axis=1, keepdims=True) + 1.0e-6)
     expected *= scale.numpy().astype(np.float32)
     expected *= gate_np / (1.0 + np.exp(-gate_np))
+    np.testing.assert_allclose(output.numpy(), expected, atol=0.04, rtol=0.02)
+
+
+def test_group_query_attention_bfloat16():
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(21)
+    sequence_length, query_heads, kv_heads, head_size = 3, 2, 1, 8
+    query_np = rng.normal(size=(query_heads, sequence_length, head_size)).astype(np.float32)
+    key_np = rng.normal(size=(kv_heads, sequence_length, head_size)).astype(np.float32)
+    value_np = rng.normal(size=(kv_heads, sequence_length, head_size)).astype(np.float32)
+    query = wp.array(query_np.reshape(-1, head_size), dtype=wp.bfloat16, device="cuda:0")
+    key = wp.array(key_np.reshape(-1, head_size), dtype=wp.bfloat16, device="cuda:0")
+    value = wp.array(value_np.reshape(-1, head_size), dtype=wp.bfloat16, device="cuda:0")
+    lengths = wp.array(np.array([sequence_length - 1], dtype=np.int32), device="cuda:0")
+    output = wp.empty((sequence_length, query_heads * head_size), dtype=wp.bfloat16, device="cuda:0")
+    block_dim, kernel = _get_gqa_attention_kernel(head_size, wp.bfloat16)
+
+    wp.launch_tiled(
+        kernel,
+        dim=query_heads * sequence_length,
+        inputs=[
+            query,
+            key,
+            value,
+            lengths,
+            output,
+            query_heads,
+            kv_heads,
+            sequence_length,
+            sequence_length,
+            head_size**-0.5,
+        ],
+        block_dim=block_dim,
+        device="cuda:0",
+    )
+
+    expected = np.empty((sequence_length, query_heads * head_size), dtype=np.float32)
+    for token in range(sequence_length):
+        for head in range(query_heads):
+            scores = query_np[head, token] @ key_np[0, : token + 1].T / np.sqrt(head_size)
+            weights = np.exp(scores - scores.max())
+            weights /= weights.sum()
+            expected[token, head * head_size : (head + 1) * head_size] = weights @ value_np[0, : token + 1]
     np.testing.assert_allclose(output.numpy(), expected, atol=0.04, rtol=0.02)
 
 
