@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from examples.qwen3_onnx_chat import _generate
+from examples.qwen_chat import _generate
 from warp_nn.runtime import Qwen3Tokenizer, parse_qwen_tool_calls, sample_token
 from warp_nn.runtime.qwen3 import _BYTE_ENCODER
 
@@ -142,5 +142,31 @@ def test_console_generation_streams_text_and_hides_tool_markup(capsys):
     assert capsys.readouterr().out == "Checking. "
     assert generated == [1, 2, 0]
     assert cached_ids == [1, 2]
+    assert text == "Checking."
+    assert calls == [{"name": "read_file", "arguments": {"path": "README.md"}}]
+
+
+def test_qwen3_json_tool_dialect(tmp_path):
+    path = tmp_path / "tokenizer.json"
+    _write_tokenizer(path)
+    (tmp_path / "chat_template.jinja").write_text('"arguments": <args-json-object>', encoding="utf-8")
+    tokenizer = Qwen3Tokenizer(path)
+    formatted = tokenizer.format_chat(
+        [
+            {"role": "user", "content": "Read it"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"type": "function", "function": {"name": "read_file", "arguments": '{"path":"README.md"}'}}
+                ],
+            },
+        ],
+        tools=[{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+    )
+    assert '<tool_call>\n{"name": "read_file", "arguments": {"path": "README.md"}}\n</tool_call>' in formatted
+    text, calls = parse_qwen_tool_calls(
+        'Checking.\n<tool_call>\n{"name":"read_file","arguments":{"path":"README.md"}}\n</tool_call>'
+    )
     assert text == "Checking."
     assert calls == [{"name": "read_file", "arguments": {"path": "README.md"}}]

@@ -42,7 +42,7 @@ def _byte_alphabet() -> tuple[dict[int, str], dict[str, int]]:
 
 _BYTE_ENCODER, _BYTE_DECODER = _byte_alphabet()
 
-_TOOL_PROMPT = """# Tools
+_PARAMETER_TOOL_PROMPT = """# Tools
 
 You have access to the following functions:
 
@@ -61,6 +61,19 @@ value
 
 Required parameters must be specified. You may reason before the function call, but not after it. If no function
 applies, answer normally."""
+
+_JSON_TOOL_PROMPT = """# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>{tools}
+</tools>
+
+For each function call, return a JSON object with function name and arguments within <tool_call></tool_call> tags:
+<tool_call>
+{{"name": <function-name>, "arguments": <args-json-object>}}
+</tool_call>"""
 
 
 def _is_letter(character: str) -> bool:
@@ -139,7 +152,10 @@ class Qwen3Tokenizer:
     def __init__(self, path: str | Path):
         path = Path(path)
         if path.is_dir():
+            directory = path
             path /= "tokenizer.json"
+        else:
+            directory = path.parent
         data = json.loads(path.read_text(encoding="utf-8"))
         model = data["model"]
         if model["type"] != "BPE" or data["normalizer"] != {"type": "NFC"}:
@@ -153,6 +169,9 @@ class Qwen3Tokenizer:
         self._added_pattern = re.compile(f"({alternatives})")
         self.eos_token_id = self._added_tokens["<|im_end|>"]
         self.pad_token_id = self._added_tokens["<|endoftext|>"]
+        template_path = directory / "chat_template.jinja"
+        template = template_path.read_text(encoding="utf-8") if template_path.is_file() else ""
+        self._tool_dialect = "json" if "args-json-object" in template else "parameters"
 
     @lru_cache(maxsize=8192)
     def _bpe(self, piece: str) -> tuple[str, ...]:
@@ -233,13 +252,20 @@ class Qwen3Tokenizer:
         first = 0
         if tools:
             definitions = "".join(f"\n{json.dumps(tool, ensure_ascii=False, separators=(',', ':'))}" for tool in tools)
-            system = _TOOL_PROMPT.format(tools=definitions)
+            prompt = (_JSON_TOOL_PROMPT if self._tool_dialect == "json" else _PARAMETER_TOOL_PROMPT).format(
+                tools=definitions
+            )
+            system = prompt
             if messages and messages[0].get("role") in ("system", "developer"):
                 content = messages[0].get("content")
                 if not isinstance(content, str):
                     raise ValueError("Qwen3Tokenizer.format_chat requires text message content")
                 if content.strip():
-                    system += "\n\n" + content.strip()
+                    system = (
+                        content.strip() + "\n\n" + prompt
+                        if self._tool_dialect == "json"
+                        else prompt + "\n\n" + content.strip()
+                    )
                 first = 1
             formatted.append(f"<|im_start|>system\n{system}<|im_end|>\n")
 
@@ -271,15 +297,19 @@ class Qwen3Tokenizer:
                         arguments = json.loads(arguments)
                     if not isinstance(arguments, Mapping):
                         raise ValueError("Qwen3Tokenizer.format_chat requires object-valued tool arguments")
-                    parameters = "".join(
-                        f"<parameter={name}>\n{_format_tool_value(value)}\n</parameter>\n"
-                        for name, value in arguments.items()
-                    )
                     separator = "\n\n" if body else ""
-                    body += (
-                        f"{separator}<tool_call>\n<function={function['name']}>\n"
-                        f"{parameters}</function>\n</tool_call>"
-                    )
+                    if self._tool_dialect == "json":
+                        call = {"name": function["name"], "arguments": arguments}
+                        body += f"{separator}<tool_call>\n{json.dumps(call, ensure_ascii=False)}\n</tool_call>"
+                    else:
+                        parameters = "".join(
+                            f"<parameter={name}>\n{_format_tool_value(value)}\n</parameter>\n"
+                            for name, value in arguments.items()
+                        )
+                        body += (
+                            f"{separator}<tool_call>\n<function={function['name']}>\n"
+                            f"{parameters}</function>\n</tool_call>"
+                        )
             formatted.append(f"<|im_start|>{role}\n{body}<|im_end|>\n")
             index += 1
         if add_generation_prompt:
@@ -307,18 +337,36 @@ def parse_qwen_tool_calls(text: str) -> tuple[str, list[dict[str, object]]]:
     """Extract Qwen XML function calls and return remaining assistant text."""
     calls = []
     spans = []
-    pattern = re.compile(r"<tool_call>\s*<function=([^>\n]+)>\s*(.*?)</function>\s*</tool_call>", re.DOTALL)
+    pattern = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+    function_pattern = re.compile(r"<function=([^>\n]+)>\s*(.*?)</function>", re.DOTALL)
     parameter_pattern = re.compile(r"<parameter=([^>\n]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
     for match in pattern.finditer(text):
+        body = match.group(1).strip()
+        if body.startswith("{"):
+            try:
+                call = json.loads(body)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(call, Mapping) or not isinstance(call.get("name"), str):
+                continue
+            arguments = call.get("arguments", {})
+            if not isinstance(arguments, Mapping):
+                continue
+            calls.append({"name": call["name"], "arguments": dict(arguments)})
+            spans.append(match.span())
+            continue
+        function = function_pattern.fullmatch(body)
+        if function is None:
+            continue
         arguments = {}
-        for parameter in parameter_pattern.finditer(match.group(2)):
+        for parameter in parameter_pattern.finditer(function.group(2)):
             value = parameter.group(2).strip()
             try:
                 value = json.loads(value)
             except (json.JSONDecodeError, TypeError):
                 pass
             arguments[parameter.group(1).strip()] = value
-        calls.append({"name": match.group(1).strip(), "arguments": arguments})
+        calls.append({"name": function.group(1).strip(), "arguments": arguments})
         spans.append(match.span())
     for start, end in reversed(spans):
         text = text[:start] + text[end:]
