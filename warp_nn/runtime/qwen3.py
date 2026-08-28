@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 
+from warp_nn.runtime.chat import sample_token
 from warp_nn.runtime.kernels import (
     _get_greedy_argmax_kernels,
     _initialize_attention_mask,
@@ -285,9 +286,13 @@ class Qwen3Tokenizer:
                 formatted.append("<think>\n\n</think>\n\n")
         return "".join(formatted)
 
-    def encode_chat(self, messages: Sequence[Mapping[str, str]], **kwargs) -> list[int]:
+    def encode_chat(self, messages: Sequence[Mapping[str, object]], **kwargs) -> list[int]:
         """Format and encode a chat prompt."""
         return self.encode(self.format_chat(messages, **kwargs))
+
+    def parse_tool_calls(self, text: str) -> tuple[str, list[dict[str, object]]]:
+        """Extract structured function calls from Qwen assistant text."""
+        return parse_qwen_tool_calls(text)
 
 
 def _format_tool_value(value: object) -> str:
@@ -316,36 +321,6 @@ def parse_qwen_tool_calls(text: str) -> tuple[str, list[dict[str, object]]]:
     for start, end in reversed(spans):
         text = text[:start] + text[end:]
     return text.strip(), calls
-
-
-def sample_token(
-    logits: wp.array | np.ndarray,
-    temperature: float = 1.0,
-    top_k: int = 0,
-    top_p: float = 1.0,
-    rng: np.random.Generator | None = None,
-) -> int:
-    """Sample one token from the last logits row on the host."""
-    values = logits.numpy() if hasattr(logits, "numpy") else np.asarray(logits)
-    values = np.asarray(values, dtype=np.float64).reshape(-1, values.shape[-1])[-1]
-    if temperature <= 0.0:
-        return int(np.argmax(values))
-    if top_k < 0 or not 0.0 < top_p <= 1.0:
-        raise ValueError("sample_token requires top_k >= 0 and 0 < top_p <= 1")
-    candidates = np.arange(values.size)
-    if 0 < top_k < values.size:
-        candidates = np.argpartition(values, -top_k)[-top_k:]
-        values = values[candidates]
-    values = values / temperature
-    probabilities = np.exp(values - np.max(values))
-    probabilities /= probabilities.sum()
-    if top_p < 1.0:
-        order = np.argsort(probabilities)[::-1]
-        keep = np.cumsum(probabilities[order]) - probabilities[order] < top_p
-        candidates = candidates[order[keep]]
-        probabilities = probabilities[order[keep]]
-        probabilities /= probabilities.sum()
-    return int((rng or np.random.default_rng()).choice(candidates, p=probabilities))
 
 
 class Qwen3OnnxRunner:
