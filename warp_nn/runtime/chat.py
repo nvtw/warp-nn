@@ -132,8 +132,10 @@ def generate_tokens(
                 rng=rng,
             )
         )
-        yield token_id
         generated.append(token_id)
-        if is_eos_token(tokenizer, token_id):
+        eos = is_eos_token(tokenizer, token_id)
+        next_logits = None if eos else runner.decode(token_id)
+        yield token_id
+        if eos:
             break
-        logits = runner.decode(token_id)
+        logits = next_logits

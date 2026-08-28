@@ -696,18 +696,19 @@ class _MusePlan:
             )
             layer["output"] = hidden
             self.layers.append(layer)
+        final_input = "final.input"
+        self.tensors[final_input] = self.tensors[hidden][self.rows - 1 : self.rows]
+        self.shapes[final_input] = (1, self.runner.hidden_size)
         self.final_norm = self._rms(
             "final.normalized",
-            hidden,
+            final_input,
             "model.language_model.norm.weight",
             self.runner.rms_epsilon,
         )
         self.lm_head = self._linear(
             "logits", self.final_norm.outputs[0], "lm_head.weight"
         )
-        self.logits = self.tensors["logits"].reshape(
-            (1, self.rows, self.runner.vocab_size)
-        )
+        self.logits = self.tensors["logits"].reshape((1, 1, self.runner.vocab_size))
 
     def _build_attention(self, layer: dict, index: int, prefix: str, x: str) -> None:
         attention = prefix + "self_attn."

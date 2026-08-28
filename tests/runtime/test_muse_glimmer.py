@@ -255,3 +255,8 @@ def test_muse_glimmer_prefill_decode_ring_cache_and_graph_replay(tmp_path, use_c
     replayed = runner.prefill([1, 2, 3])
     np.testing.assert_allclose(replayed.numpy(), first, atol=2.0e-2, rtol=2.0e-2)
     assert 0 <= runner.sample_greedy(replayed) < 16
+    full_chunk = runner.prefill([1, 2, 3, 4]).numpy()
+    runner.prefill([1, 2, 3])
+    sequential = runner.decode(4).numpy()
+    assert full_chunk.shape == (1, 1, 16)
+    np.testing.assert_allclose(full_chunk, sequential, atol=2.0e-2, rtol=2.0e-2)

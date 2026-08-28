@@ -105,6 +105,8 @@ def _generate(
         generated.append(token_id)
         if is_eos_token(tokenizer, token_id):
             break
+        logits = runner.decode(token_id)
+        cached_ids.append(token_id)
         text = decoder.decode(tokenizer.token_bytes(token_id, skip_special_tokens=stream_filter is None))
         if stream_filter:
             text = stream_filter.feed(text)
@@ -115,8 +117,6 @@ def _generate(
             print(text, end="", flush=True)
         else:
             print(text, end="", flush=True)
-        logits = runner.decode(token_id)
-        cached_ids.append(token_id)
     tail = decoder.decode(b"", final=True)
     if stream_filter:
         tail = stream_filter.feed(tail, final=True)

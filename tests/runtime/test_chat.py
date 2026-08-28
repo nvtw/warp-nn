@@ -11,6 +11,7 @@ class _Runner:
 
     def __init__(self):
         self.tokens = iter((2, 3))
+        self.decoded = []
 
     def _logits(self):
         token = next(self.tokens)
@@ -24,6 +25,7 @@ class _Runner:
 
     def decode(self, token_id):
         assert token_id == 2
+        self.decoded.append(token_id)
         return self._logits()
 
     def sample_greedy(self, logits):
@@ -36,6 +38,13 @@ class _Tokenizer:
 
 def test_generate_tokens_uses_common_runner_interface():
     assert list(generate_tokens(_Runner(), _Tokenizer(), [1], max_new_tokens=4)) == [2, 3]
+
+
+def test_generate_tokens_enqueues_decode_before_yielding():
+    runner = _Runner()
+    tokens = generate_tokens(runner, _Tokenizer(), [1], max_new_tokens=4)
+    assert next(tokens) == 2
+    assert runner.decoded == [2]
 
 
 def test_generate_tokens_accepts_multiple_end_tokens():
