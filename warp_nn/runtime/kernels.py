@@ -521,6 +521,31 @@ def _dequantize_e4m3_kernel(
     output[index] = output.dtype(magnitude * wp.float32(scale[0]))
 
 
+def _create_gather_q8_0_rows_kernel(dtype: type):
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def kernel(
+        values: wp.array3d[wp.int8],
+        indices: wp.array2d[wp.int64],
+        scales: wp.array2d[wp.float16],
+        output: wp.array3d(dtype=DTYPE),
+    ):
+        batch, sequence, column = wp.tid()
+        row = indices[batch, sequence]
+        block = column / 32
+        output[batch, sequence, column] = DTYPE(
+            wp.float32(values[row, block, column % 32]) * wp.float32(scales[row, block])
+        )
+
+    return kernel
+
+
+@lru_cache(maxsize=None)
+def _get_gather_q8_0_rows_kernel(dtype: type):
+    return _create_gather_q8_0_rows_kernel(dtype)
+
+
 @wp.kernel(module="unique")
 def _gather_rows_kernel(
     data: wp.array2d[Any], indices: wp.array2d[wp.int64], output: wp.array3d[Any]
@@ -642,24 +667,40 @@ def _gather_single_index_kernel(
     output[output_index] = data[(prefix * axis_size + index) * stride + suffix]
 
 
-@wp.kernel(enable_backward=False, module="unique", grid_stride=False)
-def _quantize_activation_int8_kernel(
-    activations: wp.array2d[wp.float16],
-    quantized: wp.array2d[wp.int8],
-    scales: wp.array2d[wp.float32],
-):
-    """Quantize FP16 rows to symmetric INT8 in 32-value blocks."""
-    thread = wp.tid()
-    lane = thread % 32
-    block = (thread / 32) % scales.shape[1]
-    row = (thread / 32) / scales.shape[1]
-    column = block * 32 + lane
-    value = wp.float32(activations[row, column])
-    maximum = warp_max_broadcast(wp.abs(value))
-    scale = maximum / 127.0 if maximum > 0.0 else 1.0
-    quantized[row, column] = wp.int8(wp.clamp(wp.round(value / scale), -127.0, 127.0))
-    if lane == 0:
-        scales[row, block] = scale
+def _create_quantize_activation_int8_kernel(dtype: type):
+    """Build symmetric INT8 activation quantization for one input dtype."""
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(
+        activations: wp.array2d(dtype=DTYPE),
+        quantized: wp.array2d[wp.int8],
+        scales: wp.array2d[wp.float32],
+    ):
+        typed_zero = DTYPE(0.0)  # noqa: F841 - binds the factory dtype for Warp
+        thread = wp.tid()
+        lane = thread % 32
+        block = (thread / 32) % scales.shape[1]
+        row = (thread / 32) / scales.shape[1]
+        column = block * 32 + lane
+        value = wp.float32(activations[row, column])
+        maximum = warp_max_broadcast(wp.abs(value))
+        scale = maximum / 127.0 if maximum > 0.0 else 1.0
+        quantized[row, column] = wp.int8(
+            wp.clamp(wp.round(value / scale), -127.0, 127.0)
+        )
+        if lane == 0:
+            scales[row, block] = scale
+
+    return kernel
+
+
+@lru_cache(maxsize=None)
+def _get_quantize_activation_int8_kernel(dtype: type):
+    return _create_quantize_activation_int8_kernel(dtype)
+
+
+_quantize_activation_int8_kernel = _get_quantize_activation_int8_kernel(wp.float16)
 
 
 @wp.func
@@ -713,10 +754,14 @@ def _matmul_int4_q8_kernel(
 
 
 @lru_cache(maxsize=None)
-def _get_matmul_int8_q8_kernel(reduction_width: int):
-    """Build an INT8 matrix-vector kernel using ``reduction_width`` lanes."""
+def _get_matmul_int8_q8_kernel(
+    reduction_width: int, dtype: type = wp.float16, signed_weights: bool = False
+):
+    """Build a block-scaled INT8 matrix-vector kernel."""
     REDUCTION_WIDTH = reduction_width
     WORDS_PER_LANE = 8 // reduction_width
+    DTYPE = dtype
+    SIGNED_WEIGHTS = signed_weights
 
     @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
     def kernel(
@@ -724,9 +769,9 @@ def _get_matmul_int8_q8_kernel(reduction_width: int):
         activation_scales: wp.array2d[wp.float32],
         weights: wp.array3d[wp.uint32],
         weight_scales: wp.array2d[wp.float16],
-        output: wp.array2d[wp.float16],
+        output: wp.array2d(dtype=DTYPE),
     ):
-        """Multiply Q8 activations by block-scaled INT8 weights."""
+        output_zero = DTYPE(0.0)  # noqa: F841 - binds the factory dtype for Warp
         thread = wp.tid()
         lane = thread % REDUCTION_WIDTH
         item = thread / REDUCTION_WIDTH
@@ -738,10 +783,13 @@ def _get_matmul_int8_q8_kernel(reduction_width: int):
             for group in range(WORDS_PER_LANE):
                 word = lane + group * REDUCTION_WIDTH
                 packed_activation = wp.int32(activations[row, block, word])
-                signed_weights = wp.int32(
-                    weights[column, block, word] ^ wp.uint32(0x80808080)
-                )
-                block_total = dp4a(signed_weights, packed_activation, block_total)
+                if wp.static(SIGNED_WEIGHTS):
+                    packed_weights = wp.int32(weights[column, block, word])
+                else:
+                    packed_weights = wp.int32(
+                        weights[column, block, word] ^ wp.uint32(0x80808080)
+                    )
+                block_total = dp4a(packed_weights, packed_activation, block_total)
             total += (
                 wp.float32(block_total)
                 * activation_scales[row, block]
@@ -749,7 +797,7 @@ def _get_matmul_int8_q8_kernel(reduction_width: int):
             )
         total = subgroup_sum(total, REDUCTION_WIDTH)
         if lane == 0:
-            output[row, column] = wp.float16(total)
+            output[row, column] = DTYPE(total)
 
     return kernel
 
@@ -1955,6 +2003,10 @@ def _create_partitioned_gqa_attention_kernels(
         return score * scale if key_offset < valid_keys else wp.float32(-3.402823466e38)
 
     @wp.func
+    def mask_cache_value(value: DTYPE, key_offset: wp.int32, valid_keys: wp.int32):
+        return value if key_offset < valid_keys else DTYPE(0.0)
+
+    @wp.func
     def exp_difference(value: wp.float32, maximum: wp.float32):
         return wp.exp(value - maximum)
 
@@ -1967,6 +2019,10 @@ def _create_partitioned_gqa_attention_kernels(
     @wp.func
     def strided_index(offset: wp.int32, base: wp.int32, stride: wp.int32):
         return base + offset * stride
+
+    @wp.func
+    def clamp_group_index(offset: wp.int32, valid_count: wp.int32):
+        return wp.min(offset, valid_count - 1)
 
     @wp.func
     def scale_value(value: wp.float32, scale: wp.float32):
@@ -2023,7 +2079,11 @@ def _create_partitioned_gqa_attention_kernels(
         partition_start = first_key + partition * keys_per_partition
         partition_end = wp.min(valid_keys, partition_start + keys_per_partition)
 
-        query_members = wp.tile_arange(GROUP, dtype=wp.int32)
+        query_members = wp.tile_map(
+            clamp_group_index,
+            wp.tile_arange(GROUP, dtype=wp.int32),
+            valid_heads,
+        )
         query_indices = wp.tile_map(
             strided_index, query_members, query_item_0, sequence_length
         )
@@ -2046,6 +2106,10 @@ def _create_partitioned_gqa_attention_kernels(
             wp.tile_reshape(key_offsets, shape=(1, KEY_TILE)),
             shape=(GROUP, KEY_TILE),
         )
+        cache_offset_group = wp.tile_broadcast(
+            wp.tile_reshape(key_offsets, shape=(KEY_TILE, 1)),
+            shape=(KEY_TILE, head_size),
+        )
 
         for key_start in range(partition_start, partition_end, KEY_TILE):
             valid_tile_keys = wp.min(KEY_TILE, partition_end - key_start)
@@ -2067,6 +2131,13 @@ def _create_partitioned_gqa_attention_kernels(
                     key,
                     shape=(KEY_TILE, head_size),
                     offset=(cache_row, 0),
+                )
+            if valid_tile_keys < KEY_TILE:
+                key_values = wp.tile_map(
+                    mask_cache_value,
+                    key_values,
+                    cache_offset_group,
+                    valid_tile_keys,
                 )
             scores = wp.tile_zeros(shape=(GROUP, KEY_TILE), dtype=wp.float32)
             wp.tile_matmul(queries, wp.tile_transpose(key_values), scores)
@@ -2104,6 +2175,13 @@ def _create_partitioned_gqa_attention_kernels(
                     value,
                     shape=(KEY_TILE, head_size),
                     offset=(cache_row, 0),
+                )
+            if valid_tile_keys < KEY_TILE:
+                value_values = wp.tile_map(
+                    mask_cache_value,
+                    value_values,
+                    cache_offset_group,
+                    valid_tile_keys,
                 )
             contribution = wp.tile_zeros(shape=(GROUP, head_size), dtype=wp.float32)
             wp.tile_matmul(typed_probabilities, value_values, contribution)

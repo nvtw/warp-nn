@@ -14,11 +14,17 @@ import numpy as np
 import warp as wp
 
 from warp_nn.runtime._cublas import try_create_cublas
-from warp_nn.runtime.gguf import GGUFArchive, MappedGGUFArchive, find_gguf_files
+from warp_nn.runtime.gguf import (
+    BlockQuantizedTensor,
+    GGUFArchive,
+    MappedGGUFArchive,
+    find_gguf_files,
+)
 from warp_nn.runtime.kernels import (
     _append_head_cache_kernel,
     _causal_conv_rows_kernel,
     _gather_rows_kernel,
+    _get_gather_q8_0_rows_kernel,
     _get_gated_rms_norm_kernel,
     _get_gqa_attention_kernel,
     _get_greedy_argmax_kernels,
@@ -142,6 +148,49 @@ def _gguf_weight_map(config: dict) -> dict[str, str]:
             }
         )
     return names
+
+
+def _gguf_config(metadata: dict) -> dict:
+    """Build the text runtime configuration from self-contained Qwen GGUF metadata."""
+    layers = int(metadata["qwen35.block_count"]) - int(
+        metadata.get("qwen35.nextn_predict_layers", 0)
+    )
+    interval = int(metadata["qwen35.full_attention_interval"])
+    head_dim = int(metadata["qwen35.attention.key_length"])
+    linear_dim = int(metadata["qwen35.ssm.state_size"])
+    linear_value_heads = int(metadata["qwen35.ssm.inner_size"]) // linear_dim
+    return {
+        "attention_bias": False,
+        "attn_output_gate": True,
+        "head_dim": head_dim,
+        "hidden_act": "silu",
+        "hidden_size": int(metadata["qwen35.embedding_length"]),
+        "intermediate_size": int(metadata["qwen35.feed_forward_length"]),
+        "layer_types": [
+            "full_attention" if (index + 1) % interval == 0 else "linear_attention"
+            for index in range(layers)
+        ],
+        "linear_conv_kernel_dim": int(metadata["qwen35.ssm.conv_kernel"]),
+        "linear_key_head_dim": linear_dim,
+        "linear_num_key_heads": int(metadata["qwen35.ssm.group_count"]),
+        "linear_num_value_heads": linear_value_heads,
+        "linear_value_head_dim": linear_dim,
+        "max_position_embeddings": int(metadata["qwen35.context_length"]),
+        "num_attention_heads": int(metadata["qwen35.attention.head_count"]),
+        "num_hidden_layers": layers,
+        "num_key_value_heads": int(metadata["qwen35.attention.head_count_kv"]),
+        "output_gate_type": "swish",
+        "rms_norm_eps": float(metadata["qwen35.attention.layer_norm_rms_epsilon"]),
+        "rope_parameters": {
+            "mrope_interleaved": True,
+            "mrope_section": list(metadata["qwen35.rope.dimension_sections"][:3]),
+            "partial_rotary_factor": float(metadata["qwen35.rope.dimension_count"])
+            / head_dim,
+            "rope_theta": float(metadata["qwen35.rope.freq_base"]),
+            "rope_type": "default",
+        },
+        "vocab_size": len(metadata["tokenizer.ggml.tokens"]),
+    }
 
 
 def _validate_config(config: dict) -> None:
@@ -691,16 +740,28 @@ class _Qwen35Plan:
 
     def execute(self) -> wp.array:
         """Execute the preallocated plan on its staged token buffers."""
-        wp.launch(
-            _gather_rows_kernel,
-            dim=self.embedding.shape,
-            inputs=[
-                self.runner.weights["model.language_model.embed_tokens.weight"],
-                self.input_ids,
-                self.embedding,
-            ],
-            device=self.device,
-        )
+        embedding_weight = self.runner.weights[
+            "model.language_model.embed_tokens.weight"
+        ]
+        if isinstance(embedding_weight, BlockQuantizedTensor):
+            wp.launch(
+                _get_gather_q8_0_rows_kernel(self.dtype),
+                dim=self.embedding.shape,
+                inputs=[
+                    embedding_weight.values,
+                    self.input_ids,
+                    embedding_weight.scales,
+                    self.embedding,
+                ],
+                device=self.device,
+            )
+        else:
+            wp.launch(
+                _gather_rows_kernel,
+                dim=self.embedding.shape,
+                inputs=[embedding_weight, self.input_ids, self.embedding],
+                device=self.device,
+            )
         self._execute_op(self.first_norm)
         for index, layer in enumerate(self.layers):
             if layer["type"] == "linear_attention":
@@ -732,8 +793,18 @@ class Qwen35Runner:
         use_cublas: bool = True,
     ):
         path = Path(path)
-        config_data = json.loads((path / "config.json").read_text(encoding="utf-8"))
-        self.config = config_data.get("text_config", config_data)
+        directory = path if path.is_dir() else path.parent
+        if any(directory.glob("*.safetensors")):
+            config_data = json.loads(
+                (directory / "config.json").read_text(encoding="utf-8")
+            )
+            self.config = config_data.get("text_config", config_data)
+            gguf = None
+        else:
+            gguf = GGUFArchive(find_gguf_files(path))
+            if gguf.metadata.get("general.architecture") != "qwen35":
+                raise ValueError("GGUF checkpoint is not a Qwen 3.5 model")
+            self.config = _gguf_config(gguf.metadata)
         _validate_config(self.config)
         self.device = parse_device(device)
         self.cache_capacity = int(cache_capacity)
@@ -758,15 +829,12 @@ class Qwen35Runner:
         if self.rotary_dim <= 0 or self.rotary_dim % 2:
             raise ValueError("Qwen 3.5 rotary dimension must be positive and even")
 
-        if any(path.glob("*.safetensors")):
-            archive = SafeTensorArchive(path)
+        if gguf is None:
+            archive = SafeTensorArchive(directory)
             self.gguf_layout = False
             self.centered_norm_scales = True
             self.ssm_a_is_decay = False
         else:
-            gguf = GGUFArchive(find_gguf_files(path))
-            if gguf.metadata.get("general.architecture") != "qwen35":
-                raise ValueError("GGUF checkpoint is not a Qwen 3.5 model")
             archive = MappedGGUFArchive(gguf, _gguf_weight_map(self.config))
             self.gguf_layout = True
             self.centered_norm_scales = False
@@ -796,7 +864,12 @@ class Qwen35Runner:
                     self.weights[name] = weight.reshape(
                         (weight.shape[0], 1, weight.shape[1])
                     )
-        self.dtype = self.weights["model.language_model.embed_tokens.weight"].dtype
+        embedding_weight = self.weights["model.language_model.embed_tokens.weight"]
+        self.dtype = (
+            wp.bfloat16
+            if isinstance(embedding_weight, BlockQuantizedTensor)
+            else embedding_weight.dtype
+        )
         if self.dtype not in (wp.float16, wp.bfloat16):
             raise TypeError("Qwen 3.5 activations require FP16 or BF16 weights")
         self.zero_bias = wp.zeros(1, dtype=self.dtype, device=self.device)
@@ -950,9 +1023,7 @@ class Qwen35Runner:
         start = 0
         while start < len(token_ids):
             remaining = len(token_ids) - start
-            rows = min(
-                self.prefill_chunk_size, 1 << (remaining.bit_length() - 1)
-            )
+            rows = min(self.prefill_chunk_size, 1 << (remaining.bit_length() - 1))
             if rows == 1:
                 logits = self._stage_one(int(token_ids[start]))
             else:

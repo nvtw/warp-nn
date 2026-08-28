@@ -12,12 +12,16 @@ from dataclasses import dataclass, field
 import numpy as np
 import warp as wp
 
+from warp_nn.runtime.gguf import BlockQuantizedTensor
+
 from warp_nn.runtime.kernels import (
     _GEMM_CONFIG,
     _GEMM_TRANSB_TILED_KERNEL,
     _gather_block_quantized_int8_kernel,
     _get_linear_tiled_kernel,
     _get_linear_vector_kernel,
+    _get_matmul_int8_q8_kernel,
+    _get_quantize_activation_int8_kernel,
     _get_rms_norm_kernels,
     _get_swiglu_kernel,
     _gqa_copy_past_fp16_kernel,
@@ -59,6 +63,28 @@ def _exec_linear(op, tensors, shapes, device):
     x = tensors[op.inputs[0]].reshape((op.attrs["_rows"], op.attrs["_inner"]))
     weight = tensors[op.inputs[1]]
     output = tensors[op.outputs[0]].reshape((op.attrs["_rows"], op.attrs["_columns"]))
+    if "_q8_activations" in op.attrs:
+        wp.launch(
+            op.attrs["_q8_quantize_kernel"],
+            dim=op.attrs["_rows"] * op.attrs["_inner"],
+            inputs=[x, op.attrs["_q8_activations"], op.attrs["_q8_scales"]],
+            block_dim=32,
+            device=device,
+        )
+        wp.launch(
+            op.attrs["_q8_kernel"],
+            dim=op.attrs["_rows"] * op.attrs["_columns"] * 8,
+            inputs=[
+                op.attrs["_q8_activation_words"],
+                op.attrs["_q8_scales"],
+                weight.words,
+                weight.scales,
+                output,
+            ],
+            block_dim=128,
+            device=device,
+        )
+        return
     cublas = op.attrs.get("_cublas")
     if cublas is not None:
         cublas.gemm(
@@ -113,7 +139,33 @@ def plan_linear(
             f"Linear has incompatible shapes {(rows, inner)} and {(columns, weight_inner)}"
         )
     dtype = tensors[op.inputs[0]].dtype
-    if tensors[op.inputs[1]].dtype != dtype or dtype not in (
+    weight = tensors[op.inputs[1]]
+    if isinstance(weight, BlockQuantizedTensor):
+        if not device.is_cuda or dtype not in (wp.float16, wp.bfloat16):
+            raise TypeError("Q8_0 Linear requires CUDA FP16/BF16 activations")
+        if inner % 32:
+            raise ValueError("Q8_0 Linear requires an inner width divisible by 32")
+        output = wp.empty((rows, columns), dtype=dtype, device=device)
+        tensors[op.outputs[0]] = output
+        shapes[op.outputs[0]] = output.shape
+        op.attrs.update({"_rows": rows, "_columns": columns, "_inner": inner})
+        blocks = inner // 32
+        quantized = wp.empty((rows, inner), dtype=wp.int8, device=device)
+        op.attrs["_q8_activations"] = quantized
+        op.attrs["_q8_activation_words"] = wp.array(
+            ptr=quantized.ptr,
+            capacity=quantized.capacity,
+            dtype=wp.uint32,
+            shape=(rows, blocks, 8),
+            device=device,
+        )
+        op.attrs["_q8_scales"] = wp.empty(
+            (rows, blocks), dtype=wp.float32, device=device
+        )
+        op.attrs["_q8_quantize_kernel"] = _get_quantize_activation_int8_kernel(dtype)
+        op.attrs["_q8_kernel"] = _get_matmul_int8_q8_kernel(8, dtype, True)
+        return
+    if weight.dtype != dtype or dtype not in (
         wp.float16,
         wp.bfloat16,
         wp.float32,

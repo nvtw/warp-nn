@@ -115,10 +115,10 @@ class GGUFTensorMetadata:
 
 @dataclass(frozen=True)
 class BlockQuantizedTensor:
-    """A packed block tensor with logical shape and device-side typed views."""
+    """A block tensor with contiguous device-side values and scales."""
 
-    raw: wp.array
     values: wp.array
+    words: wp.array
     scales: wp.array
     shape: tuple[int, ...]
     format: str
@@ -390,9 +390,8 @@ class GGUFArchive:
                     capacity=info.nbytes,
                     device="cpu",
                 )
-                host_views.append(host)
                 packed = wp.clone(host, device=device)
-                scales = wp.array(
+                packed_scales = wp.array(
                     ptr=packed.ptr,
                     dtype=wp.float16,
                     shape=(rows, blocks),
@@ -401,7 +400,7 @@ class GGUFArchive:
                     device=device,
                     copy=False,
                 )
-                values = wp.array(
+                packed_values = wp.array(
                     ptr=packed.ptr + 2,
                     dtype=wp.int8,
                     shape=(rows, blocks, 32),
@@ -410,9 +409,25 @@ class GGUFArchive:
                     device=device,
                     copy=False,
                 )
-                output[name] = BlockQuantizedTensor(
-                    packed, values, scales, info.shape, info.format
+                values = wp.clone(packed_values)
+                scales = wp.clone(packed_scales)
+                words = wp.array(
+                    ptr=values.ptr,
+                    dtype=wp.uint32,
+                    shape=(rows, blocks, 8),
+                    capacity=values.capacity,
+                    device=device,
+                    copy=False,
                 )
+                output[name] = BlockQuantizedTensor(
+                    values, words, scales, info.shape, info.format
+                )
+                if device.is_cuda:
+                    wp.synchronize_stream(device)
+                host_views.clear()
+                byte_views.clear()
+                if hasattr(mapping, "madvise") and hasattr(mmap, "MADV_DONTNEED"):
+                    mapping.madvise(mmap.MADV_DONTNEED)
             else:
                 host = wp.array(
                     ptr=raw.ctypes.data,

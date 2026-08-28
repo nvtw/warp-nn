@@ -15,12 +15,13 @@ import numpy as np
 import warp as wp
 
 from warp_nn.runtime._cublas import try_create_cublas
-from warp_nn.runtime.gguf import GGUFArchive
+from warp_nn.runtime.gguf import BlockQuantizedTensor, GGUFArchive
 from warp_nn.runtime.kernels import (
     _append_circular_head_cache_kernel,
     _append_head_cache_kernel,
     _binary_broadcast_kernel,
     _gather_rows_kernel,
+    _get_gather_q8_0_rows_kernel,
     _get_gqa_attention_kernel,
     _get_greedy_argmax_kernels,
     _allocate_partitioned_gqa,
@@ -901,16 +902,28 @@ class _MusePlan:
 
     def execute(self) -> wp.array:
         """Execute the fixed plan on its staged token IDs."""
-        wp.launch(
-            _gather_rows_kernel,
-            dim=self.embedding.shape,
-            inputs=[
-                self.runner.weights["model.language_model.embed_tokens.weight"],
-                self.input_ids,
-                self.embedding,
-            ],
-            device=self.device,
-        )
+        embedding_weight = self.runner.weights[
+            "model.language_model.embed_tokens.weight"
+        ]
+        if isinstance(embedding_weight, BlockQuantizedTensor):
+            wp.launch(
+                _get_gather_q8_0_rows_kernel(self.dtype),
+                dim=self.embedding.shape,
+                inputs=[
+                    embedding_weight.values,
+                    self.input_ids,
+                    embedding_weight.scales,
+                    self.embedding,
+                ],
+                device=self.device,
+            )
+        else:
+            wp.launch(
+                _gather_rows_kernel,
+                dim=self.embedding.shape,
+                inputs=[embedding_weight, self.input_ids, self.embedding],
+                device=self.device,
+            )
         self._execute_op(self.embedding_norm)
         hidden = self.embedding_norm.outputs[0]
         for index, layer in enumerate(self.layers):
@@ -1024,9 +1037,10 @@ class MuseGlimmerRunner(Qwen35Runner):
             raise ValueError(
                 f"Muse Glimmer checkpoint is missing {sorted(missing)[:5]}"
             )
-        embedding_dtype = archive.metadata(
-            "model.language_model.embed_tokens.weight"
-        ).dtype
+        embedding_info = archive.metadata("model.language_model.embed_tokens.weight")
+        embedding_dtype = (
+            wp.bfloat16 if embedding_info.format == "Q8_0" else embedding_info.dtype
+        )
         if embedding_dtype not in (wp.float16, wp.bfloat16):
             raise TypeError("Muse Glimmer embeddings must use FP16 or BF16")
         required_bytes = sum(archive.metadata(name).nbytes for name in names)

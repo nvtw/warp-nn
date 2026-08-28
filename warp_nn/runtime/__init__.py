@@ -37,11 +37,22 @@ from warp_nn.runtime.qwen35 import Qwen35Runner
 def create_text_runner(path, **kwargs):
     """Create the matching text runner for a supported local model directory."""
     path = Path(path)
-    if (path / "model.onnx").is_file():
-        return Qwen3OnnxRunner(path / "model.onnx", **kwargs)
-    if not (path / "config.json").is_file():
-        return MuseGlimmerRunner(path, **kwargs)
-    config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    directory = path if path.is_dir() else path.parent
+    if (directory / "model.onnx").is_file():
+        return Qwen3OnnxRunner(directory / "model.onnx", **kwargs)
+    config_path = directory / "config.json"
+    if not config_path.is_file():
+        archive = GGUFArchive(find_gguf_files(path))
+        runner_types = {
+            "muse-glimmer": MuseGlimmerRunner,
+            "qwen35": Qwen35Runner,
+        }
+        try:
+            runner_type = runner_types[archive.metadata.get("general.architecture")]
+        except KeyError as exc:
+            raise ValueError("Unsupported GGUF model architecture") from exc
+        return runner_type(path, **kwargs)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
     runner_types = {"muse_glimmer": MuseGlimmerRunner, "nemotron_h": NemotronHRunner}
     runner_type = runner_types.get(config.get("model_type"), Qwen35Runner)
     return runner_type(path, **kwargs)
@@ -50,18 +61,23 @@ def create_text_runner(path, **kwargs):
 def create_tokenizer(path):
     """Create the matching dependency-free tokenizer for a model directory."""
     path = Path(path)
-    if not (path / "config.json").is_file():
-        return MuseGlimmerTokenizer(path)
-    if not (path / "tokenizer.json").is_file():
+    directory = path if path.is_dir() else path.parent
+    config_path = directory / "config.json"
+    if not config_path.is_file():
+        archive = GGUFArchive(find_gguf_files(path))
+        if archive.metadata.get("general.architecture") == "muse-glimmer":
+            return MuseGlimmerTokenizer(path)
+        return Qwen3Tokenizer(gguf_tokenizer_data(archive.metadata))
+    if not (directory / "tokenizer.json").is_file():
         archive = GGUFArchive(find_gguf_files(path))
         return Qwen3Tokenizer(gguf_tokenizer_data(archive.metadata))
-    config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    config = json.loads(config_path.read_text(encoding="utf-8"))
     tokenizer_type = (
         MuseGlimmerTokenizer
         if config.get("model_type") == "muse_glimmer"
         else Qwen3Tokenizer
     )
-    return tokenizer_type(path)
+    return tokenizer_type(directory)
 
 
 __all__ = [

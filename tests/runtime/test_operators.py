@@ -8,6 +8,7 @@ import warp as wp
 
 from tests.utilities import is_device_available
 from warp_nn.runtime._cublas import try_create_cublas
+from warp_nn.runtime.gguf import BlockQuantizedTensor
 from warp_nn.runtime.kernels import (
     _append_head_cache_kernel,
     _append_circular_head_cache_kernel,
@@ -81,6 +82,53 @@ def test_linear_operation_cublas():
 
     np.testing.assert_allclose(
         tensors["output"].numpy(), x_np @ weight_np.T, atol=0.2, rtol=0.02
+    )
+
+
+@pytest.mark.parametrize("rows", [1, 3, 32])
+def test_q8_0_linear_operation(rows):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(23)
+    columns, inner = 40, 64
+    blocks = inner // 32
+    x_np = rng.normal(0.0, 0.5, (rows, inner)).astype(np.float32)
+    weight_values = rng.integers(-127, 128, (columns, blocks, 32), dtype=np.int8)
+    weight_scales = rng.uniform(0.001, 0.02, (columns, blocks)).astype(np.float16)
+    values = wp.array(weight_values, dtype=wp.int8, device="cuda:0")
+    words = wp.array(
+        ptr=values.ptr,
+        capacity=values.capacity,
+        shape=(columns, blocks, 8),
+        dtype=wp.uint32,
+        device="cuda:0",
+        copy=False,
+    )
+    scales = wp.array(weight_scales, dtype=wp.float16, device="cuda:0")
+    weight = BlockQuantizedTensor(values, words, scales, (columns, inner), "Q8_0")
+    tensors = {
+        "x": wp.array(x_np, dtype=wp.bfloat16, device="cuda:0"),
+        "weight": weight,
+    }
+    shapes = {name: tuple(value.shape) for name, value in tensors.items()}
+    operation = Operation("Linear", ["x", "weight"], ["output"])
+    device = wp.get_device("cuda:0")
+    plan_linear(operation, tensors, shapes, device)
+
+    execute_operations([operation], tensors, shapes, device)
+
+    x_bf16 = tensors["x"].numpy().astype(np.float32)
+    reshaped = x_bf16.reshape(rows, blocks, 32)
+    activation_scales = np.max(np.abs(reshaped), axis=2, keepdims=True) / 127.0
+    activation_scales[activation_scales == 0.0] = 1.0
+    x_bf16 = (
+        np.clip(np.rint(reshaped / activation_scales), -127, 127) * activation_scales
+    ).reshape(rows, inner)
+    dequantized = (
+        weight_values.astype(np.float32) * weight_scales.astype(np.float32)[:, :, None]
+    ).reshape(columns, inner)
+    np.testing.assert_allclose(
+        tensors["output"].numpy(), x_bf16 @ dequantized.T, atol=0.3, rtol=0.03
     )
 
 
@@ -287,6 +335,9 @@ def test_partitioned_decode_attention_matches_serial(
     for token in range(length):
         key_cache[:, token % capacity] = key_np[:, token]
         value_cache[:, token % capacity] = value_np[:, token]
+    if window == 0 and length < capacity:
+        key_cache[:, length:] = np.nan
+        value_cache[:, length:] = np.nan
     key = wp.array(key_cache.reshape(-1, head_size), dtype=wp.bfloat16, device="cuda:0")
     value = wp.array(
         value_cache.reshape(-1, head_size), dtype=wp.bfloat16, device="cuda:0"

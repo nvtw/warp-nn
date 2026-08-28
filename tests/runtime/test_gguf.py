@@ -18,7 +18,9 @@ def _string(value):
 
 def _write_gguf(path, tensors, metadata=(), *, version=3, alignment=32):
     fields = [("general.alignment", 4, alignment), *metadata]
-    header = bytearray(b"GGUF" + struct.pack("<IQQ", version, len(tensors), len(fields)))
+    header = bytearray(
+        b"GGUF" + struct.pack("<IQQ", version, len(tensors), len(fields))
+    )
     for key, value_type, value in fields:
         header += _string(key) + struct.pack("<I", value_type)
         if value_type == 8:
@@ -30,7 +32,9 @@ def _write_gguf(path, tensors, metadata=(), *, version=3, alignment=32):
                 header += b"".join(_string(item) for item in values)
             else:
                 formats = {4: "I", 6: "f"}
-                header += struct.pack("<" + formats[element_type] * len(values), *values)
+                header += struct.pack(
+                    "<" + formats[element_type] * len(values), *values
+                )
         else:
             formats = {4: "I", 7: "B", 11: "q", 12: "d"}
             header += struct.pack("<" + formats[value_type], value)
@@ -110,26 +114,33 @@ def test_gguf_indexes_q8_0_blocks_as_raw_storage(tmp_path):
     assert info.nbytes == 68
     loaded = archive.load("cpu")["weight"]
     assert loaded.shape == (2, 32)
-    np.testing.assert_array_equal(loaded.raw.numpy(), raw)
     np.testing.assert_array_equal(
         loaded.values.numpy(),
         np.stack((raw[2:34].view(np.int8), raw[36:68].view(np.int8)))[:, None, :],
     )
     np.testing.assert_array_equal(
-        loaded.scales.numpy().view(np.uint16), np.array([[0x0100], [0x2322]], dtype=np.uint16)
+        loaded.words.numpy().view(np.uint8), loaded.values.numpy().view(np.uint8)
+    )
+    np.testing.assert_array_equal(
+        loaded.scales.numpy().view(np.uint16),
+        np.array([[0x0100], [0x2322]], dtype=np.uint16),
     )
 
 
 def test_gguf_supports_v2_and_selected_loading(tmp_path):
     values = np.arange(6, dtype=np.float32).reshape(2, 3)
     path = tmp_path / "v2.gguf"
-    _write_gguf(path, [("weight", 0, values)], [("flag", 7, True), ("count", 11, -3)], version=2)
+    _write_gguf(
+        path, [("weight", 0, values)], [("flag", 7, True), ("count", 11, -3)], version=2
+    )
 
     archive = GGUFArchive(path)
 
     assert archive.metadata["flag"] is True
     assert archive.metadata["count"] == -3
-    np.testing.assert_array_equal(archive.load("cpu", ["weight"])["weight"].numpy(), values)
+    np.testing.assert_array_equal(
+        archive.load("cpu", ["weight"])["weight"].numpy(), values
+    )
     with pytest.raises(KeyError, match="Unknown GGUF tensors"):
         archive.load("cpu", ["missing"])
 
@@ -163,7 +174,10 @@ def test_gguf_loads_split_archive(tmp_path):
     ("mutate", "message"),
     [
         (lambda data: b"BAD!" + data[4:], "magic"),
-        (lambda data: data[:4] + struct.pack("<I", 1) + data[8:], "unsupported version"),
+        (
+            lambda data: data[:4] + struct.pack("<I", 1) + data[8:],
+            "unsupported version",
+        ),
         (lambda data: data[:-1], "invalid data range"),
     ],
 )
