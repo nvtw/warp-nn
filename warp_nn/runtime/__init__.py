@@ -16,6 +16,7 @@
 import json
 from pathlib import Path
 
+from warp_nn.runtime.gguf import GGUFArchive
 from warp_nn.runtime.onnx_runtime import OnnxRuntime
 from warp_nn.runtime.openai_server import ChatCompletions, OpenAIHTTPServer
 from warp_nn.runtime.muse_glimmer import MuseGlimmerRunner, MuseGlimmerTokenizer, parse_atem_tool_calls
@@ -44,6 +45,7 @@ def create_tokenizer(path):
 
 
 __all__ = [
+    "GGUFArchive",
     "OnnxRuntime",
     "ChatCompletions",
     "OpenAIHTTPServer",
