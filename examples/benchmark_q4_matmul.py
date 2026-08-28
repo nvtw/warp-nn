@@ -13,6 +13,7 @@ import numpy as np
 import warp as wp
 
 from warp_nn.runtime import OnnxRuntime
+from warp_nn.runtime.kernels import _get_dequantize_nbits_kernel
 
 
 def make_model(path: Path, rows: int, columns: int, inner: int) -> None:
@@ -75,8 +76,8 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
-    if args.rows < 2 or args.inner % 32 or min(args.columns, args.iterations) < 1:
-        parser.error("rows must be at least 2, inner must be divisible by 32, and other sizes must be positive")
+    if args.rows < 1 or args.inner % 32 or min(args.columns, args.iterations) < 1:
+        parser.error("rows must be positive, inner must be divisible by 32, and other sizes must be positive")
 
     wp.init()
     device = wp.get_device(args.device)
@@ -89,17 +90,36 @@ def main() -> None:
         make_model(model_path, args.rows, args.columns, args.inner)
         warp_runtime = OnnxRuntime(model_path, device=device, use_cublas=False)
         cublas_runtime = OnnxRuntime(model_path, device=device, use_cublas=True)
+        if args.rows == 1 and cublas_runtime._cublas is not None:
+            for op in cublas_runtime._ops:
+                if op.op_type == "MatMulNBits":
+                    for name in tuple(op.attrs):
+                        if name.startswith("_q8_"):
+                            del op.attrs[name]
+                    op.attrs["_cublas"] = cublas_runtime._cublas
+                    op.attrs["_dequantized_weights"] = wp.empty(
+                        (args.columns, args.inner), dtype=wp.float16, device=device
+                    )
+                    op.attrs["_dequantize_kernel"] = _get_dequantize_nbits_kernel(4, 32, wp.float16)
         warp_ms, warp_output = measure(warp_runtime, activations, args.iterations)
         if cublas_runtime._cublas is None:
             print(f"Warp packed INT4: {warp_ms:.3f} ms (cuBLAS unavailable)")
             return
         cublas_ms, cublas_output = measure(cublas_runtime, activations, args.iterations)
 
-    np.testing.assert_allclose(warp_output, cublas_output, rtol=2.0e-2, atol=2.0e-2)
+    difference = np.abs(warp_output.astype(np.float32) - cublas_output.astype(np.float32))
+    np.testing.assert_allclose(
+        warp_output,
+        cublas_output,
+        rtol=5.0e-2 if args.rows == 1 else 2.0e-2,
+        atol=7.5e-2 if args.rows == 1 else 2.0e-2,
+    )
     print(f"Shape: ({args.rows}, {args.inner}) @ ({args.columns}, {args.inner}).T")
-    print(f"Warp packed INT4: {warp_ms:.3f} ms")
+    print(f"Warp {'INT4/Q8 DP4A' if args.rows == 1 else 'packed INT4'}: {warp_ms:.3f} ms")
     print(f"cuBLAS + dequant: {cublas_ms:.3f} ms")
-    print(f"cuBLAS speedup:   {warp_ms / cublas_ms:.2f}x")
+    faster = "Warp" if warp_ms < cublas_ms else "cuBLAS"
+    print(f"Faster path:      {faster} {max(warp_ms, cublas_ms) / min(warp_ms, cublas_ms):.2f}x")
+    print(f"Difference:       mean {difference.mean():.5f}, max {difference.max():.5f}")
 
 
 if __name__ == "__main__":
