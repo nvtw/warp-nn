@@ -250,7 +250,8 @@ def plan_linear(
             and contraction_blocks >= (device.sm_count + 1) // 2
         ):
             mma_geometry = (16, 64, 128)
-        expansion_blocks = rows // 64 * (columns // 32)
+        expansion_tile_m = 128 if rows % 128 == 0 else 64
+        expansion_blocks = rows // expansion_tile_m * (columns // 32)
         if (
             mma_common
             and rows >= 64
@@ -259,7 +260,7 @@ def plan_linear(
             and columns > inner
             and expansion_blocks >= 2 * device.sm_count
         ):
-            mma_geometry = (64, 32, 256)
+            mma_geometry = (expansion_tile_m, 32, expansion_tile_m * 4)
         if mma_geometry is not None:
             tile_m, tile_n, block_dim = mma_geometry
             op.attrs["_kernel"] = _get_prefill_mma_linear_kernel(dtype, tile_m, tile_n)

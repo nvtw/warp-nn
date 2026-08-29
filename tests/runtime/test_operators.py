@@ -119,7 +119,11 @@ def test_grouped_decode_linear_kernel(dtype):
 @pytest.mark.parametrize("dtype", [wp.float16, wp.bfloat16])
 @pytest.mark.parametrize(
     ("tile_m", "tile_n", "rows", "columns", "inner", "block_dim"),
-    [(16, 64, 32, 128, 128, 128), (64, 32, 128, 128, 128, 256)],
+    [
+        (16, 64, 32, 128, 128, 128),
+        (64, 32, 64, 128, 128, 256),
+        (128, 32, 128, 128, 128, 512),
+    ],
 )
 def test_prefill_mma_linear_kernel(
     dtype, tile_m, tile_n, rows, columns, inner, block_dim
