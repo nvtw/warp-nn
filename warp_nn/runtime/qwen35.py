@@ -241,11 +241,19 @@ def _reuse_layer_operation_outputs(
 ) -> None:
     """Alias same-role operation outputs across sequential model layers."""
     for role, value in layer.items():
-        if isinstance(value, Operation) and (op_type is None or value.op_type == op_type):
+        if isinstance(value, Operation) and (
+            op_type is None or value.op_type == op_type
+        ):
             for output_index, name in enumerate(value.outputs):
                 if name and name in tensors:
                     output = tensors[name]
-                    key = ("operation", role, output_index, tuple(output.shape), output.dtype)
+                    key = (
+                        "operation",
+                        role,
+                        output_index,
+                        tuple(output.shape),
+                        output.dtype,
+                    )
                     shared = pool.setdefault(key, output)
                     tensors[name] = shared
                     if output_index == 0 and "_output_2d" in value.attrs:
