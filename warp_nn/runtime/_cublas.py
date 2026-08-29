@@ -130,6 +130,39 @@ class Cublas:
             "cublasGemmEx",
         )
 
+    def gemm_nn(self, left, right, output, rows, columns, inner, stream, data_type):
+        """Compute row-major left times right without materializing a transpose."""
+        if stream != self._stream:
+            self._check(
+                self._lib.cublasSetStream_v2(self._handle, ctypes.c_void_p(stream)),
+                "cublasSetStream",
+            )
+            self._stream = stream
+        self._check(
+            self._lib.cublasGemmEx(
+                self._handle,
+                0,
+                0,
+                columns,
+                rows,
+                inner,
+                ctypes.byref(self._alpha),
+                ctypes.c_void_p(right),
+                data_type,
+                columns,
+                ctypes.c_void_p(left),
+                data_type,
+                inner,
+                ctypes.byref(self._beta),
+                ctypes.c_void_p(output),
+                data_type,
+                columns,
+                68,
+                99,
+            ),
+            "cublasGemmEx",
+        )
+
 
 def try_create_cublas():
     try:

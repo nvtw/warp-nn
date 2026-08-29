@@ -181,6 +181,18 @@ class _TiledLinearKernels:
     grad_weight: object
 
 
+@dataclass(frozen=True)
+class _TiledLoRAKernels:
+    transposed_right: object
+
+
+@dataclass(frozen=True)
+class _SplitKLoRAKernels:
+    transposed_right: object
+    regular_right: object
+    reduce: object
+
+
 _TILE_M = 32
 _TILE_N = 32
 _TILE_K = 32
@@ -286,6 +298,134 @@ def _get_tiled_linear_kernels(dtype: type) -> _TiledLinearKernels:
     )
 
 
+@lru_cache(maxsize=None)
+def _get_tiled_lora_kernels(dtype: type) -> _TiledLoRAKernels:
+    """Create tensor-core low-precision GEMMs with FP32 LoRA outputs."""
+    if dtype not in _STORAGE_DTYPES:
+        raise TypeError("tiled LoRA supports FP16 and BF16 storage")
+    DTYPE = dtype
+
+    def create_kernel(transpose_right: bool):
+        TRANSPOSE_RIGHT = transpose_right
+
+        @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+        def kernel(
+            left: wp.array2d(dtype=DTYPE),
+            right: wp.array2d(dtype=DTYPE),
+            output: wp.array2d(dtype=wp.float32),
+            reduction: int,
+            scale: wp.float32,
+        ):
+            tile_row, tile_column = wp.tid()
+            accumulator = wp.tile_zeros(shape=(_TILE_M, _TILE_N), dtype=wp.float32)
+            for inner_tile in range((reduction + _TILE_K - 1) / _TILE_K):
+                inner_offset = inner_tile * _TILE_K
+                left_tile = wp.tile_load(
+                    left,
+                    shape=(_TILE_M, _TILE_K),
+                    offset=(tile_row * _TILE_M, inner_offset),
+                )
+                if wp.static(TRANSPOSE_RIGHT):
+                    right_tile = wp.tile_transpose(
+                        wp.tile_load(
+                            right,
+                            shape=(_TILE_N, _TILE_K),
+                            offset=(tile_column * _TILE_N, inner_offset),
+                        )
+                    )
+                else:
+                    right_tile = wp.tile_load(
+                        right,
+                        shape=(_TILE_K, _TILE_N),
+                        offset=(inner_offset, tile_column * _TILE_N),
+                    )
+                wp.tile_matmul(left_tile, right_tile, accumulator)
+            accumulator *= scale
+            wp.tile_store(
+                output,
+                accumulator,
+                offset=(tile_row * _TILE_M, tile_column * _TILE_N),
+            )
+
+        kernel.module.options["enable_backward"] = False
+        return kernel
+
+    return _TiledLoRAKernels(transposed_right=create_kernel(True))
+
+
+@lru_cache(maxsize=None)
+def _get_split_k_lora_kernels(dtype: type) -> _SplitKLoRAKernels:
+    """Create a split-K tensor-core kernel for skinny LoRA products."""
+    if dtype not in _STORAGE_DTYPES:
+        raise TypeError("split-K LoRA supports FP16 and BF16 storage")
+    DTYPE = dtype
+
+    def create_kernel(transpose_right: bool):
+        TRANSPOSE_RIGHT = transpose_right
+
+        @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+        def kernel(
+            left: wp.array2d(dtype=DTYPE),
+            right: wp.array2d(dtype=DTYPE),
+            partial: wp.array2d(dtype=wp.float32),
+            reduction: int,
+            splits: int,
+            rows: int,
+        ):
+            split, tile_row, tile_column = wp.tid()
+            accumulator = wp.tile_zeros(shape=(_TILE_M, _TILE_N), dtype=wp.float32)
+            inner_tiles = (reduction + _TILE_K - 1) / _TILE_K
+            tiles_per_split = (inner_tiles + splits - 1) / splits
+            for local_tile in range(tiles_per_split):
+                inner_tile = split * tiles_per_split + local_tile
+                if inner_tile < inner_tiles:
+                    inner_offset = inner_tile * _TILE_K
+                    left_tile = wp.tile_load(
+                        left,
+                        shape=(_TILE_M, _TILE_K),
+                        offset=(tile_row * _TILE_M, inner_offset),
+                    )
+                    if wp.static(TRANSPOSE_RIGHT):
+                        right_tile = wp.tile_transpose(
+                            wp.tile_load(
+                                right,
+                                shape=(_TILE_N, _TILE_K),
+                                offset=(tile_column * _TILE_N, inner_offset),
+                            )
+                        )
+                    else:
+                        right_tile = wp.tile_load(
+                            right,
+                            shape=(_TILE_K, _TILE_N),
+                            offset=(inner_offset, tile_column * _TILE_N),
+                        )
+                    wp.tile_matmul(left_tile, right_tile, accumulator)
+            wp.tile_store(
+                partial,
+                accumulator,
+                offset=(split * rows + tile_row * _TILE_M, tile_column * _TILE_N),
+            )
+
+        kernel.module.options["enable_backward"] = False
+        return kernel
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def reduce(
+        partial: wp.array2d(dtype=wp.float32),
+        output: wp.array2d(dtype=wp.float32),
+        splits: int,
+        scale: wp.float32,
+    ):
+        row, column = wp.tid()
+        total = wp.float32(0.0)
+        for split in range(splits):
+            total += partial[split * output.shape[0] + row, column]
+        output[row, column] = scale * total
+
+    reduce.module.options["enable_backward"] = False
+    return _SplitKLoRAKernels(create_kernel(True), create_kernel(False), reduce)
+
+
 def _check_array(
     name: str, value: wp.array, shape: tuple[int, int], dtype: type, device
 ) -> None:
@@ -338,6 +478,23 @@ def _use_tiled(
     )
 
 
+def _lora_split_count(rows: int, rank: int, reduction: int, dtype: type, device) -> int:
+    """Choose bounded split-K parallelism from geometry and available SMs."""
+    minimum_arch = 80 if dtype == wp.bfloat16 else 70
+    if (
+        not device.is_cuda
+        or device.arch < minimum_arch
+        or rows < 16
+        or rank < 16
+        or reduction < 16
+    ):
+        return 1
+    output_tiles = ((rows + _TILE_M - 1) // _TILE_M) * ((rank + _TILE_N - 1) // _TILE_N)
+    inner_tiles = (reduction + _TILE_K - 1) // _TILE_K
+    target_splits = (4 * device.sm_count + output_tiles - 1) // output_tiles
+    return min(64, inner_tiles, max(1, target_splits))
+
+
 def _launch_tiled(
     kernel,
     left: wp.array,
@@ -360,11 +517,56 @@ def _launch_tiled(
     )
 
 
-def linear_forward(x: wp.array, weight: wp.array, output: wp.array) -> None:
+def _launch_split_k_lora(
+    kernels: _SplitKLoRAKernels,
+    left: wp.array,
+    right: wp.array,
+    partial: wp.array,
+    output: wp.array,
+    rows: int,
+    columns: int,
+    reduction: int,
+    splits: int,
+    scale: float,
+    transposed_right: bool = False,
+) -> None:
+    wp.launch_tiled(
+        kernels.transposed_right if transposed_right else kernels.regular_right,
+        dim=(
+            splits,
+            (rows + _TILE_M - 1) // _TILE_M,
+            (columns + _TILE_N - 1) // _TILE_N,
+        ),
+        inputs=[left, right, partial, reduction, splits, rows],
+        block_dim=_TILE_BLOCK_DIM,
+        device=left.device,
+    )
+    wp.launch(
+        kernels.reduce,
+        dim=(rows, columns),
+        inputs=[partial, output, splits, float(scale)],
+        device=left.device,
+    )
+
+
+def linear_forward(
+    x: wp.array, weight: wp.array, output: wp.array, *, cublas=None
+) -> None:
     """Launch ``output = x @ weight.T`` into a preallocated low-precision array."""
     rows, columns, inner = _linear_shapes(x, weight)
     _check_array("output", output, (rows, columns), x.dtype, x.device)
-    if _use_tiled(rows, columns, inner, x.dtype, x.device, x, weight, output):
+    if cublas is not None and x.device.is_cuda:
+        cublas.gemm(
+            x.ptr,
+            weight.ptr,
+            output.ptr,
+            rows,
+            columns,
+            inner,
+            wp.get_stream(x.device).cuda_stream,
+            2 if x.dtype == wp.float16 else 14,
+        )
+    elif _use_tiled(rows, columns, inner, x.dtype, x.device, x, weight, output):
         _launch_tiled(
             _get_tiled_linear_kernels(x.dtype).forward,
             x,
@@ -392,6 +594,7 @@ def linear_backward(
     grad_weight: wp.array | None = None,
     *,
     accumulate: bool = False,
+    cublas=None,
 ) -> None:
     """Overwrite activation gradients and optionally accumulate FP32 weight gradients."""
     rows, columns, inner = _linear_shapes(x, weight)
@@ -400,7 +603,18 @@ def linear_backward(
     if grad_weight is not None:
         _check_array("grad_weight", grad_weight, (columns, inner), wp.float32, x.device)
 
-    if _use_tiled(
+    if cublas is not None and x.device.is_cuda:
+        cublas.gemm_nn(
+            grad_output.ptr,
+            weight.ptr,
+            grad_input.ptr,
+            rows,
+            inner,
+            columns,
+            wp.get_stream(x.device).cuda_stream,
+            2 if x.dtype == wp.float16 else 14,
+        )
+    elif _use_tiled(
         rows, inner, columns, x.dtype, x.device, grad_output, weight, grad_input
     ):
         _launch_tiled(
@@ -465,6 +679,10 @@ def lora_forward(
     hidden: wp.array,
     output: wp.array,
     scale: float,
+    *,
+    cublas=None,
+    matmul_workspace: wp.array | None = None,
+    matmul_splits: int = 1,
 ) -> None:
     """Launch ``x @ W.T + scale * (x @ A.T) @ B.T``.
 
@@ -475,14 +693,50 @@ def lora_forward(
     _check_array("hidden", hidden, (rows, rank), wp.float32, x.device)
     _check_array("output", output, (rows, columns), x.dtype, x.device)
     kernels = _get_linear_kernels(x.dtype)
-    wp.launch(
-        kernels.lora_down,
-        dim=(rows, rank),
-        inputs=[x, lora_a],
-        outputs=[hidden],
-        device=x.device,
-    )
-    linear_forward(x, weight, output)
+    if matmul_splits > 1:
+        if (
+            not isinstance(matmul_workspace, wp.array)
+            or matmul_workspace.ndim != 2
+            or matmul_workspace.dtype != wp.float32
+            or matmul_workspace.device != x.device
+            or not matmul_workspace.is_contiguous
+            or matmul_workspace.shape[0] < matmul_splits * rows
+            or matmul_workspace.shape[1] != rank
+        ):
+            raise ValueError("split-K LoRA requires a matching FP32 workspace")
+        _launch_split_k_lora(
+            _get_split_k_lora_kernels(x.dtype),
+            x,
+            lora_a,
+            matmul_workspace,
+            hidden,
+            rows,
+            rank,
+            x.shape[1],
+            matmul_splits,
+            1.0,
+            transposed_right=True,
+        )
+    elif _use_tiled(rows, rank, x.shape[1], x.dtype, x.device, x, lora_a, hidden):
+        _launch_tiled(
+            _get_tiled_lora_kernels(x.dtype).transposed_right,
+            x,
+            lora_a,
+            hidden,
+            rows,
+            rank,
+            x.shape[1],
+            1.0,
+        )
+    else:
+        wp.launch(
+            kernels.lora_down,
+            dim=(rows, rank),
+            inputs=[x, lora_a],
+            outputs=[hidden],
+            device=x.device,
+        )
+    linear_forward(x, weight, output, cublas=cublas)
     wp.launch(
         kernels.lora_output,
         dim=(rows, columns),
@@ -506,6 +760,9 @@ def lora_backward(
     grad_weight: wp.array | None = None,
     *,
     accumulate: bool = False,
+    matmul_workspace: wp.array | None = None,
+    matmul_splits: int = 1,
+    cublas=None,
 ) -> None:
     """Overwrite Linear+LoRA gradients in preallocated arrays.
 
@@ -520,13 +777,39 @@ def lora_backward(
     _check_array("grad_a", grad_a, (rank, inner), wp.float32, x.device)
     _check_array("grad_b", grad_b, (columns, rank), wp.float32, x.device)
     kernels = _get_linear_kernels(x.dtype)
-    wp.launch(
-        kernels.lora_grad_down,
-        dim=(rows, rank),
-        inputs=[grad_output, lora_b, float(scale)],
-        outputs=[grad_hidden],
-        device=x.device,
-    )
+    if matmul_splits < 1:
+        raise ValueError("matmul_splits must be positive")
+    if matmul_splits > 1:
+        if (
+            not isinstance(matmul_workspace, wp.array)
+            or matmul_workspace.ndim != 2
+            or matmul_workspace.dtype != wp.float32
+            or matmul_workspace.device != x.device
+            or not matmul_workspace.is_contiguous
+            or matmul_workspace.shape[0] < matmul_splits * rows
+            or matmul_workspace.shape[1] != rank
+        ):
+            raise ValueError("split-K LoRA requires a matching FP32 workspace")
+        _launch_split_k_lora(
+            _get_split_k_lora_kernels(x.dtype),
+            grad_output,
+            lora_b,
+            matmul_workspace,
+            grad_hidden,
+            rows,
+            rank,
+            columns,
+            matmul_splits,
+            float(scale),
+        )
+    else:
+        wp.launch(
+            kernels.lora_grad_down,
+            dim=(rows, rank),
+            inputs=[grad_output, lora_b, float(scale)],
+            outputs=[grad_hidden],
+            device=x.device,
+        )
     linear_backward(
         x,
         weight,
@@ -534,6 +817,7 @@ def lora_backward(
         grad_input,
         grad_weight,
         accumulate=accumulate,
+        cublas=cublas,
     )
     wp.launch(
         kernels.lora_grad_input,

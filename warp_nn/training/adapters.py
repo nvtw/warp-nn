@@ -11,6 +11,8 @@ from typing import Mapping
 import numpy as np
 import warp as wp
 
+from warp_nn.runtime._cublas import try_create_cublas
+
 from .optimizer import AdamWPlan
 from .step import LoRALinearTrainingPlan
 
@@ -69,6 +71,7 @@ class LoRAAdapterCollection:
         *,
         seed: int = 0,
         optimizer_options: Mapping[str, object] | None = None,
+        use_cublas: bool = True,
     ):
         if not weights:
             raise ValueError("LoRA adapters require at least one target weight")
@@ -82,6 +85,7 @@ class LoRAAdapterCollection:
         parameters = []
         gradients = []
         device = None
+        shared_cublas = None
         for name in names:
             weight = weights[name]
             if not isinstance(weight, wp.array) or weight.ndim != 2:
@@ -94,6 +98,8 @@ class LoRAAdapterCollection:
                 )
             if device is None:
                 device = weight.device
+                if use_cublas and device.is_cuda:
+                    shared_cublas = try_create_cublas()
             elif weight.device != device:
                 raise ValueError("all LoRA target weights must share one device")
             out_features, in_features = weight.shape
@@ -112,6 +118,7 @@ class LoRAAdapterCollection:
                 config.rank,
                 weight.dtype,
                 device=device,
+                cublas=shared_cublas,
             )
             targets[name] = LoRAAdapterTarget(
                 name, config, weight, lora_a, lora_b, plan
@@ -120,6 +127,7 @@ class LoRAAdapterCollection:
             gradients.extend((plan.grad_a, plan.grad_b))
 
         self.device = device
+        self.cublas = shared_cublas
         self.configs = MappingProxyType(dict(target_configs))
         self.targets = MappingProxyType(targets)
         self.optimizer = AdamWPlan(
