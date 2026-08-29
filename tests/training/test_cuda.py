@@ -311,7 +311,10 @@ def test_cuda_bfloat16_gqa_full_and_sliding_reference(window):
     np.testing.assert_allclose(_numpy(lse), reference[1], atol=3e-5, rtol=3e-5)
 
 
-@pytest.mark.parametrize("dtype,head_size", [(wp.float16, 8), (wp.bfloat16, 128)])
+@pytest.mark.parametrize(
+    "dtype,head_size",
+    [(wp.float16, 8), (wp.bfloat16, 128), (wp.bfloat16, 256)],
+)
 @pytest.mark.parametrize("window", [0, 2])
 def test_cuda_streaming_gqa_backward_reference_and_accumulate(dtype, head_size, window):
     device = CUDA_DEVICES[0]

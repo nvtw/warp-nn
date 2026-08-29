@@ -648,7 +648,7 @@ def gqa_attention_backward(
     if query.device.is_cuda:
         kernels = _attention_kernels(query.dtype, head_size)
         block_dim = min(1024, max(32, 1 << (head_size - 1).bit_length()))
-        if head_size % 8 == 0 and head_size <= 128:
+        if head_size % 8 == 0 and head_size <= 256:
             flash_gqa_query_backward(
                 query,
                 key,
@@ -682,7 +682,7 @@ def gqa_attention_backward(
                 block_dim=block_dim,
                 device=query.device,
             )
-        if head_size % 8 == 0 and head_size <= 128:
+        if head_size % 8 == 0 and head_size <= 256:
             flash_gqa_key_value_backward(
                 query,
                 key,
