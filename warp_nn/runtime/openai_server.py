@@ -14,7 +14,15 @@ from collections.abc import Callable, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from warp_nn.runtime.chat import Runner, Tokenizer, generate_tokens, is_eos_token, split_reasoning, split_tool_prefix
+from warp_nn.runtime.chat import (
+    ChatEncodingCache,
+    Runner,
+    Tokenizer,
+    generate_tokens,
+    is_eos_token,
+    split_reasoning,
+    split_tool_prefix,
+)
 
 
 class APIError(Exception):
@@ -87,6 +95,7 @@ class ChatCompletions:
         self.reasoning_effort = reasoning_effort
         self.preserve_thinking = preserve_thinking
         self.lock = threading.Lock()
+        self._chat_encoder = ChatEncodingCache(tokenizer)
         self._cached_ids: list[int] = []
 
     def complete(self, request: Mapping[str, object], emit: Callable[[dict[str, object]], None] | None = None):
@@ -128,20 +137,6 @@ class ChatCompletions:
             raise APIError("max tokens must be a positive integer", param="max_completion_tokens")
         max_tokens = min(max_tokens, self.max_new_tokens)
 
-        try:
-            prompt_ids = self.tokenizer.encode_chat(
-                messages,
-                tools=tools,
-                enable_thinking=enable_thinking,
-                reasoning_effort=reasoning_effort,
-                preserve_thinking=preserve_thinking,
-            )
-        except (KeyError, TypeError, ValueError) as error:
-            raise APIError(str(error), param="messages") from error
-        available = self.runner.cache_capacity - len(prompt_ids)
-        if available <= 0:
-            raise APIError("Prompt exceeds the model context window", status=400, param="messages")
-        max_tokens = min(max_tokens, available)
         completion_id = "chatcmpl-" + uuid.uuid4().hex
         created = int(time.time())
         generated = []
@@ -191,6 +186,20 @@ class ChatCompletions:
                 emit(self._chunk(completion_id, created, {"reasoning_content": streamable}))
 
         with self.lock:
+            try:
+                prompt_ids = self._chat_encoder.encode_chat(
+                    messages,
+                    tools=tools,
+                    enable_thinking=enable_thinking,
+                    reasoning_effort=reasoning_effort,
+                    preserve_thinking=preserve_thinking,
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise APIError(str(error), param="messages") from error
+            available = self.runner.cache_capacity - len(prompt_ids)
+            if available <= 0:
+                raise APIError("Prompt exceeds the model context window", status=400, param="messages")
+            request_max_tokens = min(max_tokens, available)
             cached_prefix = self._cached_ids
             self._cached_ids = []
             if (
@@ -206,7 +215,7 @@ class ChatCompletions:
                 self.runner,
                 self.tokenizer,
                 prompt_ids,
-                max_tokens,
+                request_max_tokens,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
@@ -231,6 +240,7 @@ class ChatCompletions:
                 else generated
             )
             self._cached_ids = [*prompt_ids, *cached_completion]
+            self._chat_encoder.extend_raw(generated)
         tail = decoder.decode(b"", final=True)
         if stream_filter:
             tail = stream_filter.feed(tail, final=True)

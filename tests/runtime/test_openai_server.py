@@ -3,6 +3,7 @@
 
 import json
 import threading
+import time
 from urllib.request import Request, urlopen
 
 from warp_nn.runtime import ChatCompletions, OpenAIHTTPServer, parse_qwen_tool_calls
@@ -62,6 +63,45 @@ class _CachingTokenizer(_Tokenizer):
         return {"first": [9], "continued": [9, 1, 0, 7], "different": [5]}[messages[-1]["content"]]
 
 
+class _IncrementalTokenizer(_Tokenizer):
+    def __init__(self):
+        super().__init__("A")
+        self.full_calls = 0
+        self.encoded = []
+        self.active = 0
+        self.max_active = 0
+        self.state_lock = threading.Lock()
+        self.delay = 0.0
+
+    def format_chat(self, messages, **kwargs):
+        del kwargs
+        with self.state_lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        if self.delay:
+            time.sleep(self.delay)
+        rendered = "".join(f"{message['role']}:{message['content']};" for message in messages)
+        with self.state_lock:
+            self.active -= 1
+        return rendered + "assistant:"
+
+    def encode(self, text):
+        self.encoded.append(text)
+        return [1 if char == "A" else 0 if char == ";" else ord(char) + 10 for char in text]
+
+    def encode_chat(self, messages, **kwargs):
+        self.full_calls += 1
+        return self.encode(self.format_chat(messages, **kwargs))
+
+    def decode(self, token_ids, skip_special_tokens=False):
+        del skip_special_tokens
+        return "".join("A" if token_id == 1 else ";" if token_id == 0 else "" for token_id in token_ids)
+
+
+def _chat(content):
+    return {"model": "warp-qwen", "messages": content}
+
+
 def _request(server, body, path="/v1/chat/completions"):
     request = Request(
         f"http://127.0.0.1:{server.server_port}{path}",
@@ -99,6 +139,60 @@ def test_chat_completions_reuses_exact_runner_prefix():
         ("append", [0, 7]),
         ("prefill", [5]),
     ]
+
+
+def test_chat_completions_incrementally_encodes_appended_turns():
+    runner = _CachingRunner()
+    runner.cache_capacity = 4096
+    tokenizer = _IncrementalTokenizer()
+    completions = ChatCompletions("warp-qwen", runner, tokenizer, max_new_tokens=2)
+    first = [{"role": "user", "content": "x"}]
+    continued = [
+        *first,
+        {"role": "assistant", "content": "A"},
+        {"role": "user", "content": "y"},
+    ]
+
+    completions.complete(_chat(first))
+    first_prompt = runner.calls[0][1]
+    completions.complete(_chat(continued))
+
+    assert tokenizer.full_calls == 1
+    assert tokenizer.encoded[-1] == "user:y;assistant:"
+    expected_suffix = tokenizer.encode("user:y;assistant:")
+    assert runner.calls[1] == ("append", [0, *expected_suffix])
+    assert runner.calls[0] == ("prefill", first_prompt)
+
+    completions.complete(_chat([{"role": "user", "content": "different"}]))
+    assert tokenizer.full_calls == 2
+    assert runner.calls[-1][0] == "prefill"
+
+
+def test_chat_completions_serializes_incremental_encoder_with_runner():
+    runner = _CachingRunner()
+    runner.cache_capacity = 4096
+    tokenizer = _IncrementalTokenizer()
+    tokenizer.delay = 0.02
+    completions = ChatCompletions("warp-qwen", runner, tokenizer, max_new_tokens=2)
+    errors = []
+
+    def complete(content):
+        try:
+            completions.complete(_chat([{"role": "user", "content": content}]))
+        except Exception as error:
+            errors.append(error)
+
+    threads = [
+        threading.Thread(target=complete, args=("one",)),
+        threading.Thread(target=complete, args=("two",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    assert tokenizer.max_active == 1
 
 
 def test_chat_completions_streams_text_and_usage():

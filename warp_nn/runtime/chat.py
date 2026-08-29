@@ -54,6 +54,9 @@ class ChatEncodingCache:
 
     def __init__(self, tokenizer: Any):
         self.tokenizer = tokenizer
+        self._incremental = callable(getattr(tokenizer, "format_chat", None)) and callable(
+            getattr(tokenizer, "encode", None)
+        )
         self.reset()
 
     def reset(self) -> None:
@@ -63,7 +66,7 @@ class ChatEncodingCache:
 
     def extend_raw(self, token_ids: Sequence[int]) -> None:
         """Append exact model-generated IDs to the cached assistant prefix."""
-        if not token_ids:
+        if not token_ids or not self._incremental:
             return
         if not self._rendered:
             raise ValueError("encode_chat must be called before extend_raw")
@@ -75,6 +78,8 @@ class ChatEncodingCache:
         self, messages: Sequence[Mapping[str, object]], **kwargs: Any
     ) -> list[int]:
         """Return exact chat IDs, reusing an unchanged rendered prefix when possible."""
+        if not self._incremental:
+            return self.tokenizer.encode_chat(messages, **kwargs)
         rendered = self.tokenizer.format_chat(messages, **kwargs)
         if self._rendered and rendered.startswith(self._rendered):
             token_ids = self._token_ids + self.tokenizer.encode(
