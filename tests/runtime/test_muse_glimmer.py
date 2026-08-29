@@ -273,9 +273,7 @@ def test_muse_tokenizer_chat_and_atem_tools(tmp_path):
     assert cache.encode_chat(tool_history[:1], tools=tools) == initial
     cache.extend_raw(generated_call)
     visible_assistant = {
-        key: value
-        for key, value in tool_history[1].items()
-        if key != "_raw_token_ids"
+        key: value for key, value in tool_history[1].items() if key != "_raw_token_ids"
     }
     assert cache.encode_continuation(
         [tool_history[0], visible_assistant], tool_history[2:], tools=tools
