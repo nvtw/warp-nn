@@ -12,6 +12,7 @@ from warp_nn.runtime.gguf import BlockQuantizedTensor
 from warp_nn.runtime.kernels import (
     _append_head_cache_kernel,
     _append_circular_head_cache_kernel,
+    _attention_group_geometry,
     _causal_conv_rows_kernel,
     _decode_attention_head_group,
     _decode_attention_partitions,
@@ -215,6 +216,23 @@ def test_decode_attention_head_group_follows_gqa_geometry(
 def test_decode_attention_head_group_rejects_invalid_geometry(query_heads, kv_heads):
     with pytest.raises(ValueError, match="positive multiple"):
         _decode_attention_head_group(query_heads, kv_heads, 128)
+
+
+@pytest.mark.parametrize(
+    "query_heads,kv_heads,head_size,rows,geometry",
+    [
+        (32, 2, 128, 1024, (1, 16)),
+        (24, 4, 256, 256, (2, 4)),
+        (32, 4, 128, 64, (2, 8)),
+        (24, 2, 128, 64, (4, 4)),
+        (32, 2, 128, 8, (1, 4)),
+        (32, 2, 128, 1, (1, 16)),
+    ],
+)
+def test_attention_group_geometry_preserves_query_budget(
+    query_heads, kv_heads, head_size, rows, geometry
+):
+    assert _attention_group_geometry(query_heads, kv_heads, head_size, rows) == geometry
 
 
 @pytest.mark.parametrize(

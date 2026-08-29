@@ -58,6 +58,24 @@ def _decode_attention_head_group(
     return max(4, min(16, 1 << (queries_per_kv.bit_length() - 1)))
 
 
+def _attention_group_geometry(
+    query_heads: int, kv_heads: int | None, head_size: int, rows: int
+) -> tuple[int, int]:
+    """Choose a bounded query tile without introducing partial head groups."""
+    heads_per_group = 4
+    if kv_heads and (rows == 1 or rows >= 16):
+        candidate = _decode_attention_head_group(query_heads, kv_heads, head_size)
+        queries_per_kv = query_heads // kv_heads
+        if rows == 1 or queries_per_kv % candidate == 0:
+            heads_per_group = candidate
+    rows_per_group = (
+        1
+        if rows < 16
+        else max(1, min(4, 2048 // head_size // heads_per_group))
+    )
+    return rows_per_group, heads_per_group
+
+
 @wp.kernel
 def _gemm_transb_kernel(
     A: wp.array2d[Any],  # (M, K)
@@ -2520,14 +2538,13 @@ def _allocate_partitioned_gqa(
     kv_heads: int | None = None,
 ):
     """Allocate one reusable workspace for partitioned decode attention."""
+    default_rows, default_heads = _attention_group_geometry(
+        heads, kv_heads, head_size, rows
+    )
     if rows_per_group is None:
-        rows_per_group = 1 if rows < 16 else max(1, min(4, 512 // head_size))
+        rows_per_group = default_rows
     if heads_per_group is None:
-        heads_per_group = (
-            _decode_attention_head_group(heads, kv_heads, head_size)
-            if rows == 1 and kv_heads
-            else 4
-        )
+        heads_per_group = default_heads
     block_dim, partitions, kernels = _get_partitioned_gqa_attention_kernels(
         head_size, dtype, partitions, rows_per_group, heads_per_group
     )
