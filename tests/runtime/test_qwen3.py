@@ -9,6 +9,7 @@ import numpy as np
 
 from examples.qwen_chat import _generate
 from warp_nn.runtime import Qwen3Tokenizer, parse_qwen_tool_calls, sample_token
+from warp_nn.runtime.chat import ChatEncodingCache
 from warp_nn.runtime.qwen3 import _BYTE_ENCODER
 
 
@@ -85,6 +86,37 @@ def test_qwen_tokenizer_and_chat_template(tmp_path):
         ]
     )
     assert tokenizer.encode_chat(messages, enable_thinking=False)[: len(cached)] == cached
+
+
+
+def test_incremental_chat_encoding_matches_full_history(tmp_path):
+    path = tmp_path / "tokenizer.json"
+    _write_tokenizer(path)
+    tokenizer = Qwen3Tokenizer(path)
+    cache = ChatEncodingCache(tokenizer)
+    messages = [{"role": "user", "content": "Hello"}]
+
+    initial = cache.encode_chat(messages, enable_thinking=False)
+    assert initial == tokenizer.encode_chat(messages, enable_thinking=False)
+    generated = tokenizer.encode("Hello") + [tokenizer.eos_token_id]
+    cache.extend_raw(generated)
+    messages.extend(
+        [
+            {
+                "role": "assistant",
+                "content": tokenizer.generation_prefix(False) + "Hello",
+            },
+            {"role": "user", "content": "Again"},
+        ]
+    )
+    assert cache.encode_chat(messages, enable_thinking=False) == tokenizer.encode_chat(
+        messages, enable_thinking=False
+    )
+
+    edited = [{"role": "user", "content": "Changed"}]
+    assert cache.encode_chat(edited, enable_thinking=False) == tokenizer.encode_chat(
+        edited, enable_thinking=False
+    )
 
 
 def test_nemotron_tokenizer_metadata(tmp_path):

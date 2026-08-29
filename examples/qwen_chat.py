@@ -14,7 +14,7 @@ import threading
 import numpy as np
 
 from warp_nn.runtime import create_text_runner, create_tokenizer, sample_token
-from warp_nn.runtime.chat import is_eos_token, split_tool_prefix
+from warp_nn.runtime.chat import ChatEncodingCache, is_eos_token, split_tool_prefix
 from warp_nn.runtime.coding_tools import CodingTools
 
 
@@ -202,6 +202,7 @@ def main():
         )
     messages = [] if system is None else [{"role": "system", "content": system}]
     cached_ids = []
+    chat_encoder = ChatEncodingCache(tokenizer)
     if args.unsafe_shell and not args.coding_agent:
         parser.error("--unsafe-shell requires --tools")
     shell = "unsafe" if args.unsafe_shell else "sandbox"
@@ -229,13 +230,14 @@ def main():
         if prompt == "/clear":
             messages = [] if system is None else [{"role": "system", "content": system}]
             cached_ids.clear()
+            chat_encoder.reset()
             print("History cleared.")
             continue
 
         messages.append({"role": "user", "content": prompt})
         with _EscapeMonitor() as cancel:
             for tool_round in range(8):
-                token_ids = tokenizer.encode_chat(
+                token_ids = chat_encoder.encode_chat(
                     messages,
                     enable_thinking=thinking,
                     tools=coding_tools.schemas if coding_tools else None,
@@ -267,6 +269,7 @@ def main():
                     rng=rng,
                     cancelled=cancel.cancelled.is_set,
                 )
+                chat_encoder.extend_raw(generated)
                 print()
                 if cancel.cancelled.is_set():
                     messages.append(
@@ -310,6 +313,7 @@ def main():
                         if response:
                             messages.append({"role": "assistant", "content": history_response})
                         cached_ids.clear()
+                        chat_encoder.reset()
                         print("[Cancelled.]")
                         break
                     _show_tool_result(result)

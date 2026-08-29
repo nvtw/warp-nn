@@ -45,6 +45,45 @@ class Runner(Protocol):
     def sample_greedy(self, logits: Any) -> int: ...
 
 
+
+
+class ChatEncodingCache:
+    """Encode only the suffix added to an unchanged rendered chat history."""
+
+    def __init__(self, tokenizer: Any):
+        self.tokenizer = tokenizer
+        self.reset()
+
+    def reset(self) -> None:
+        """Forget the cached rendered and tokenized history."""
+        self._rendered = ""
+        self._token_ids: list[int] = []
+
+    def extend_raw(self, token_ids: Sequence[int]) -> None:
+        """Append exact model-generated IDs to the cached assistant prefix."""
+        if not token_ids:
+            return
+        if not self._rendered:
+            raise ValueError("encode_chat must be called before extend_raw")
+        ids = [int(token_id) for token_id in token_ids]
+        self._rendered += self.tokenizer.decode(ids, skip_special_tokens=False)
+        self._token_ids.extend(ids)
+
+    def encode_chat(
+        self, messages: Sequence[Mapping[str, object]], **kwargs: Any
+    ) -> list[int]:
+        """Return exact chat IDs, reusing an unchanged rendered prefix when possible."""
+        rendered = self.tokenizer.format_chat(messages, **kwargs)
+        if self._rendered and rendered.startswith(self._rendered):
+            token_ids = self._token_ids + self.tokenizer.encode(
+                rendered[len(self._rendered) :]
+            )
+        else:
+            token_ids = self.tokenizer.encode_chat(messages, **kwargs)
+        self._rendered = rendered
+        self._token_ids = list(token_ids)
+        return list(token_ids)
+
 def is_eos_token(tokenizer: Tokenizer, token_id: int) -> bool:
     """Return whether ``token_id`` is any model-declared end token."""
     return token_id in getattr(tokenizer, "eos_token_ids", (tokenizer.eos_token_id,))

@@ -8,6 +8,7 @@ import pytest
 
 from tests.utilities import is_device_available, write_safetensors
 from warp_nn.runtime import create_text_runner, create_tokenizer
+from warp_nn.runtime.chat import ChatEncodingCache
 from warp_nn.runtime.muse_glimmer import (
     MuseGlimmerRunner,
     MuseGlimmerTokenizer,
@@ -186,6 +187,17 @@ def test_muse_tokenizer_chat_and_atem_tools(tmp_path):
     )
     assert continued[: len(initial) + len(generated) - 1] == initial + generated[:-1]
 
+    history = [
+        {"role": "user", "content": "Read it"},
+        {"role": "assistant", "content": "Answer", "_raw_token_ids": generated},
+        {"role": "user", "content": "Again"},
+    ]
+    cache = ChatEncodingCache(tokenizer)
+    assert cache.encode_chat(history[:1], tools=tools) == initial
+    cache.extend_raw(generated)
+    assert cache.encode_chat(history, tools=tools) == continued
+
+
     generated_call = tokenizer.encode(
         ' to=read_file<|message|><atem:function_calls>\n<atem:invoke name="read_file">\n'
         '<atem:parameter name="path">README.md</atem:parameter>\n</atem:invoke>\n</atem:function_calls><|eot|>'
@@ -195,6 +207,32 @@ def test_muse_tokenizer_chat_and_atem_tools(tmp_path):
         tools=tools,
     )
     assert continued[: len(initial) + len(generated_call) - 1] == initial + generated_call[:-1]
+
+    tool_history = [
+        {"role": "user", "content": "Read it"},
+        {
+            "role": "assistant",
+            "_raw_token_ids": generated_call,
+            "tool_calls": [
+                {
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"README.md"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_0", "content": "file contents"},
+    ]
+    cache.reset()
+    assert cache.encode_chat(tool_history[:1], tools=tools) == initial
+    cache.extend_raw(generated_call)
+    assert cache.encode_chat(tool_history, tools=tools) == tokenizer.encode_chat(
+        tool_history, tools=tools
+    )
+
 
 
     stream = _MuseStreamFilter()
