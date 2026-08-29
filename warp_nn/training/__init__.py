@@ -15,6 +15,7 @@ from .bridges import (
 )
 from .checkpoint import LoRACheckpoint, load_lora_safetensors, save_lora_safetensors
 from .gated_delta import GatedDeltaInputPlan
+from .gated_delta_rule import GatedDeltaRulePlan
 from .gqa import GQALoRAAttentionPlan
 from .linear import linear_backward, linear_forward, lora_backward, lora_forward
 from .mlp import LoRASwiGLUPlan
@@ -31,6 +32,7 @@ __all__ = [
     "CrossEntropyPlan",
     "EmbeddingPlan",
     "GatedDeltaInputPlan",
+    "GatedDeltaRulePlan",
     "GQALoRAAttentionPlan",
     "LoRAAdapterCollection",
     "LoRAAdapterConfig",
