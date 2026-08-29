@@ -93,8 +93,8 @@ def _gqa_backward_reference(query, key, value, output_grad, lengths, scale, wind
 
 def _gqa_buffers(device, seed=17):
     rng = np.random.default_rng(seed)
-    query_shape = (1, 4, 4, 3)
-    kv_shape = (1, 2, 4, 3)
+    query_shape = (1, 4, 4, 8)
+    kv_shape = (1, 2, 4, 8)
     query = _array(rng.normal(size=query_shape).astype(np.float32), wp.bfloat16, device)
     key = _array(rng.normal(size=kv_shape).astype(np.float32), wp.bfloat16, device)
     value = _array(rng.normal(size=kv_shape).astype(np.float32), wp.bfloat16, device)

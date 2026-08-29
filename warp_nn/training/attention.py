@@ -13,6 +13,8 @@ import math
 
 import warp as wp
 
+from .flash_attention import flash_gqa_forward
+
 
 _SUPPORTED_DTYPES = (wp.float16, wp.bfloat16)
 
@@ -541,6 +543,19 @@ def gqa_attention_forward(
         raise ValueError("GQA scale must be finite")
 
     if query.device.is_cuda:
+        if head_size % 8 == 0:
+            flash_gqa_forward(
+                query,
+                key,
+                value,
+                lengths,
+                output,
+                lse,
+                accumulator,
+                scale=effective_scale,
+                window=window,
+            )
+            return
         kernels = _attention_kernels(query.dtype, head_size)
         block_dim = min(1024, max(32, 1 << (head_size - 1).bit_length()))
         wp.launch_tiled(
