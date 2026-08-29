@@ -108,9 +108,7 @@ def _exec_linear(op, tensors, shapes, device):
         if op.attrs.get("_prefill_mma_kernel"):
             wp.launch(
                 op.attrs["_kernel"],
-                dim=(op.attrs["_rows"] // 16)
-                * (op.attrs["_columns"] // 64)
-                * 128,
+                dim=(op.attrs["_rows"] // 16) * (op.attrs["_columns"] // 64) * 128,
                 inputs=[x, weight, output, op.attrs["_columns"], op.attrs["_inner"]],
                 block_dim=128,
                 device=device,

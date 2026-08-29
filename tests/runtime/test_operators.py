@@ -142,9 +142,7 @@ def test_prefill_mma_linear_kernel(dtype):
     wp.capture_launch(capture.graph)
     wp.synchronize_device(device)
 
-    np.testing.assert_allclose(
-        output.numpy(), x_np @ weight_np.T, atol=0.2, rtol=0.02
-    )
+    np.testing.assert_allclose(output.numpy(), x_np @ weight_np.T, atol=0.2, rtol=0.02)
 
 
 def test_linear_operation_cublas():

@@ -295,9 +295,18 @@ def get_prefill_mma_projection(dtype: type):
         native_type, ptx_type = "wp::bfloat16", "bf16"
     else:
         raise TypeError("Prefill MMA projection requires FP16 or BF16")
-    snippet = _PREFILL_MMA_PROJECTION.replace("NATIVE_TYPE", native_type).replace("PTX_TYPE", ptx_type)
+    snippet = _PREFILL_MMA_PROJECTION.replace("NATIVE_TYPE", native_type).replace(
+        "PTX_TYPE", ptx_type
+    )
 
     @wp.func_native(snippet)
-    def project(x: wp.array2d[dtype], weight: wp.array2d[dtype], output: wp.array2d[dtype], tid: int, columns: int, inner: int): ...
+    def project(
+        x: wp.array2d[dtype],
+        weight: wp.array2d[dtype],
+        output: wp.array2d[dtype],
+        tid: int,
+        columns: int,
+        inner: int,
+    ): ...
 
     return project
