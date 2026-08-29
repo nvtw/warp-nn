@@ -7,9 +7,9 @@ import argparse
 import codecs
 import json
 import os
-from pathlib import Path
 import sys
 import threading
+from pathlib import Path
 
 import numpy as np
 
@@ -158,6 +158,11 @@ def main():
     parser.add_argument("--cache-capacity", type=int, default=1024)
     parser.add_argument("--prefill-chunk-size", type=int, default=256)
     parser.add_argument(
+        "--weight-quantization",
+        choices=("q8_0",),
+        help="Opt-in projection-weight compression during model loading",
+    )
+    parser.add_argument(
         "--yarn",
         action="store_true",
         help="Explicitly extend RoPE to cache capacity with YaRN",
@@ -224,6 +229,8 @@ def main():
         if args.yarn_factor is not None:
             rope_scaling["factor"] = args.yarn_factor
     runner_options = {"rope_scaling": rope_scaling} if rope_scaling else {}
+    if args.weight_quantization:
+        runner_options["weight_quantization"] = args.weight_quantization
     runner = create_text_runner(
         args.model_dir,
         device=args.device,

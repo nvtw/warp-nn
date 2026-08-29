@@ -5,9 +5,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-
 import json
+import weakref
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -21,23 +21,23 @@ from warp_nn.runtime.gguf import (
     find_gguf_files,
 )
 from warp_nn.runtime.kernels import (
+    _allocate_partitioned_gqa,
     _append_head_cache_kernel,
     _causal_conv_rows_kernel,
     _decode_attention_partitions,
     _gather_rows_kernel,
-    _get_gather_q8_0_rows_kernel,
     _get_gated_rms_norm_kernel,
+    _get_gather_q8_0_rows_kernel,
     _get_gqa_attention_kernel,
     _get_greedy_argmax_kernels,
-    _get_top_k_kernels,
     _get_linear_attention_kernel,
-    _allocate_partitioned_gqa,
+    _get_lp_normalization_kernel,
+    _get_top_k_kernels,
     _launch_partitioned_gqa,
     _linear_attention_value_blocks,
-    _get_lp_normalization_kernel,
     _prepare_gated_delta_kernel,
-    _reorder_interleaved_heads_kernel,
     _reorder_heads_kernel,
+    _reorder_interleaved_heads_kernel,
     _rotary_embedding_kernel_for_dtype,
     _set_sequence_end,
     _sigmoid_gate_kernel,
@@ -54,8 +54,13 @@ from warp_nn.runtime.operators import (
     plan_rms_norm,
     plan_swiglu,
 )
-from warp_nn.runtime.safetensors import SafeTensorArchive
+from warp_nn.runtime.quantization import (
+    estimate_loaded_weight_bytes,
+    load_native_weights,
+    normalize_weight_quantization,
+)
 from warp_nn.runtime.rope import resolve_rope_parameters, rotary_cache_values
+from warp_nn.runtime.safetensors import SafeTensorArchive
 from warp_nn.utils.device import parse_device
 
 
@@ -330,7 +335,7 @@ class _Qwen35Plan:
     """Fixed-row execution plan sharing weights and recurrent state."""
 
     def __init__(self, runner: Qwen35Runner, rows: int):
-        self.runner = runner
+        self.runner = weakref.proxy(runner)
         self.rows = rows
         self.device = runner.device
         self.dtype = runner.dtype
@@ -896,6 +901,7 @@ class Qwen35Runner:
         prefill_chunk_size: int = 16,
         use_cublas: bool = True,
         rope_scaling: Mapping[str, object] | None = None,
+        weight_quantization: str | None = None,
     ):
         path = Path(path)
         directory = path if path.is_dir() else path.parent
@@ -912,6 +918,7 @@ class Qwen35Runner:
             self.config = _gguf_config(gguf.metadata)
         _validate_config(self.config)
         self.device = parse_device(device)
+        self.weight_quantization = normalize_weight_quantization(weight_quantization)
         self.cache_capacity = int(cache_capacity)
         if self.cache_capacity <= 0:
             raise ValueError("cache_capacity must be positive")
@@ -954,18 +961,24 @@ class Qwen35Runner:
         missing = set(names) - set(archive.names)
         if missing:
             raise ValueError(f"Qwen 3.5 checkpoint is missing {sorted(missing)[:5]}")
-        required_bytes = sum(archive.metadata(name).nbytes for name in names)
+        required_bytes, largest_weight_source = estimate_loaded_weight_bytes(
+            archive, names, self.weight_quantization
+        )
+        weight_load_peak = required_bytes + largest_weight_source
         full_layers = self.config["layer_types"].count("full_attention")
         required_bytes += (
             full_layers * 2 * self.kv_heads * self.cache_capacity * self.head_size * 2
         )
         required_bytes += self.cache_capacity * self.rotary_dim * 4
+        required_bytes = max(required_bytes, weight_load_peak)
         if self.device.is_cuda and required_bytes > self.device.free_memory * 0.95:
             raise MemoryError(
                 f"Qwen 3.5 needs at least {required_bytes / 2**30:.1f} GiB for selected weights and KV cache; "
                 f"{self.device.free_memory / 2**30:.1f} GiB is currently free"
             )
-        self.weights = archive.load(self.device, names)
+        self.weights = load_native_weights(
+            archive, self.device, names, self.weight_quantization
+        )
         if self.gguf_layout:
             for index, layer_type in enumerate(self.config["layer_types"]):
                 if layer_type == "linear_attention":

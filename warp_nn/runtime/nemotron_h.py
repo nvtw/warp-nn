@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import weakref
 
 import warp as wp
 
@@ -128,7 +129,7 @@ class _NemotronPlan:
     """Fixed-row Nemotron execution plan sharing persistent model state."""
 
     def __init__(self, runner: NemotronHRunner, rows: int):
-        self.runner = runner
+        self.runner = weakref.proxy(runner)
         self.rows = rows
         self.device = runner.device
         self.dtype = runner.dtype

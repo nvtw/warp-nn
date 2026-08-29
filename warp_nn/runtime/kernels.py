@@ -17,9 +17,8 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from functools import lru_cache
+from typing import Any
 
 import warp as wp
 
@@ -36,7 +35,6 @@ from warp_nn.runtime._cuda import (
     warp_max_broadcast,
 )
 from warp_nn.utils.config import get_kernel_config
-
 
 # ---------------------------------------------------------------------------
 # Inference kernels
@@ -826,15 +824,17 @@ def _gather_single_index_kernel(
     output[output_index] = data[(prefix * axis_size + index) * stride + suffix]
 
 
-def _create_quantize_activation_int8_kernel(dtype: type):
-    """Build symmetric INT8 activation quantization for one input dtype."""
+def _create_quantize_int8_kernel(dtype: type, scale_dtype: type, zero_scale_one: bool):
+    """Build symmetric block-32 INT8 quantization for input and scale dtypes."""
     DTYPE = dtype
+    SCALE_DTYPE = scale_dtype
+    ZERO_SCALE_ONE = zero_scale_one
 
     @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
     def kernel(
         activations: wp.array2d(dtype=DTYPE),
         quantized: wp.array2d[wp.int8],
-        scales: wp.array2d[wp.float32],
+        scales: wp.array2d(dtype=SCALE_DTYPE),
     ):
         typed_zero = DTYPE(0.0)  # noqa: F841 - binds the factory dtype for Warp
         thread = wp.tid()
@@ -844,19 +844,26 @@ def _create_quantize_activation_int8_kernel(dtype: type):
         column = block * 32 + lane
         value = wp.float32(activations[row, column])
         maximum = warp_max_broadcast(wp.abs(value))
-        scale = maximum / 127.0 if maximum > 0.0 else 1.0
+        scale = maximum / 127.0
+        quantization_scale = scale if maximum > 0.0 else 1.0
         quantized[row, column] = wp.int8(
-            wp.clamp(wp.round(value / scale), -127.0, 127.0)
+            wp.clamp(wp.round(value / quantization_scale), -127.0, 127.0)
         )
         if lane == 0:
-            scales[row, block] = scale
+            scales[row, block] = SCALE_DTYPE(
+                quantization_scale if ZERO_SCALE_ONE else scale
+            )
 
     return kernel
 
 
 @lru_cache(maxsize=None)
+def _get_quantize_int8_kernel(dtype: type, scale_dtype: type, zero_scale_one: bool):
+    return _create_quantize_int8_kernel(dtype, scale_dtype, zero_scale_one)
+
+
 def _get_quantize_activation_int8_kernel(dtype: type):
-    return _create_quantize_activation_int8_kernel(dtype)
+    return _get_quantize_int8_kernel(dtype, wp.float32, True)
 
 
 _quantize_activation_int8_kernel = _get_quantize_activation_int8_kernel(wp.float16)

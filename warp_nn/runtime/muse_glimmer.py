@@ -5,17 +5,19 @@
 
 from __future__ import annotations
 
+import json
+import re
+import weakref
 from collections.abc import Mapping, Sequence
 from datetime import date
-import json
 from pathlib import Path
-import re
 
 import warp as wp
 
 from warp_nn.runtime._cublas import try_create_cublas
 from warp_nn.runtime.gguf import BlockQuantizedTensor, GGUFArchive
 from warp_nn.runtime.kernels import (
+    _allocate_partitioned_gqa,
     _append_circular_head_cache_kernel,
     _append_head_cache_kernel,
     _binary_broadcast_kernel,
@@ -24,11 +26,10 @@ from warp_nn.runtime.kernels import (
     _get_gather_q8_0_rows_kernel,
     _get_gqa_attention_kernel,
     _get_greedy_argmax_kernels,
-    _allocate_partitioned_gqa,
     _launch_partitioned_gqa,
     _logit_softcap_kernel,
-    _reorder_interleaved_heads_kernel,
     _reorder_heads_kernel,
+    _reorder_interleaved_heads_kernel,
     _rotary_embedding_kernel_for_dtype,
     _scale_kernel,
     _sigmoid_gate_kernel,
@@ -40,10 +41,15 @@ from warp_nn.runtime.operators import (
     plan_rms_norm,
     plan_swiglu,
 )
-from warp_nn.runtime.qwen35 import Qwen35Runner, _reuse_layer_operation_outputs
+from warp_nn.runtime.quantization import (
+    estimate_loaded_weight_bytes,
+    load_native_weights,
+    normalize_weight_quantization,
+)
 from warp_nn.runtime.qwen3 import Qwen3Tokenizer, _pretokenize_o200k
-from warp_nn.runtime.safetensors import SafeTensorArchive
+from warp_nn.runtime.qwen35 import Qwen35Runner, _reuse_layer_operation_outputs
 from warp_nn.runtime.rope import resolve_rope_parameters, rotary_cache_values
+from warp_nn.runtime.safetensors import SafeTensorArchive
 from warp_nn.utils.device import parse_device
 
 
@@ -571,7 +577,7 @@ class _MusePlan:
     """Fixed-row Muse execution plan sharing the runner's persistent caches."""
 
     def __init__(self, runner: MuseGlimmerRunner, rows: int):
-        self.runner = runner
+        self.runner = weakref.proxy(runner)
         self.rows = rows
         self.device = runner.device
         self.dtype = runner.dtype
@@ -1032,6 +1038,7 @@ class MuseGlimmerRunner(Qwen35Runner):
         prefill_chunk_size: int = 16,
         use_cublas: bool = True,
         rope_scaling: Mapping[str, object] | None = None,
+        weight_quantization: str | None = None,
     ):
         path = Path(path)
         directory = path if path.is_dir() else path.parent
@@ -1050,6 +1057,7 @@ class MuseGlimmerRunner(Qwen35Runner):
             self.centered_norm_scales = False
         _validate_config(self.config)
         self.device = parse_device(device)
+        self.weight_quantization = normalize_weight_quantization(weight_quantization)
         self.cache_capacity = int(cache_capacity)
         if self.cache_capacity <= 0:
             raise ValueError("cache_capacity must be positive")
@@ -1093,7 +1101,10 @@ class MuseGlimmerRunner(Qwen35Runner):
         )
         if embedding_dtype not in (wp.float16, wp.bfloat16):
             raise TypeError("Muse Glimmer embeddings must use FP16 or BF16")
-        required_bytes = sum(archive.metadata(name).nbytes for name in names)
+        required_bytes, largest_weight_source = estimate_loaded_weight_bytes(
+            archive, names, self.weight_quantization
+        )
+        weight_load_peak = required_bytes + largest_weight_source
         for layer_type in self.layer_types:
             capacity = (
                 self.local_cache_capacity
@@ -1102,12 +1113,15 @@ class MuseGlimmerRunner(Qwen35Runner):
             )
             required_bytes += 2 * self.kv_heads * capacity * self.head_dim * 2
         required_bytes += self.cache_capacity * self.head_dim * 4
+        required_bytes = max(required_bytes, weight_load_peak)
         if self.device.is_cuda and required_bytes > self.device.free_memory * 0.95:
             raise MemoryError(
                 f"Muse Glimmer needs at least {required_bytes / 2**30:.1f} GiB for text weights and KV cache; "
                 f"{self.device.free_memory / 2**30:.1f} GiB is currently free"
             )
-        self.weights = archive.load(self.device, names)
+        self.weights = load_native_weights(
+            archive, self.device, names, self.weight_quantization
+        )
         self.dtype = embedding_dtype
         self.unit_scales = {
             "__unit_hidden": wp.ones(
