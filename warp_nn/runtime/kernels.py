@@ -30,6 +30,7 @@ from warp_nn.runtime._cuda import (
     expand_int4x4_low,
     get_grouped_decode_projection,
     get_prefill_mma_projection,
+    get_q8_grouped_decode_projection,
     get_q8_prefill_mma_projection,
     subgroup_sum,
     warp_max_broadcast,
@@ -228,6 +229,41 @@ def _create_prefill_mma_linear_kernel(dtype: type, tile_m: int, tile_n: int):
 def _get_prefill_mma_linear_kernel(dtype: type, tile_m: int, tile_n: int):
     """Return a cached SM80+ dense projection kernel."""
     return _create_prefill_mma_linear_kernel(dtype, tile_m, tile_n)
+
+
+def _create_q8_grouped_decode_linear_kernel(dtype: type):
+    """Build the signed-Q8 two-output DP4A decode wrapper."""
+    DTYPE = dtype
+    project = get_q8_grouped_decode_projection(dtype)
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(
+        activations: wp.array3d[wp.uint32],
+        activation_scales: wp.array2d[wp.float32],
+        weights: wp.array3d[wp.uint32],
+        weight_scales: wp.array2d[wp.float16],
+        output: wp.array2d(dtype=DTYPE),
+        blocks: int,
+    ):
+        typed_zero = DTYPE(0.0)  # noqa: F841 - retain dtype in the Warp closure
+        wp.static(project)(
+            activations,
+            activation_scales,
+            weights,
+            weight_scales,
+            output,
+            wp.tid(),
+            blocks,
+        )
+
+    kernel.module.options["enable_backward"] = False
+    return kernel
+
+
+@lru_cache(maxsize=None)
+def _get_q8_grouped_decode_linear_kernel(dtype: type):
+    """Return the cached signed-Q8 grouped decode kernel."""
+    return _create_q8_grouped_decode_linear_kernel(dtype)
 
 
 def _create_q8_prefill_mma_linear_kernel(dtype: type, tile_m: int):

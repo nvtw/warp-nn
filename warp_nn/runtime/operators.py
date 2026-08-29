@@ -22,6 +22,7 @@ from warp_nn.runtime.kernels import (
     _get_linear_tiled_kernel,
     _get_prefill_mma_linear_kernel,
     _get_linear_vector_kernel,
+    _get_q8_grouped_decode_linear_kernel,
     _get_q8_prefill_mma_linear_kernel,
     _get_matmul_int8_q8_kernel,
     _get_quantize_activation_int8_kernel,
@@ -74,6 +75,23 @@ def _exec_linear(op, tensors, shapes, device):
             block_dim=32,
             device=device,
         )
+        q8_decode = op.attrs.get("_q8_grouped_decode_kernel")
+        if q8_decode is not None:
+            wp.launch(
+                q8_decode,
+                dim=(op.attrs["_columns"] // 2) * 8,
+                inputs=[
+                    op.attrs["_q8_activation_words"],
+                    op.attrs["_q8_scales"],
+                    weight.words,
+                    weight.scales,
+                    output,
+                    op.attrs["_inner"] // 32,
+                ],
+                block_dim=128,
+                device=device,
+            )
+            return
         q8_mma = op.attrs.get("_q8_mma_kernel")
         if q8_mma is not None:
             wp.launch(
@@ -241,6 +259,15 @@ def plan_linear(
         grouped_blocks = (rows * ((columns + 1) // 2) * 8 + 127) // 128
         outputs_per_group = 2 if grouped_blocks >= 2 * device.sm_count else 1
         op.attrs["_q8_outputs_per_group"] = outputs_per_group
+        if (
+            rows == 1
+            and outputs_per_group == 2
+            and columns % 2 == 0
+            and device.arch >= 61
+        ):
+            op.attrs["_q8_grouped_decode_kernel"] = (
+                _get_q8_grouped_decode_linear_kernel(dtype)
+            )
         op.attrs["_q8_kernel"] = _get_matmul_int8_q8_kernel(
             8, dtype, True, outputs_per_group
         )
