@@ -109,6 +109,64 @@ def test_adamw_bfloat16_sub_ulp_updates_accumulate_in_master_cpu():
     assert parameter.numpy()[0] < 1.0
 
 
+def test_adamw_normalizes_once_by_accumulated_valid_tokens_cpu():
+    parameter = wp.array([0.5, -1.0], dtype=wp.float32, device="cpu")
+    gradient = wp.array([12.0, -6.0], dtype=wp.float32, device="cpu")
+    plan = AdamWPlan(
+        [parameter],
+        [gradient],
+        learning_rate=0.1,
+        beta1=0.0,
+        beta2=0.0,
+        epsilon=1.0,
+        loss_scale=2.0,
+        normalize_by_valid_tokens=True,
+    )
+    plan.accumulate_valid_tokens(wp.array([2], dtype=wp.int32, device="cpu"))
+    plan.accumulate_valid_tokens(wp.array([1], dtype=wp.int32, device="cpu"))
+
+    plan.step()
+
+    normalized_gradient = np.array([2.0, -1.0], dtype=np.float32)
+    expected = np.array([0.5, -1.0], dtype=np.float32) - 0.1 * (
+        normalized_gradient / (np.abs(normalized_gradient) + 1.0)
+    )
+    np.testing.assert_allclose(parameter.numpy(), expected, atol=2.0e-6)
+    np.testing.assert_array_equal(plan.first_moments[0].numpy(), normalized_gradient)
+    np.testing.assert_array_equal(
+        plan.second_moments[0].numpy(), normalized_gradient**2
+    )
+    np.testing.assert_allclose(plan.normalization_multiplier.numpy(), [1.0 / 6.0])
+    np.testing.assert_array_equal(plan.valid_token_count.numpy(), [3])
+    np.testing.assert_array_equal(plan.step_count.numpy(), [1])
+
+    plan.zero_grad()
+    np.testing.assert_array_equal(plan.valid_token_count.numpy(), [0])
+    plan.step()
+    np.testing.assert_array_equal(plan.all_finite.numpy(), [1])
+    np.testing.assert_array_equal(plan.step_enabled.numpy(), [0])
+    np.testing.assert_array_equal(plan.step_count.numpy(), [1])
+
+
+def test_adamw_nonfinite_gradient_skips_all_step_state_cpu():
+    parameter = wp.array([0.5, -1.0], dtype=wp.bfloat16, device="cpu")
+    gradient = wp.array([np.nan, np.inf], dtype=wp.float32, device="cpu")
+    plan = AdamWPlan([parameter], [gradient], learning_rate=0.1)
+    parameter_before = parameter.numpy().copy()
+    master_before = plan.masters[0].numpy().copy()
+    first_before = plan.first_moments[0].numpy().copy()
+    second_before = plan.second_moments[0].numpy().copy()
+
+    plan.step()
+
+    np.testing.assert_array_equal(plan.all_finite.numpy(), [0])
+    np.testing.assert_array_equal(plan.step_count.numpy(), [0])
+    np.testing.assert_array_equal(parameter.numpy(), parameter_before)
+    np.testing.assert_array_equal(plan.masters[0].numpy(), master_before)
+    np.testing.assert_array_equal(plan.first_moments[0].numpy(), first_before)
+    np.testing.assert_array_equal(plan.second_moments[0].numpy(), second_before)
+
+
 def test_adamw_rejects_empty_or_noncontiguous_buffers_cpu():
     empty_parameter = wp.empty(0, dtype=wp.bfloat16, device="cpu")
     empty_gradient = wp.empty(0, dtype=wp.float32, device="cpu")

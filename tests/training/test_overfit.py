@@ -16,7 +16,7 @@ def _array(values, dtype, device):
     return wp.array(np.asarray(values), dtype=dtype, device=device)
 
 
-def _overfit_identity(device, steps):
+def _overfit_identity(device, steps, *, capture=False):
     size = 4
     dtype = wp.bfloat16
     rng = np.random.default_rng(7)
@@ -65,7 +65,8 @@ def _overfit_identity(device, steps):
     linear.forward(x, weight, lora_a, lora_b, scale=1.0)
     cast_to_float32(linear.output, logits)
     initial_loss = float(cross_entropy.forward(logits, targets).numpy()[0])
-    for _ in range(steps):
+
+    def train_step():
         gradient = cross_entropy.backward(logits, targets)
         cast_from_float32(gradient, grad_output)
         linear.backward(x, weight, lora_a, lora_b, grad_output, scale=1.0)
@@ -73,6 +74,22 @@ def _overfit_identity(device, steps):
         linear.forward(x, weight, lora_a, lora_b, scale=1.0)
         cast_to_float32(linear.output, logits)
         cross_entropy.forward(logits, targets)
+
+    if capture:
+        train_step()  # Compile every kernel before capture.
+        wp.synchronize_device(device)
+        wp.capture_begin(device=device)
+        try:
+            train_step()
+            graph = wp.capture_end(device=device)
+        except Exception:
+            wp.capture_end(device=device)
+            raise
+        for _ in range(steps - 1):
+            wp.capture_launch(graph)
+    else:
+        for _ in range(steps):
+            train_step()
 
     final_loss = float(cross_entropy.loss.numpy()[0])
     predictions = np.argmax(logits.numpy(), axis=1)
@@ -104,4 +121,4 @@ CUDA_DEVICES = [device for device in wp.get_devices() if device.is_cuda]
 
 @pytest.mark.skipif(not CUDA_DEVICES, reason="CUDA device required")
 def test_lora_identity_guaranteed_overfit_cuda():
-    _overfit_identity(CUDA_DEVICES[0], steps=80)
+    _overfit_identity(CUDA_DEVICES[0], steps=80, capture=True)

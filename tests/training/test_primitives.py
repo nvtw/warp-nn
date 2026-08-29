@@ -265,3 +265,18 @@ def test_cross_entropy_all_ignored_is_zero():
     np.testing.assert_array_equal(
         plan.backward(logits, targets).numpy(), np.zeros((2, 2), dtype=np.float32)
     )
+
+
+def test_cross_entropy_sum_preserves_mean_compatibility():
+    logits = _array([[2.0, 1.0, -1.0], [0.5, -0.5, 1.5], [4.0, 3.0, 2.0]])
+    targets = _array([0, 2, -100], dtype=wp.int32)
+    plan = CrossEntropyPlan(3, 3, device="cpu")
+
+    mean_loss = plan.forward(logits, targets).numpy().copy()
+    mean_gradient = plan.backward(logits, targets).numpy().copy()
+    sum_loss = plan.forward(logits, targets, reduction="sum").numpy().copy()
+    sum_gradient = plan.backward(logits, targets, reduction="sum").numpy().copy()
+
+    np.testing.assert_allclose(sum_loss, 2.0 * mean_loss, rtol=1.0e-6)
+    np.testing.assert_allclose(sum_gradient, 2.0 * mean_gradient, rtol=1.0e-6)
+    np.testing.assert_array_equal(plan.valid_count.numpy(), [2])

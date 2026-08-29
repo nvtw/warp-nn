@@ -191,6 +191,7 @@ def _cross_entropy_forward_kernel(
 def _cross_entropy_reduce_kernel(
     losses: wp.array1d(dtype=wp.float32),
     valid: wp.array1d(dtype=wp.int32),
+    normalize: bool,
     loss: wp.array1d(dtype=wp.float32),
     valid_count: wp.array1d(dtype=wp.int32),
 ):
@@ -200,10 +201,10 @@ def _cross_entropy_reduce_kernel(
         loss_sum += losses[row]
         count += valid[row]
     valid_count[0] = count
-    if count > 0:
+    if count > 0 and normalize:
         loss[0] = loss_sum / wp.float32(count)
     else:
-        loss[0] = wp.float32(0.0)
+        loss[0] = loss_sum
 
 
 @wp.kernel
@@ -215,6 +216,7 @@ def _cross_entropy_backward_kernel(
     valid_count: wp.array1d(dtype=wp.int32),
     ignore_index: int,
     loss_scale: wp.float32,
+    normalize: bool,
     gradient: wp.array2d(dtype=wp.float32),
 ):
     row, column = wp.tid()
@@ -226,7 +228,8 @@ def _cross_entropy_backward_kernel(
     value = wp.exp(logits[row, column] - maximum[row] - logsumexp[row])
     if column == target:
         value -= wp.float32(1.0)
-    gradient[row, column] = value * loss_scale / wp.float32(count)
+    divisor = wp.float32(count) if normalize else wp.float32(1.0)
+    gradient[row, column] = value * loss_scale / divisor
 
 
 class _FixedPlan:
@@ -452,7 +455,9 @@ class CrossEntropyPlan(_FixedPlan):
     """Stable mean cross-entropy with explicit preallocated backward storage.
 
     ``backward`` uses the log-sum-exp values produced by the latest ``forward``
-    call. Targets must contain class indices or ``ignore_index``.
+    call. Targets must contain class indices or ``ignore_index``. Mean reduction
+    remains the default; sum reduction supports exact cross-microbatch token
+    normalization by :class:`warp_nn.training.optimizer.AdamWPlan`.
     """
 
     def __init__(
@@ -481,8 +486,12 @@ class CrossEntropyPlan(_FixedPlan):
         self._check(logits, (self.rows, self.classes), wp.float32, "logits")
         self._check(targets, (self.rows,), wp.int32, "targets")
 
-    def forward(self, logits: wp.array, targets: wp.array) -> wp.array:
+    def forward(
+        self, logits: wp.array, targets: wp.array, *, reduction: str = "mean"
+    ) -> wp.array:
         self._inputs(logits, targets)
+        if reduction not in ("mean", "sum"):
+            raise ValueError("cross-entropy reduction must be mean or sum")
         wp.launch(
             _cross_entropy_forward_kernel,
             dim=self.rows,
@@ -493,16 +502,23 @@ class CrossEntropyPlan(_FixedPlan):
         wp.launch(
             _cross_entropy_reduce_kernel,
             dim=1,
-            inputs=[self.losses, self.valid],
+            inputs=[self.losses, self.valid, reduction == "mean"],
             outputs=[self.loss, self.valid_count],
             device=self.device,
         )
         return self.loss
 
     def backward(
-        self, logits: wp.array, targets: wp.array, *, loss_scale: float = 1.0
+        self,
+        logits: wp.array,
+        targets: wp.array,
+        *,
+        loss_scale: float = 1.0,
+        reduction: str = "mean",
     ) -> wp.array:
         self._inputs(logits, targets)
+        if reduction not in ("mean", "sum"):
+            raise ValueError("cross-entropy reduction must be mean or sum")
         wp.launch(
             _cross_entropy_backward_kernel,
             dim=(self.rows, self.classes),
@@ -514,6 +530,7 @@ class CrossEntropyPlan(_FixedPlan):
                 self.valid_count,
                 self.ignore_index,
                 loss_scale,
+                reduction == "mean",
             ],
             outputs=[self.gradient],
             device=self.device,

@@ -441,3 +441,45 @@ def test_cuda_adamw_master_and_bfloat16_mirror_graph_replay():
         plan.second_moments[0].ptr,
         plan.step_count.ptr,
     )
+
+
+def test_cuda_adamw_token_normalization_and_nonfinite_graph_replay():
+    device = CUDA_DEVICES[0]
+    parameter = _array([1.0], wp.bfloat16, device)
+    gradient = _array([4.0], wp.float32, device)
+    valid_count = _array([2], wp.int32, device)
+    plan = AdamWPlan(
+        [parameter],
+        [gradient],
+        learning_rate=0.1,
+        beta1=0.0,
+        beta2=0.0,
+        loss_scale=2.0,
+        normalize_by_valid_tokens=True,
+    )
+    plan.accumulate_valid_tokens(valid_count)
+
+    # Warm an independent plan so compilation is not part of capture.
+    warm_parameter = _array([0.0], wp.bfloat16, device)
+    warm_gradient = _array([1.0], wp.float32, device)
+    warm = AdamWPlan([warm_parameter], [warm_gradient])
+    warm.step()
+    wp.synchronize_device(device)
+
+    wp.capture_begin(device=device)
+    try:
+        plan.step()
+        graph = wp.capture_end(device=device)
+    except Exception:
+        wp.capture_end(device=device)
+        raise
+    wp.capture_launch(graph)
+    wp.capture_launch(graph)
+    np.testing.assert_array_equal(plan.step_count.numpy(), [2])
+    np.testing.assert_allclose(plan.masters[0].numpy(), [0.8], atol=2e-7)
+
+    gradient.assign(np.array([np.nan], dtype=np.float32))
+    wp.capture_launch(graph)
+    np.testing.assert_array_equal(plan.step_count.numpy(), [2])
+    np.testing.assert_allclose(plan.masters[0].numpy(), [0.8], atol=2e-7)
+    np.testing.assert_array_equal(plan.all_finite.numpy(), [0])
