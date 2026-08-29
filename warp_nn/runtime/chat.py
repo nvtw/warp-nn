@@ -54,9 +54,9 @@ class ChatEncodingCache:
 
     def __init__(self, tokenizer: Any):
         self.tokenizer = tokenizer
-        self._incremental = callable(getattr(tokenizer, "format_chat", None)) and callable(
-            getattr(tokenizer, "encode", None)
-        )
+        self._incremental = callable(
+            getattr(tokenizer, "format_chat", None)
+        ) and callable(getattr(tokenizer, "encode", None))
         self.reset()
 
     def reset(self) -> None:

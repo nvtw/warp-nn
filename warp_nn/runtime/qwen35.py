@@ -378,9 +378,7 @@ class _Qwen35Plan:
         ]
         self.shapes[last_normalized] = (1, self.runner.hidden_size)
         self.lm_head = self._linear("logits", last_normalized, "lm_head.weight")
-        self.logits = self.tensors["logits"].reshape(
-            (1, 1, self.config["vocab_size"])
-        )
+        self.logits = self.tensors["logits"].reshape((1, 1, self.config["vocab_size"]))
 
     def _build_linear_attention(
         self, layer: dict, index: int, prefix: str, x: str
