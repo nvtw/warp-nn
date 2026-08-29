@@ -65,6 +65,34 @@ def test_linear_operation(device, rows):
     )
 
 
+
+@pytest.mark.parametrize("dtype", [wp.float16, wp.bfloat16])
+def test_linear_operation_uses_m64_when_grid_stays_large(dtype):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    device = wp.get_device("cuda:0")
+    rows, inner, columns = 64, 32, 64 * device.sm_count
+    rng = np.random.default_rng(31)
+    x_np = rng.normal(0.0, 0.2, size=(rows, inner)).astype(np.float32)
+    weight_np = rng.normal(0.0, 0.2, size=(columns, inner)).astype(np.float32)
+    tensors = {
+        "x": wp.array(x_np, dtype=dtype, device=device),
+        "weight": wp.array(weight_np, dtype=dtype, device=device),
+    }
+    shapes = {name: tuple(value.shape) for name, value in tensors.items()}
+    operation = Operation("Linear", ["x", "weight"], ["output"])
+    plan_linear(operation, tensors, shapes, device)
+
+    assert operation.attrs["_tile_shape"] == (64, 32)
+    execute_operations([operation], tensors, shapes, device)
+
+    np.testing.assert_allclose(
+        tensors["output"].numpy(),
+        x_np @ weight_np.T,
+        atol=0.2,
+        rtol=0.02,
+
+    )
 @pytest.mark.parametrize("dtype", [wp.float16, wp.bfloat16])
 def test_grouped_decode_linear_kernel(dtype):
     if not is_device_available("cuda:0"):

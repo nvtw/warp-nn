@@ -220,8 +220,13 @@ def plan_linear(
             op.attrs["_kernel"] = _get_linear_vector_kernel(dtype)
             op.attrs["_vector_kernel"] = True
         else:
+            tile_m = 8 if rows < 16 else 16 if rows < 32 else 32
+            candidate_blocks = (rows + 63) // 64 * ((columns + 31) // 32)
+            if rows >= 64 and candidate_blocks >= 2 * device.sm_count:
+                tile_m = 64
+            tile_k = 128 if tile_m == 16 else 32
             op.attrs["_kernel"], op.attrs["_tile_shape"] = _get_linear_tiled_kernel(
-                dtype, rows
+                dtype, tile_m, tile_k
             )
 
 
