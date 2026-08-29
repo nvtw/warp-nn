@@ -58,11 +58,14 @@ from warp_nn.runtime.safetensors import SafeTensorArchive
 from warp_nn.runtime.rope import resolve_rope_parameters, rotary_cache_values
 from warp_nn.utils.device import parse_device
 
+
 class _PlanMemoryError(MemoryError):
     pass
 
 
-def _cuda_storage_intervals(value, seen: set[int] | None = None) -> list[tuple[int, int]]:
+def _cuda_storage_intervals(
+    value, seen: set[int] | None = None
+) -> list[tuple[int, int]]:
     """Collect CUDA byte ranges reachable through plan storage containers."""
     if seen is None:
         seen = set()
@@ -75,9 +78,7 @@ def _cuda_storage_intervals(value, seen: set[int] | None = None) -> list[tuple[i
             return [(int(value.ptr), int(value.ptr) + int(value.capacity))]
         return []
     if isinstance(value, BlockQuantizedTensor):
-        return _cuda_storage_intervals(
-            (value.values, value.words, value.scales), seen
-        )
+        return _cuda_storage_intervals((value.values, value.words, value.scales), seen)
     if isinstance(value, Operation):
         return _cuda_storage_intervals(value.attrs, seen)
     if isinstance(value, Mapping):
@@ -111,7 +112,6 @@ def _storage_bytes(value, excluded=()) -> int:
     return _union_storage_bytes(intervals + excluded_intervals) - _union_storage_bytes(
         excluded_intervals
     )
-
 
 
 def _weight_names(config: dict) -> list[str]:
@@ -1110,8 +1110,7 @@ class Qwen35Runner:
                 return plan.execute()
             if graph_entry is None and (
                 getattr(plan, "_capture_disabled", False)
-                or self.device.free_memory
-                < getattr(plan, "_owned_storage_bytes", 0)
+                or self.device.free_memory < getattr(plan, "_owned_storage_bytes", 0)
             ):
                 plan._capture_disabled = True
                 return plan.execute()
