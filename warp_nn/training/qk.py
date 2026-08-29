@@ -39,6 +39,7 @@ def _qk_kernels(dtype: type, rotary_dim: int):
         sine: wp.array2d(dtype=DTYPE),
         inverse: wp.array1d(dtype=wp.float32),
         scale: wp.float32,
+        weight_offset: wp.float32,
         output: wp.array4d(dtype=DTYPE),
     ):
         batch, head, token, column = wp.tid()
@@ -46,7 +47,7 @@ def _qk_kernels(dtype: type, rotary_dim: int):
         normalized = (
             wp.float32(x[batch, head, token, column])
             * inverse[row]
-            * wp.float32(weight[column])
+            * (wp.float32(weight[column]) + weight_offset)
             * scale
         )
         if column < ROTARY_DIM:
@@ -57,7 +58,7 @@ def _qk_kernels(dtype: type, rotary_dim: int):
             partner_value = (
                 wp.float32(x[batch, head, token, partner])
                 * inverse[row]
-                * wp.float32(weight[partner])
+                * (wp.float32(weight[partner]) + weight_offset)
                 * scale
             )
             position = positions[batch, token]
@@ -75,6 +76,7 @@ def _qk_kernels(dtype: type, rotary_dim: int):
         sine: wp.array2d(dtype=DTYPE),
         output_grad: wp.array4d(dtype=wp.float32),
         scale: wp.float32,
+        weight_offset: wp.float32,
         normalized_grad: wp.array4d(dtype=wp.float32),
         dot: wp.array1d(dtype=wp.float32),
     ):
@@ -98,7 +100,7 @@ def _qk_kernels(dtype: type, rotary_dim: int):
             dot,
             row,
             gradient
-            * wp.float32(weight[column])
+            * (wp.float32(weight[column]) + weight_offset)
             * wp.float32(x[batch, head, token, column]),
         )
 
@@ -109,6 +111,7 @@ def _qk_kernels(dtype: type, rotary_dim: int):
         inverse: wp.array1d(dtype=wp.float32),
         normalized_grad: wp.array4d(dtype=wp.float32),
         dot: wp.array1d(dtype=wp.float32),
+        weight_offset: wp.float32,
         output: wp.array4d(dtype=wp.float32),
     ):
         batch, head, token, column = wp.tid()
@@ -116,7 +119,7 @@ def _qk_kernels(dtype: type, rotary_dim: int):
         inverse_value = inverse[row]
         output[batch, head, token, column] = normalized_grad[
             batch, head, token, column
-        ] * wp.float32(weight[column]) * inverse_value - wp.float32(
+        ] * (wp.float32(weight[column]) + weight_offset) * inverse_value - wp.float32(
             x[batch, head, token, column]
         ) * inverse_value * inverse_value * inverse_value * dot[row] / wp.float32(
             x.shape[3]
@@ -146,6 +149,7 @@ class QKTransformPlan:
         rotary_dim: int | None = None,
         epsilon: float = 1.0e-6,
         scale: float = 1.0,
+        weight_offset: float = 0.0,
         device=None,
     ):
         if dtype not in (wp.float16, wp.bfloat16):
@@ -158,8 +162,8 @@ class QKTransformPlan:
             raise ValueError("rotary_dim must be even and between zero and head_size")
         if not math.isfinite(epsilon) or epsilon <= 0.0:
             raise ValueError("Q/K epsilon must be finite and positive")
-        if not math.isfinite(scale):
-            raise ValueError("Q/K scale must be finite")
+        if not math.isfinite(scale) or not math.isfinite(weight_offset):
+            raise ValueError("Q/K scale and weight offset must be finite")
         self.device = wp.get_device(device)
         self.shape = (batch, heads, sequence, head_size)
         self.row_shape = (batch * heads * sequence, head_size)
@@ -167,6 +171,7 @@ class QKTransformPlan:
         self.rotary_dim = rotary_dim
         self.epsilon = float(epsilon)
         self.scale = float(scale)
+        self.weight_offset = float(weight_offset)
         self._kernels = _qk_kernels(dtype, rotary_dim)
         rows = self.row_shape[0]
         self.mean_square = wp.empty(rows, dtype=wp.float32, device=self.device)
@@ -235,7 +240,16 @@ class QKTransformPlan:
         wp.launch(
             self._kernels[1],
             dim=self.shape,
-            inputs=[x, weight, positions, cosine, sine, self.inverse_rms, self.scale],
+            inputs=[
+                x,
+                weight,
+                positions,
+                cosine,
+                sine,
+                self.inverse_rms,
+                self.scale,
+                self.weight_offset,
+            ],
             outputs=[self.output],
             device=self.device,
         )
@@ -251,14 +265,30 @@ class QKTransformPlan:
         wp.launch(
             self._kernels[2],
             dim=self.shape,
-            inputs=[x, weight, positions, cosine, sine, output_grad, self.scale],
+            inputs=[
+                x,
+                weight,
+                positions,
+                cosine,
+                sine,
+                output_grad,
+                self.scale,
+                self.weight_offset,
+            ],
             outputs=[self.normalized_grad, self.dot],
             device=self.device,
         )
         wp.launch(
             self._kernels[3],
             dim=self.shape,
-            inputs=[x, weight, self.inverse_rms, self.normalized_grad, self.dot],
+            inputs=[
+                x,
+                weight,
+                self.inverse_rms,
+                self.normalized_grad,
+                self.dot,
+                self.weight_offset,
+            ],
             outputs=[self.input_grad],
             device=self.device,
         )

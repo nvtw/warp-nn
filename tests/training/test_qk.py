@@ -67,6 +67,7 @@ def test_qk_transform_forward_backward_reference_cpu(rotary_dim):
         rotary_dim=rotary_dim,
         epsilon=1.0e-5,
         scale=0.75,
+        weight_offset=0.5,
         device="cpu",
     )
     x = wp.array(x_np, dtype=wp.bfloat16, device="cpu")
@@ -87,7 +88,7 @@ def test_qk_transform_forward_backward_reference_cpu(rotary_dim):
     sine_actual = kwargs["sine"].numpy() if rotary_dim else None
     expected_output, expected_grad = _reference(
         x_actual,
-        weight_actual,
+        weight_actual + 0.5,
         positions_np,
         cosine_actual,
         sine_actual,
