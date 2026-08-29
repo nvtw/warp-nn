@@ -69,9 +69,7 @@ def _attention_group_geometry(
         if rows == 1 or queries_per_kv % candidate == 0:
             heads_per_group = candidate
     rows_per_group = (
-        1
-        if rows < 16
-        else max(1, min(4, 2048 // head_size // heads_per_group))
+        1 if rows < 16 else max(1, min(4, 2048 // head_size // heads_per_group))
     )
     return rows_per_group, heads_per_group
 
