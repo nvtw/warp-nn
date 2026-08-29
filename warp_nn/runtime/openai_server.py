@@ -38,7 +38,11 @@ def _text_content(content: object, param: str) -> str | None:
     if isinstance(content, list):
         text = []
         for part in content:
-            if not isinstance(part, Mapping) or part.get("type") != "text" or not isinstance(part.get("text"), str):
+            if (
+                not isinstance(part, Mapping)
+                or part.get("type") != "text"
+                or not isinstance(part.get("text"), str)
+            ):
                 raise APIError("Only text message content is supported", param=param)
             text.append(part["text"])
         return "".join(text)
@@ -59,9 +63,14 @@ def _messages(value: object) -> list[dict[str, object]]:
         ):
             raise APIError("Invalid message role", param=f"messages.{index}.role")
         item = dict(message)
-        item["content"] = _text_content(item.get("content"), f"messages.{index}.content")
+        item["content"] = _text_content(
+            item.get("content"), f"messages.{index}.content"
+        )
         if item["content"] is None and item["role"] != "assistant":
-            raise APIError("Only assistant messages may have null content", param=f"messages.{index}.content")
+            raise APIError(
+                "Only assistant messages may have null content",
+                param=f"messages.{index}.content",
+            )
         result.append(item)
     return result
 
@@ -98,9 +107,17 @@ class ChatCompletions:
         self._chat_encoder = ChatEncodingCache(tokenizer)
         self._cached_ids: list[int] = []
 
-    def complete(self, request: Mapping[str, object], emit: Callable[[dict[str, object]], None] | None = None):
+    def complete(
+        self,
+        request: Mapping[str, object],
+        emit: Callable[[dict[str, object]], None] | None = None,
+    ):
         if request.get("model") not in (None, self.model):
-            raise APIError(f"Model {request['model']!r} is not available", status=404, param="model")
+            raise APIError(
+                f"Model {request['model']!r} is not available",
+                status=404,
+                param="model",
+            )
         if request.get("n", 1) != 1:
             raise APIError("Only n=1 is supported", param="n")
         if request.get("stop") not in (None, [], ""):
@@ -113,35 +130,68 @@ class ChatCompletions:
             tools = None
         template_kwargs = request.get("chat_template_kwargs") or {}
         if not isinstance(template_kwargs, Mapping):
-            raise APIError("chat_template_kwargs must be an object", param="chat_template_kwargs")
-        enable_thinking = template_kwargs.get("enable_thinking", request.get("enable_thinking", self.enable_thinking))
+            raise APIError(
+                "chat_template_kwargs must be an object", param="chat_template_kwargs"
+            )
+        enable_thinking = template_kwargs.get(
+            "enable_thinking", request.get("enable_thinking", self.enable_thinking)
+        )
         preserve_thinking = template_kwargs.get(
-            "preserve_thinking", request.get("preserve_thinking", self.preserve_thinking)
+            "preserve_thinking",
+            request.get("preserve_thinking", self.preserve_thinking),
         )
         reasoning_effort = request.get("reasoning_effort", self.reasoning_effort)
-        if not isinstance(enable_thinking, bool) or not isinstance(preserve_thinking, bool):
+        if not isinstance(enable_thinking, bool) or not isinstance(
+            preserve_thinking, bool
+        ):
             raise APIError("thinking controls must be boolean")
-        if reasoning_effort is not None and reasoning_effort not in ("low", "medium", "xhigh"):
-            raise APIError("reasoning_effort must be low, medium, or xhigh", param="reasoning_effort")
+        if reasoning_effort is not None and reasoning_effort not in (
+            "low",
+            "medium",
+            "xhigh",
+        ):
+            raise APIError(
+                "reasoning_effort must be low, medium, or xhigh",
+                param="reasoning_effort",
+            )
         try:
             temperature = float(request.get("temperature", self.temperature))
             top_p = float(request.get("top_p", self.top_p))
             top_k = int(request.get("top_k", self.top_k))
-            presence_penalty = float(request.get("presence_penalty", self.presence_penalty))
+            presence_penalty = float(
+                request.get("presence_penalty", self.presence_penalty)
+            )
         except (TypeError, ValueError) as error:
             raise APIError("invalid sampling parameter") from error
-        if temperature < 0.0 or not 0.0 < top_p <= 1.0 or top_k < 0 or not -2.0 <= presence_penalty <= 2.0:
+        if (
+            temperature < 0.0
+            or not 0.0 < top_p <= 1.0
+            or top_k < 0
+            or not -2.0 <= presence_penalty <= 2.0
+        ):
             raise APIError("sampling parameters are outside their supported ranges")
-        max_tokens = request.get("max_completion_tokens", request.get("max_tokens", self.max_new_tokens))
-        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
-            raise APIError("max tokens must be a positive integer", param="max_completion_tokens")
+        max_tokens = request.get(
+            "max_completion_tokens", request.get("max_tokens", self.max_new_tokens)
+        )
+        if (
+            isinstance(max_tokens, bool)
+            or not isinstance(max_tokens, int)
+            or max_tokens <= 0
+        ):
+            raise APIError(
+                "max tokens must be a positive integer", param="max_completion_tokens"
+            )
         max_tokens = min(max_tokens, self.max_new_tokens)
 
         completion_id = "chatcmpl-" + uuid.uuid4().hex
         created = int(time.time())
         generated = []
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
-        stream_filter = self.tokenizer.stream_filter() if hasattr(self.tokenizer, "stream_filter") else None
+        stream_filter = (
+            self.tokenizer.stream_filter()
+            if hasattr(self.tokenizer, "stream_filter")
+            else None
+        )
         tool_marker = self.tokenizer.tool_call_start if tools else None
         pending = ""
         tool_started = bool(tools) and not tool_marker
@@ -157,7 +207,9 @@ class ChatCompletions:
             if tool_started:
                 pending += text
             elif tool_marker:
-                text, pending, tool_started = split_tool_prefix(pending + text, tool_marker)
+                text, pending, tool_started = split_tool_prefix(
+                    pending + text, tool_marker
+                )
                 if text:
                     emit(self._chunk(completion_id, created, {"content": text}))
             else:
@@ -172,7 +224,11 @@ class ChatCompletions:
             before, marker, after = text.partition("</think>")
             if marker:
                 if emit is not None and before:
-                    emit(self._chunk(completion_id, created, {"reasoning_content": before}))
+                    emit(
+                        self._chunk(
+                            completion_id, created, {"reasoning_content": before}
+                        )
+                    )
                 reasoning_pending = ""
                 reasoning_done = True
                 emit_content(after.lstrip())
@@ -183,7 +239,11 @@ class ChatCompletions:
             streamable = text[:-keep] if keep else text
             reasoning_pending = text[-keep:] if keep else ""
             if emit is not None and streamable:
-                emit(self._chunk(completion_id, created, {"reasoning_content": streamable}))
+                emit(
+                    self._chunk(
+                        completion_id, created, {"reasoning_content": streamable}
+                    )
+                )
 
         with self.lock:
             try:
@@ -198,7 +258,11 @@ class ChatCompletions:
                 raise APIError(str(error), param="messages") from error
             available = self.runner.cache_capacity - len(prompt_ids)
             if available <= 0:
-                raise APIError("Prompt exceeds the model context window", status=400, param="messages")
+                raise APIError(
+                    "Prompt exceeds the model context window",
+                    status=400,
+                    param="messages",
+                )
             request_max_tokens = min(max_tokens, available)
             cached_prefix = self._cached_ids
             self._cached_ids = []
@@ -223,13 +287,19 @@ class ChatCompletions:
                 initial_logits=logits,
             ):
                 if emit is not None and not response_started:
-                    emit(self._chunk(completion_id, created, {"role": "assistant", "content": ""}))
+                    emit(
+                        self._chunk(
+                            completion_id, created, {"role": "assistant", "content": ""}
+                        )
+                    )
                     response_started = True
                 generated.append(token_id)
                 if is_eos_token(self.tokenizer, token_id):
                     break
                 text = decoder.decode(
-                    self.tokenizer.token_bytes(token_id, skip_special_tokens=stream_filter is None)
+                    self.tokenizer.token_bytes(
+                        token_id, skip_special_tokens=stream_filter is None
+                    )
                 )
                 if stream_filter:
                     text = stream_filter.feed(text)
@@ -247,10 +317,20 @@ class ChatCompletions:
         emit_text(tail, final=True)
 
         decoded = self.tokenizer.decode(generated, skip_special_tokens=True)
-        text, reasoning = (decoded, None) if stream_filter else split_reasoning(decoded, enable_thinking)
+        text, reasoning = (
+            (decoded, None)
+            if stream_filter
+            else split_reasoning(decoded, enable_thinking)
+        )
         text, tool_calls = self.tokenizer.parse_tool_calls(text)
-        finish_reason = "tool_calls" if tool_calls else (
-            "stop" if generated and is_eos_token(self.tokenizer, generated[-1]) else "length"
+        finish_reason = (
+            "tool_calls"
+            if tool_calls
+            else (
+                "stop"
+                if generated and is_eos_token(self.tokenizer, generated[-1])
+                else "length"
+            )
         )
         message: dict[str, object] = {"role": "assistant", "content": text or None}
         if reasoning is not None:
@@ -263,7 +343,9 @@ class ChatCompletions:
                     "type": "function",
                     "function": {
                         "name": call["name"],
-                        "arguments": json.dumps(call["arguments"], ensure_ascii=False, separators=(",", ":")),
+                        "arguments": json.dumps(
+                            call["arguments"], ensure_ascii=False, separators=(",", ":")
+                        ),
                     },
                 }
                 for call in tool_calls
@@ -276,7 +358,8 @@ class ChatCompletions:
         if emit is not None:
             if tool_calls:
                 stream_calls = [
-                    {"index": index, **tool_call} for index, tool_call in enumerate(message["tool_calls"])
+                    {"index": index, **tool_call}
+                    for index, tool_call in enumerate(message["tool_calls"])
                 ]
                 emit(self._chunk(completion_id, created, {"tool_calls": stream_calls}))
             elif pending:
@@ -287,11 +370,19 @@ class ChatCompletions:
             "object": "chat.completion",
             "created": created,
             "model": self.model,
-            "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+            "choices": [
+                {"index": 0, "message": message, "finish_reason": finish_reason}
+            ],
             "usage": usage,
         }
 
-    def _chunk(self, completion_id: str, created: int, delta: dict[str, object], finish_reason=None):
+    def _chunk(
+        self,
+        completion_id: str,
+        created: int,
+        delta: dict[str, object],
+        finish_reason=None,
+    ):
         return {
             "id": completion_id,
             "object": "chat.completion.chunk",
@@ -323,7 +414,13 @@ class OpenAIRequestHandler(BaseHTTPRequestHandler):
                 200,
                 {
                     "object": "list",
-                    "data": [{"id": self._server.backend.model, "object": "model", "owned_by": "warp-nn"}],
+                    "data": [
+                        {
+                            "id": self._server.backend.model,
+                            "object": "model",
+                            "owned_by": "warp-nn",
+                        }
+                    ],
                 },
             )
         else:
@@ -360,7 +457,10 @@ class OpenAIRequestHandler(BaseHTTPRequestHandler):
                 self._error(APIError("Inference failed", status=500))
 
     def _authorize(self):
-        if self._server.api_key is not None and self.headers.get("Authorization") != f"Bearer {self._server.api_key}":
+        if (
+            self._server.api_key is not None
+            and self.headers.get("Authorization") != f"Bearer {self._server.api_key}"
+        ):
             raise APIError("Invalid API key", status=401)
 
     def _stream(self, request: Mapping[str, object]):
@@ -380,13 +480,22 @@ class OpenAIRequestHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 self._stream_started = True
                 started = True
-            self.wfile.write(b"data: " + json.dumps(chunk, ensure_ascii=False).encode("utf-8") + b"\n\n")
+            self.wfile.write(
+                b"data: "
+                + json.dumps(chunk, ensure_ascii=False).encode("utf-8")
+                + b"\n\n"
+            )
             self.wfile.flush()
 
         response = self._server.backend.complete(request, emit)
         if stream_options.get("include_usage"):
             usage = {**response, "object": "chat.completion.chunk", "choices": []}
-            emit({key: usage[key] for key in ("id", "object", "created", "model", "choices", "usage")})
+            emit(
+                {
+                    key: usage[key]
+                    for key in ("id", "object", "created", "model", "choices", "usage")
+                }
+            )
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
@@ -401,7 +510,14 @@ class OpenAIRequestHandler(BaseHTTPRequestHandler):
     def _error(self, error: APIError):
         self._json(
             error.status,
-            {"error": {"message": str(error), "type": "invalid_request_error", "param": error.param, "code": None}},
+            {
+                "error": {
+                    "message": str(error),
+                    "type": "invalid_request_error",
+                    "param": error.param,
+                    "code": None,
+                }
+            },
         )
 
     def log_message(self, format, *args):

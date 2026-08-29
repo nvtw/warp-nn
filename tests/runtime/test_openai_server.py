@@ -60,7 +60,9 @@ class _CachingRunner(_Runner):
 class _CachingTokenizer(_Tokenizer):
     def encode_chat(self, messages, **kwargs):
         del kwargs
-        return {"first": [9], "continued": [9, 1, 0, 7], "different": [5]}[messages[-1]["content"]]
+        return {"first": [9], "continued": [9, 1, 0, 7], "different": [5]}[
+            messages[-1]["content"]
+        ]
 
 
 class _IncrementalTokenizer(_Tokenizer):
@@ -80,14 +82,18 @@ class _IncrementalTokenizer(_Tokenizer):
             self.max_active = max(self.max_active, self.active)
         if self.delay:
             time.sleep(self.delay)
-        rendered = "".join(f"{message['role']}:{message['content']};" for message in messages)
+        rendered = "".join(
+            f"{message['role']}:{message['content']};" for message in messages
+        )
         with self.state_lock:
             self.active -= 1
         return rendered + "assistant:"
 
     def encode(self, text):
         self.encoded.append(text)
-        return [1 if char == "A" else 0 if char == ";" else ord(char) + 10 for char in text]
+        return [
+            1 if char == "A" else 0 if char == ";" else ord(char) + 10 for char in text
+        ]
 
     def encode_chat(self, messages, **kwargs):
         self.full_calls += 1
@@ -95,7 +101,10 @@ class _IncrementalTokenizer(_Tokenizer):
 
     def decode(self, token_ids, skip_special_tokens=False):
         del skip_special_tokens
-        return "".join("A" if token_id == 1 else ";" if token_id == 0 else "" for token_id in token_ids)
+        return "".join(
+            "A" if token_id == 1 else ";" if token_id == 0 else ""
+            for token_id in token_ids
+        )
 
 
 def _chat(content):
@@ -115,7 +124,10 @@ def _request(server, body, path="/v1/chat/completions"):
 def _serve(text, enable_thinking=False):
     tokenizer = _Tokenizer(text)
     server = OpenAIHTTPServer(
-        ("127.0.0.1", 0), ChatCompletions("warp-qwen", _Runner(), tokenizer, enable_thinking=enable_thinking)
+        ("127.0.0.1", 0),
+        ChatCompletions(
+            "warp-qwen", _Runner(), tokenizer, enable_thinking=enable_thinking
+        ),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -124,7 +136,9 @@ def _serve(text, enable_thinking=False):
 
 def test_chat_completions_reuses_exact_runner_prefix():
     runner = _CachingRunner()
-    completions = ChatCompletions("warp-qwen", runner, _CachingTokenizer("Hi"), max_new_tokens=2)
+    completions = ChatCompletions(
+        "warp-qwen", runner, _CachingTokenizer("Hi"), max_new_tokens=2
+    )
     completions.complete(
         {"model": "warp-qwen", "messages": [{"role": "user", "content": "first"}]}
     )
@@ -211,19 +225,27 @@ def test_chat_completions_streams_text_and_usage():
         server.shutdown()
         server.server_close()
         thread.join()
-    events = [line[6:] for line in body.decode().splitlines() if line.startswith("data: ")]
+    events = [
+        line[6:] for line in body.decode().splitlines() if line.startswith("data: ")
+    ]
     chunks = [json.loads(event) for event in events[:-1]]
     assert content_type == "text/event-stream"
     assert events[-1] == "[DONE]"
     assert chunks[0]["choices"][0]["delta"]["role"] == "assistant"
     assert chunks[1]["choices"][0]["delta"]["content"] == "Hi"
     assert chunks[-1]["choices"] == []
-    assert chunks[-1]["usage"] == {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+    assert chunks[-1]["usage"] == {
+        "prompt_tokens": 1,
+        "completion_tokens": 2,
+        "total_tokens": 3,
+    }
     assert tokenizer.request[0] == [{"role": "user", "content": "Hello"}]
 
 
 def test_chat_completions_separates_reasoning():
-    server, thread, tokenizer = _serve("Reasoning</think>\n\nAnswer", enable_thinking=True)
+    server, thread, tokenizer = _serve(
+        "Reasoning</think>\n\nAnswer", enable_thinking=True
+    )
     try:
         body, _ = _request(
             server,
@@ -231,7 +253,10 @@ def test_chat_completions_separates_reasoning():
                 "model": "warp-qwen",
                 "messages": [{"role": "user", "content": "Think"}],
                 "reasoning_effort": "low",
-                "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": False},
+                "chat_template_kwargs": {
+                    "enable_thinking": True,
+                    "preserve_thinking": False,
+                },
                 "stream": True,
             },
         )
@@ -239,10 +264,14 @@ def test_chat_completions_separates_reasoning():
         server.shutdown()
         server.server_close()
         thread.join()
-    events = [line[6:] for line in body.decode().splitlines() if line.startswith("data: ")][:-1]
+    events = [
+        line[6:] for line in body.decode().splitlines() if line.startswith("data: ")
+    ][:-1]
     chunks = [json.loads(event) for event in events]
     deltas = [chunk["choices"][0]["delta"] for chunk in chunks]
-    assert "".join(delta.get("reasoning_content", "") for delta in deltas) == "Reasoning"
+    assert (
+        "".join(delta.get("reasoning_content", "") for delta in deltas) == "Reasoning"
+    )
     assert "".join(delta.get("content", "") for delta in deltas) == "Answer"
     assert tokenizer.request[1]["enable_thinking"] is True
     assert tokenizer.request[1]["reasoning_effort"] == "low"
@@ -252,7 +281,10 @@ def test_chat_completions_separates_reasoning():
 def test_chat_completions_returns_reasoning():
     server, thread, _ = _serve("Reasoning</think>\n\nAnswer", enable_thinking=True)
     try:
-        body, _ = _request(server, {"model": "warp-qwen", "messages": [{"role": "user", "content": "Think"}]})
+        body, _ = _request(
+            server,
+            {"model": "warp-qwen", "messages": [{"role": "user", "content": "Think"}]},
+        )
     finally:
         server.shutdown()
         server.server_close()
@@ -273,7 +305,9 @@ def test_chat_completions_returns_structured_tool_call():
             {
                 "model": "warp-qwen",
                 "messages": [{"role": "user", "content": "Read it"}],
-                "tools": [{"type": "function", "function": {"name": "read", "parameters": {}}}],
+                "tools": [
+                    {"type": "function", "function": {"name": "read", "parameters": {}}}
+                ],
             },
         )
     finally:
@@ -298,7 +332,9 @@ def test_chat_completions_streams_structured_tool_call():
             {
                 "model": "warp-qwen",
                 "messages": [{"role": "user", "content": "Read it"}],
-                "tools": [{"type": "function", "function": {"name": "read", "parameters": {}}}],
+                "tools": [
+                    {"type": "function", "function": {"name": "read", "parameters": {}}}
+                ],
                 "stream": True,
             },
         )
@@ -306,11 +342,21 @@ def test_chat_completions_streams_structured_tool_call():
         server.shutdown()
         server.server_close()
         thread.join()
-    events = [line[6:] for line in body.decode().splitlines() if line.startswith("data: ")][:-1]
+    events = [
+        line[6:] for line in body.decode().splitlines() if line.startswith("data: ")
+    ][:-1]
     chunks = [json.loads(event) for event in events]
-    assert "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks) == "Checking. "
-    tool_delta = next(chunk for chunk in chunks if chunk["choices"][0]["delta"].get("tool_calls"))
+    assert (
+        "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks)
+        == "Checking. "
+    )
+    tool_delta = next(
+        chunk for chunk in chunks if chunk["choices"][0]["delta"].get("tool_calls")
+    )
     tool_call = tool_delta["choices"][0]["delta"]["tool_calls"][0]
     assert tool_call["index"] == 0
-    assert tool_call["function"] == {"name": "read", "arguments": '{"path":"README.md"}'}
+    assert tool_call["function"] == {
+        "name": "read",
+        "arguments": '{"path":"README.md"}',
+    }
     assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
