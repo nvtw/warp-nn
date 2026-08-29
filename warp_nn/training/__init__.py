@@ -17,6 +17,7 @@ from .checkpoint import LoRACheckpoint, load_lora_safetensors, save_lora_safeten
 from .gqa import GQALoRAAttentionPlan
 from .linear import linear_backward, linear_forward, lora_backward, lora_forward
 from .mlp import LoRASwiGLUPlan
+from .muse import MuseLoRATransformerBlockPlan
 from .optimizer import AdamWPlan
 from .primitives import CrossEntropyPlan, EmbeddingPlan, TransformerPrimitivePlan
 from .qk import QKTransformPlan
@@ -33,6 +34,7 @@ __all__ = [
     "LoRACheckpoint",
     "LoRALinearTrainingPlan",
     "LoRASwiGLUPlan",
+    "MuseLoRATransformerBlockPlan",
     "QKTransformPlan",
     "TransformerPrimitivePlan",
     "accumulate_fp32_gradient",
