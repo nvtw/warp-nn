@@ -96,12 +96,12 @@ def test_linear_operation_uses_m64_when_grid_stays_large(dtype):
 
 
 @pytest.mark.parametrize("dtype", [wp.float16, wp.bfloat16])
-def test_linear_operation_uses_m64n64_for_large_contraction(dtype):
+def test_linear_operation_uses_m64n64_for_one_wave_contraction(dtype):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
     device = wp.get_device("cuda:0")
     rows = 1024
-    columns = inner = 64 * ((2 * device.sm_count + 15) // 16)
+    columns = inner = 64 * ((device.sm_count + 15) // 16)
     tensors = {
         "x": wp.empty((rows, inner), dtype=dtype, device=device),
         "weight": wp.empty((columns, inner), dtype=dtype, device=device),

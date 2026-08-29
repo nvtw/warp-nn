@@ -248,7 +248,7 @@ def plan_linear(
             and rows % 64 == 0
             and columns % 64 == 0
             and columns <= inner
-            and contraction_blocks >= 2 * device.sm_count
+            and contraction_blocks >= device.sm_count
         ):
             mma_geometry = (64, 64, 512)
         elif (
