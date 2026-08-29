@@ -168,6 +168,44 @@ def sample_token(
     )
 
 
+def sample_runner_token(
+    runner: Runner,
+    logits: Any,
+    temperature: float = 1.0,
+    top_k: int = 0,
+    top_p: float = 1.0,
+    presence_penalty: float = 0.0,
+    previous_tokens: Sequence[int] = (),
+    rng: np.random.Generator | None = None,
+) -> int:
+    """Sample through a runner's bounded device path when one is available."""
+    if temperature > 0.0 and (
+        top_k < 0 or not 0.0 < top_p <= 1.0 or not -2.0 <= presence_penalty <= 2.0
+    ):
+        raise ValueError("invalid top_k, top_p, or presence_penalty")
+    if temperature <= 0.0 or (top_k == 1 and presence_penalty == 0.0):
+        return runner.sample_greedy(logits)
+    read_top_k = getattr(runner, "read_top_k", None)
+    if callable(read_top_k) and presence_penalty == 0.0 and 1 < top_k <= 32:
+        values, candidates = read_top_k(logits, top_k)
+        return _sample_candidates(
+            values,
+            candidates,
+            temperature,
+            top_p,
+            rng or np.random.default_rng(),
+        )
+    return sample_token(
+        logits,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        presence_penalty=presence_penalty,
+        previous_tokens=previous_tokens,
+        rng=rng,
+    )
+
+
 def generate_tokens(
     runner: Runner,
     tokenizer: Tokenizer,
@@ -181,30 +219,20 @@ def generate_tokens(
     initial_logits: Any | None = None,
 ) -> Iterator[int]:
     """Generate tokens incrementally through the common stateful runner API."""
-    if temperature > 0.0 and (
-        top_k < 0 or not 0.0 < top_p <= 1.0 or not -2.0 <= presence_penalty <= 2.0
-    ):
-        raise ValueError("invalid top_k, top_p, or presence_penalty")
     logits = runner.prefill(prompt_ids) if initial_logits is None else initial_logits
     generated = []
     rng = np.random.default_rng(seed)
     for _ in range(max_new_tokens):
-        read_top_k = getattr(runner, "read_top_k", None)
-        if temperature <= 0.0 or (top_k == 1 and presence_penalty == 0.0):
-            token_id = runner.sample_greedy(logits)
-        elif callable(read_top_k) and presence_penalty == 0.0 and 1 < top_k <= 32:
-            values, candidates = read_top_k(logits, top_k)
-            token_id = _sample_candidates(values, candidates, temperature, top_p, rng)
-        else:
-            token_id = sample_token(
-                logits,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                presence_penalty=presence_penalty,
-                previous_tokens=generated,
-                rng=rng,
-            )
+        token_id = sample_runner_token(
+            runner,
+            logits,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            presence_penalty=presence_penalty,
+            previous_tokens=generated,
+            rng=rng,
+        )
         generated.append(token_id)
         eos = is_eos_token(tokenizer, token_id)
         next_logits = None if eos else runner.decode(token_id)

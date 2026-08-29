@@ -233,8 +233,16 @@ def test_qwen_tool_template_and_parser(tmp_path):
 
 def test_console_generation_streams_text_and_hides_tool_markup(capsys):
     class Runner:
+        def __init__(self):
+            self.top_k_reads = 0
+
         def sample_greedy(self, logits):
             return logits
+
+        def read_top_k(self, logits, top_k):
+            assert top_k == 2
+            self.top_k_reads += 1
+            return np.array([10.0, -100.0]), np.array([logits, 99])
 
         def decode(self, token_id):
             return {1: 2, 2: 0}[token_id]
@@ -267,6 +275,22 @@ def test_console_generation_streams_text_and_hides_tool_markup(capsys):
     assert cached_ids == [1, 2]
     assert text == "Checking."
     assert calls == [{"name": "read_file", "arguments": {"path": "README.md"}}]
+
+    runner = Runner()
+    cached_ids = []
+    generated, text, calls = _generate(
+        runner,
+        Tokenizer(),
+        1,
+        4,
+        0.01,
+        cached_ids,
+        "<tool_call>",
+        top_k=2,
+        rng=np.random.default_rng(19),
+    )
+    assert generated == [1, 2, 0]
+    assert runner.top_k_reads == 3
 
     cached_ids = []
     generated, text, calls = _generate(

@@ -13,8 +13,13 @@ import threading
 
 import numpy as np
 
-from warp_nn.runtime import create_text_runner, create_tokenizer, sample_token
-from warp_nn.runtime.chat import ChatEncodingCache, is_eos_token, split_tool_prefix
+from warp_nn.runtime import create_text_runner, create_tokenizer
+from warp_nn.runtime.chat import (
+    ChatEncodingCache,
+    is_eos_token,
+    sample_runner_token,
+    split_tool_prefix,
+)
 from warp_nn.runtime.coding_tools import CodingTools
 
 
@@ -91,18 +96,15 @@ def _generate(
     for _ in range(limit):
         if cancelled and cancelled():
             break
-        token_id = (
-            runner.sample_greedy(logits)
-            if temperature <= 0.0
-            else sample_token(
-                logits,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                presence_penalty=presence_penalty,
-                previous_tokens=generated,
-                rng=rng,
-            )
+        token_id = sample_runner_token(
+            runner,
+            logits,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            presence_penalty=presence_penalty,
+            previous_tokens=generated,
+            rng=rng,
         )
         generated.append(token_id)
         if is_eos_token(tokenizer, token_id):
