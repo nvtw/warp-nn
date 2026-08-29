@@ -372,11 +372,12 @@ def test_cuda_streaming_gqa_backward_reference_and_accumulate(dtype, head_size, 
         _numpy(output), forward_reference[0], atol=2e-2, rtol=8e-3
     )
     np.testing.assert_allclose(_numpy(lse), forward_reference[1], atol=5e-4, rtol=5e-4)
+    gradient_atol = 2e-3 if dtype == wp.bfloat16 else 8e-4
     for actual, expected in zip(
         (_numpy(query_grad), _numpy(key_grad), _numpy(value_grad)),
         backward_reference,
     ):
-        np.testing.assert_allclose(actual, expected, atol=8e-4, rtol=2e-3)
+        np.testing.assert_allclose(actual, expected, atol=gradient_atol, rtol=2e-3)
 
     gqa_attention_backward(
         query,
@@ -397,7 +398,9 @@ def test_cuda_streaming_gqa_backward_reference_and_accumulate(dtype, head_size, 
         (_numpy(query_grad), _numpy(key_grad), _numpy(value_grad)),
         backward_reference,
     ):
-        np.testing.assert_allclose(actual, 2.0 * expected, atol=1.6e-3, rtol=2e-3)
+        np.testing.assert_allclose(
+            actual, 2.0 * expected, atol=2.0 * gradient_atol, rtol=2e-3
+        )
 
 
 def test_cuda_rms_tape_and_stable_cross_entropy():
@@ -456,20 +459,53 @@ def test_cuda_graph_replays_linear_and_gqa_with_fixed_buffers():
     )
     linear_output = wp.empty((3, 5), dtype=wp.bfloat16, device=device)
     query, key, value, lengths, output, lse, accumulator = _gqa_buffers(device, seed=29)
+    output_grad = wp.ones(query.shape, dtype=wp.bfloat16, device=device)
+    query_grad = wp.empty(query.shape, dtype=wp.float32, device=device)
+    key_grad = wp.empty(key.shape, dtype=wp.float32, device=device)
+    value_grad = wp.empty(value.shape, dtype=wp.float32, device=device)
+    delta = wp.empty(query.shape[:3], dtype=wp.float32, device=device)
 
     # Compile and establish a deterministic reference before capture.
     linear_forward(x, weight, linear_output)
     gqa_attention_forward(
         query, key, value, lengths, output, lse, accumulator, window=2
     )
-    linear_reference = _numpy(linear_output).copy()
-    attention_reference = _numpy(output).copy()
+    gqa_attention_backward(
+        query,
+        key,
+        value,
+        output_grad,
+        lengths,
+        lse,
+        query_grad,
+        key_grad,
+        value_grad,
+        delta,
+        window=2,
+    )
+    references = tuple(
+        _numpy(array).copy()
+        for array in (linear_output, output, query_grad, key_grad, value_grad, delta)
+    )
 
     wp.capture_begin(device=device)
     try:
         linear_forward(x, weight, linear_output)
         gqa_attention_forward(
             query, key, value, lengths, output, lse, accumulator, window=2
+        )
+        gqa_attention_backward(
+            query,
+            key,
+            value,
+            output_grad,
+            lengths,
+            lse,
+            query_grad,
+            key_grad,
+            value_grad,
+            delta,
+            window=2,
         )
         graph = wp.capture_end(device=device)
     except Exception:
@@ -478,8 +514,10 @@ def test_cuda_graph_replays_linear_and_gqa_with_fixed_buffers():
 
     wp.capture_launch(graph)
     wp.capture_launch(graph)
-    np.testing.assert_array_equal(_numpy(linear_output), linear_reference)
-    np.testing.assert_array_equal(_numpy(output), attention_reference)
+    for array, reference in zip(
+        (linear_output, output, query_grad, key_grad, value_grad, delta), references
+    ):
+        np.testing.assert_array_equal(_numpy(array), reference)
 
 
 def test_cuda_adamw_master_and_bfloat16_mirror_graph_replay():

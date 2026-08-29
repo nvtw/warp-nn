@@ -13,7 +13,11 @@ import math
 
 import warp as wp
 
-from .flash_attention import flash_gqa_forward
+from .flash_attention import (
+    flash_gqa_forward,
+    flash_gqa_key_value_backward,
+    flash_gqa_query_backward,
+)
 
 
 _SUPPORTED_DTYPES = (wp.float16, wp.bfloat16)
@@ -644,10 +648,8 @@ def gqa_attention_backward(
     if query.device.is_cuda:
         kernels = _attention_kernels(query.dtype, head_size)
         block_dim = min(1024, max(32, 1 << (head_size - 1).bit_length()))
-        wp.launch_tiled(
-            kernels[1],
-            dim=batch * query_heads * sequence,
-            inputs=[
+        if head_size % 8 == 0 and head_size <= 128:
+            flash_gqa_query_backward(
                 query,
                 key,
                 value,
@@ -656,17 +658,32 @@ def gqa_attention_backward(
                 lse,
                 delta,
                 query_grad,
-                effective_scale,
-                window,
-                accumulate,
-            ],
-            block_dim=block_dim,
-            device=query.device,
-        )
-        wp.launch_tiled(
-            kernels[2],
-            dim=batch * key.shape[1] * sequence,
-            inputs=[
+                scale=effective_scale,
+                window=window,
+                accumulate=accumulate,
+            )
+        else:
+            wp.launch_tiled(
+                kernels[1],
+                dim=batch * query_heads * sequence,
+                inputs=[
+                    query,
+                    key,
+                    value,
+                    output_grad,
+                    lengths,
+                    lse,
+                    delta,
+                    query_grad,
+                    effective_scale,
+                    window,
+                    accumulate,
+                ],
+                block_dim=block_dim,
+                device=query.device,
+            )
+        if head_size % 8 == 0 and head_size <= 128:
+            flash_gqa_key_value_backward(
                 query,
                 key,
                 value,
@@ -676,13 +693,31 @@ def gqa_attention_backward(
                 delta,
                 key_grad,
                 value_grad,
-                effective_scale,
-                window,
-                accumulate,
-            ],
-            block_dim=block_dim,
-            device=query.device,
-        )
+                scale=effective_scale,
+                window=window,
+                accumulate=accumulate,
+            )
+        else:
+            wp.launch_tiled(
+                kernels[2],
+                dim=batch * key.shape[1] * sequence,
+                inputs=[
+                    query,
+                    key,
+                    value,
+                    output_grad,
+                    lengths,
+                    lse,
+                    delta,
+                    key_grad,
+                    value_grad,
+                    effective_scale,
+                    window,
+                    accumulate,
+                ],
+                block_dim=block_dim,
+                device=query.device,
+            )
         return
 
     kernels = _attention_kernels(query.dtype)
