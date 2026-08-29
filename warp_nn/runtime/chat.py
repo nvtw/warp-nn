@@ -26,9 +26,13 @@ class Tokenizer(Protocol):
         preserve_thinking: bool = True,
     ) -> list[int]: ...
 
-    def decode(self, token_ids: Sequence[int], skip_special_tokens: bool = False) -> str: ...
+    def decode(
+        self, token_ids: Sequence[int], skip_special_tokens: bool = False
+    ) -> str: ...
 
-    def token_bytes(self, token_id: int, skip_special_tokens: bool = False) -> bytes: ...
+    def token_bytes(
+        self, token_id: int, skip_special_tokens: bool = False
+    ) -> bytes: ...
 
     def parse_tool_calls(self, text: str) -> tuple[str, list[dict[str, object]]]: ...
 
@@ -43,8 +47,6 @@ class Runner(Protocol):
     def decode(self, token_id: int) -> Any: ...
 
     def sample_greedy(self, logits: Any) -> int: ...
-
-
 
 
 class ChatEncodingCache:
@@ -84,6 +86,7 @@ class ChatEncodingCache:
         self._token_ids = list(token_ids)
         return list(token_ids)
 
+
 def is_eos_token(tokenizer: Tokenizer, token_id: int) -> bool:
     """Return whether ``token_id`` is any model-declared end token."""
     return token_id in getattr(tokenizer, "eos_token_ids", (tokenizer.eos_token_id,))
@@ -119,7 +122,9 @@ def sample_token(
 ) -> int:
     """Sample one token from the last logits row on the host."""
     values = logits.numpy() if hasattr(logits, "numpy") else np.asarray(logits)
-    values = np.asarray(values, dtype=np.float64).reshape(-1, values.shape[-1])[-1].copy()
+    values = (
+        np.asarray(values, dtype=np.float64).reshape(-1, values.shape[-1])[-1].copy()
+    )
     if temperature <= 0.0:
         return int(np.argmax(values))
     if top_k < 0 or not 0.0 < top_p <= 1.0 or not -2.0 <= presence_penalty <= 2.0:

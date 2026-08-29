@@ -89,16 +89,28 @@ def _write_tiny_muse(path):
         tensors[name] = (dtype, shape, data)
 
     path.mkdir()
-    (path / "config.json").write_text(json.dumps({"model_type": "muse_glimmer", "text_config": config}))
+    (path / "config.json").write_text(
+        json.dumps({"model_type": "muse_glimmer", "text_config": config})
+    )
     write_safetensors(path / "model.safetensors", tensors)
 
 
 def _write_tiny_tokenizer(path):
-    vocabulary = {character: index for index, character in enumerate(_BYTE_ENCODER.values())}
+    vocabulary = {
+        character: index for index, character in enumerate(_BYTE_ENCODER.values())
+    }
     vocabulary.update({piece: len(vocabulary) for piece in ("123", "camel", "Case")})
-    special = ("<|begin_of_text|>", "<|end_of_text|>", "<|eom|>", "<|eot|>", "<|start|>", "<|message|>")
+    special = (
+        "<|begin_of_text|>",
+        "<|end_of_text|>",
+        "<|eom|>",
+        "<|eot|>",
+        "<|start|>",
+        "<|message|>",
+    )
     added_tokens = [
-        {"id": 300 + index, "content": token, "special": True} for index, token in enumerate(special)
+        {"id": 300 + index, "content": token, "special": True}
+        for index, token in enumerate(special)
     ]
     (path / "tokenizer.json").write_text(
         json.dumps(
@@ -116,7 +128,8 @@ def _write_tiny_tokenizer(path):
         encoding="utf-8",
     )
     (path / "tokenizer_config.json").write_text(
-        json.dumps({"eos_token": "<|end_of_text|>", "pad_token": "<|end_of_text|>"}), encoding="utf-8"
+        json.dumps({"eos_token": "<|end_of_text|>", "pad_token": "<|end_of_text|>"}),
+        encoding="utf-8",
     )
     (path / "generation_config.json").write_text(
         json.dumps({"eos_token_id": [301, 303], "pad_token_id": 301}), encoding="utf-8"
@@ -129,7 +142,13 @@ def test_muse_glimmer_30b_metadata_compatibility():
         "intermediate_size": 19968,
         "vocab_size": 202048,
         "num_hidden_layers": 52,
-        "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "full_attention"] * 13,
+        "layer_types": [
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+        ]
+        * 13,
         "layer_rope_theta": [500000.0, 500000.0, 500000.0, 0.0] * 13,
         "num_attention_heads": 32,
         "num_key_value_heads": 2,
@@ -150,7 +169,9 @@ def test_muse_glimmer_30b_metadata_compatibility():
 
 
 def test_muse_tokenizer_chat_and_atem_tools(tmp_path):
-    (tmp_path / "config.json").write_text(json.dumps({"model_type": "muse_glimmer"}), encoding="utf-8")
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "muse_glimmer"}), encoding="utf-8"
+    )
     _write_tiny_tokenizer(tmp_path)
     tokenizer = create_tokenizer(tmp_path)
 
@@ -161,8 +182,15 @@ def test_muse_tokenizer_chat_and_atem_tools(tmp_path):
         tokenizer._vocabulary["camel"],
         tokenizer._vocabulary["Case"],
     ]
-    tools = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]
-    formatted = tokenizer.format_chat([{"role": "user", "content": "Read it"}], tools=tools)
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "read_file", "parameters": {"type": "object"}},
+        }
+    ]
+    formatted = tokenizer.format_chat(
+        [{"role": "user", "content": "Read it"}], tools=tools
+    )
     assert formatted.startswith("<|begin_of_text|><|start|>system<|message|>")
     assert '"name":"read_file"' in formatted
     assert formatted.endswith("<|start|>assistant")
@@ -174,9 +202,13 @@ def test_muse_tokenizer_chat_and_atem_tools(tmp_path):
     text, calls = parse_atem_tool_calls(response)
     assert text == "Checking."
     assert calls == [{"name": "read_file", "arguments": {"path": "README.md"}}]
-    generated = tokenizer.encode(" to=self<|message|>Reason<|eom|><|start|>assistant to=user<|message|>Answer<|eot|>")
+    generated = tokenizer.encode(
+        " to=self<|message|>Reason<|eom|><|start|>assistant to=user<|message|>Answer<|eot|>"
+    )
     assert tokenizer.decode(generated, skip_special_tokens=True) == "Answer"
-    initial = tokenizer.encode_chat([{"role": "user", "content": "Read it"}], tools=tools)
+    initial = tokenizer.encode_chat(
+        [{"role": "user", "content": "Read it"}], tools=tools
+    )
     continued = tokenizer.encode_chat(
         [
             {"role": "user", "content": "Read it"},
@@ -197,16 +229,21 @@ def test_muse_tokenizer_chat_and_atem_tools(tmp_path):
     cache.extend_raw(generated)
     assert cache.encode_chat(history, tools=tools) == continued
 
-
     generated_call = tokenizer.encode(
         ' to=read_file<|message|><atem:function_calls>\n<atem:invoke name="read_file">\n'
         '<atem:parameter name="path">README.md</atem:parameter>\n</atem:invoke>\n</atem:function_calls><|eot|>'
     )
     continued = tokenizer.encode_chat(
-        [{"role": "user", "content": "Read it"}, {"role": "assistant", "_raw_token_ids": generated_call}],
+        [
+            {"role": "user", "content": "Read it"},
+            {"role": "assistant", "_raw_token_ids": generated_call},
+        ],
         tools=tools,
     )
-    assert continued[: len(initial) + len(generated_call) - 1] == initial + generated_call[:-1]
+    assert (
+        continued[: len(initial) + len(generated_call) - 1]
+        == initial + generated_call[:-1]
+    )
 
     tool_history = [
         {"role": "user", "content": "Read it"},
@@ -233,15 +270,16 @@ def test_muse_tokenizer_chat_and_atem_tools(tmp_path):
         tool_history, tools=tools
     )
 
-
-
     stream = _MuseStreamFilter()
     pieces = (
         " to=self<|message|>Reason<|eo",
         "m|><|start|>assistant to=user<|message|>Ans",
         "wer<|eot|>",
     )
-    assert "".join(stream.feed(piece) for piece in pieces) + stream.feed("", final=True) == "Answer"
+    assert (
+        "".join(stream.feed(piece) for piece in pieces) + stream.feed("", final=True)
+        == "Answer"
+    )
 
 
 def test_muse_yarn_context_extension_is_explicit(tmp_path):
@@ -279,7 +317,11 @@ def test_muse_glimmer_prefill_decode_ring_cache_and_graph_replay(tmp_path, use_c
     model_path = tmp_path / "tiny-muse"
     _write_tiny_muse(model_path)
     runner = create_text_runner(
-        model_path, device="cuda:0", cache_capacity=8, prefill_chunk_size=4, use_cublas=use_cublas
+        model_path,
+        device="cuda:0",
+        cache_capacity=8,
+        prefill_chunk_size=4,
+        use_cublas=use_cublas,
     )
     plan = runner._chunk_plan
     assert (

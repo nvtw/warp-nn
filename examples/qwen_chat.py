@@ -85,7 +85,9 @@ def _generate(
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     pending = ""
     tool_started = False
-    stream_filter = tokenizer.stream_filter() if hasattr(tokenizer, "stream_filter") else None
+    stream_filter = (
+        tokenizer.stream_filter() if hasattr(tokenizer, "stream_filter") else None
+    )
     for _ in range(limit):
         if cancelled and cancelled():
             break
@@ -107,7 +109,9 @@ def _generate(
             break
         logits = runner.decode(token_id)
         cached_ids.append(token_id)
-        text = decoder.decode(tokenizer.token_bytes(token_id, skip_special_tokens=stream_filter is None))
+        text = decoder.decode(
+            tokenizer.token_bytes(token_id, skip_special_tokens=stream_filter is None)
+        )
         if stream_filter:
             text = stream_filter.feed(text)
         if tool_started:
@@ -128,7 +132,9 @@ def _generate(
     else:
         print(tail, end="", flush=True)
     response = tokenizer.decode(generated, skip_special_tokens=True)
-    text, calls = tokenizer.parse_tool_calls(response) if tool_marker else (response, [])
+    text, calls = (
+        tokenizer.parse_tool_calls(response) if tool_marker else (response, [])
+    )
     if pending and not calls:
         print(pending, end="", flush=True)
     return generated, text, calls
@@ -140,19 +146,31 @@ def _show_tool_result(result):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("model_dir", type=Path, help="Directory containing a supported ONNX or safetensors model")
+    parser.add_argument(
+        "model_dir",
+        type=Path,
+        help="Directory containing a supported ONNX or safetensors model",
+    )
     parser.add_argument("--system", help="Optional system message")
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--cache-capacity", type=int, default=1024)
     parser.add_argument("--prefill-chunk-size", type=int, default=16)
-    parser.add_argument("--yarn", action="store_true", help="Explicitly extend RoPE to cache capacity with YaRN")
-    parser.add_argument("--yarn-factor", type=float, help="Optional YaRN extension factor")
+    parser.add_argument(
+        "--yarn",
+        action="store_true",
+        help="Explicitly extend RoPE to cache capacity with YaRN",
+    )
+    parser.add_argument(
+        "--yarn-factor", type=float, help="Optional YaRN extension factor"
+    )
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--top-p", type=float)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--presence-penalty", type=float)
     parser.add_argument("--seed", type=int)
-    parser.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--thinking", action=argparse.BooleanOptionalAction, default=None
+    )
     parser.add_argument("--reasoning-effort", choices=("low", "medium", "xhigh"))
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
@@ -161,14 +179,31 @@ def main():
         action="store_true",
         help="Enable file and available sandboxed-shell tools",
     )
-    parser.add_argument("--trusted-folder", type=Path, default=Path.cwd(), help="Root allowed for coding tools")
-    parser.add_argument("--unsafe-shell", action="store_true", help="Allow shell commands without containment")
+    parser.add_argument(
+        "--trusted-folder",
+        type=Path,
+        default=Path.cwd(),
+        help="Root allowed for coding tools",
+    )
+    parser.add_argument(
+        "--unsafe-shell",
+        action="store_true",
+        help="Allow shell commands without containment",
+    )
     args = parser.parse_args()
     tokenizer = create_tokenizer(args.model_dir)
-    thinking = tokenizer.default_enable_thinking if args.thinking is None else args.thinking
-    temperature = args.temperature if args.temperature is not None else (1.0 if thinking else 0.7)
+    thinking = (
+        tokenizer.default_enable_thinking if args.thinking is None else args.thinking
+    )
+    temperature = (
+        args.temperature if args.temperature is not None else (1.0 if thinking else 0.7)
+    )
     top_p = args.top_p if args.top_p is not None else (0.95 if thinking else 0.8)
-    presence_penalty = args.presence_penalty if args.presence_penalty is not None else (0.0 if thinking else 1.5)
+    presence_penalty = (
+        args.presence_penalty
+        if args.presence_penalty is not None
+        else (0.0 if thinking else 1.5)
+    )
     if temperature < 0.0 or not 0.0 < top_p <= 1.0 or args.top_k < 0:
         parser.error("invalid sampling parameters")
     if not -2.0 <= presence_penalty <= 2.0:
@@ -206,17 +241,25 @@ def main():
     if args.unsafe_shell and not args.coding_agent:
         parser.error("--unsafe-shell requires --tools")
     shell = "unsafe" if args.unsafe_shell else "sandbox"
-    coding_tools = CodingTools(args.trusted_folder, shell=shell) if args.coding_agent else None
+    coding_tools = (
+        CodingTools(args.trusted_folder, shell=shell) if args.coding_agent else None
+    )
 
     print("Enter /clear to forget the conversation or /exit to quit.")
     print("Press Esc to stop a response and return to user input.")
-    print("The first response may spend a few minutes compiling Warp kernels with no GPU activity.")
+    print(
+        "The first response may spend a few minutes compiling Warp kernels with no GPU activity."
+    )
     if coding_tools:
         print(f"Coding tools confined to trusted folder {coding_tools.root}.")
         if coding_tools.shell == "unsafe":
-            print("Warning: shell commands are unsandboxed and can modify files outside that folder.")
+            print(
+                "Warning: shell commands are unsandboxed and can modify files outside that folder."
+            )
         elif not coding_tools.shell_available:
-            print("Sandboxed shell unavailable on this host; command execution is disabled.")
+            print(
+                "Sandboxed shell unavailable on this host; command execution is disabled."
+            )
     while True:
         try:
             prompt = input("You: ").strip()
@@ -246,7 +289,9 @@ def main():
                 if len(token_ids) >= args.cache_capacity:
                     if tool_round == 0:
                         messages.pop()
-                    print("The conversation no longer fits in the KV cache; use /clear or a larger --cache-capacity.")
+                    print(
+                        "The conversation no longer fits in the KV cache; use /clear or a larger --cache-capacity."
+                    )
                     break
                 print("Assistant: ", end="", flush=True)
                 if cached_ids and token_ids[: len(cached_ids)] == cached_ids:
@@ -254,7 +299,9 @@ def main():
                 else:
                     logits = runner.prefill(token_ids)
                 cached_ids = list(token_ids)
-                generation_limit = min(args.max_new_tokens, args.cache_capacity - len(token_ids))
+                generation_limit = min(
+                    args.max_new_tokens, args.cache_capacity - len(token_ids)
+                )
                 generated, response, calls = _generate(
                     runner,
                     tokenizer,
@@ -273,12 +320,17 @@ def main():
                 print()
                 if cancel.cancelled.is_set():
                     messages.append(
-                        {"role": "assistant", "content": tokenizer.generation_prefix(thinking) + response}
+                        {
+                            "role": "assistant",
+                            "content": tokenizer.generation_prefix(thinking) + response,
+                        }
                     )
                     print("[Cancelled.]")
                     break
                 if not generated or not is_eos_token(tokenizer, generated[-1]):
-                    print(f"[Stopped at the {generation_limit}-token limit; use --max-new-tokens or /clear.]")
+                    print(
+                        f"[Stopped at the {generation_limit}-token limit; use --max-new-tokens or /clear.]"
+                    )
                 if not calls:
                     history_response = tokenizer.generation_prefix(thinking) + response
                     message = {"role": "assistant", "content": history_response}
@@ -289,7 +341,9 @@ def main():
                 tool_calls = []
                 for index, call in enumerate(calls):
                     call_id = f"call_{tool_round}_{index}"
-                    arguments = json.dumps(call["arguments"], ensure_ascii=False, separators=(",", ":"))
+                    arguments = json.dumps(
+                        call["arguments"], ensure_ascii=False, separators=(",", ":")
+                    )
                     tool_calls.append(
                         {
                             "id": call_id,
@@ -299,25 +353,41 @@ def main():
                     )
                 history_response = tokenizer.generation_prefix(thinking) + response
                 assistant_index = len(messages)
-                message = {"role": "assistant", "content": history_response, "tool_calls": tool_calls}
+                message = {
+                    "role": "assistant",
+                    "content": history_response,
+                    "tool_calls": tool_calls,
+                }
                 if generated and is_eos_token(tokenizer, generated[-1]):
                     message["_raw_token_ids"] = list(generated)
                 messages.append(message)
                 for call, tool_call in zip(calls, tool_calls):
-                    print(f"[tool] {call['name']}({json.dumps(call['arguments'], ensure_ascii=False)})")
+                    print(
+                        f"[tool] {call['name']}({json.dumps(call['arguments'], ensure_ascii=False)})"
+                    )
                     result = coding_tools.execute(
-                        call["name"], call["arguments"], cancelled=cancel.cancelled.is_set
+                        call["name"],
+                        call["arguments"],
+                        cancelled=cancel.cancelled.is_set,
                     )
                     if cancel.cancelled.is_set():
                         del messages[assistant_index:]
                         if response:
-                            messages.append({"role": "assistant", "content": history_response})
+                            messages.append(
+                                {"role": "assistant", "content": history_response}
+                            )
                         cached_ids.clear()
                         chat_encoder.reset()
                         print("[Cancelled.]")
                         break
                     _show_tool_result(result)
-                    messages.append({"role": "tool", "tool_call_id": tool_call["id"], "content": result})
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "content": result,
+                        }
+                    )
                 if cancel.cancelled.is_set():
                     break
                 if tool_round == 7:
