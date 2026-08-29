@@ -8,7 +8,13 @@ import json
 import numpy as np
 
 from tests.utilities import is_device_available, write_safetensors
-from warp_nn.runtime.qwen35 import Qwen35Runner, _validate_config, _weight_names
+from warp_nn.runtime.qwen35 import (
+    Qwen35Runner,
+    _PlanMemoryError,
+    _union_storage_bytes,
+    _validate_config,
+    _weight_names,
+)
 
 
 def _bfloat16_bytes(values: np.ndarray) -> bytes:
@@ -159,6 +165,10 @@ def test_qwen38_text_metadata_compatibility():
         _validate_config(config)
 
 
+def test_union_storage_bytes_deduplicates_overlapping_views():
+    assert _union_storage_bytes([(100, 140), (120, 180), (220, 228)]) == 88
+
+
 @pytest.mark.parametrize("use_cublas", [False, True])
 def test_qwen35_native_prefill_decode_and_graph_replay(tmp_path, use_cublas):
     if not is_device_available("cuda:0"):
@@ -173,6 +183,8 @@ def test_qwen35_native_prefill_decode_and_graph_replay(tmp_path, use_cublas):
         use_cublas=use_cublas,
     )
     plan = runner._chunk_plan
+    assert plan._owned_storage_bytes > 0
+    assert 0 < plan._pool_storage_bytes <= plan._owned_storage_bytes
     assert (
         plan.tensors[plan.layers[0]["mlp_gate"].outputs[0]].ptr
         == plan.tensors[plan.layers[1]["mlp_gate"].outputs[0]].ptr
@@ -208,3 +220,37 @@ def test_qwen35_native_prefill_decode_and_graph_replay(tmp_path, use_cublas):
     sequential = runner.decode(4).numpy()
     assert full_chunk.shape == (1, 1, 16)
     np.testing.assert_allclose(full_chunk, sequential, atol=2.0e-2, rtol=2.0e-2)
+
+
+def test_qwen35_low_memory_tail_falls_back_to_decode(tmp_path, monkeypatch):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    model_path = tmp_path / "tiny-qwen35"
+    _write_tiny_qwen35(model_path)
+    runner = Qwen35Runner(
+        model_path,
+        device="cuda:0",
+        cache_capacity=8,
+        prefill_chunk_size=4,
+        use_cublas=False,
+    )
+    expected = runner.prefill([1, 2, 3]).numpy()
+    runner._chunk_plans = {4: runner._chunk_plan}
+    original = runner._plan_for_rows
+
+    def deny_two_rows(rows):
+        if rows == 2:
+            raise _PlanMemoryError("test headroom denial")
+        return original(rows)
+
+    monkeypatch.setattr(runner, "_plan_for_rows", deny_two_rows)
+    actual = runner.prefill([1, 2, 3]).numpy()
+    np.testing.assert_allclose(actual, expected, atol=2.0e-2, rtol=2.0e-2)
+    assert runner.sequence_length == 3
+    assert set(runner._chunk_plans) == {4}
+    runner._chunk_plan._owned_storage_bytes = runner.device.total_memory
+    warm = runner.prefill([1, 2, 3, 4]).numpy()
+    uncaptured = runner.prefill([1, 2, 3, 4]).numpy()
+    assert runner._chunk_plan._capture_disabled
+    assert not runner._chunk_plan.graphs
+    np.testing.assert_allclose(uncaptured, warm, atol=2.0e-2, rtol=2.0e-2)

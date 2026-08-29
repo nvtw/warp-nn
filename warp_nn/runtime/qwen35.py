@@ -58,6 +58,61 @@ from warp_nn.runtime.safetensors import SafeTensorArchive
 from warp_nn.runtime.rope import resolve_rope_parameters, rotary_cache_values
 from warp_nn.utils.device import parse_device
 
+class _PlanMemoryError(MemoryError):
+    pass
+
+
+def _cuda_storage_intervals(value, seen: set[int] | None = None) -> list[tuple[int, int]]:
+    """Collect CUDA byte ranges reachable through plan storage containers."""
+    if seen is None:
+        seen = set()
+    identity = id(value)
+    if identity in seen:
+        return []
+    seen.add(identity)
+    if isinstance(value, wp.array):
+        if value.device.is_cuda and value.ptr and value.capacity:
+            return [(int(value.ptr), int(value.ptr) + int(value.capacity))]
+        return []
+    if isinstance(value, BlockQuantizedTensor):
+        return _cuda_storage_intervals(
+            (value.values, value.words, value.scales), seen
+        )
+    if isinstance(value, Operation):
+        return _cuda_storage_intervals(value.attrs, seen)
+    if isinstance(value, Mapping):
+        intervals = []
+        for item in value.values():
+            intervals.extend(_cuda_storage_intervals(item, seen))
+        return intervals
+    if isinstance(value, (list, tuple, set)):
+        intervals = []
+        for item in value:
+            intervals.extend(_cuda_storage_intervals(item, seen))
+        return intervals
+    return []
+
+
+def _union_storage_bytes(intervals: list[tuple[int, int]]) -> int:
+    """Return the byte size of overlapping storage ranges counted once."""
+    total = 0
+    end = 0
+    for start, stop in sorted(intervals):
+        if stop <= end:
+            continue
+        total += stop - max(start, end)
+        end = stop
+    return total
+
+
+def _storage_bytes(value, excluded=()) -> int:
+    intervals = _cuda_storage_intervals(value)
+    excluded_intervals = _cuda_storage_intervals(excluded)
+    return _union_storage_bytes(intervals + excluded_intervals) - _union_storage_bytes(
+        excluded_intervals
+    )
+
+
 
 def _weight_names(config: dict) -> list[str]:
     names = [
@@ -969,6 +1024,8 @@ class Qwen35Runner:
         self._decode_plan = _Qwen35Plan(self, 1)
         self._chunk_plan = _Qwen35Plan(self, self.prefill_chunk_size)
         self._chunk_plan._capture_ready = False
+        self._record_plan_storage(self._decode_plan)
+        self._record_plan_storage(self._chunk_plan)
         self._sample_partial_values = wp.empty(
             128, dtype=wp.float32, device=self.device
         )
@@ -980,6 +1037,52 @@ class Qwen35Runner:
         self._sampled_token_host_view = self._sampled_token_host.numpy()
         self._greedy_argmax_kernels = _get_greedy_argmax_kernels(1024, 128, self.dtype)
         self.sequence_length = 0
+
+    def _record_plan_storage(self, plan) -> None:
+        if not self.device.is_cuda:
+            plan._owned_storage_bytes = 0
+            plan._pool_storage_bytes = 0
+            return
+        persistent = (
+            self.weights,
+            getattr(self, "kv_caches", None),
+            getattr(self, "conv_states", None),
+            getattr(self, "recurrent_states", None),
+            getattr(self, "cos_cache", None),
+            getattr(self, "sin_cache", None),
+            getattr(self, "sequence_end", None),
+            getattr(self, "unit_scales", None),
+            getattr(self, "zero_bias", None),
+        )
+        values = {
+            name: value
+            for name, value in vars(plan).items()
+            if name not in {"runner", "graph", "graphs"}
+            and not name.endswith("_storage_bytes")
+        }
+        plan._owned_storage_bytes = _storage_bytes(values, persistent)
+        plan._pool_storage_bytes = _storage_bytes(
+            getattr(plan, "_layer_buffer_pool", {}), persistent
+        )
+
+    def _lazy_plan_allocation_bound(self) -> int:
+        if not hasattr(self._chunk_plan, "_owned_storage_bytes"):
+            self._record_plan_storage(self._chunk_plan)
+        return self._chunk_plan._owned_storage_bytes + (
+            self._chunk_plan._pool_storage_bytes
+        )
+
+    def _require_lazy_plan_headroom(self, rows: int) -> None:
+        if not self.device.is_cuda:
+            return
+        required = self._lazy_plan_allocation_bound()
+        free = self.device.free_memory
+        if free < required:
+            raise _PlanMemoryError(
+                f"Cannot allocate a {rows}-row inference plan: "
+                f"{required / 2**20:.1f} MiB of shape-derived headroom is required, "
+                f"but only {free / 2**20:.1f} MiB is free"
+            )
 
     def reset(self) -> None:
         """Clear recurrent state while retaining all preallocated buffers."""
@@ -1004,6 +1107,13 @@ class Qwen35Runner:
                     return plan.execute()
             if graph_entry is None and not getattr(plan, "_capture_ready", True):
                 plan._capture_ready = True
+                return plan.execute()
+            if graph_entry is None and (
+                getattr(plan, "_capture_disabled", False)
+                or self.device.free_memory
+                < getattr(plan, "_owned_storage_bytes", 0)
+            ):
+                plan._capture_disabled = True
                 return plan.execute()
             if graph_entry is None:
                 wp.capture_begin(device=self.device)
@@ -1046,8 +1156,10 @@ class Qwen35Runner:
             plans = self._chunk_plans = {self.prefill_chunk_size: self._chunk_plan}
         plan = plans.get(rows)
         if plan is None:
+            self._require_lazy_plan_headroom(rows)
             plan = plans[rows] = type(self._chunk_plan)(self, rows)
             plan._capture_ready = False
+            self._record_plan_storage(plan)
         return plan
 
     def _stage_many(self, token_ids: Sequence[int]) -> wp.array:
@@ -1074,14 +1186,39 @@ class Qwen35Runner:
         if self.sequence_length + len(token_ids) > self.cache_capacity:
             raise ValueError("Qwen35Runner token sequence exceeds cache_capacity")
         logits = None
+        denied_rows = set()
         start = 0
         while start < len(token_ids):
             remaining = len(token_ids) - start
             rows = min(self.prefill_chunk_size, 1 << (remaining.bit_length() - 1))
+            if rows in denied_rows:
+                rows = max(
+                    (
+                        existing
+                        for existing in getattr(self, "_chunk_plans", {})
+                        if existing <= remaining
+                    ),
+                    default=1,
+                )
             if rows == 1:
                 logits = self._stage_one(int(token_ids[start]))
             else:
-                logits = self._stage_many(token_ids[start : start + rows])
+                try:
+                    logits = self._stage_many(token_ids[start : start + rows])
+                except _PlanMemoryError:
+                    denied_rows.add(rows)
+                    rows = max(
+                        (
+                            existing
+                            for existing in getattr(self, "_chunk_plans", {})
+                            if existing < rows
+                        ),
+                        default=1,
+                    )
+                    if rows == 1:
+                        logits = self._stage_one(int(token_ids[start]))
+                    else:
+                        logits = self._stage_many(token_ids[start : start + rows])
             start += rows
         return logits
 

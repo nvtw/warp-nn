@@ -324,6 +324,8 @@ def test_muse_glimmer_prefill_decode_ring_cache_and_graph_replay(tmp_path, use_c
         use_cublas=use_cublas,
     )
     plan = runner._chunk_plan
+    assert plan._owned_storage_bytes > 0
+    assert 0 < plan._pool_storage_bytes <= plan._owned_storage_bytes
     assert (
         plan.tensors[plan.layers[0]["mlp_gate"].outputs[0]].ptr
         == plan.tensors[plan.layers[1]["mlp_gate"].outputs[0]].ptr

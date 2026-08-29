@@ -1143,6 +1143,8 @@ class MuseGlimmerRunner(Qwen35Runner):
         self._decode_plan = _MusePlan(self, 1)
         self._chunk_plan = _MusePlan(self, self.prefill_chunk_size)
         self._chunk_plan._capture_ready = False
+        self._record_plan_storage(self._decode_plan)
+        self._record_plan_storage(self._chunk_plan)
         self._sample_partial_values = wp.empty(
             128, dtype=wp.float32, device=self.device
         )
