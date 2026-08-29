@@ -393,42 +393,79 @@ _Q8_PREFILL_MMA_64X32_PROJECTION = r"""
     const int local_row_1 = local_row_0 + 8;
     const int local_column_0 = (warp_column << 3) + (thread_in_group << 1);
     const int local_column_1 = local_column_0 + 1;
+    constexpr int VALUE_STAGE = 64 * 32 + 32 * 32;
     float total_0 = 0.0f, total_1 = 0.0f;
     float total_2 = 0.0f, total_3 = 0.0f;
-    __shared__ __align__(16) signed char values[64 * 32 + 32 * 32];
-    __shared__ float activation_scale_tile[64];
-    __shared__ wp::float16 weight_scale_tile[32];
+    __shared__ __align__(16) signed char values[2 * VALUE_STAGE];
+    __shared__ float activation_scale_tile[2 * 64];
+    __shared__ wp::float16 weight_scale_tile[2 * 32];
 
-    for (int k_block = 0; k_block < blocks; ++k_block) {
-        const int copy = threadIdx.x;
-        if (copy < 128) {
-            const int row = copy >> 1;
-            const int segment = copy & 1;
-            *reinterpret_cast<uint4*>(values + row * 32 + segment * 16) =
-                *reinterpret_cast<const uint4*>(activations.data +
-                    (row_base + row) * (blocks << 5) + (k_block << 5) + segment * 16);
-        } else if (copy < 192) {
-            const int weight_copy = copy - 128;
-            const int row = weight_copy >> 1;
-            const int segment = weight_copy & 1;
-            *reinterpret_cast<uint4*>(values + 64 * 32 + row * 32 + segment * 16) =
-                *reinterpret_cast<const uint4*>(weights.data +
-                    (column_tile + row) * (blocks << 5) + (k_block << 5) + segment * 16);
+    const int copy = threadIdx.x;
+    if (copy < 128) {
+        const int row = copy >> 1;
+        const int segment = copy & 1;
+        signed char* dst = values + row * 32 + segment * 16;
+        const signed char* src = activations.data +
+            (row_base + row) * (blocks << 5) + segment * 16;
+        const unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
+    } else if (copy < 192) {
+        const int weight_copy = copy - 128;
+        const int row = weight_copy >> 1;
+        const int segment = weight_copy & 1;
+        signed char* dst = values + 64 * 32 + row * 32 + segment * 16;
+        const signed char* src = weights.data +
+            (column_tile + row) * (blocks << 5) + segment * 16;
+        const unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
+    }
+    if (copy < 64)
+        activation_scale_tile[copy] = activation_scales.data[(row_base + copy) * blocks];
+    if (copy >= 64 && copy < 96)
+        weight_scale_tile[copy - 64] = weight_scales.data[(column_tile + copy - 64) * blocks];
+    asm volatile("cp.async.commit_group;");
+    asm volatile("cp.async.wait_group 0;");
+    __syncthreads();
+
+    for (int k_block = 0, stage = 0; k_block < blocks; ++k_block, stage ^= 1) {
+        if (k_block + 1 < blocks) {
+            signed char* next = values + (stage ^ 1) * VALUE_STAGE;
+            if (copy < 128) {
+                const int row = copy >> 1;
+                const int segment = copy & 1;
+                signed char* dst = next + row * 32 + segment * 16;
+                const signed char* src = activations.data +
+                    (row_base + row) * (blocks << 5) + ((k_block + 1) << 5) + segment * 16;
+                const unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
+            } else if (copy < 192) {
+                const int weight_copy = copy - 128;
+                const int row = weight_copy >> 1;
+                const int segment = weight_copy & 1;
+                signed char* dst = next + 64 * 32 + row * 32 + segment * 16;
+                const signed char* src = weights.data +
+                    (column_tile + row) * (blocks << 5) + ((k_block + 1) << 5) + segment * 16;
+                const unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
+            }
+            if (copy < 64)
+                activation_scale_tile[(stage ^ 1) * 64 + copy] =
+                    activation_scales.data[(row_base + copy) * blocks + k_block + 1];
+            if (copy >= 64 && copy < 96)
+                weight_scale_tile[(stage ^ 1) * 32 + copy - 64] =
+                    weight_scales.data[(column_tile + copy - 64) * blocks + k_block + 1];
+            asm volatile("cp.async.commit_group;");
         }
-        if (copy < 64)
-            activation_scale_tile[copy] = activation_scales.data[(row_base + copy) * blocks + k_block];
-        if (copy >= 64 && copy < 96)
-            weight_scale_tile[copy - 64] = weight_scales.data[(column_tile + copy - 64) * blocks + k_block];
-        __syncthreads();
 
+        signed char* current = values + stage * VALUE_STAGE;
         const int fragment = thread_in_group << 2;
-        const signed char* a_row_0 = values + local_row_0 * 32;
-        const signed char* a_row_1 = values + local_row_1 * 32;
+        const signed char* a_row_0 = current + local_row_0 * 32;
+        const signed char* a_row_1 = current + local_row_1 * 32;
         const unsigned a0 = *reinterpret_cast<const unsigned*>(a_row_0 + fragment);
         const unsigned a1 = *reinterpret_cast<const unsigned*>(a_row_1 + fragment);
         const unsigned a2 = *reinterpret_cast<const unsigned*>(a_row_0 + fragment + 16);
         const unsigned a3 = *reinterpret_cast<const unsigned*>(a_row_1 + fragment + 16);
-        const signed char* b_row = values + 64 * 32 + ((warp_column << 3) + group) * 32;
+        const signed char* b_row = current + 64 * 32 + ((warp_column << 3) + group) * 32;
         const unsigned b0 = *reinterpret_cast<const unsigned*>(b_row + fragment);
         const unsigned b1 = *reinterpret_cast<const unsigned*>(b_row + fragment + 16);
         int d0, d1, d2, d3;
@@ -439,15 +476,20 @@ _Q8_PREFILL_MMA_64X32_PROJECTION = r"""
             : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
               "r"(zero), "r"(zero), "r"(zero), "r"(zero));
-        const float activation_scale_0 = activation_scale_tile[local_row_0];
-        const float activation_scale_1 = activation_scale_tile[local_row_1];
-        const float weight_scale_0 = static_cast<float>(weight_scale_tile[local_column_0]);
-        const float weight_scale_1 = static_cast<float>(weight_scale_tile[local_column_1]);
+        const float activation_scale_0 = activation_scale_tile[stage * 64 + local_row_0];
+        const float activation_scale_1 = activation_scale_tile[stage * 64 + local_row_1];
+        const float weight_scale_0 = static_cast<float>(
+            weight_scale_tile[stage * 32 + local_column_0]);
+        const float weight_scale_1 = static_cast<float>(
+            weight_scale_tile[stage * 32 + local_column_1]);
         total_0 += static_cast<float>(d0) * activation_scale_0 * weight_scale_0;
         total_1 += static_cast<float>(d1) * activation_scale_0 * weight_scale_1;
         total_2 += static_cast<float>(d2) * activation_scale_1 * weight_scale_0;
         total_3 += static_cast<float>(d3) * activation_scale_1 * weight_scale_1;
-        __syncthreads();
+        if (k_block + 1 < blocks) {
+            asm volatile("cp.async.wait_group 0;");
+            __syncthreads();
+        }
     }
     const int row_0 = row_base + local_row_0;
     const int row_1 = row_base + local_row_1;

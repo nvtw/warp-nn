@@ -226,7 +226,13 @@ def plan_linear(
             and quantized.ptr % 4 == 0
             and weight.values.ptr % 4 == 0
         ):
-            tile_m = 64 if rows % 64 == 0 else 16
+            tile_m = (
+                64
+                if rows % 64 == 0
+                and quantized.ptr % 16 == 0
+                and weight.values.ptr % 16 == 0
+                else 16
+            )
             op.attrs["_q8_mma_tile_m"] = tile_m
             op.attrs["_q8_mma_kernel"] = _get_q8_prefill_mma_linear_kernel(
                 dtype, tile_m

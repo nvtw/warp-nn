@@ -244,13 +244,21 @@ def test_decode_attention_partitions_follow_head_geometry(head_size, partitions)
 
 @pytest.mark.parametrize("dtype", [wp.float16, wp.bfloat16])
 @pytest.mark.parametrize(
-    "rows,columns", [(1, 40), (3, 40), (32, 40), (16, 64), (64, 64)]
+    "rows,columns,inner",
+    [
+        (1, 40, 64),
+        (3, 40, 64),
+        (32, 40, 64),
+        (16, 64, 64),
+        (64, 64, 32),
+        (64, 64, 64),
+        (64, 64, 96),
+    ],
 )
-def test_q8_0_linear_operation(rows, columns, dtype):
+def test_q8_0_linear_operation(rows, columns, inner, dtype):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
     rng = np.random.default_rng(23)
-    inner = 64
     blocks = inner // 32
     x_np = rng.normal(0.0, 0.5, (rows, inner)).astype(np.float32)
     weight_values = rng.integers(-127, 128, (columns, blocks, 32), dtype=np.int8)
