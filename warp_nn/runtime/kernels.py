@@ -230,10 +230,10 @@ def _get_prefill_mma_linear_kernel(dtype: type, tile_m: int, tile_n: int):
     return _create_prefill_mma_linear_kernel(dtype, tile_m, tile_n)
 
 
-def _create_q8_prefill_mma_linear_kernel(dtype: type):
-    """Build the shared 16x32 signed-INT8 tensor-core projection wrapper."""
+def _create_q8_prefill_mma_linear_kernel(dtype: type, tile_m: int):
+    """Build a shared signed-INT8 tensor-core projection wrapper."""
     DTYPE = dtype
-    project = get_q8_prefill_mma_projection(dtype)
+    project = get_q8_prefill_mma_projection(dtype, tile_m)
 
     @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
     def kernel(
@@ -262,9 +262,9 @@ def _create_q8_prefill_mma_linear_kernel(dtype: type):
 
 
 @lru_cache(maxsize=None)
-def _get_q8_prefill_mma_linear_kernel(dtype: type):
-    """Return the cached 16x32 signed-INT8 tensor-core projection kernel."""
-    return _create_q8_prefill_mma_linear_kernel(dtype)
+def _get_q8_prefill_mma_linear_kernel(dtype: type, tile_m: int):
+    """Return a cached signed-INT8 tensor-core projection kernel."""
+    return _create_q8_prefill_mma_linear_kernel(dtype, tile_m)
 
 
 def _create_linear_tiled_kernel(dtype: type, tile_m: int, tile_k: int):

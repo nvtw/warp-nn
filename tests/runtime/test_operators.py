@@ -243,7 +243,9 @@ def test_decode_attention_partitions_follow_head_geometry(head_size, partitions)
 
 
 @pytest.mark.parametrize("dtype", [wp.float16, wp.bfloat16])
-@pytest.mark.parametrize("rows,columns", [(1, 40), (3, 40), (32, 40), (16, 64)])
+@pytest.mark.parametrize(
+    "rows,columns", [(1, 40), (3, 40), (32, 40), (16, 64), (64, 64)]
+)
 def test_q8_0_linear_operation(rows, columns, dtype):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
@@ -279,7 +281,10 @@ def test_q8_0_linear_operation(rows, columns, dtype):
     reshaped = x_bf16.reshape(rows, blocks, 32)
     activation_scales = np.max(np.abs(reshaped), axis=2, keepdims=True) / 127.0
     activation_scales[activation_scales == 0.0] = 1.0
-    assert ("_q8_mma_kernel" in operation.attrs) == (rows == 16 and columns == 64)
+    uses_mma = rows in (16, 64) and columns == 64
+    assert ("_q8_mma_kernel" in operation.attrs) == uses_mma
+    if uses_mma:
+        assert operation.attrs["_q8_mma_tile_m"] == rows
 
     x_bf16 = (
         np.clip(np.rint(reshaped / activation_scales), -127, 127) * activation_scales

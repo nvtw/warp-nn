@@ -78,7 +78,13 @@ def _exec_linear(op, tensors, shapes, device):
         if q8_mma is not None:
             wp.launch(
                 q8_mma,
-                dim=(op.attrs["_rows"] // 16) * (op.attrs["_columns"] // 32) * 128,
+                dim=(
+                    op.attrs["_rows"]
+                    // op.attrs["_q8_mma_tile_m"]
+                    * (op.attrs["_columns"] // 32)
+                    * op.attrs["_q8_mma_tile_m"]
+                    * 8
+                ),
                 inputs=[
                     op.attrs["_q8_activations"],
                     op.attrs["_q8_scales"],
@@ -88,7 +94,7 @@ def _exec_linear(op, tensors, shapes, device):
                     op.attrs["_columns"],
                     op.attrs["_inner"] // 32,
                 ],
-                block_dim=128,
+                block_dim=op.attrs["_q8_mma_tile_m"] * 8,
                 device=device,
             )
             return
@@ -220,7 +226,11 @@ def plan_linear(
             and quantized.ptr % 4 == 0
             and weight.values.ptr % 4 == 0
         ):
-            op.attrs["_q8_mma_kernel"] = _get_q8_prefill_mma_linear_kernel(dtype)
+            tile_m = 64 if rows % 64 == 0 else 16
+            op.attrs["_q8_mma_tile_m"] = tile_m
+            op.attrs["_q8_mma_kernel"] = _get_q8_prefill_mma_linear_kernel(
+                dtype, tile_m
+            )
         # Share activation loads only when halving the grid retains two CTAs per SM.
         grouped_blocks = (rows * ((columns + 1) // 2) * 8 + 127) // 128
         outputs_per_group = 2 if grouped_blocks >= 2 * device.sm_count else 1

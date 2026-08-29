@@ -322,7 +322,7 @@ def get_prefill_mma_projection(dtype: type, tile_m: int, tile_n: int):
     return project
 
 
-_Q8_PREFILL_MMA_PROJECTION = r"""
+_Q8_PREFILL_MMA_16X32_PROJECTION = r"""
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -377,8 +377,92 @@ _Q8_PREFILL_MMA_PROJECTION = r"""
 """
 
 
+_Q8_PREFILL_MMA_64X32_PROJECTION = r"""
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int block = tid >> 9;
+    const int row_tiles = output.shape.dims[0] >> 6;
+    const int row_base = (block % row_tiles) << 6;
+    const int column_tile = (block / row_tiles) << 5;
+    const int warp_row = warp >> 2;
+    const int warp_column = warp & 3;
+    const int group = lane >> 2;
+    const int thread_in_group = lane & 3;
+    const int local_row_0 = (warp_row << 4) + group;
+    const int local_row_1 = local_row_0 + 8;
+    const int local_column_0 = (warp_column << 3) + (thread_in_group << 1);
+    const int local_column_1 = local_column_0 + 1;
+    float total_0 = 0.0f, total_1 = 0.0f;
+    float total_2 = 0.0f, total_3 = 0.0f;
+    __shared__ __align__(16) signed char values[64 * 32 + 32 * 32];
+    __shared__ float activation_scale_tile[64];
+    __shared__ wp::float16 weight_scale_tile[32];
+
+    for (int k_block = 0; k_block < blocks; ++k_block) {
+        const int copy = threadIdx.x;
+        if (copy < 128) {
+            const int row = copy >> 1;
+            const int segment = copy & 1;
+            *reinterpret_cast<uint4*>(values + row * 32 + segment * 16) =
+                *reinterpret_cast<const uint4*>(activations.data +
+                    (row_base + row) * (blocks << 5) + (k_block << 5) + segment * 16);
+        } else if (copy < 192) {
+            const int weight_copy = copy - 128;
+            const int row = weight_copy >> 1;
+            const int segment = weight_copy & 1;
+            *reinterpret_cast<uint4*>(values + 64 * 32 + row * 32 + segment * 16) =
+                *reinterpret_cast<const uint4*>(weights.data +
+                    (column_tile + row) * (blocks << 5) + (k_block << 5) + segment * 16);
+        }
+        if (copy < 64)
+            activation_scale_tile[copy] = activation_scales.data[(row_base + copy) * blocks + k_block];
+        if (copy >= 64 && copy < 96)
+            weight_scale_tile[copy - 64] = weight_scales.data[(column_tile + copy - 64) * blocks + k_block];
+        __syncthreads();
+
+        const int fragment = thread_in_group << 2;
+        const signed char* a_row_0 = values + local_row_0 * 32;
+        const signed char* a_row_1 = values + local_row_1 * 32;
+        const unsigned a0 = *reinterpret_cast<const unsigned*>(a_row_0 + fragment);
+        const unsigned a1 = *reinterpret_cast<const unsigned*>(a_row_1 + fragment);
+        const unsigned a2 = *reinterpret_cast<const unsigned*>(a_row_0 + fragment + 16);
+        const unsigned a3 = *reinterpret_cast<const unsigned*>(a_row_1 + fragment + 16);
+        const signed char* b_row = values + 64 * 32 + ((warp_column << 3) + group) * 32;
+        const unsigned b0 = *reinterpret_cast<const unsigned*>(b_row + fragment);
+        const unsigned b1 = *reinterpret_cast<const unsigned*>(b_row + fragment + 16);
+        int d0, d1, d2, d3;
+        const int zero = 0;
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+            : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+              "r"(zero), "r"(zero), "r"(zero), "r"(zero));
+        const float activation_scale_0 = activation_scale_tile[local_row_0];
+        const float activation_scale_1 = activation_scale_tile[local_row_1];
+        const float weight_scale_0 = static_cast<float>(weight_scale_tile[local_column_0]);
+        const float weight_scale_1 = static_cast<float>(weight_scale_tile[local_column_1]);
+        total_0 += static_cast<float>(d0) * activation_scale_0 * weight_scale_0;
+        total_1 += static_cast<float>(d1) * activation_scale_0 * weight_scale_1;
+        total_2 += static_cast<float>(d2) * activation_scale_1 * weight_scale_0;
+        total_3 += static_cast<float>(d3) * activation_scale_1 * weight_scale_1;
+        __syncthreads();
+    }
+    const int row_0 = row_base + local_row_0;
+    const int row_1 = row_base + local_row_1;
+    const int column_0 = column_tile + local_column_0;
+    const int column_1 = column_0 + 1;
+    output.data[row_0 * columns + column_0] = NATIVE_TYPE(total_0);
+    output.data[row_0 * columns + column_1] = NATIVE_TYPE(total_1);
+    output.data[row_1 * columns + column_0] = NATIVE_TYPE(total_2);
+    output.data[row_1 * columns + column_1] = NATIVE_TYPE(total_3);
+#endif
+"""
+
+
 @lru_cache(maxsize=None)
-def get_q8_prefill_mma_projection(dtype: type):
+def get_q8_prefill_mma_projection(dtype: type, tile_m: int):
     """Return an SM80+ block-Q8 projection using signed INT8 tensor cores."""
     if dtype == wp.float16:
         native_type = "wp::float16"
@@ -386,7 +470,14 @@ def get_q8_prefill_mma_projection(dtype: type):
         native_type = "wp::bfloat16"
     else:
         raise TypeError("Q8 prefill MMA projection requires FP16 or BF16 output")
-    snippet = _Q8_PREFILL_MMA_PROJECTION.replace("NATIVE_TYPE", native_type)
+    snippets = {
+        16: _Q8_PREFILL_MMA_16X32_PROJECTION,
+        64: _Q8_PREFILL_MMA_64X32_PROJECTION,
+    }
+    try:
+        snippet = snippets[tile_m].replace("NATIVE_TYPE", native_type)
+    except KeyError as exc:
+        raise ValueError(f"Unsupported Q8 prefill tile height {tile_m}") from exc
 
     @wp.func_native(snippet)
     def project(
