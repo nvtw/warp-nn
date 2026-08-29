@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import codecs
+import copy
 import json
 import threading
 import time
@@ -75,6 +76,19 @@ def _messages(value: object) -> list[dict[str, object]]:
     return result
 
 
+def _same_visible_assistant(
+    current: Mapping[str, object], expected: Mapping[str, object]
+) -> bool:
+    ignored = {"reasoning", "reasoning_content"}
+    if any(
+        key in current and current[key] != expected.get(key) for key in ignored
+    ):
+        return False
+    return {key: value for key, value in current.items() if key not in ignored} == {
+        key: value for key, value in expected.items() if key not in ignored
+    }
+
+
 class ChatCompletions:
     """Translate OpenAI chat requests to a shared text-generation runner."""
 
@@ -106,6 +120,8 @@ class ChatCompletions:
         self.lock = threading.Lock()
         self._chat_encoder = ChatEncodingCache(tokenizer)
         self._cached_ids: list[int] = []
+        self._cache_serial = 0
+        self._continuation = None
 
     def complete(
         self,
@@ -246,13 +262,42 @@ class ChatCompletions:
                 )
 
         with self.lock:
+            self._cache_serial += 1
+            cache_serial = self._cache_serial
+            controls = (
+                copy.deepcopy(tools),
+                enable_thinking,
+                reasoning_effort,
+                preserve_thinking,
+            )
+            continuation = self._continuation
+            self._continuation = None
+            canonical_prefix = None
+            suffix = None
+            if continuation is not None and controls == continuation[2]:
+                prior_messages, assistant = continuation[:2]
+                assistant_index = len(prior_messages)
+                if (
+                    len(messages) > assistant_index + 1
+                    and messages[:assistant_index] == prior_messages
+                    and messages[assistant_index].get("role") == "assistant"
+                    and _same_visible_assistant(messages[assistant_index], assistant)
+                ):
+                    canonical_prefix = [*prior_messages, assistant]
+                    suffix = messages[assistant_index + 1 :]
             try:
-                prompt_ids = self._chat_encoder.encode_chat(
-                    messages,
-                    tools=tools,
-                    enable_thinking=enable_thinking,
-                    reasoning_effort=reasoning_effort,
-                    preserve_thinking=preserve_thinking,
+                encoding_kwargs = {
+                    "tools": tools,
+                    "enable_thinking": enable_thinking,
+                    "reasoning_effort": reasoning_effort,
+                    "preserve_thinking": preserve_thinking,
+                }
+                prompt_ids = (
+                    self._chat_encoder.encode_continuation(
+                        canonical_prefix, suffix, **encoding_kwargs
+                    )
+                    if canonical_prefix is not None
+                    else self._chat_encoder.encode_chat(messages, **encoding_kwargs)
                 )
             except (KeyError, TypeError, ValueError) as error:
                 raise APIError(str(error), param="messages") from error
@@ -350,6 +395,14 @@ class ChatCompletions:
                 }
                 for call in tool_calls
             ]
+        if generated and is_eos_token(self.tokenizer, generated[-1]):
+            with self.lock:
+                if self._cache_serial == cache_serial:
+                    self._continuation = (
+                        copy.deepcopy(messages),
+                        copy.deepcopy(message),
+                        controls,
+                    )
         usage = {
             "prompt_tokens": len(prompt_ids),
             "completion_tokens": len(generated),

@@ -6,7 +6,7 @@
 import argparse
 from pathlib import Path
 
-from warp_nn.runtime import ChatCompletions, OpenAIHTTPServer, Qwen3Tokenizer, create_text_runner
+from warp_nn.runtime import ChatCompletions, OpenAIHTTPServer, create_text_runner, create_tokenizer
 
 
 def main():
@@ -18,7 +18,9 @@ def main():
     parser.add_argument("--api-key", help="Optional bearer token; omitted means no authentication")
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--cache-capacity", type=int, default=4096)
-    parser.add_argument("--prefill-chunk-size", type=int, default=16)
+    parser.add_argument("--prefill-chunk-size", type=int, default=256)
+    parser.add_argument("--yarn", action="store_true")
+    parser.add_argument("--yarn-factor", type=float)
     parser.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--reasoning-effort", choices=("low", "medium", "xhigh"))
     parser.add_argument("--temperature", type=float)
@@ -29,13 +31,21 @@ def main():
     parser.add_argument("--no-cublas", action="store_true")
     args = parser.parse_args()
 
-    tokenizer = Qwen3Tokenizer(args.model_dir)
+    tokenizer = create_tokenizer(args.model_dir)
+    if args.yarn_factor is not None and (not args.yarn or args.yarn_factor < 1.0):
+        parser.error("--yarn-factor requires --yarn and must be at least 1")
+    rope_scaling = None
+    if args.yarn:
+        rope_scaling = {"rope_type": "yarn"}
+        if args.yarn_factor is not None:
+            rope_scaling["factor"] = args.yarn_factor
     runner = create_text_runner(
         args.model_dir,
         device=args.device,
         cache_capacity=args.cache_capacity,
         prefill_chunk_size=args.prefill_chunk_size,
         use_cublas=not args.no_cublas,
+        **({"rope_scaling": rope_scaling} if rope_scaling else {}),
     )
     model_id = args.model_id or args.model_dir.name
     thinking = tokenizer.default_enable_thinking if args.thinking is None else args.thinking

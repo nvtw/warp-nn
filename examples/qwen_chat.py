@@ -156,7 +156,7 @@ def main():
     parser.add_argument("--system", help="Optional system message")
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--cache-capacity", type=int, default=1024)
-    parser.add_argument("--prefill-chunk-size", type=int, default=16)
+    parser.add_argument("--prefill-chunk-size", type=int, default=256)
     parser.add_argument(
         "--yarn",
         action="store_true",

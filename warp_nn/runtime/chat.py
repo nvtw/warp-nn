@@ -91,6 +91,27 @@ class ChatEncodingCache:
         self._token_ids = list(token_ids)
         return list(token_ids)
 
+    def encode_continuation(
+        self,
+        prefix: Sequence[Mapping[str, object]],
+        suffix: Sequence[Mapping[str, object]],
+        **kwargs: Any,
+    ) -> list[int]:
+        """Append a verified chat suffix after exact generated token IDs."""
+        if not self._incremental or not self._rendered:
+            return self.encode_chat([*prefix, *suffix], **kwargs)
+        prefix_rendered = self.tokenizer.format_chat(
+            prefix, add_generation_prompt=False, **kwargs
+        )
+        rendered = self.tokenizer.format_chat([*prefix, *suffix], **kwargs)
+        if not rendered.startswith(prefix_rendered):
+            return self.encode_chat([*prefix, *suffix], **kwargs)
+        rendered_suffix = rendered[len(prefix_rendered) :]
+        token_ids = self._token_ids + self.tokenizer.encode(rendered_suffix)
+        self._rendered += rendered_suffix
+        self._token_ids = list(token_ids)
+        return list(token_ids)
+
 
 def is_eos_token(tokenizer: Tokenizer, token_id: int) -> bool:
     """Return whether ``token_id`` is any model-declared end token."""

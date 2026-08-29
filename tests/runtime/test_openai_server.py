@@ -76,6 +76,7 @@ class _IncrementalTokenizer(_Tokenizer):
         self.delay = 0.0
 
     def format_chat(self, messages, **kwargs):
+        add_generation_prompt = kwargs.pop("add_generation_prompt", True)
         del kwargs
         with self.state_lock:
             self.active += 1
@@ -87,7 +88,7 @@ class _IncrementalTokenizer(_Tokenizer):
         )
         with self.state_lock:
             self.active -= 1
-        return rendered + "assistant:"
+        return rendered + ("assistant:" if add_generation_prompt else "")
 
     def encode(self, text):
         self.encoded.append(text)
@@ -105,6 +106,20 @@ class _IncrementalTokenizer(_Tokenizer):
             "A" if token_id == 1 else ";" if token_id == 0 else ""
             for token_id in token_ids
         )
+
+
+class _HiddenIncrementalTokenizer(_IncrementalTokenizer):
+    def decode(self, token_ids, skip_special_tokens=False):
+        if skip_special_tokens:
+            return "Reasoning</think>A" if 1 in token_ids else ""
+        return "".join(
+            "hidden:A" if token_id == 1 else ";" if token_id == 0 else ""
+            for token_id in token_ids
+        )
+
+    def token_bytes(self, token_id, skip_special_tokens=False):
+        del skip_special_tokens
+        return b"A" if token_id == 1 else b""
 
 
 def _chat(content):
@@ -178,6 +193,38 @@ def test_chat_completions_incrementally_encodes_appended_turns():
     assert runner.calls[0] == ("prefill", first_prompt)
 
     completions.complete(_chat([{"role": "user", "content": "different"}]))
+    assert tokenizer.full_calls == 2
+    assert runner.calls[-1][0] == "prefill"
+
+
+def test_chat_completions_preserves_hidden_generated_prefix():
+    runner = _CachingRunner()
+    runner.cache_capacity = 4096
+    tokenizer = _HiddenIncrementalTokenizer()
+    completions = ChatCompletions(
+        "warp-qwen", runner, tokenizer, max_new_tokens=2, enable_thinking=True
+    )
+    first = [{"role": "user", "content": "x"}]
+
+    response = completions.complete(_chat(first))
+    returned_assistant = response["choices"][0]["message"]
+    assert returned_assistant["reasoning_content"] == "Reasoning"
+    assistant = {"role": "assistant", "content": "A"}
+    completions.complete(
+        _chat([*first, assistant, {"role": "user", "content": "y"}])
+    )
+
+    assert tokenizer.full_calls == 1
+    suffix = tokenizer.encode("user:y;assistant:")
+    assert runner.calls[1] == ("append", [0, *suffix])
+
+    changed = {
+        **assistant,
+        "content": "edited",
+    }
+    completions.complete(
+        _chat([*first, changed, {"role": "user", "content": "z"}])
+    )
     assert tokenizer.full_calls == 2
     assert runner.calls[-1][0] == "prefill"
 
