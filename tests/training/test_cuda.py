@@ -1,0 +1,261 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Small permanent CUDA checks for the allocation-free training path."""
+
+import numpy as np
+import pytest
+
+import warp as wp
+
+from warp_nn.training import (
+    CrossEntropyPlan,
+    TransformerPrimitivePlan,
+    gqa_attention_forward,
+    linear_backward,
+    linear_forward,
+)
+from warp_nn.training.linear import _use_tiled
+
+
+CUDA_DEVICES = [device for device in wp.get_devices() if device.is_cuda]
+pytestmark = pytest.mark.skipif(not CUDA_DEVICES, reason="CUDA device required")
+
+
+@wp.kernel
+def _sum_2d(values: wp.array2d(dtype=wp.float32), loss: wp.array1d(dtype=wp.float32)):
+    row, column = wp.tid()
+    wp.atomic_add(loss, 0, values[row, column])
+
+
+def _array(values, dtype, device):
+    return wp.array(np.asarray(values), dtype=dtype, device=device)
+
+
+def _numpy(array):
+    return np.asarray(array.numpy(), dtype=np.float32)
+
+
+def _gqa_reference(query, key, value, lengths, scale, window):
+    output = np.zeros_like(query, dtype=np.float32)
+    lse = np.full(query.shape[:3], -np.finfo(np.float32).max, dtype=np.float32)
+    heads_per_kv = query.shape[1] // key.shape[1]
+    for batch, length in enumerate(lengths):
+        for head in range(query.shape[1]):
+            kv_head = head // heads_per_kv
+            for token in range(int(length)):
+                first = max(0, token + 1 - window) if window else 0
+                keys = slice(first, token + 1)
+                scores = key[batch, kv_head, keys] @ query[batch, head, token] * scale
+                maximum = np.max(scores)
+                exponentials = np.exp(scores - maximum)
+                probabilities = exponentials / np.sum(exponentials)
+                output[batch, head, token] = probabilities @ value[batch, kv_head, keys]
+                lse[batch, head, token] = maximum + np.log(np.sum(exponentials))
+    return output, lse
+
+
+def _gqa_buffers(device, seed=17):
+    rng = np.random.default_rng(seed)
+    query_shape = (1, 4, 4, 3)
+    kv_shape = (1, 2, 4, 3)
+    query = _array(rng.normal(size=query_shape).astype(np.float32), wp.bfloat16, device)
+    key = _array(rng.normal(size=kv_shape).astype(np.float32), wp.bfloat16, device)
+    value = _array(rng.normal(size=kv_shape).astype(np.float32), wp.bfloat16, device)
+    lengths = _array(np.array([3], dtype=np.int32), wp.int32, device)
+    output = wp.empty(query_shape, dtype=wp.bfloat16, device=device)
+    lse = wp.empty(query_shape[:3], dtype=wp.float32, device=device)
+    accumulator = wp.empty(query_shape, dtype=wp.float32, device=device)
+    return query, key, value, lengths, output, lse, accumulator
+
+
+def test_cuda_bfloat16_linear_forward_backward():
+    device = CUDA_DEVICES[0]
+    rng = np.random.default_rng(5)
+    x = _array(rng.normal(size=(3, 5)).astype(np.float32), wp.bfloat16, device)
+    weight = _array(rng.normal(size=(4, 5)).astype(np.float32), wp.bfloat16, device)
+    grad_output = _array(
+        rng.normal(size=(3, 4)).astype(np.float32), wp.bfloat16, device
+    )
+    output = wp.empty((3, 4), dtype=wp.bfloat16, device=device)
+    grad_input = wp.empty_like(x)
+    grad_weight = wp.empty((4, 5), dtype=wp.float32, device=device)
+
+    linear_forward(x, weight, output)
+    linear_backward(x, weight, grad_output, grad_input, grad_weight)
+
+    x_ref, weight_ref, grad_ref = _numpy(x), _numpy(weight), _numpy(grad_output)
+    np.testing.assert_allclose(
+        _numpy(output), x_ref @ weight_ref.T, atol=4e-2, rtol=4e-2
+    )
+    np.testing.assert_allclose(
+        _numpy(grad_input), grad_ref @ weight_ref, atol=4e-2, rtol=4e-2
+    )
+    np.testing.assert_allclose(
+        _numpy(grad_weight), grad_ref.T @ x_ref, atol=3e-5, rtol=3e-5
+    )
+
+
+def test_cuda_bfloat16_tiled_linear_tails_and_graph_replay():
+    device = CUDA_DEVICES[0]
+    if device.arch < 80:
+        pytest.skip("BF16 tiled Linear requires SM80 or newer")
+
+    rows, columns, inner = 33, 35, 37
+    rng = np.random.default_rng(37)
+    x = _array(rng.normal(size=(rows, inner)).astype(np.float32), wp.bfloat16, device)
+    weight = _array(
+        rng.normal(size=(columns, inner)).astype(np.float32), wp.bfloat16, device
+    )
+    grad_output = _array(
+        rng.normal(size=(rows, columns)).astype(np.float32), wp.bfloat16, device
+    )
+    output = wp.empty((rows, columns), dtype=wp.bfloat16, device=device)
+    grad_input = wp.empty((rows, inner), dtype=wp.bfloat16, device=device)
+    grad_weight = wp.empty((columns, inner), dtype=wp.float32, device=device)
+
+    assert _use_tiled(rows, columns, inner, wp.bfloat16, device, x, weight, output)
+    assert _use_tiled(
+        rows, inner, columns, wp.bfloat16, device, grad_output, weight, grad_input
+    )
+    assert _use_tiled(
+        columns, inner, rows, wp.bfloat16, device, grad_output, x, grad_weight
+    )
+
+    # Warm compilation also establishes the fixed-buffer replay reference.
+    linear_forward(x, weight, output)
+    linear_backward(x, weight, grad_output, grad_input, grad_weight)
+    x_ref, weight_ref, grad_ref = _numpy(x), _numpy(weight), _numpy(grad_output)
+    np.testing.assert_allclose(
+        _numpy(output), x_ref @ weight_ref.T, atol=1.2e-1, rtol=3.0e-2
+    )
+    np.testing.assert_allclose(
+        _numpy(grad_input), grad_ref @ weight_ref, atol=1.2e-1, rtol=3.0e-2
+    )
+    np.testing.assert_allclose(
+        _numpy(grad_weight), grad_ref.T @ x_ref, atol=3.0e-3, rtol=3.0e-3
+    )
+    output_reference = _numpy(output).copy()
+    grad_input_reference = _numpy(grad_input).copy()
+    grad_weight_reference = _numpy(grad_weight).copy()
+
+    wp.capture_begin(device=device)
+    try:
+        linear_forward(x, weight, output)
+        linear_backward(x, weight, grad_output, grad_input, grad_weight)
+        graph = wp.capture_end(device=device)
+    except Exception:
+        wp.capture_end(device=device)
+        raise
+
+    wp.capture_launch(graph)
+    wp.capture_launch(graph)
+    np.testing.assert_array_equal(_numpy(output), output_reference)
+    np.testing.assert_array_equal(_numpy(grad_input), grad_input_reference)
+    np.testing.assert_array_equal(_numpy(grad_weight), grad_weight_reference)
+
+
+@pytest.mark.parametrize("window", [0, 2])
+def test_cuda_bfloat16_gqa_full_and_sliding_reference(window):
+    device = CUDA_DEVICES[0]
+    query, key, value, lengths, output, lse, accumulator = _gqa_buffers(device)
+    scale = 0.37
+    gqa_attention_forward(
+        query,
+        key,
+        value,
+        lengths,
+        output,
+        lse,
+        accumulator,
+        scale=scale,
+        window=window,
+    )
+
+    reference = _gqa_reference(
+        _numpy(query), _numpy(key), _numpy(value), lengths.numpy(), scale, window
+    )
+    np.testing.assert_allclose(_numpy(output), reference[0], atol=2e-2, rtol=8e-3)
+    np.testing.assert_allclose(_numpy(lse), reference[1], atol=3e-5, rtol=3e-5)
+
+
+def test_cuda_rms_tape_and_stable_cross_entropy():
+    device = CUDA_DEVICES[0]
+    x_values = np.array([[1.0, -2.0, 0.5], [-0.25, 1.5, 2.0]], dtype=np.float32)
+    weight_values = np.array([0.5, -1.0, 2.0], dtype=np.float32)
+    x = wp.array(x_values, dtype=wp.float32, device=device, requires_grad=True)
+    weight = wp.array(
+        weight_values, dtype=wp.float32, device=device, requires_grad=True
+    )
+    plan = TransformerPrimitivePlan(2, 3, rotary_dim=2, epsilon=1e-5, device=device)
+    loss = wp.zeros(1, dtype=wp.float32, device=device, requires_grad=True)
+    tape = wp.Tape()
+    with tape:
+        output = plan.rms_norm(x, weight)
+        wp.launch(
+            _sum_2d,
+            dim=output.shape,
+            inputs=[output],
+            outputs=[loss],
+            device=device,
+        )
+    tape.backward(loss)
+
+    inverse_rms = 1.0 / np.sqrt(np.mean(x_values**2, axis=1, keepdims=True) + 1e-5)
+    weighted_sum = np.sum(x_values * weight_values, axis=1, keepdims=True)
+    expected_grad = weight_values * inverse_rms - (
+        x_values * weighted_sum * inverse_rms**3 / x_values.shape[1]
+    )
+    assert np.all(np.isfinite(_numpy(x.grad)))
+    np.testing.assert_allclose(_numpy(x.grad), expected_grad, atol=3e-5, rtol=3e-5)
+
+    logits_np = np.array(
+        [[10000.0, 9999.0, 9998.0], [-10000.0, -9997.0, -9999.0]],
+        dtype=np.float32,
+    )
+    targets_np = np.array([0, 2], dtype=np.int32)
+    logits = _array(logits_np, wp.float32, device)
+    targets = _array(targets_np, wp.int32, device)
+    cross_entropy = CrossEntropyPlan(2, 3, device=device)
+    actual_loss = cross_entropy.forward(logits, targets).numpy()[0]
+    actual_gradient = cross_entropy.backward(logits, targets).numpy()
+    shifted = logits_np - np.max(logits_np, axis=1, keepdims=True)
+    probabilities = np.exp(shifted) / np.sum(np.exp(shifted), axis=1, keepdims=True)
+    expected_loss = np.mean(-np.log(probabilities[np.arange(2), targets_np]))
+    probabilities[np.arange(2), targets_np] -= 1.0
+    np.testing.assert_allclose(actual_loss, expected_loss, rtol=2e-6)
+    np.testing.assert_allclose(actual_gradient, probabilities / 2.0, atol=2e-7)
+
+
+def test_cuda_graph_replays_linear_and_gqa_with_fixed_buffers():
+    device = CUDA_DEVICES[0]
+    x = _array(np.arange(12, dtype=np.float32).reshape(3, 4) / 7, wp.bfloat16, device)
+    weight = _array(
+        np.arange(20, dtype=np.float32).reshape(5, 4) / 11, wp.bfloat16, device
+    )
+    linear_output = wp.empty((3, 5), dtype=wp.bfloat16, device=device)
+    query, key, value, lengths, output, lse, accumulator = _gqa_buffers(device, seed=29)
+
+    # Compile and establish a deterministic reference before capture.
+    linear_forward(x, weight, linear_output)
+    gqa_attention_forward(
+        query, key, value, lengths, output, lse, accumulator, window=2
+    )
+    linear_reference = _numpy(linear_output).copy()
+    attention_reference = _numpy(output).copy()
+
+    wp.capture_begin(device=device)
+    try:
+        linear_forward(x, weight, linear_output)
+        gqa_attention_forward(
+            query, key, value, lengths, output, lse, accumulator, window=2
+        )
+        graph = wp.capture_end(device=device)
+    except Exception:
+        wp.capture_end(device=device)
+        raise
+
+    wp.capture_launch(graph)
+    wp.capture_launch(graph)
+    np.testing.assert_array_equal(_numpy(linear_output), linear_reference)
+    np.testing.assert_array_equal(_numpy(output), attention_reference)
