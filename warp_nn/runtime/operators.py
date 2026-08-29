@@ -106,11 +106,14 @@ def _exec_linear(op, tensors, shapes, device):
         )
     elif device.is_cuda:
         if op.attrs.get("_prefill_mma_kernel"):
+            tile_m, tile_n = op.attrs["_mma_tile_shape"]
             wp.launch(
                 op.attrs["_kernel"],
-                dim=(op.attrs["_rows"] // 16) * (op.attrs["_columns"] // 64) * 128,
+                dim=(op.attrs["_rows"] // tile_m)
+                * (op.attrs["_columns"] // tile_n)
+                * op.attrs["_mma_block_dim"],
                 inputs=[x, weight, output, op.attrs["_columns"], op.attrs["_inner"]],
-                block_dim=128,
+                block_dim=op.attrs["_mma_block_dim"],
                 device=device,
             )
         elif op.attrs.get("_grouped_decode_kernel"):
@@ -225,26 +228,44 @@ def plan_linear(
     elif cublas is not None and device.is_cuda and dtype in (wp.float16, wp.bfloat16):
         op.attrs["_cublas"] = cublas
     elif device.is_cuda:
-        mma_blocks = rows // 16 * (columns // 64)
-        prefill_mma = (
+        mma_geometry = None
+        mma_common = (
             device.arch >= 80
             and dtype in (wp.float16, wp.bfloat16)
-            and rows >= 16
-            and rows % 16 == 0
-            and columns % 64 == 0
             and inner % 32 == 0
-            and columns <= inner
             and activation.is_contiguous
             and weight.is_contiguous
             and output.is_contiguous
             and activation.ptr % 16 == 0
             and weight.ptr % 16 == 0
             and output.ptr % 16 == 0
-            and mma_blocks >= (device.sm_count + 1) // 2
         )
-        if prefill_mma:
-            op.attrs["_kernel"] = _get_prefill_mma_linear_kernel(dtype)
+        contraction_blocks = rows // 16 * (columns // 64)
+        if (
+            mma_common
+            and rows >= 16
+            and rows % 16 == 0
+            and columns % 64 == 0
+            and columns <= inner
+            and contraction_blocks >= (device.sm_count + 1) // 2
+        ):
+            mma_geometry = (16, 64, 128)
+        expansion_blocks = rows // 64 * (columns // 32)
+        if (
+            mma_common
+            and rows >= 64
+            and rows % 64 == 0
+            and columns % 32 == 0
+            and columns > inner
+            and expansion_blocks >= 2 * device.sm_count
+        ):
+            mma_geometry = (64, 32, 256)
+        if mma_geometry is not None:
+            tile_m, tile_n, block_dim = mma_geometry
+            op.attrs["_kernel"] = _get_prefill_mma_linear_kernel(dtype, tile_m, tile_n)
             op.attrs["_prefill_mma_kernel"] = True
+            op.attrs["_mma_tile_shape"] = (tile_m, tile_n)
+            op.attrs["_mma_block_dim"] = block_dim
         elif rows < 8:
             op.attrs["_kernel"] = _get_linear_vector_kernel(dtype)
             op.attrs["_vector_kernel"] = True

@@ -190,13 +190,16 @@ _PREFILL_MMA_PROJECTION = r"""
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
-    const int block = tid >> 7;
-    const int column_tiles = columns / 64;
-    const int row_base = (block / column_tiles) * 16;
-    const int column = (block % column_tiles) * 64;
+    const int block = tid / BLOCK_DIM;
+    const int column_tiles = columns / TILE_N;
+    const int row_base = (block / column_tiles) * TILE_M;
+    const int column = (block % column_tiles) * TILE_N;
+    constexpr int WARP_COLUMNS = TILE_N / 16;
+    const int warp_row = warp / WARP_COLUMNS;
+    const int warp_column = warp % WARP_COLUMNS;
     constexpr int LD = 40;
-    constexpr int A_SIZE = 16 * LD;
-    constexpr int B_SIZE = 64 * LD;
+    constexpr int A_SIZE = TILE_M * LD;
+    constexpr int B_SIZE = TILE_N * LD;
     constexpr int STAGE_SIZE = A_SIZE + B_SIZE;
     __shared__ __align__(16) unsigned short smem[2 * STAGE_SIZE];
     const NATIVE_TYPE* xp = x.data;
@@ -205,19 +208,19 @@ _PREFILL_MMA_PROJECTION = r"""
     float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
     float c4 = 0.0f, c5 = 0.0f, c6 = 0.0f, c7 = 0.0f;
 
-    if (threadIdx.x < 64) {
-        const int row = threadIdx.x >> 2;
-        const int segment = threadIdx.x & 3;
+    #pragma unroll
+    for (int copy = threadIdx.x; copy < TILE_M * 4; copy += BLOCK_DIM) {
+        const int row = copy >> 2;
+        const int segment = copy & 3;
         unsigned short* dst = smem + row * LD + segment * 8;
         const NATIVE_TYPE* src = xp + (row_base + row) * inner + segment * 8;
         const unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
         asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
     }
     #pragma unroll
-    for (int copy = 0; copy < 2; ++copy) {
-        const int local = threadIdx.x + copy * 128;
-        const int row = local >> 2;
-        const int segment = local & 3;
+    for (int copy = threadIdx.x; copy < TILE_N * 4; copy += BLOCK_DIM) {
+        const int row = copy >> 2;
+        const int segment = copy & 3;
         unsigned short* dst = smem + A_SIZE + row * LD + segment * 8;
         const NATIVE_TYPE* src = weightp + (column + row) * inner + segment * 8;
         const unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
@@ -230,19 +233,19 @@ _PREFILL_MMA_PROJECTION = r"""
     for (int k = 0, stage = 0; k < inner; k += 32, stage ^= 1) {
         if (k + 32 < inner) {
             unsigned short* next = smem + (stage ^ 1) * STAGE_SIZE;
-            if (threadIdx.x < 64) {
-                const int row = threadIdx.x >> 2;
-                const int segment = threadIdx.x & 3;
+            #pragma unroll
+            for (int copy = threadIdx.x; copy < TILE_M * 4; copy += BLOCK_DIM) {
+                const int row = copy >> 2;
+                const int segment = copy & 3;
                 unsigned short* dst = next + row * LD + segment * 8;
                 const NATIVE_TYPE* src = xp + (row_base + row) * inner + k + 32 + segment * 8;
                 const unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
                 asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
             }
             #pragma unroll
-            for (int copy = 0; copy < 2; ++copy) {
-                const int local = threadIdx.x + copy * 128;
-                const int row = local >> 2;
-                const int segment = local & 3;
+            for (int copy = threadIdx.x; copy < TILE_N * 4; copy += BLOCK_DIM) {
+                const int row = copy >> 2;
+                const int segment = copy & 3;
                 unsigned short* dst = next + A_SIZE + row * LD + segment * 8;
                 const NATIVE_TYPE* src = weightp + (column + row) * inner + k + 32 + segment * 8;
                 const unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
@@ -252,8 +255,8 @@ _PREFILL_MMA_PROJECTION = r"""
         }
 
         unsigned short* current = smem + stage * STAGE_SIZE;
-        unsigned short* sa = current;
-        unsigned short* sb = current + A_SIZE + warp * 16 * LD;
+        unsigned short* sa = current + warp_row * 16 * LD;
+        unsigned short* sb = current + A_SIZE + warp_column * 16 * LD;
         const int quadrant = lane >> 3;
         const int local_row = lane & 7;
         #pragma unroll
@@ -272,8 +275,8 @@ _PREFILL_MMA_PROJECTION = r"""
         }
     }
 
-    const int row = lane >> 2;
-    const int col = column + warp * 16 + (lane & 3) * 2;
+    const int row = warp_row * 16 + (lane >> 2);
+    const int col = column + warp_column * 16 + (lane & 3) * 2;
     op[row * columns + col] = NATIVE_TYPE(c0);
     op[row * columns + col + 1] = NATIVE_TYPE(c1);
     op[(row + 8) * columns + col] = NATIVE_TYPE(c2);
@@ -287,16 +290,23 @@ _PREFILL_MMA_PROJECTION = r"""
 
 
 @lru_cache(maxsize=None)
-def get_prefill_mma_projection(dtype: type):
-    """Return an SM80+ M16xN64 projection primitive for FP16/BF16 storage."""
+def get_prefill_mma_projection(dtype: type, tile_m: int, tile_n: int):
+    """Return an SM80+ projection primitive for one supported tile geometry."""
+    if (tile_m, tile_n) not in ((16, 64), (64, 32)):
+        raise ValueError("Prefill MMA supports M16xN64 and M64xN32 tiles")
+    block_dim = tile_m * tile_n // 8
     if dtype == wp.float16:
         native_type, ptx_type = "wp::float16", "f16"
     elif dtype == wp.bfloat16:
         native_type, ptx_type = "wp::bfloat16", "bf16"
     else:
         raise TypeError("Prefill MMA projection requires FP16 or BF16")
-    snippet = _PREFILL_MMA_PROJECTION.replace("NATIVE_TYPE", native_type).replace(
-        "PTX_TYPE", ptx_type
+    snippet = (
+        _PREFILL_MMA_PROJECTION.replace("NATIVE_TYPE", native_type)
+        .replace("PTX_TYPE", ptx_type)
+        .replace("TILE_M", str(tile_m))
+        .replace("TILE_N", str(tile_n))
+        .replace("BLOCK_DIM", str(block_dim))
     )
 
     @wp.func_native(snippet)

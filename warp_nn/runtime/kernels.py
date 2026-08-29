@@ -187,10 +187,10 @@ def _get_grouped_decode_linear_kernel(dtype: type):
     return _create_grouped_decode_linear_kernel(dtype)
 
 
-def _create_prefill_mma_linear_kernel(dtype: type):
-    """Build the SM80+ M16xN64 dense projection wrapper."""
+def _create_prefill_mma_linear_kernel(dtype: type, tile_m: int, tile_n: int):
+    """Build an SM80+ dense projection wrapper for one tile geometry."""
     DTYPE = dtype
-    project = get_prefill_mma_projection(dtype)
+    project = get_prefill_mma_projection(dtype, tile_m, tile_n)
 
     @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
     def kernel(
@@ -208,9 +208,9 @@ def _create_prefill_mma_linear_kernel(dtype: type):
 
 
 @lru_cache(maxsize=None)
-def _get_prefill_mma_linear_kernel(dtype: type):
-    """Return the cached SM80+ M16xN64 projection kernel."""
-    return _create_prefill_mma_linear_kernel(dtype)
+def _get_prefill_mma_linear_kernel(dtype: type, tile_m: int, tile_n: int):
+    """Return a cached SM80+ dense projection kernel."""
+    return _create_prefill_mma_linear_kernel(dtype, tile_m, tile_n)
 
 
 def _create_linear_tiled_kernel(dtype: type, tile_m: int, tile_k: int):

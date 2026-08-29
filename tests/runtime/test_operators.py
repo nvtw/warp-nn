@@ -84,7 +84,7 @@ def test_linear_operation_uses_m64_when_grid_stays_large(dtype):
     operation = Operation("Linear", ["x", "weight"], ["output"])
     plan_linear(operation, tensors, shapes, device)
 
-    assert operation.attrs["_tile_shape"] == (64, 32)
+    assert operation.attrs["_mma_tile_shape"] == (64, 32)
     execute_operations([operation], tensors, shapes, device)
 
     np.testing.assert_allclose(
@@ -117,26 +117,29 @@ def test_grouped_decode_linear_kernel(dtype):
 
 
 @pytest.mark.parametrize("dtype", [wp.float16, wp.bfloat16])
-def test_prefill_mma_linear_kernel(dtype):
+@pytest.mark.parametrize(
+    ("tile_m", "tile_n", "rows", "columns", "inner", "block_dim"),
+    [(16, 64, 32, 128, 128, 128), (64, 32, 128, 128, 128, 256)],
+)
+def test_prefill_mma_linear_kernel(dtype, tile_m, tile_n, rows, columns, inner, block_dim):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
     device = wp.get_device("cuda:0")
     if device.arch < 80:
         pytest.skip("SM80 MMA is not available")
     rng = np.random.default_rng(37)
-    rows, columns, inner = 32, 128, 128
     x_np = rng.normal(0.0, 0.2, size=(rows, inner)).astype(np.float32)
     weight_np = rng.normal(0.0, 0.2, size=(columns, inner)).astype(np.float32)
     x = wp.array(x_np, dtype=dtype, device=device)
     weight = wp.array(weight_np, dtype=dtype, device=device)
     output = wp.empty((rows, columns), dtype=dtype, device=device)
-    kernel = _get_prefill_mma_linear_kernel(dtype)
+    kernel = _get_prefill_mma_linear_kernel(dtype, tile_m, tile_n)
     with wp.ScopedCapture(device) as capture:
         wp.launch(
             kernel,
-            dim=(rows // 16) * (columns // 64) * 128,
+            dim=(rows // tile_m) * (columns // tile_n) * block_dim,
             inputs=[x, weight, output, columns, inner],
-            block_dim=128,
+            block_dim=block_dim,
             device=device,
         )
     wp.capture_launch(capture.graph)
