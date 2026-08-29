@@ -79,7 +79,8 @@ def _exec_linear(op, tensors, shapes, device):
         if q8_decode is not None:
             wp.launch(
                 q8_decode,
-                dim=(op.attrs["_columns"] // 2) * 8,
+                dim=(op.attrs["_columns"] // op.attrs["_q8_decode_outputs_per_group"])
+                * 8,
                 inputs=[
                     op.attrs["_q8_activation_words"],
                     op.attrs["_q8_scales"],
@@ -259,14 +260,10 @@ def plan_linear(
         grouped_blocks = (rows * ((columns + 1) // 2) * 8 + 127) // 128
         outputs_per_group = 2 if grouped_blocks >= 2 * device.sm_count else 1
         op.attrs["_q8_outputs_per_group"] = outputs_per_group
-        if (
-            rows == 1
-            and outputs_per_group == 2
-            and columns % 2 == 0
-            and device.arch >= 61
-        ):
+        if rows == 1 and columns % outputs_per_group == 0 and device.arch >= 61:
+            op.attrs["_q8_decode_outputs_per_group"] = outputs_per_group
             op.attrs["_q8_grouped_decode_kernel"] = (
-                _get_q8_grouped_decode_linear_kernel(dtype)
+                _get_q8_grouped_decode_linear_kernel(dtype, outputs_per_group)
             )
         op.attrs["_q8_kernel"] = _get_matmul_int8_q8_kernel(
             8, dtype, True, outputs_per_group

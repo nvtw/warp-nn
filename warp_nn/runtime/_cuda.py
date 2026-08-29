@@ -325,58 +325,81 @@ def get_prefill_mma_projection(dtype: type, tile_m: int, tile_n: int):
 _Q8_GROUPED_DECODE_PROJECTION = r"""
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
     const int lane = tid & 7;
-    const int column_0 = (tid >> 3) << 1;
-    const int column_1 = column_0 + 1;
+    const int column_0 = (tid >> 3) * OUTPUTS_PER_GROUP;
     float total_0 = 0.0f;
+    #if OUTPUTS_PER_GROUP == 2
+    const int column_1 = column_0 + 1;
     float total_1 = 0.0f;
+    #endif
     for (int block = 0; block < blocks; ++block) {
         const int activation = static_cast<int>(activations.data[block * 8 + lane]);
         const int weight_0 = static_cast<int>(
             weights.data[(column_0 * blocks + block) * 8 + lane]);
+        #if OUTPUTS_PER_GROUP == 2
         const int weight_1 = static_cast<int>(
             weights.data[(column_1 * blocks + block) * 8 + lane]);
-        int dot_0, dot_1;
+        #endif
+        int dot_0;
+        #if OUTPUTS_PER_GROUP == 2
+        int dot_1;
+        #endif
         const int zero = 0;
         asm("dp4a.s32.s32 %0, %1, %2, %3;"
             : "=r"(dot_0) : "r"(weight_0), "r"(activation), "r"(zero));
+        #if OUTPUTS_PER_GROUP == 2
         asm("dp4a.s32.s32 %0, %1, %2, %3;"
             : "=r"(dot_1) : "r"(weight_1), "r"(activation), "r"(zero));
+        #endif
         float activation_scale =
             lane == 0 ? activation_scales.data[block] : 0.0f;
         float weight_scale_0 = lane == 0
             ? static_cast<float>(weight_scales.data[column_0 * blocks + block])
             : 0.0f;
+        #if OUTPUTS_PER_GROUP == 2
         float weight_scale_1 = lane == 0
             ? static_cast<float>(weight_scales.data[column_1 * blocks + block])
             : 0.0f;
+        #endif
         activation_scale = __shfl_sync(0xffffffffu, activation_scale, 0, 8);
         weight_scale_0 = __shfl_sync(0xffffffffu, weight_scale_0, 0, 8);
+        #if OUTPUTS_PER_GROUP == 2
         weight_scale_1 = __shfl_sync(0xffffffffu, weight_scale_1, 0, 8);
+        #endif
         total_0 += static_cast<float>(dot_0) * activation_scale * weight_scale_0;
+        #if OUTPUTS_PER_GROUP == 2
         total_1 += static_cast<float>(dot_1) * activation_scale * weight_scale_1;
+        #endif
     }
     for (int offset = 4; offset > 0; offset >>= 1) {
         total_0 += __shfl_down_sync(0xffffffffu, total_0, offset, 8);
+        #if OUTPUTS_PER_GROUP == 2
         total_1 += __shfl_down_sync(0xffffffffu, total_1, offset, 8);
+        #endif
     }
     if (lane == 0) {
         output.data[column_0] = NATIVE_TYPE(total_0);
+        #if OUTPUTS_PER_GROUP == 2
         output.data[column_1] = NATIVE_TYPE(total_1);
+        #endif
     }
 #endif
 """
 
 
 @lru_cache(maxsize=None)
-def get_q8_grouped_decode_projection(dtype: type):
-    """Return a signed-Q8 two-output DP4A decode projection."""
+def get_q8_grouped_decode_projection(dtype: type, outputs_per_group: int):
+    """Return a signed-Q8 grouped DP4A decode projection."""
+    if outputs_per_group not in (1, 2):
+        raise ValueError("Q8 native decode grouping must be 1 or 2")
     if dtype == wp.float16:
         native_type = "wp::float16"
     elif dtype == wp.bfloat16:
         native_type = "wp::bfloat16"
     else:
         raise TypeError("Q8 grouped decode requires FP16 or BF16 output")
-    snippet = _Q8_GROUPED_DECODE_PROJECTION.replace("NATIVE_TYPE", native_type)
+    snippet = _Q8_GROUPED_DECODE_PROJECTION.replace("NATIVE_TYPE", native_type).replace(
+        "OUTPUTS_PER_GROUP", str(outputs_per_group)
+    )
 
     @wp.func_native(snippet)
     def project(

@@ -294,8 +294,11 @@ def test_q8_0_linear_operation(rows, columns, inner, dtype):
     assert ("_q8_mma_kernel" in operation.attrs) == uses_mma
     if uses_mma:
         assert operation.attrs["_q8_mma_tile_m"] == rows
-    uses_grouped_decode = rows == 1 and columns == 12288
+    uses_grouped_decode = rows == 1
     assert ("_q8_grouped_decode_kernel" in operation.attrs) == uses_grouped_decode
+    if uses_grouped_decode:
+        expected_group = 2 if columns == 12288 else 1
+        assert operation.attrs["_q8_decode_outputs_per_group"] == expected_group
 
     x_bf16 = (
         np.clip(np.rint(reshaped / activation_scales), -127, 127) * activation_scales

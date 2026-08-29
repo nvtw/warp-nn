@@ -231,10 +231,10 @@ def _get_prefill_mma_linear_kernel(dtype: type, tile_m: int, tile_n: int):
     return _create_prefill_mma_linear_kernel(dtype, tile_m, tile_n)
 
 
-def _create_q8_grouped_decode_linear_kernel(dtype: type):
-    """Build the signed-Q8 two-output DP4A decode wrapper."""
+def _create_q8_grouped_decode_linear_kernel(dtype: type, outputs_per_group: int):
+    """Build a signed-Q8 grouped DP4A decode wrapper."""
     DTYPE = dtype
-    project = get_q8_grouped_decode_projection(dtype)
+    project = get_q8_grouped_decode_projection(dtype, outputs_per_group)
 
     @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
     def kernel(
@@ -261,9 +261,9 @@ def _create_q8_grouped_decode_linear_kernel(dtype: type):
 
 
 @lru_cache(maxsize=None)
-def _get_q8_grouped_decode_linear_kernel(dtype: type):
+def _get_q8_grouped_decode_linear_kernel(dtype: type, outputs_per_group: int):
     """Return the cached signed-Q8 grouped decode kernel."""
-    return _create_q8_grouped_decode_linear_kernel(dtype)
+    return _create_q8_grouped_decode_linear_kernel(dtype, outputs_per_group)
 
 
 def _create_q8_prefill_mma_linear_kernel(dtype: type, tile_m: int):
