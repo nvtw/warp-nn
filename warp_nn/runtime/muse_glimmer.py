@@ -596,10 +596,17 @@ class _MusePlan:
         self._build()
         self.graphs = {}
 
-    def _linear(self, name: str, x: str, weight: str) -> Operation:
+    def _linear(
+        self, name: str, x: str, weight: str, q8_activation_cache=None
+    ) -> Operation:
         op = Operation("Linear", [x, weight], [name])
         plan_linear(
-            op, self.tensors, self.shapes, self.device, cublas=self.runner.cublas
+            op,
+            self.tensors,
+            self.shapes,
+            self.device,
+            cublas=self.runner.cublas,
+            q8_activation_cache=q8_activation_cache,
         )
         op.attrs["_sequence"] = (op,)
         return op
@@ -701,15 +708,18 @@ class _MusePlan:
                 self.runner.rms_epsilon,
                 self.runner.centered_norm_scales,
             )
+            mlp_q8_cache = {}
             layer["mlp_gate"] = self._linear(
                 f"layer.{index}.mlp_gate",
                 layer["feedforward_input"].outputs[0],
                 prefix + "mlp.gate_proj.weight",
+                mlp_q8_cache,
             )
             layer["mlp_up"] = self._linear(
                 f"layer.{index}.mlp_up",
                 layer["feedforward_input"].outputs[0],
                 prefix + "mlp.up_proj.weight",
+                mlp_q8_cache,
             )
             layer["swiglu"] = self._swiglu(
                 f"layer.{index}.swiglu",
@@ -755,11 +765,13 @@ class _MusePlan:
 
     def _build_attention(self, layer: dict, index: int, prefix: str, x: str) -> None:
         attention = prefix + "self_attn."
+        projection_q8_cache = {}
         for projection in ("q", "k", "v", "gate"):
             layer[projection + "_proj"] = self._linear(
                 f"layer.{index}.{projection}_projected",
                 x,
                 attention + projection + "_proj.weight",
+                projection_q8_cache,
             )
         q_shape = (self.runner.query_heads * self.rows, self.runner.head_dim)
         kv_shape = (self.runner.kv_heads * self.rows, self.runner.head_dim)

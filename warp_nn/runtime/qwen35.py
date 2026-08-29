@@ -354,10 +354,17 @@ class _Qwen35Plan:
         self._build()
         self.graphs = {}
 
-    def _linear(self, name: str, x: str, weight: str) -> Operation:
+    def _linear(
+        self, name: str, x: str, weight: str, q8_activation_cache=None
+    ) -> Operation:
         op = Operation("Linear", [x, weight], [name])
         plan_linear(
-            op, self.tensors, self.shapes, self.device, cublas=self.runner.cublas
+            op,
+            self.tensors,
+            self.shapes,
+            self.device,
+            cublas=self.runner.cublas,
+            q8_activation_cache=q8_activation_cache,
         )
         op.attrs["_sequence"] = (op,)
         return op
@@ -422,11 +429,18 @@ class _Qwen35Plan:
                 prefix + "post_attention_layernorm.weight",
                 residual,
             )
+            mlp_q8_cache = {}
             layer["mlp_gate"] = self._linear(
-                f"layer.{index}.mlp_gate", mlp_input, prefix + "mlp.gate_proj.weight"
+                f"layer.{index}.mlp_gate",
+                mlp_input,
+                prefix + "mlp.gate_proj.weight",
+                mlp_q8_cache,
             )
             layer["mlp_up"] = self._linear(
-                f"layer.{index}.mlp_up", mlp_input, prefix + "mlp.up_proj.weight"
+                f"layer.{index}.mlp_up",
+                mlp_input,
+                prefix + "mlp.up_proj.weight",
+                mlp_q8_cache,
             )
             layer["swiglu"] = self._swiglu(
                 f"layer.{index}.mlp_hidden",
@@ -469,12 +483,22 @@ class _Qwen35Plan:
         self, layer: dict, index: int, prefix: str, x: str
     ) -> None:
         attn = prefix + "linear_attn."
+        projection_q8_cache = {}
         layer["qkv"] = self._linear(
-            f"layer.{index}.qkv", x, attn + "in_proj_qkv.weight"
+            f"layer.{index}.qkv",
+            x,
+            attn + "in_proj_qkv.weight",
+            projection_q8_cache,
         )
-        layer["z"] = self._linear(f"layer.{index}.z", x, attn + "in_proj_z.weight")
-        layer["a"] = self._linear(f"layer.{index}.a", x, attn + "in_proj_a.weight")
-        layer["b"] = self._linear(f"layer.{index}.b", x, attn + "in_proj_b.weight")
+        layer["z"] = self._linear(
+            f"layer.{index}.z", x, attn + "in_proj_z.weight", projection_q8_cache
+        )
+        layer["a"] = self._linear(
+            f"layer.{index}.a", x, attn + "in_proj_a.weight", projection_q8_cache
+        )
+        layer["b"] = self._linear(
+            f"layer.{index}.b", x, attn + "in_proj_b.weight", projection_q8_cache
+        )
         conv_dim = (
             self.runner.linear_key_heads * self.runner.linear_key_size * 2
             + self.runner.linear_value_heads * self.runner.linear_value_size
@@ -538,14 +562,24 @@ class _Qwen35Plan:
     ) -> None:
         attn = prefix + "self_attn."
         attention_width = self.runner.query_heads * self.runner.head_size
+        projection_q8_cache = {}
         layer["q_proj"] = self._linear(
-            f"layer.{index}.q_projected", x, attn + "q_proj.weight"
+            f"layer.{index}.q_projected",
+            x,
+            attn + "q_proj.weight",
+            projection_q8_cache,
         )
         layer["k_proj"] = self._linear(
-            f"layer.{index}.k_projected", x, attn + "k_proj.weight"
+            f"layer.{index}.k_projected",
+            x,
+            attn + "k_proj.weight",
+            projection_q8_cache,
         )
         layer["v_proj"] = self._linear(
-            f"layer.{index}.v_projected", x, attn + "v_proj.weight"
+            f"layer.{index}.v_projected",
+            x,
+            attn + "v_proj.weight",
+            projection_q8_cache,
         )
         layer["q"] = wp.empty(
             (self.runner.query_heads * self.rows, self.runner.head_size),

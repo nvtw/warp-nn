@@ -311,6 +311,80 @@ def test_q8_0_linear_operation(rows, columns, inner, dtype):
     )
 
 
+def test_q8_linear_operations_share_quantized_activation():
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(31)
+    rows, columns, inner = 64, 64, 64
+    blocks = inner // 32
+    values = wp.array(
+        rng.integers(-127, 128, (columns, blocks, 32), dtype=np.int8),
+        dtype=wp.int8,
+        device="cuda:0",
+    )
+    words = wp.array(
+        ptr=values.ptr,
+        capacity=values.capacity,
+        shape=(columns, blocks, 8),
+        dtype=wp.uint32,
+        device="cuda:0",
+        copy=False,
+    )
+    scales = wp.array(
+        rng.uniform(0.001, 0.02, (columns, blocks)).astype(np.float16),
+        dtype=wp.float16,
+        device="cuda:0",
+    )
+    weight = BlockQuantizedTensor(values, words, scales, (columns, inner), "Q8_0")
+    tensors = {
+        "x": wp.array(
+            rng.normal(0.0, 0.5, (rows, inner)).astype(np.float32),
+            dtype=wp.bfloat16,
+            device="cuda:0",
+        ),
+        "weight.0": weight,
+        "weight.1": weight,
+    }
+    shapes = {name: tuple(value.shape) for name, value in tensors.items()}
+    operations = [
+        Operation("Linear", ["x", f"weight.{index}"], [f"output.{index}"])
+        for index in range(2)
+    ]
+    cache = {}
+    device = wp.get_device("cuda:0")
+    for operation in operations:
+        plan_linear(
+            operation,
+            tensors,
+            shapes,
+            device,
+            q8_activation_cache=cache,
+        )
+
+    assert len(cache) == 1
+    assert "_q8_quantize_kernel" in operations[0].attrs
+    assert "_q8_quantize_kernel" not in operations[1].attrs
+    assert (
+        operations[0].attrs["_q8_activations"].ptr
+        == operations[1].attrs["_q8_activations"].ptr
+    )
+    assert (
+        operations[0].attrs["_q8_scales"].ptr == operations[1].attrs["_q8_scales"].ptr
+    )
+
+    execute_operations(operations, tensors, shapes, device)
+    first_output = tensors["output.0"].numpy()
+    np.testing.assert_array_equal(first_output, tensors["output.1"].numpy())
+
+    with wp.ScopedCapture(device) as capture:
+        execute_operations(operations, tensors, shapes, device)
+    tensors["x"].assign(rng.normal(0.0, 0.5, (rows, inner)).astype(np.float32))
+    wp.capture_launch(capture.graph)
+    second_output = tensors["output.0"].numpy()
+    assert not np.array_equal(first_output, second_output)
+    np.testing.assert_array_equal(second_output, tensors["output.1"].numpy())
+
+
 def test_q8_grouped_outputs_match_single_output_kernel():
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")

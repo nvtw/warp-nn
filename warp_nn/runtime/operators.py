@@ -68,13 +68,15 @@ def _exec_linear(op, tensors, shapes, device):
     weight = tensors[op.inputs[1]]
     output = tensors[op.outputs[0]].reshape((op.attrs["_rows"], op.attrs["_columns"]))
     if "_q8_activations" in op.attrs:
-        wp.launch(
-            op.attrs["_q8_quantize_kernel"],
-            dim=op.attrs["_rows"] * op.attrs["_inner"],
-            inputs=[x, op.attrs["_q8_activations"], op.attrs["_q8_scales"]],
-            block_dim=32,
-            device=device,
-        )
+        quantize_kernel = op.attrs.get("_q8_quantize_kernel")
+        if quantize_kernel is not None:
+            wp.launch(
+                quantize_kernel,
+                dim=op.attrs["_rows"] * op.attrs["_inner"],
+                inputs=[x, op.attrs["_q8_activations"], op.attrs["_q8_scales"]],
+                block_dim=32,
+                device=device,
+            )
         q8_decode = op.attrs.get("_q8_grouped_decode_kernel")
         if q8_decode is not None:
             wp.launch(
@@ -200,6 +202,7 @@ def plan_linear(
     shapes: dict[str, tuple[int, ...]],
     device,
     cublas=None,
+    q8_activation_cache=None,
 ):
     """Allocate and specialize a dense projection operation."""
     rows, inner = shapes[op.inputs[0]]
@@ -221,19 +224,38 @@ def plan_linear(
         shapes[op.outputs[0]] = output.shape
         op.attrs.update({"_rows": rows, "_columns": columns, "_inner": inner})
         blocks = inner // 32
-        quantized = wp.empty((rows, inner), dtype=wp.int8, device=device)
+        cache_key = (op.inputs[0], rows, inner, dtype)
+        cached_activation = (
+            q8_activation_cache.get(cache_key)
+            if q8_activation_cache is not None
+            else None
+        )
+        if cached_activation is None:
+            quantized = wp.empty((rows, inner), dtype=wp.int8, device=device)
+            activation_words = wp.array(
+                ptr=quantized.ptr,
+                capacity=quantized.capacity,
+                dtype=wp.uint32,
+                shape=(rows, blocks, 8),
+                device=device,
+            )
+            activation_scales = wp.empty(
+                (rows, blocks), dtype=wp.float32, device=device
+            )
+            if q8_activation_cache is not None:
+                q8_activation_cache[cache_key] = (
+                    quantized,
+                    activation_words,
+                    activation_scales,
+                )
+            op.attrs["_q8_quantize_kernel"] = _get_quantize_activation_int8_kernel(
+                dtype
+            )
+        else:
+            quantized, activation_words, activation_scales = cached_activation
         op.attrs["_q8_activations"] = quantized
-        op.attrs["_q8_activation_words"] = wp.array(
-            ptr=quantized.ptr,
-            capacity=quantized.capacity,
-            dtype=wp.uint32,
-            shape=(rows, blocks, 8),
-            device=device,
-        )
-        op.attrs["_q8_scales"] = wp.empty(
-            (rows, blocks), dtype=wp.float32, device=device
-        )
-        op.attrs["_q8_quantize_kernel"] = _get_quantize_activation_int8_kernel(dtype)
+        op.attrs["_q8_activation_words"] = activation_words
+        op.attrs["_q8_scales"] = activation_scales
         if (
             device.arch >= 80
             and rows % 16 == 0
