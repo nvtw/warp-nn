@@ -292,7 +292,7 @@ _PREFILL_MMA_PROJECTION = r"""
 @lru_cache(maxsize=None)
 def get_prefill_mma_projection(dtype: type, tile_m: int, tile_n: int):
     """Return an SM80+ projection primitive for one supported tile geometry."""
-    if (tile_m, tile_n) not in ((16, 64), (64, 32), (128, 32)):
+    if (tile_m, tile_n) not in ((16, 64), (64, 64), (64, 32), (128, 32)):
         raise ValueError("Unsupported prefill MMA tile geometry")
     block_dim = tile_m * tile_n // 8
     if dtype == wp.float16:

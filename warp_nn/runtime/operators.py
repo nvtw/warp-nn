@@ -240,14 +240,24 @@ def plan_linear(
             and weight.ptr % 16 == 0
             and output.ptr % 16 == 0
         )
-        contraction_blocks = rows // 16 * (columns // 64)
+        contraction_tile_m = 64 if rows % 64 == 0 else 16
+        contraction_blocks = rows // contraction_tile_m * (columns // 64)
         if (
+            mma_common
+            and rows >= 64
+            and rows % 64 == 0
+            and columns % 64 == 0
+            and columns <= inner
+            and contraction_blocks >= 2 * device.sm_count
+        ):
+            mma_geometry = (64, 64, 512)
+        elif (
             mma_common
             and rows >= 16
             and rows % 16 == 0
             and columns % 64 == 0
             and columns <= inner
-            and contraction_blocks >= (device.sm_count + 1) // 2
+            and rows // 16 * (columns // 64) >= (device.sm_count + 1) // 2
         ):
             mma_geometry = (16, 64, 128)
         expansion_tile_m = 128 if rows % 128 == 0 else 64

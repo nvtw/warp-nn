@@ -96,6 +96,26 @@ def test_linear_operation_uses_m64_when_grid_stays_large(dtype):
 
 
 @pytest.mark.parametrize("dtype", [wp.float16, wp.bfloat16])
+def test_linear_operation_uses_m64n64_for_large_contraction(dtype):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    device = wp.get_device("cuda:0")
+    rows = 1024
+    columns = inner = 64 * ((2 * device.sm_count + 15) // 16)
+    tensors = {
+        "x": wp.empty((rows, inner), dtype=dtype, device=device),
+        "weight": wp.empty((columns, inner), dtype=dtype, device=device),
+    }
+    shapes = {name: tuple(value.shape) for name, value in tensors.items()}
+    operation = Operation("Linear", ["x", "weight"], ["output"])
+
+    plan_linear(operation, tensors, shapes, device)
+
+    assert operation.attrs["_mma_tile_shape"] == (64, 64)
+    assert operation.attrs["_mma_block_dim"] == 512
+
+
+@pytest.mark.parametrize("dtype", [wp.float16, wp.bfloat16])
 def test_grouped_decode_linear_kernel(dtype):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
@@ -121,6 +141,7 @@ def test_grouped_decode_linear_kernel(dtype):
     ("tile_m", "tile_n", "rows", "columns", "inner", "block_dim"),
     [
         (16, 64, 32, 128, 128, 128),
+        (64, 64, 64, 128, 128, 512),
         (64, 32, 64, 128, 128, 256),
         (128, 32, 128, 128, 128, 512),
     ],
