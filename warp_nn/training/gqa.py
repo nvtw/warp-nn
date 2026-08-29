@@ -84,11 +84,53 @@ def _gate_kernels(dtype: type):
     return forward, backward, add_input
 
 
+@lru_cache(maxsize=None)
+def _packed_query_gate_kernels(dtype: type):
+    """Split and reassemble per-head ``[Q, gate]`` projection storage."""
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def unpack(
+        packed: wp.array2d(dtype=DTYPE),
+        query: wp.array4d(dtype=DTYPE),
+        gate: wp.array2d(dtype=DTYPE),
+    ):
+        row, head, column = wp.tid()
+        sequence = query.shape[2]
+        head_size = query.shape[3]
+        batch = row // sequence
+        token = row % sequence
+        source = head * head_size * 2
+        query[batch, head, token, column] = packed[row, source + column]
+        gate[row, head * head_size + column] = packed[row, source + head_size + column]
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def pack_gradient(
+        query: wp.array4d(dtype=DTYPE),
+        gate: wp.array2d(dtype=DTYPE),
+        packed: wp.array2d(dtype=DTYPE),
+    ):
+        row, head, column = wp.tid()
+        sequence = query.shape[2]
+        head_size = query.shape[3]
+        batch = row // sequence
+        token = row % sequence
+        destination = head * head_size * 2
+        packed[row, destination + column] = query[batch, head, token, column]
+        packed[row, destination + head_size + column] = gate[
+            row, head * head_size + column
+        ]
+
+    for kernel in (unpack, pack_gradient):
+        kernel.module.options["enable_backward"] = False
+    return unpack, pack_gradient
+
+
 class GQALoRAAttentionPlan:
     """Compose named LoRA projections with exact causal/sliding GQA.
 
     The plan owns every intermediate and saved backward buffer. It supports optional
-    frozen Q/K normalization and RoPE transforms plus a separate sigmoid gate. One
+    frozen Q/K normalization and RoPE transforms plus a separate or packed sigmoid gate. One
     instance supports one outstanding
     forward and is safe to capture because execution performs no allocation.
     """
@@ -102,6 +144,7 @@ class GQALoRAAttentionPlan:
         value: str,
         output: str,
         gate: str | None = None,
+        packed_query_gate: bool = False,
         batch: int,
         sequence: int,
         query_heads: int,
@@ -119,6 +162,8 @@ class GQALoRAAttentionPlan:
             raise ValueError("query heads must be divisible by key/value heads")
         if window < 0:
             raise ValueError("GQA window must be non-negative")
+        if gate is not None and packed_query_gate:
+            raise ValueError("separate and packed GQA gates are mutually exclusive")
         names = (query, key, value, output)
         projection_names = names + ((gate,) if gate is not None else ())
         if len(set(projection_names)) != len(projection_names) or any(
@@ -144,7 +189,7 @@ class GQALoRAAttentionPlan:
         query_width = query_heads * head_size
         kv_width = kv_heads * head_size
         expected = (
-            (query_width, hidden),
+            (query_width * (2 if packed_query_gate else 1), hidden),
             (kv_width, hidden),
             (kv_width, hidden),
             (hidden, query_width),
@@ -199,6 +244,7 @@ class GQALoRAAttentionPlan:
         self.adapters = adapters
         self.names = names
         self.gate_name = gate
+        self.packed_query_gate = packed_query_gate
         self.device = device
         self.dtype = dtype
         self.batch = batch
@@ -222,14 +268,24 @@ class GQALoRAAttentionPlan:
         self.value = wp.empty(kv_shape, dtype=dtype, device=device)
         self.core = wp.empty(query_shape, dtype=dtype, device=device)
         self.merged = wp.empty((rows, query_width), dtype=dtype, device=device)
+        self.packed_gate = (
+            wp.empty((rows, query_width), dtype=dtype, device=device)
+            if packed_query_gate
+            else None
+        )
+        self.packed_gate_grad = (
+            wp.empty((rows, query_width), dtype=dtype, device=device)
+            if packed_query_gate
+            else None
+        )
         self.gated = (
             wp.empty((rows, query_width), dtype=dtype, device=device)
-            if gate is not None
+            if gate is not None or packed_query_gate
             else None
         )
         self.merged_core_grad = (
             wp.empty((rows, query_width), dtype=dtype, device=device)
-            if gate is not None
+            if gate is not None or packed_query_gate
             else None
         )
         self.lse = wp.empty(query_shape[:3], dtype=wp.float32, device=device)
@@ -259,7 +315,18 @@ class GQALoRAAttentionPlan:
             if self.gate_name is not None
             else None
         )
-        split_heads(self.adapters.forward(query_name, x), self.query)
+        query_projection = self.adapters.forward(query_name, x)
+        if self.packed_query_gate:
+            wp.launch(
+                _packed_query_gate_kernels(self.dtype)[0],
+                dim=(self.rows, self.query_heads, self.head_size),
+                inputs=[query_projection],
+                outputs=[self.query, self.packed_gate],
+                device=self.device,
+            )
+            gate_values = self.packed_gate
+        else:
+            split_heads(query_projection, self.query)
         split_heads(self.adapters.forward(key_name, x), self.key)
         split_heads(self.adapters.forward(value_name, x), self.value)
         query_ready, key_ready = self.query, self.key
@@ -307,13 +374,23 @@ class GQALoRAAttentionPlan:
     ) -> wp.array:
         """Run O, Flash-GQA, and Q/K/V backward into fixed FP32 input gradient."""
         query_name, key_name, value_name, output_name = self.names
-        projection_input = self.gated if self.gate_name is not None else self.merged
+        has_gate = self.gate_name is not None or self.packed_query_gate
+        projection_input = self.gated if has_gate else self.merged
         merged_grad = self.adapters.backward(
             output_name, projection_input, grad_output, accumulate=accumulate
         )
         core_gradient = merged_grad
-        if self.gate_name is not None:
-            gate_values = self.adapters.targets[self.gate_name].plan.output
+        if has_gate:
+            gate_values = (
+                self.adapters.targets[self.gate_name].plan.output
+                if self.gate_name is not None
+                else self.packed_gate
+            )
+            gate_grad = (
+                gate_values.grad
+                if self.gate_name is not None
+                else self.packed_gate_grad
+            )
             wp.launch(
                 _gate_kernels(self.dtype)[1],
                 dim=self.merged.size,
@@ -324,7 +401,7 @@ class GQALoRAAttentionPlan:
                 ],
                 outputs=[
                     self.merged_core_grad.flatten(),
-                    gate_values.grad.flatten(),
+                    gate_grad.flatten(),
                 ],
                 device=self.device,
             )
@@ -368,13 +445,32 @@ class GQALoRAAttentionPlan:
                 cosine,
                 sine,
             )
-        for gradient, storage, name in (
-            (query_projection_grad, self.query_grad_storage, query_name),
-            (key_projection_grad, self.key_grad_storage, key_name),
-            (self.value_grad, self.value_grad_storage, value_name),
+        for gradient, storage in (
+            (query_projection_grad, self.query_grad_storage),
+            (key_projection_grad, self.key_grad_storage),
+            (self.value_grad, self.value_grad_storage),
         ):
             cast_from_float32(gradient, storage)
-            merge_heads(storage, self.adapters.targets[name].plan.output.grad)
+        if self.packed_query_gate:
+            wp.launch(
+                _packed_query_gate_kernels(self.dtype)[1],
+                dim=(self.rows, self.query_heads, self.head_size),
+                inputs=[self.query_grad_storage, self.packed_gate_grad],
+                outputs=[self.adapters.targets[query_name].plan.output.grad],
+                device=self.device,
+            )
+        else:
+            merge_heads(
+                self.query_grad_storage,
+                self.adapters.targets[query_name].plan.output.grad,
+            )
+        merge_heads(
+            self.key_grad_storage, self.adapters.targets[key_name].plan.output.grad
+        )
+        merge_heads(
+            self.value_grad_storage,
+            self.adapters.targets[value_name].plan.output.grad,
+        )
 
         query_input = self.adapters.backward(
             query_name,

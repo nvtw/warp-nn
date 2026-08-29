@@ -157,6 +157,94 @@ def test_gqa_lora_attention_optional_gate_cpu():
     assert np.any(gate_gradient)
 
 
+def test_gqa_lora_attention_packed_query_gate_matches_separate_gate_cpu():
+    rng = np.random.default_rng(103)
+    dtype = wp.bfloat16
+    rows, hidden, heads, head_size = 3, 8, 2, 4
+    query = rng.normal(0.0, 0.2, (heads * head_size, hidden)).astype(np.float32)
+    gate = rng.normal(0.0, 0.2, query.shape).astype(np.float32)
+    packed = np.empty((2 * heads * head_size, hidden), dtype=np.float32)
+    for head in range(heads):
+        packed[head * 2 * head_size : head * 2 * head_size + head_size] = query[
+            head * head_size : (head + 1) * head_size
+        ]
+        packed[head * 2 * head_size + head_size : (head + 1) * 2 * head_size] = gate[
+            head * head_size : (head + 1) * head_size
+        ]
+    common = {
+        "k": rng.normal(0.0, 0.2, (head_size, hidden)).astype(np.float32),
+        "v": rng.normal(0.0, 0.2, (head_size, hidden)).astype(np.float32),
+        "o": rng.normal(0.0, 0.2, (hidden, heads * head_size)).astype(np.float32),
+    }
+
+    def collection(values):
+        return LoRAAdapterCollection(
+            {
+                name: wp.array(value, dtype=dtype, device="cpu")
+                for name, value in values.items()
+            },
+            rows=rows,
+            configs=LoRAAdapterConfig(rank=2),
+            seed=11,
+            use_cublas=False,
+        )
+
+    separate = collection({"q": query, "g": gate, **common})
+    packed_adapters = collection({"q": packed, **common})
+    separate_plan = GQALoRAAttentionPlan(
+        separate,
+        query="q",
+        key="k",
+        value="v",
+        output="o",
+        gate="g",
+        batch=1,
+        sequence=rows,
+        query_heads=heads,
+        kv_heads=1,
+        head_size=head_size,
+        window=2,
+    )
+    packed_plan = GQALoRAAttentionPlan(
+        packed_adapters,
+        query="q",
+        key="k",
+        value="v",
+        output="o",
+        packed_query_gate=True,
+        batch=1,
+        sequence=rows,
+        query_heads=heads,
+        kv_heads=1,
+        head_size=head_size,
+        window=2,
+    )
+    x = wp.array(rng.normal(0.0, 0.2, (rows, hidden)), dtype=dtype, device="cpu")
+    lengths = wp.array([rows], dtype=wp.int32, device="cpu")
+    gradient = wp.array(rng.normal(0.0, 0.2, (rows, hidden)), dtype=dtype, device="cpu")
+
+    np.testing.assert_array_equal(
+        packed_plan.forward(x, lengths).numpy(),
+        separate_plan.forward(x, lengths).numpy(),
+    )
+    packed_input = packed_plan.backward(x, lengths, gradient).numpy()
+    separate_input = separate_plan.backward(x, lengths, gradient).numpy()
+    np.testing.assert_allclose(packed_input, separate_input, rtol=0.02, atol=0.01)
+    expected = np.empty((rows, 2 * heads * head_size), dtype=np.float32)
+    q_grad = separate.targets["q"].plan.output.grad.numpy()
+    g_grad = separate.targets["g"].plan.output.grad.numpy()
+    for head in range(heads):
+        expected[:, head * 2 * head_size : head * 2 * head_size + head_size] = q_grad[
+            :, head * head_size : (head + 1) * head_size
+        ]
+        expected[:, head * 2 * head_size + head_size : (head + 1) * 2 * head_size] = (
+            g_grad[:, head * head_size : (head + 1) * head_size]
+        )
+    np.testing.assert_array_equal(
+        packed_adapters.targets["q"].plan.output.grad.numpy(), expected
+    )
+
+
 CUDA_DEVICES = [device for device in wp.get_devices() if device.is_cuda]
 
 

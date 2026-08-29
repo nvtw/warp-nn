@@ -232,6 +232,30 @@ def _cross_entropy_backward_kernel(
     gradient[row, column] = value * loss_scale / divisor
 
 
+def residual_forward(x: wp.array, skip: wp.array, output: wp.array) -> None:
+    """Add two fixed FP16/BF16/FP32 matrices into caller-owned storage."""
+    for name, value in (("x", x), ("skip", skip), ("output", output)):
+        if not isinstance(value, wp.array) or value.ndim != 2:
+            raise TypeError(f"{name} must be a 2-D Warp array")
+        if not value.is_contiguous:
+            raise ValueError(f"{name} must be contiguous")
+    if x.shape != skip.shape or x.shape != output.shape:
+        raise ValueError("x, skip, and output shapes must match")
+    if x.dtype != skip.dtype or x.dtype != output.dtype:
+        raise TypeError("x, skip, and output dtypes must match")
+    if x.device != skip.device or x.device != output.device:
+        raise ValueError("x, skip, and output devices must match")
+    if x.dtype not in _STORAGE_DTYPES:
+        raise TypeError("residual storage must use FP32, FP16, or BF16")
+    wp.launch(
+        _get_primitive_kernels(x.dtype).residual,
+        dim=x.shape,
+        inputs=[x, skip],
+        outputs=[output],
+        device=x.device,
+    )
+
+
 class _FixedPlan:
     def __init__(self, device: object | None):
         self.device = wp.get_device(device)

@@ -3,31 +3,13 @@
 
 """Exact fixed-buffer Muse Glimmer transformer-layer training composition."""
 
-from functools import lru_cache
-
 import warp as wp
 
 from .bridges import add_fp32_gradients, cast_from_float32, cast_to_float32
 from .gqa import GQALoRAAttentionPlan
 from .mlp import LoRASwiGLUPlan
+from .primitives import residual_forward
 from .qk import QKTransformPlan
-
-
-@lru_cache(maxsize=None)
-def _residual_kernel(dtype: type):
-    DTYPE = dtype
-
-    @wp.kernel(enable_backward=False, module="unique")
-    def kernel(
-        left: wp.array1d(dtype=DTYPE),
-        right: wp.array1d(dtype=DTYPE),
-        output: wp.array1d(dtype=DTYPE),
-    ):
-        index = wp.tid()
-        output[index] = DTYPE(wp.float32(left[index]) + wp.float32(right[index]))
-
-    kernel.module.options["enable_backward"] = False
-    return kernel
 
 
 class MuseLoRATransformerBlockPlan:
@@ -130,13 +112,7 @@ class MuseLoRATransformerBlockPlan:
         post_attention = self.post_attention_norm.forward(
             attention_output.reshape(self.shape4), self.weights[1]
         ).reshape(self.shape)
-        wp.launch(
-            _residual_kernel(self.dtype),
-            dim=self.output.size,
-            inputs=[x.flatten(), post_attention.flatten()],
-            outputs=[self.attention_residual.flatten()],
-            device=self.device,
-        )
+        residual_forward(x, post_attention, self.attention_residual)
         feedforward_input = self.feedforward_norm.forward(
             self.attention_residual.reshape(self.shape4), self.weights[2]
         ).reshape(self.shape)
@@ -144,13 +120,7 @@ class MuseLoRATransformerBlockPlan:
         post_feedforward = self.post_feedforward_norm.forward(
             mlp_output.reshape(self.shape4), self.weights[3]
         ).reshape(self.shape)
-        wp.launch(
-            _residual_kernel(self.dtype),
-            dim=self.output.size,
-            inputs=[self.attention_residual.flatten(), post_feedforward.flatten()],
-            outputs=[self.output.flatten()],
-            device=self.device,
-        )
+        residual_forward(self.attention_residual, post_feedforward, self.output)
         return self.output
 
     def backward(

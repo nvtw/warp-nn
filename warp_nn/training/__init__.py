@@ -21,6 +21,7 @@ from .muse import MuseLoRATransformerBlockPlan
 from .optimizer import AdamWPlan
 from .primitives import CrossEntropyPlan, EmbeddingPlan, TransformerPrimitivePlan
 from .qk import QKTransformPlan
+from .qwen import QwenLoRATransformerBlockPlan
 from .step import LoRALinearTrainingPlan
 
 
@@ -36,6 +37,7 @@ __all__ = [
     "LoRASwiGLUPlan",
     "MuseLoRATransformerBlockPlan",
     "QKTransformPlan",
+    "QwenLoRATransformerBlockPlan",
     "TransformerPrimitivePlan",
     "accumulate_fp32_gradient",
     "add_fp32_gradients",
