@@ -932,6 +932,7 @@ class Qwen35Runner:
         self.sin_cache = wp.array(sin_cache, dtype=self.dtype, device=self.device)
         self._decode_plan = _Qwen35Plan(self, 1)
         self._chunk_plan = _Qwen35Plan(self, self.prefill_chunk_size)
+        self._chunk_plan._capture_ready = False
         self._sample_partial_values = wp.empty(
             128, dtype=wp.float32, device=self.device
         )

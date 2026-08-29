@@ -108,6 +108,8 @@ def test_linear_operation_cublas():
     np.testing.assert_allclose(
         tensors["output"].numpy(), x_np @ weight_np.T, atol=0.2, rtol=0.02
     )
+    cublas.close()
+    cublas.close()
 
 
 @pytest.mark.parametrize(

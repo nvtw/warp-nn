@@ -44,6 +44,7 @@ class Cublas:
             raise OSError("cuBLAS is not available")
 
         self._lib.cublasCreate_v2.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        self._lib.cublasDestroy_v2.argtypes = [ctypes.c_void_p]
         self._lib.cublasSetStream_v2.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         self._lib.cublasGemmEx.argtypes = [
             ctypes.c_void_p,
@@ -78,6 +79,21 @@ class Cublas:
     def _check(status, operation):
         if status:
             raise RuntimeError(f"{operation} failed with cuBLAS status {status}")
+
+    def close(self):
+        """Release the native handle; repeated calls are harmless."""
+        handle = getattr(self, "_handle", None)
+        if not handle:
+            return
+        self._handle = None
+        self._stream = None
+        self._check(self._lib.cublasDestroy_v2(handle), "cublasDestroy")
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def gemm(
         self, activations, weights, output, rows, columns, inner, stream, data_type
