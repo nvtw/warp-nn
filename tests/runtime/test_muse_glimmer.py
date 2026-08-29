@@ -330,8 +330,10 @@ def test_muse_glimmer_prefill_decode_ring_cache_and_graph_replay(tmp_path, use_c
     )
     assert (
         plan.tensors[plan.layers[0]["swiglu"].outputs[0]].ptr
-        != plan.tensors[plan.layers[1]["swiglu"].outputs[0]].ptr
+        == plan.tensors[plan.layers[1]["swiglu"].outputs[0]].ptr
     )
+    assert plan.layers[0]["q"].ptr == plan.layers[1]["q"].ptr
+    assert plan.layers[0]["core"].ptr == plan.layers[1]["core"].ptr
 
     assert isinstance(runner, MuseGlimmerRunner)
     assert runner.local_cache_capacity == 6

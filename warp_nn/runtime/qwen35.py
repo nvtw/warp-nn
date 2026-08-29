@@ -236,14 +236,31 @@ def _validate_config(config: dict) -> None:
         raise ValueError("Only default Qwen rotary embeddings are supported")
 
 
+def _reuse_layer_operation_outputs(
+    layer: dict, tensors: dict, pool: dict, op_type: str | None = None
+) -> None:
+    """Alias same-role operation outputs across sequential model layers."""
+    for role, value in layer.items():
+        if isinstance(value, Operation) and (op_type is None or value.op_type == op_type):
+            for output_index, name in enumerate(value.outputs):
+                if name and name in tensors:
+                    output = tensors[name]
+                    key = ("operation", role, output_index, tuple(output.shape), output.dtype)
+                    shared = pool.setdefault(key, output)
+                    tensors[name] = shared
+                    if output_index == 0 and "_output_2d" in value.attrs:
+                        value.attrs["_output_2d"] = shared.reshape(
+                            value.attrs["_output_2d"].shape
+                        )
+                    if output_index == 3 and "_residual_2d" in value.attrs:
+                        value.attrs["_residual_2d"] = shared.reshape(
+                            value.attrs["_residual_2d"].shape
+                        )
+
+
 def _reuse_layer_linear_outputs(layer: dict, tensors: dict, pool: dict) -> None:
     """Alias same-role Linear outputs across sequential model layers."""
-    for role, value in layer.items():
-        if isinstance(value, Operation) and value.op_type == "Linear":
-            name = value.outputs[0]
-            output = tensors[name]
-            key = (role, tuple(output.shape), output.dtype)
-            tensors[name] = pool.setdefault(key, output)
+    _reuse_layer_operation_outputs(layer, tensors, pool, "Linear")
 
 
 class _Qwen35Plan:

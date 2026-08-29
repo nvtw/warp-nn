@@ -40,7 +40,7 @@ from warp_nn.runtime.operators import (
     plan_rms_norm,
     plan_swiglu,
 )
-from warp_nn.runtime.qwen35 import Qwen35Runner, _reuse_layer_linear_outputs
+from warp_nn.runtime.qwen35 import Qwen35Runner, _reuse_layer_operation_outputs
 from warp_nn.runtime.qwen3 import Qwen3Tokenizer, _pretokenize_o200k
 from warp_nn.runtime.safetensors import SafeTensorArchive
 from warp_nn.runtime.rope import resolve_rope_parameters, rotary_cache_values
@@ -621,6 +621,40 @@ class _MusePlan:
         self.shapes[name] = tuple(value.shape)
         return name
 
+    def _reuse_layer_buffers(self, layer: dict, index: int) -> None:
+        """Alias non-overlapping per-layer temporaries by their execution role."""
+        _reuse_layer_operation_outputs(layer, self.tensors, self._layer_buffer_pool)
+
+        def reuse(role: str, value: wp.array, name: str | None = None, slot: int = 0):
+            key = ("buffer", role, slot, tuple(value.shape), value.dtype)
+            shared = self._layer_buffer_pool.setdefault(key, value)
+            layer[role] = shared
+            if name is not None:
+                self.tensors[name] = shared
+
+        for role in ("q", "k"):
+            reuse(role, layer[role], f"layer.{index}.{role}")
+        reuse("v", layer["v"])
+        reuse("core", layer["core"])
+        reuse(
+            "gated",
+            layer["gated"],
+            f"layer.{index}.attention_gated",
+        )
+        for role in ("attention_residual", "output"):
+            name = layer[role]
+            value = self.tensors[name]
+            slot = index % 2 if role == "output" else 0
+            self.tensors[name] = self._layer_buffer_pool.setdefault(
+                ("buffer", role, slot, tuple(value.shape), value.dtype), value
+            )
+        if layer["local"]:
+            reuse("q_ready", layer["q_ready"])
+            reuse("k_ready", layer["k_ready"])
+        else:
+            layer["q_ready"] = self.tensors[layer["q_norm"].outputs[0]]
+            layer["k_ready"] = self.tensors[layer["k_norm"].outputs[0]]
+
     def _build(self) -> None:
         hidden = "hidden.0"
         self.embedding_norm = self._rms(
@@ -697,7 +731,7 @@ class _MusePlan:
                 ),
             )
             layer["output"] = hidden
-            _reuse_layer_linear_outputs(layer, self.tensors, self._layer_buffer_pool)
+            self._reuse_layer_buffers(layer, index)
             self.layers.append(layer)
         final_input = "final.input"
         self.tensors[final_input] = self.tensors[hidden][self.rows - 1 : self.rows]
