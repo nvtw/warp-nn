@@ -243,6 +243,15 @@ def test_muse_glimmer_prefill_decode_ring_cache_and_graph_replay(tmp_path, use_c
     runner = create_text_runner(
         model_path, device="cuda:0", cache_capacity=8, prefill_chunk_size=4, use_cublas=use_cublas
     )
+    plan = runner._chunk_plan
+    assert (
+        plan.tensors[plan.layers[0]["mlp_gate"].outputs[0]].ptr
+        == plan.tensors[plan.layers[1]["mlp_gate"].outputs[0]].ptr
+    )
+    assert (
+        plan.tensors[plan.layers[0]["swiglu"].outputs[0]].ptr
+        != plan.tensors[plan.layers[1]["swiglu"].outputs[0]].ptr
+    )
 
     assert isinstance(runner, MuseGlimmerRunner)
     assert runner.local_cache_capacity == 6

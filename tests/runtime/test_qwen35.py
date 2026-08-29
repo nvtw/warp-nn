@@ -172,6 +172,15 @@ def test_qwen35_native_prefill_decode_and_graph_replay(tmp_path, use_cublas):
         prefill_chunk_size=4,
         use_cublas=use_cublas,
     )
+    plan = runner._chunk_plan
+    assert (
+        plan.tensors[plan.layers[0]["mlp_gate"].outputs[0]].ptr
+        == plan.tensors[plan.layers[1]["mlp_gate"].outputs[0]].ptr
+    )
+    assert (
+        plan.tensors[plan.layers[0]["swiglu"].outputs[0]].ptr
+        != plan.tensors[plan.layers[1]["swiglu"].outputs[0]].ptr
+    )
 
     first = runner.prefill([1, 2, 3]).numpy()
     assert set(runner._chunk_plans) == {2, 4}

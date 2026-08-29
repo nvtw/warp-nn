@@ -235,6 +235,16 @@ def _validate_config(config: dict) -> None:
         raise ValueError("Only default Qwen rotary embeddings are supported")
 
 
+def _reuse_layer_linear_outputs(layer: dict, tensors: dict, pool: dict) -> None:
+    """Alias same-role Linear outputs across sequential model layers."""
+    for role, value in layer.items():
+        if isinstance(value, Operation) and value.op_type == "Linear":
+            name = value.outputs[0]
+            output = tensors[name]
+            key = (role, tuple(output.shape), output.dtype)
+            tensors[name] = pool.setdefault(key, output)
+
+
 class _Qwen35Plan:
     """Fixed-row execution plan sharing weights and recurrent state."""
 
@@ -254,6 +264,7 @@ class _Qwen35Plan:
         self.tensors["hidden.0"] = self.embedding.reshape((rows, runner.hidden_size))
         self.shapes["hidden.0"] = (rows, runner.hidden_size)
         self.layers = []
+        self._layer_buffer_pool = {}
         self._build()
         self.graphs = {}
 
@@ -357,6 +368,7 @@ class _Qwen35Plan:
                 next_scale,
                 hidden_name,
             )
+            _reuse_layer_linear_outputs(layer, self.tensors, self._layer_buffer_pool)
             self.layers.append(layer)
 
         last_normalized = "final.last_normalized"

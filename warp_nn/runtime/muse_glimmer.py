@@ -40,7 +40,7 @@ from warp_nn.runtime.operators import (
     plan_rms_norm,
     plan_swiglu,
 )
-from warp_nn.runtime.qwen35 import Qwen35Runner
+from warp_nn.runtime.qwen35 import Qwen35Runner, _reuse_layer_linear_outputs
 from warp_nn.runtime.qwen3 import Qwen3Tokenizer, _pretokenize_o200k
 from warp_nn.runtime.safetensors import SafeTensorArchive
 from warp_nn.runtime.rope import resolve_rope_parameters, rotary_cache_values
@@ -586,6 +586,7 @@ class _MusePlan:
         self.tensors["hidden.0"] = self.embedding.reshape((rows, runner.hidden_size))
         self.shapes["hidden.0"] = (rows, runner.hidden_size)
         self.layers = []
+        self._layer_buffer_pool = {}
         self._build()
         self.graphs = {}
 
@@ -696,6 +697,7 @@ class _MusePlan:
                 ),
             )
             layer["output"] = hidden
+            _reuse_layer_linear_outputs(layer, self.tensors, self._layer_buffer_pool)
             self.layers.append(layer)
         final_input = "final.input"
         self.tensors[final_input] = self.tensors[hidden][self.rows - 1 : self.rows]
