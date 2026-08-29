@@ -80,9 +80,7 @@ def _same_visible_assistant(
     current: Mapping[str, object], expected: Mapping[str, object]
 ) -> bool:
     ignored = {"reasoning", "reasoning_content"}
-    if any(
-        key in current and current[key] != expected.get(key) for key in ignored
-    ):
+    if any(key in current and current[key] != expected.get(key) for key in ignored):
         return False
     return {key: value for key, value in current.items() if key not in ignored} == {
         key: value for key, value in expected.items() if key not in ignored

@@ -6,22 +6,38 @@
 import argparse
 from pathlib import Path
 
-from warp_nn.runtime import ChatCompletions, OpenAIHTTPServer, create_text_runner, create_tokenizer
+from warp_nn.runtime import (
+    ChatCompletions,
+    OpenAIHTTPServer,
+    create_text_runner,
+    create_tokenizer,
+)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("model_dir", type=Path, help="Directory containing a supported ONNX or safetensors model")
+    parser.add_argument(
+        "model_dir",
+        type=Path,
+        help="Directory containing a supported ONNX or safetensors model",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--model-id", help="Model name exposed by the API; defaults to the directory name")
-    parser.add_argument("--api-key", help="Optional bearer token; omitted means no authentication")
+    parser.add_argument(
+        "--model-id",
+        help="Model name exposed by the API; defaults to the directory name",
+    )
+    parser.add_argument(
+        "--api-key", help="Optional bearer token; omitted means no authentication"
+    )
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--cache-capacity", type=int, default=4096)
     parser.add_argument("--prefill-chunk-size", type=int, default=256)
     parser.add_argument("--yarn", action="store_true")
     parser.add_argument("--yarn-factor", type=float)
-    parser.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--thinking", action=argparse.BooleanOptionalAction, default=None
+    )
     parser.add_argument("--reasoning-effort", choices=("low", "medium", "xhigh"))
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--top-p", type=float)
@@ -48,10 +64,18 @@ def main():
         **({"rope_scaling": rope_scaling} if rope_scaling else {}),
     )
     model_id = args.model_id or args.model_dir.name
-    thinking = tokenizer.default_enable_thinking if args.thinking is None else args.thinking
-    temperature = args.temperature if args.temperature is not None else (1.0 if thinking else 0.7)
+    thinking = (
+        tokenizer.default_enable_thinking if args.thinking is None else args.thinking
+    )
+    temperature = (
+        args.temperature if args.temperature is not None else (1.0 if thinking else 0.7)
+    )
     top_p = args.top_p if args.top_p is not None else (0.95 if thinking else 0.8)
-    presence_penalty = args.presence_penalty if args.presence_penalty is not None else (0.0 if thinking else 1.5)
+    presence_penalty = (
+        args.presence_penalty
+        if args.presence_penalty is not None
+        else (0.0 if thinking else 1.5)
+    )
     if temperature < 0.0 or not 0.0 < top_p <= 1.0 or args.top_k < 0:
         parser.error("invalid sampling parameters")
     if not -2.0 <= presence_penalty <= 2.0:

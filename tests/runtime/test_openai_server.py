@@ -210,9 +210,7 @@ def test_chat_completions_preserves_hidden_generated_prefix():
     returned_assistant = response["choices"][0]["message"]
     assert returned_assistant["reasoning_content"] == "Reasoning"
     assistant = {"role": "assistant", "content": "A"}
-    completions.complete(
-        _chat([*first, assistant, {"role": "user", "content": "y"}])
-    )
+    completions.complete(_chat([*first, assistant, {"role": "user", "content": "y"}]))
 
     assert tokenizer.full_calls == 1
     suffix = tokenizer.encode("user:y;assistant:")
@@ -222,9 +220,7 @@ def test_chat_completions_preserves_hidden_generated_prefix():
         **assistant,
         "content": "edited",
     }
-    completions.complete(
-        _chat([*first, changed, {"role": "user", "content": "z"}])
-    )
+    completions.complete(_chat([*first, changed, {"role": "user", "content": "z"}]))
     assert tokenizer.full_calls == 2
     assert runner.calls[-1][0] == "prefill"
 
