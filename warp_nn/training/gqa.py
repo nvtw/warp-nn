@@ -10,6 +10,7 @@ import warp as wp
 from .adapters import LoRAAdapterCollection
 from .attention import gqa_attention_backward, gqa_attention_forward
 from .bridges import cast_from_float32, merge_heads, split_heads
+from .qk import QKTransformPlan
 
 
 @lru_cache(maxsize=None)
@@ -55,6 +56,10 @@ class GQALoRAAttentionPlan:
         kv_heads: int,
         head_size: int,
         window: int = 0,
+        query_transform: QKTransformPlan | None = None,
+        key_transform: QKTransformPlan | None = None,
+        query_norm_weight: wp.array | None = None,
+        key_norm_weight: wp.array | None = None,
     ):
         if min(batch, sequence, query_heads, kv_heads, head_size) <= 0:
             raise ValueError("GQA LoRA dimensions must be positive")
@@ -94,6 +99,35 @@ class GQALoRAAttentionPlan:
             raise ValueError(
                 f"GQA LoRA projection shapes must be {expected}, got {actual}"
             )
+        transform_items = (
+            (
+                query_transform,
+                query_norm_weight,
+                (batch, query_heads, sequence, head_size),
+            ),
+            (key_transform, key_norm_weight, (batch, kv_heads, sequence, head_size)),
+        )
+        enabled = tuple(transform is not None for transform, _, _ in transform_items)
+        if enabled not in ((False, False), (True, True)):
+            raise ValueError("query and key transforms must be enabled together")
+        for transform, weight, shape in transform_items:
+            if transform is None:
+                if weight is not None:
+                    raise ValueError("normalization weights require Q/K transforms")
+                continue
+            if (
+                transform.shape != shape
+                or transform.dtype != dtype
+                or transform.device != device
+            ):
+                raise ValueError("Q/K transform shape, dtype, and device must match")
+            if (
+                not isinstance(weight, wp.array)
+                or weight.shape != (head_size,)
+                or weight.dtype != dtype
+                or weight.device != device
+            ):
+                raise ValueError("Q/K normalization weights must match head storage")
 
         self.adapters = adapters
         self.names = names
@@ -108,6 +142,10 @@ class GQALoRAAttentionPlan:
         self.head_size = head_size
         self.window = window
         self.scale = head_size**-0.5
+        self.query_transform = query_transform
+        self.key_transform = key_transform
+        self.query_norm_weight = query_norm_weight
+        self.key_norm_weight = key_norm_weight
 
         query_shape = (batch, query_heads, sequence, head_size)
         kv_shape = (batch, kv_heads, sequence, head_size)
@@ -133,15 +171,25 @@ class GQALoRAAttentionPlan:
         """Return the fixed output buffer of the O projection."""
         return self.adapters.targets[self.names[3]].plan.output
 
-    def forward(self, x: wp.array, lengths: wp.array) -> wp.array:
+    def forward(
+        self, x: wp.array, lengths: wp.array, positions=None, cosine=None, sine=None
+    ) -> wp.array:
         """Execute Q/K/V projections, exact GQA, and the O projection."""
         query_name, key_name, value_name, output_name = self.names
         split_heads(self.adapters.forward(query_name, x), self.query)
         split_heads(self.adapters.forward(key_name, x), self.key)
         split_heads(self.adapters.forward(value_name, x), self.value)
+        query_ready, key_ready = self.query, self.key
+        if self.query_transform is not None:
+            query_ready = self.query_transform.forward(
+                self.query, self.query_norm_weight, positions, cosine, sine
+            )
+            key_ready = self.key_transform.forward(
+                self.key, self.key_norm_weight, positions, cosine, sine
+            )
         gqa_attention_forward(
-            self.query,
-            self.key,
+            query_ready,
+            key_ready,
             self.value,
             lengths,
             self.core,
@@ -158,6 +206,9 @@ class GQALoRAAttentionPlan:
         x: wp.array,
         lengths: wp.array,
         grad_output: wp.array,
+        positions=None,
+        cosine=None,
+        sine=None,
         *,
         accumulate: bool = False,
     ) -> wp.array:
@@ -167,9 +218,15 @@ class GQALoRAAttentionPlan:
             output_name, self.merged, grad_output, accumulate=accumulate
         )
         split_heads(merged_grad, self.core_grad)
+        query_ready = (
+            self.query if self.query_transform is None else self.query_transform.output
+        )
+        key_ready = (
+            self.key if self.key_transform is None else self.key_transform.output
+        )
         gqa_attention_backward(
-            self.query,
-            self.key,
+            query_ready,
+            key_ready,
             self.value,
             self.core_grad,
             lengths,
@@ -181,9 +238,27 @@ class GQALoRAAttentionPlan:
             scale=self.scale,
             window=self.window,
         )
+        query_projection_grad, key_projection_grad = self.query_grad, self.key_grad
+        if self.query_transform is not None:
+            query_projection_grad = self.query_transform.backward(
+                self.query,
+                self.query_norm_weight,
+                self.query_grad,
+                positions,
+                cosine,
+                sine,
+            )
+            key_projection_grad = self.key_transform.backward(
+                self.key,
+                self.key_norm_weight,
+                self.key_grad,
+                positions,
+                cosine,
+                sine,
+            )
         for gradient, storage, name in (
-            (self.query_grad, self.query_grad_storage, query_name),
-            (self.key_grad, self.key_grad_storage, key_name),
+            (query_projection_grad, self.query_grad_storage, query_name),
+            (key_projection_grad, self.key_grad_storage, key_name),
             (self.value_grad, self.value_grad_storage, value_name),
         ):
             cast_from_float32(gradient, storage)

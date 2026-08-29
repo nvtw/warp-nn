@@ -8,6 +8,7 @@ import warp as wp
 
 from warp_nn.training.adapters import LoRAAdapterCollection, LoRAAdapterConfig
 from warp_nn.training.gqa import GQALoRAAttentionPlan
+from warp_nn.training.qk import QKTransformPlan
 
 
 def _fixture(device):
@@ -91,6 +92,41 @@ def test_gqa_lora_attention_fixed_buffers_and_accumulation_cpu():
     assert any(np.any(values) for values in first_gradients.values())
     for name, gradient in adapters.named_gradients.items():
         np.testing.assert_allclose(gradient.numpy(), 2.0 * first_gradients[name])
+
+
+def test_gqa_lora_attention_composes_qk_norm_and_rope_cpu():
+    adapters, _, x, lengths, grad_output = _fixture("cpu")
+    query_transform = QKTransformPlan(1, 2, 3, 4, wp.bfloat16, device="cpu")
+    key_transform = QKTransformPlan(1, 1, 3, 4, wp.bfloat16, device="cpu")
+    unit = wp.ones(4, dtype=wp.bfloat16, device="cpu")
+    plan = GQALoRAAttentionPlan(
+        adapters,
+        query="q",
+        key="k",
+        value="v",
+        output="o",
+        batch=1,
+        sequence=3,
+        query_heads=2,
+        kv_heads=1,
+        head_size=4,
+        window=2,
+        query_transform=query_transform,
+        key_transform=key_transform,
+        query_norm_weight=unit,
+        key_norm_weight=unit,
+    )
+    positions = wp.array([[0, 1, 2]], dtype=wp.int64, device="cpu")
+    cosine = wp.ones((3, 2), dtype=wp.bfloat16, device="cpu")
+    sine = wp.zeros((3, 2), dtype=wp.bfloat16, device="cpu")
+
+    plan.forward(x, lengths, positions, cosine, sine)
+    plan.backward(x, lengths, grad_output, positions, cosine, sine)
+
+    assert np.isfinite(plan.output.numpy()).all()
+    assert np.isfinite(plan.input_grad.numpy()).all()
+    assert np.isfinite(query_transform.input_grad.numpy()).all()
+    assert np.isfinite(key_transform.input_grad.numpy()).all()
 
 
 CUDA_DEVICES = [device for device in wp.get_devices() if device.is_cuda]
