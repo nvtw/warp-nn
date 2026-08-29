@@ -242,12 +242,13 @@ def test_decode_attention_partitions_follow_head_geometry(head_size, partitions)
     assert _decode_attention_partitions(head_size) == partitions
 
 
-@pytest.mark.parametrize("rows", [1, 3, 32])
-def test_q8_0_linear_operation(rows):
+@pytest.mark.parametrize("dtype", [wp.float16, wp.bfloat16])
+@pytest.mark.parametrize("rows,columns", [(1, 40), (3, 40), (32, 40), (16, 64)])
+def test_q8_0_linear_operation(rows, columns, dtype):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
     rng = np.random.default_rng(23)
-    columns, inner = 40, 64
+    inner = 64
     blocks = inner // 32
     x_np = rng.normal(0.0, 0.5, (rows, inner)).astype(np.float32)
     weight_values = rng.integers(-127, 128, (columns, blocks, 32), dtype=np.int8)
@@ -264,7 +265,7 @@ def test_q8_0_linear_operation(rows):
     scales = wp.array(weight_scales, dtype=wp.float16, device="cuda:0")
     weight = BlockQuantizedTensor(values, words, scales, (columns, inner), "Q8_0")
     tensors = {
-        "x": wp.array(x_np, dtype=wp.bfloat16, device="cuda:0"),
+        "x": wp.array(x_np, dtype=dtype, device="cuda:0"),
         "weight": weight,
     }
     shapes = {name: tuple(value.shape) for name, value in tensors.items()}
@@ -278,6 +279,8 @@ def test_q8_0_linear_operation(rows):
     reshaped = x_bf16.reshape(rows, blocks, 32)
     activation_scales = np.max(np.abs(reshaped), axis=2, keepdims=True) / 127.0
     activation_scales[activation_scales == 0.0] = 1.0
+    assert ("_q8_mma_kernel" in operation.attrs) == (rows == 16 and columns == 64)
+
     x_bf16 = (
         np.clip(np.rint(reshaped / activation_scales), -127, 127) * activation_scales
     ).reshape(rows, inner)

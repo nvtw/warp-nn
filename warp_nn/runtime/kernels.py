@@ -30,6 +30,7 @@ from warp_nn.runtime._cuda import (
     expand_int4x4_low,
     get_grouped_decode_projection,
     get_prefill_mma_projection,
+    get_q8_prefill_mma_projection,
     subgroup_sum,
     warp_max_broadcast,
 )
@@ -227,6 +228,43 @@ def _create_prefill_mma_linear_kernel(dtype: type, tile_m: int, tile_n: int):
 def _get_prefill_mma_linear_kernel(dtype: type, tile_m: int, tile_n: int):
     """Return a cached SM80+ dense projection kernel."""
     return _create_prefill_mma_linear_kernel(dtype, tile_m, tile_n)
+
+
+def _create_q8_prefill_mma_linear_kernel(dtype: type):
+    """Build the shared 16x32 signed-INT8 tensor-core projection wrapper."""
+    DTYPE = dtype
+    project = get_q8_prefill_mma_projection(dtype)
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(
+        activations: wp.array2d[wp.int8],
+        activation_scales: wp.array2d[wp.float32],
+        weights: wp.array3d[wp.int8],
+        weight_scales: wp.array2d[wp.float16],
+        output: wp.array2d(dtype=DTYPE),
+        columns: int,
+        blocks: int,
+    ):
+        typed_zero = DTYPE(0.0)  # noqa: F841 - retain dtype in the Warp closure
+        wp.static(project)(
+            activations,
+            activation_scales,
+            weights,
+            weight_scales,
+            output,
+            wp.tid(),
+            columns,
+            blocks,
+        )
+
+    kernel.module.options["enable_backward"] = False
+    return kernel
+
+
+@lru_cache(maxsize=None)
+def _get_q8_prefill_mma_linear_kernel(dtype: type):
+    """Return the cached 16x32 signed-INT8 tensor-core projection kernel."""
+    return _create_q8_prefill_mma_linear_kernel(dtype)
 
 
 def _create_linear_tiled_kernel(dtype: type, tile_m: int, tile_k: int):

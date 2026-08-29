@@ -22,6 +22,7 @@ from warp_nn.runtime.kernels import (
     _get_linear_tiled_kernel,
     _get_prefill_mma_linear_kernel,
     _get_linear_vector_kernel,
+    _get_q8_prefill_mma_linear_kernel,
     _get_matmul_int8_q8_kernel,
     _get_quantize_activation_int8_kernel,
     _get_rms_norm_kernels,
@@ -73,6 +74,24 @@ def _exec_linear(op, tensors, shapes, device):
             block_dim=32,
             device=device,
         )
+        q8_mma = op.attrs.get("_q8_mma_kernel")
+        if q8_mma is not None:
+            wp.launch(
+                q8_mma,
+                dim=(op.attrs["_rows"] // 16) * (op.attrs["_columns"] // 32) * 128,
+                inputs=[
+                    op.attrs["_q8_activations"],
+                    op.attrs["_q8_scales"],
+                    weight.values,
+                    weight.scales,
+                    output,
+                    op.attrs["_columns"],
+                    op.attrs["_inner"] // 32,
+                ],
+                block_dim=128,
+                device=device,
+            )
+            return
         wp.launch(
             op.attrs["_q8_kernel"],
             dim=(
@@ -190,6 +209,18 @@ def plan_linear(
             (rows, blocks), dtype=wp.float32, device=device
         )
         op.attrs["_q8_quantize_kernel"] = _get_quantize_activation_int8_kernel(dtype)
+        if (
+            device.arch >= 80
+            and rows % 16 == 0
+            and columns % 32 == 0
+            and quantized.is_contiguous
+            and weight.values.is_contiguous
+            and weight.scales.is_contiguous
+            and output.is_contiguous
+            and quantized.ptr % 4 == 0
+            and weight.values.ptr % 4 == 0
+        ):
+            op.attrs["_q8_mma_kernel"] = _get_q8_prefill_mma_linear_kernel(dtype)
         # Share activation loads only when halving the grid retains two CTAs per SM.
         grouped_blocks = (rows * ((columns + 1) // 2) * 8 + 127) // 128
         outputs_per_group = 2 if grouped_blocks >= 2 * device.sm_count else 1
