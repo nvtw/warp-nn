@@ -903,8 +903,9 @@ def test_mixed_state_linear_attention_bfloat16(tiled_value_heads, scalar_gated_d
         (0.05 * rng.normal(size=(value_heads * width, width))).astype(np.float32),
         device="cuda:0",
     )
+    decay_log = rng.uniform(-0.2, -0.01, size=(rows, value_heads)).astype(np.float32)
     decay = wp.array(
-        rng.uniform(-0.2, -0.01, size=(rows, value_heads)).astype(np.float32),
+        np.exp(decay_log) if scalar_gated_delta else decay_log,
         device="cuda:0",
     )
     beta = wp.array(
@@ -961,7 +962,11 @@ def test_mixed_state_linear_attention_bfloat16(tiled_value_heads, scalar_gated_d
             )
             key_vector = k_np[row, key_head * width : (key_head + 1) * width]
             value_vector = v_np[row, value_head * width : (value_head + 1) * width]
-            state[value_head] *= np.exp(decay_np[row, value_head])
+            state[value_head] *= (
+                decay_np[row, value_head]
+                if scalar_gated_delta
+                else np.exp(decay_np[row, value_head])
+            )
             delta = beta_np[row, value_head] * (
                 value_vector - key_vector @ state[value_head]
             )
@@ -1036,7 +1041,9 @@ def test_gated_delta_preparation_and_row_causal_conv():
     np.testing.assert_array_equal(state.numpy(), padded[-(kernel_size - 1) :].T)
     a_np, b_np = a.numpy(), b.numpy()
     expected_beta = 1.0 / (1.0 + np.exp(-b_np))
-    expected_decay = -np.exp(a_log.numpy()) * np.logaddexp(0.0, a_np + dt_bias.numpy())
+    expected_decay = np.exp(
+        -np.exp(a_log.numpy()) * np.logaddexp(0.0, a_np + dt_bias.numpy())
+    )
     np.testing.assert_allclose(beta.numpy(), expected_beta, atol=1.0e-6)
     np.testing.assert_allclose(decay.numpy(), expected_decay, atol=1.0e-6)
 

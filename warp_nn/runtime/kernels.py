@@ -1233,7 +1233,7 @@ def _prepare_gated_delta_kernel(
     decay: wp.array2d[wp.float32],
     beta: wp.array2d[wp.float32],
 ):
-    """Compute FP32 decay and beta controls for gated-delta attention."""
+    """Compute multiplicative FP32 decay and beta for gated-delta attention."""
     row, head = wp.tid()
     b_value = wp.float32(b[row, head])
     beta[row, head] = wp.float32(1.0) / (wp.float32(1.0) + wp.exp(-b_value))
@@ -1242,7 +1242,8 @@ def _prepare_gated_delta_kernel(
         wp.float32(1.0) + wp.exp(-wp.abs(dt))
     )
     a_value = wp.float32(a_log[head])
-    decay[row, head] = (a_value if a_is_decay else -wp.exp(a_value)) * softplus
+    log_decay = (a_value if a_is_decay else -wp.exp(a_value)) * softplus
+    decay[row, head] = wp.exp(log_decay)
 
 
 _dequantize_nbits_kernel_cache = {}
@@ -1690,9 +1691,7 @@ def _create_linear_attention_kernel(
                         offset=(token_row, query_head * KEY_SIZE),
                     ),
                 )
-                decay_value = STATE_DTYPE(
-                    wp.exp(wp.float32(decay[token_row, value_head]))
-                )
+                decay_value = STATE_DTYPE(decay[token_row, value_head])
                 beta_value = STATE_DTYPE(beta[token_row, value_head])
                 probes = wp.tile_zeros(shape=(2, KEY_SIZE), dtype=STATE_DTYPE)
                 wp.tile_assign(probes, key_row, offset=(0, 0))
