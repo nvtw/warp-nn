@@ -772,6 +772,7 @@ class _MusePlan:
                     self.device,
                     partitions,
                     rows=self.rows,
+                    kv_heads=self.runner.kv_heads,
                 )
             }
         layer["partitioned_attention"] = self.partitioned_attention

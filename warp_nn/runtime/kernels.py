@@ -45,6 +45,18 @@ def _decode_attention_partitions(head_size: int) -> int:
     return max(64, min(256, int(head_size)))
 
 
+def _decode_attention_head_group(
+    query_heads: int, kv_heads: int, head_size: int
+) -> int:
+    """Choose bounded K/V reuse from the grouped-query ratio."""
+    if kv_heads <= 0 or query_heads < kv_heads or query_heads % kv_heads:
+        raise ValueError("query_heads must be a positive multiple of kv_heads")
+    if head_size > 128:
+        return 4
+    queries_per_kv = query_heads // kv_heads
+    return max(4, min(16, 1 << (queries_per_kv.bit_length() - 1)))
+
+
 @wp.kernel
 def _gemm_transb_kernel(
     A: wp.array2d[Any],  # (M, K)
@@ -2097,12 +2109,16 @@ def _create_gqa_attention_kernel(head_size: int, dtype: type):
 
 
 def _create_partitioned_gqa_attention_kernels(
-    head_size: int, dtype: type, partitions: int, rows_per_group: int
+    head_size: int,
+    dtype: type,
+    partitions: int,
+    rows_per_group: int,
+    heads_per_group: int,
 ):
     """Build blockwise parallel decode attention and its softmax reduction."""
     DTYPE = dtype
     PARTITIONS = partitions
-    GROUP = 4
+    GROUP = heads_per_group
     ROWS_PER_GROUP = rows_per_group
     QUERY_GROUP = GROUP * ROWS_PER_GROUP
     KEY_TILE = 32
@@ -2455,9 +2471,10 @@ def _get_partitioned_gqa_attention_kernels(
     dtype: type = wp.float16,
     partitions: int = 256,
     rows_per_group: int = 1,
+    heads_per_group: int = 4,
 ):
     """Return cached partitioned decode attention kernels and their launch dimensions."""
-    key = (head_size, dtype, partitions, rows_per_group)
+    key = (head_size, dtype, partitions, rows_per_group, heads_per_group)
     if key not in _partitioned_gqa_attention_kernel_cache:
         _partitioned_gqa_attention_kernel_cache[key] = (
             _create_partitioned_gqa_attention_kernels(*key)
@@ -2474,18 +2491,27 @@ def _allocate_partitioned_gqa(
     partitions: int = 256,
     rows: int = 1,
     rows_per_group: int | None = None,
+    heads_per_group: int | None = None,
+    kv_heads: int | None = None,
 ):
     """Allocate one reusable workspace for partitioned decode attention."""
     if rows_per_group is None:
         rows_per_group = 1 if rows < 16 else max(1, min(4, 512 // head_size))
+    if heads_per_group is None:
+        heads_per_group = (
+            _decode_attention_head_group(heads, kv_heads, head_size)
+            if rows == 1 and kv_heads
+            else 4
+        )
     block_dim, partitions, kernels = _get_partitioned_gqa_attention_kernels(
-        head_size, dtype, partitions, rows_per_group
+        head_size, dtype, partitions, rows_per_group, heads_per_group
     )
     items = rows * heads * partitions
     return (
         block_dim,
         partitions,
         rows_per_group,
+        heads_per_group,
         kernels,
         wp.empty(items, dtype=wp.float32, device=device),
         wp.empty(items, dtype=wp.float32, device=device),
@@ -2512,13 +2538,16 @@ def _launch_partitioned_gqa(
         block_dim,
         partitions,
         rows_per_group,
+        heads_per_group,
         kernels,
         partial_maximum,
         partial_denominator,
         partial_output,
     ) = workspace
     queries_per_kv = query_heads // kv_heads
-    groups_per_batch = kv_heads * ((queries_per_kv + 3) // 4)
+    groups_per_batch = kv_heads * (
+        (queries_per_kv + heads_per_group - 1) // heads_per_group
+    )
     sequence_length = output.shape[0]
     row_groups = (sequence_length + rows_per_group - 1) // rows_per_group
     batches = query.shape[0] // (query_heads * sequence_length)

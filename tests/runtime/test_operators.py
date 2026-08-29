@@ -13,6 +13,7 @@ from warp_nn.runtime.kernels import (
     _append_head_cache_kernel,
     _append_circular_head_cache_kernel,
     _causal_conv_rows_kernel,
+    _decode_attention_head_group,
     _decode_attention_partitions,
     _get_gated_rms_norm_kernel,
     _get_gqa_attention_kernel,
@@ -107,6 +108,22 @@ def test_linear_operation_cublas():
     np.testing.assert_allclose(
         tensors["output"].numpy(), x_np @ weight_np.T, atol=0.2, rtol=0.02
     )
+
+
+@pytest.mark.parametrize(
+    "query_heads,kv_heads,head_size,group",
+    [(32, 2, 128, 16), (16, 2, 128, 8), (24, 4, 128, 4), (24, 4, 256, 4)],
+)
+def test_decode_attention_head_group_follows_gqa_geometry(
+    query_heads, kv_heads, head_size, group
+):
+    assert _decode_attention_head_group(query_heads, kv_heads, head_size) == group
+
+
+@pytest.mark.parametrize("query_heads,kv_heads", [(4, 0), (2, 4), (5, 2)])
+def test_decode_attention_head_group_rejects_invalid_geometry(query_heads, kv_heads):
+    with pytest.raises(ValueError, match="positive multiple"):
+        _decode_attention_head_group(query_heads, kv_heads, 128)
 
 
 @pytest.mark.parametrize(
@@ -408,6 +425,7 @@ def test_circular_window_attention_and_logit_softcap():
     (
         "query_heads",
         "kv_heads",
+        "head_size",
         "length",
         "capacity",
         "window",
@@ -415,25 +433,27 @@ def test_circular_window_attention_and_logit_softcap():
         "rows_per_group",
     ),
     [
-        (4, 2, 1, 1, 0, 1, 1),
-        (4, 2, 13, 16, 0, 1, 1),
-        (6, 1, 19, 20, 0, 1, 1),
-        (4, 2, 19, 8, 5, 1, 1),
-        (6, 1, 19, 20, 0, 4, 1),
-        (4, 2, 19, 8, 5, 4, 1),
-        (6, 1, 19, 20, 0, 3, 2),
-        (4, 2, 19, 8, 5, 3, 2),
-        (6, 1, 19, 20, 0, 5, 4),
-        (4, 2, 19, 8, 5, 5, 4),
+        (4, 2, 32, 1, 1, 0, 1, 1),
+        (4, 2, 32, 13, 16, 0, 1, 1),
+        (6, 1, 32, 19, 20, 0, 1, 1),
+        (4, 2, 32, 19, 8, 5, 1, 1),
+        (8, 1, 128, 13, 16, 0, 1, 1),
+        (12, 1, 128, 13, 16, 0, 1, 1),
+        (16, 1, 128, 13, 16, 0, 1, 1),
+        (6, 1, 32, 19, 20, 0, 4, 1),
+        (4, 2, 32, 19, 8, 5, 4, 1),
+        (6, 1, 32, 19, 20, 0, 3, 2),
+        (4, 2, 32, 19, 8, 5, 3, 2),
+        (6, 1, 32, 19, 20, 0, 5, 4),
+        (4, 2, 32, 19, 8, 5, 5, 4),
     ],
 )
 def test_partitioned_decode_attention_matches_serial(
-    query_heads, kv_heads, length, capacity, window, rows, rows_per_group
+    query_heads, kv_heads, head_size, length, capacity, window, rows, rows_per_group
 ):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
     rng = np.random.default_rng(41)
-    head_size = 32
     query = wp.array(
         rng.normal(size=(query_heads * rows, head_size)).astype(np.float32),
         dtype=wp.bfloat16,
@@ -487,6 +507,7 @@ def test_partitioned_decode_attention_matches_serial(
         "cuda:0",
         rows=rows,
         rows_per_group=rows_per_group,
+        kv_heads=kv_heads,
     )
     _launch_partitioned_gqa(
         workspace,
