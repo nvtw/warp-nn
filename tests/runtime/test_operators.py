@@ -19,6 +19,7 @@ from warp_nn.runtime.kernels import (
     _get_gqa_attention_kernel,
     _get_greedy_argmax_kernels,
     _get_grouped_decode_linear_kernel,
+    _get_prefill_mma_linear_kernel,
     _get_top_k_kernels,
     _get_matmul_int8_q8_kernel,
     _get_linear_attention_kernel,
@@ -113,6 +114,37 @@ def test_grouped_decode_linear_kernel(dtype):
         device="cuda:0",
     )
     np.testing.assert_allclose(output.numpy(), x_np @ weight_np.T, atol=0.2, rtol=0.02)
+
+
+@pytest.mark.parametrize("dtype", [wp.float16, wp.bfloat16])
+def test_prefill_mma_linear_kernel(dtype):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    device = wp.get_device("cuda:0")
+    if device.arch < 80:
+        pytest.skip("SM80 MMA is not available")
+    rng = np.random.default_rng(37)
+    rows, columns, inner = 32, 128, 128
+    x_np = rng.normal(0.0, 0.2, size=(rows, inner)).astype(np.float32)
+    weight_np = rng.normal(0.0, 0.2, size=(columns, inner)).astype(np.float32)
+    x = wp.array(x_np, dtype=dtype, device=device)
+    weight = wp.array(weight_np, dtype=dtype, device=device)
+    output = wp.empty((rows, columns), dtype=dtype, device=device)
+    kernel = _get_prefill_mma_linear_kernel(dtype)
+    with wp.ScopedCapture(device) as capture:
+        wp.launch(
+            kernel,
+            dim=(rows // 16) * (columns // 64) * 128,
+            inputs=[x, weight, output, columns, inner],
+            block_dim=128,
+            device=device,
+        )
+    wp.capture_launch(capture.graph)
+    wp.synchronize_device(device)
+
+    np.testing.assert_allclose(
+        output.numpy(), x_np @ weight_np.T, atol=0.2, rtol=0.02
+    )
 
 
 def test_linear_operation_cublas():

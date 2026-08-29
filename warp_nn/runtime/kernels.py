@@ -29,6 +29,7 @@ from warp_nn.runtime._cuda import (
     expand_int4x4_high,
     expand_int4x4_low,
     get_grouped_decode_projection,
+    get_prefill_mma_projection,
     subgroup_sum,
     warp_max_broadcast,
 )
@@ -184,6 +185,32 @@ def _create_grouped_decode_linear_kernel(dtype: type):
 def _get_grouped_decode_linear_kernel(dtype: type):
     """Return the cached eight-output single-token projection kernel."""
     return _create_grouped_decode_linear_kernel(dtype)
+
+
+def _create_prefill_mma_linear_kernel(dtype: type):
+    """Build the SM80+ M16xN64 dense projection wrapper."""
+    DTYPE = dtype
+    project = get_prefill_mma_projection(dtype)
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(
+        x: wp.array2d(dtype=DTYPE),
+        weight: wp.array2d(dtype=DTYPE),
+        output: wp.array2d(dtype=DTYPE),
+        columns: int,
+        inner: int,
+    ):
+        typed_zero = DTYPE(0.0)  # noqa: F841 - retain dtype in the Warp closure
+        wp.static(project)(x, weight, output, wp.tid(), columns, inner)
+
+    kernel.module.options["enable_backward"] = False
+    return kernel
+
+
+@lru_cache(maxsize=None)
+def _get_prefill_mma_linear_kernel(dtype: type):
+    """Return the cached SM80+ M16xN64 projection kernel."""
+    return _create_prefill_mma_linear_kernel(dtype)
 
 
 def _create_linear_tiled_kernel(dtype: type, tile_m: int, tile_k: int):
