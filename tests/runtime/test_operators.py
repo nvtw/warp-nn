@@ -121,7 +121,9 @@ def test_grouped_decode_linear_kernel(dtype):
     ("tile_m", "tile_n", "rows", "columns", "inner", "block_dim"),
     [(16, 64, 32, 128, 128, 128), (64, 32, 128, 128, 128, 256)],
 )
-def test_prefill_mma_linear_kernel(dtype, tile_m, tile_n, rows, columns, inner, block_dim):
+def test_prefill_mma_linear_kernel(
+    dtype, tile_m, tile_n, rows, columns, inner, block_dim
+):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
     device = wp.get_device("cuda:0")
