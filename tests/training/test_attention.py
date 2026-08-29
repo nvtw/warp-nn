@@ -6,7 +6,15 @@ import pytest
 
 import warp as wp
 
-from warp_nn.training.attention import gqa_attention_backward, gqa_attention_forward
+from warp_nn.training.attention import (
+    _attention_kernels,
+    gqa_attention_backward,
+    gqa_attention_forward,
+)
+
+
+def test_gqa_attention_streaming_factory_is_bounded():
+    assert len(_attention_kernels(wp.float16, 8)) == 3
 
 
 def _reference(query, key, value, output_grad, lengths, scale, window):

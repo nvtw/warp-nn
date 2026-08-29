@@ -4,18 +4,36 @@
 """Training-oriented neural-network operations."""
 
 from .attention import gqa_attention_backward, gqa_attention_forward
+from .bridges import (
+    accumulate_fp32_gradient,
+    add_fp32_gradients,
+    cast_from_float32,
+    cast_to_float32,
+    merge_heads,
+    split_heads,
+)
 from .linear import linear_backward, linear_forward, lora_backward, lora_forward
+from .optimizer import AdamWPlan
 from .primitives import CrossEntropyPlan, EmbeddingPlan, TransformerPrimitivePlan
+from .step import LoRALinearTrainingPlan
 
 
 __all__ = [
+    "AdamWPlan",
     "CrossEntropyPlan",
     "EmbeddingPlan",
+    "LoRALinearTrainingPlan",
     "TransformerPrimitivePlan",
+    "accumulate_fp32_gradient",
+    "add_fp32_gradients",
+    "cast_from_float32",
+    "cast_to_float32",
     "gqa_attention_backward",
     "gqa_attention_forward",
     "linear_backward",
     "linear_forward",
     "lora_backward",
     "lora_forward",
+    "merge_heads",
+    "split_heads",
 ]

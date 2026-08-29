@@ -11,11 +11,13 @@ import warp as wp
 from warp_nn.training import (
     CrossEntropyPlan,
     TransformerPrimitivePlan,
+    gqa_attention_backward,
     gqa_attention_forward,
     linear_backward,
     linear_forward,
 )
 from warp_nn.training.linear import _use_tiled
+from warp_nn.training.optimizer import AdamWPlan
 
 
 CUDA_DEVICES = [device for device in wp.get_devices() if device.is_cuda]
@@ -53,6 +55,38 @@ def _gqa_reference(query, key, value, lengths, scale, window):
                 output[batch, head, token] = probabilities @ value[batch, kv_head, keys]
                 lse[batch, head, token] = maximum + np.log(np.sum(exponentials))
     return output, lse
+
+
+def _gqa_backward_reference(query, key, value, output_grad, lengths, scale, window):
+    query_grad = np.zeros_like(query, dtype=np.float32)
+    key_grad = np.zeros_like(key, dtype=np.float32)
+    value_grad = np.zeros_like(value, dtype=np.float32)
+    heads_per_kv = query.shape[1] // key.shape[1]
+    for batch, length in enumerate(lengths):
+        for head in range(query.shape[1]):
+            kv_head = head // heads_per_kv
+            for token in range(int(length)):
+                first = max(0, token + 1 - window) if window else 0
+                keys = slice(first, token + 1)
+                scores = key[batch, kv_head, keys] @ query[batch, head, token] * scale
+                probabilities = np.exp(scores - np.max(scores))
+                probabilities /= np.sum(probabilities)
+                probability_grad = (
+                    value[batch, kv_head, keys] @ output_grad[batch, head, token]
+                )
+                score_grad = probabilities * (
+                    probability_grad - probabilities @ probability_grad
+                )
+                query_grad[batch, head, token] += (
+                    score_grad @ key[batch, kv_head, keys] * scale
+                )
+                key_grad[batch, kv_head, keys] += (
+                    np.outer(score_grad, query[batch, head, token]) * scale
+                )
+                value_grad[batch, kv_head, keys] += np.outer(
+                    probabilities, output_grad[batch, head, token]
+                )
+    return query_grad, key_grad, value_grad
 
 
 def _gqa_buffers(device, seed=17):
@@ -179,6 +213,95 @@ def test_cuda_bfloat16_gqa_full_and_sliding_reference(window):
     np.testing.assert_allclose(_numpy(lse), reference[1], atol=3e-5, rtol=3e-5)
 
 
+@pytest.mark.parametrize("dtype,head_size", [(wp.float16, 8), (wp.bfloat16, 128)])
+@pytest.mark.parametrize("window", [0, 2])
+def test_cuda_streaming_gqa_backward_reference_and_accumulate(dtype, head_size, window):
+    device = CUDA_DEVICES[0]
+    rng = np.random.default_rng(91 + head_size + window)
+    batch, query_heads, kv_heads, sequence = 2, 4, 2, 4
+    query_shape = (batch, query_heads, sequence, head_size)
+    kv_shape = (batch, kv_heads, sequence, head_size)
+    query = _array(rng.normal(0.0, 0.25, query_shape), dtype, device)
+    key = _array(rng.normal(0.0, 0.25, kv_shape), dtype, device)
+    value = _array(rng.normal(0.0, 0.25, kv_shape), dtype, device)
+    output_grad = _array(rng.normal(0.0, 0.25, query_shape), dtype, device)
+    lengths_np = np.array([4, 2], dtype=np.int32)
+    lengths = _array(lengths_np, wp.int32, device)
+    output = wp.empty(query_shape, dtype=dtype, device=device)
+    lse = wp.empty(query_shape[:3], dtype=wp.float32, device=device)
+    accumulator = wp.empty(query_shape, dtype=wp.float32, device=device)
+    query_grad = wp.empty(query_shape, dtype=wp.float32, device=device)
+    key_grad = wp.empty(kv_shape, dtype=wp.float32, device=device)
+    value_grad = wp.empty(kv_shape, dtype=wp.float32, device=device)
+    delta = wp.empty(query_shape[:3], dtype=wp.float32, device=device)
+    scale = head_size**-0.5
+
+    gqa_attention_forward(
+        query,
+        key,
+        value,
+        lengths,
+        output,
+        lse,
+        accumulator,
+        scale=scale,
+        window=window,
+    )
+    gqa_attention_backward(
+        query,
+        key,
+        value,
+        output_grad,
+        lengths,
+        lse,
+        query_grad,
+        key_grad,
+        value_grad,
+        delta,
+        scale=scale,
+        window=window,
+    )
+
+    query_np, key_np, value_np = _numpy(query), _numpy(key), _numpy(value)
+    output_grad_np = _numpy(output_grad)
+    forward_reference = _gqa_reference(
+        query_np, key_np, value_np, lengths_np, scale, window
+    )
+    backward_reference = _gqa_backward_reference(
+        query_np, key_np, value_np, output_grad_np, lengths_np, scale, window
+    )
+    np.testing.assert_allclose(
+        _numpy(output), forward_reference[0], atol=2e-2, rtol=8e-3
+    )
+    np.testing.assert_allclose(_numpy(lse), forward_reference[1], atol=5e-4, rtol=5e-4)
+    for actual, expected in zip(
+        (_numpy(query_grad), _numpy(key_grad), _numpy(value_grad)),
+        backward_reference,
+    ):
+        np.testing.assert_allclose(actual, expected, atol=8e-4, rtol=2e-3)
+
+    gqa_attention_backward(
+        query,
+        key,
+        value,
+        output_grad,
+        lengths,
+        lse,
+        query_grad,
+        key_grad,
+        value_grad,
+        delta,
+        scale=scale,
+        window=window,
+        accumulate=True,
+    )
+    for actual, expected in zip(
+        (_numpy(query_grad), _numpy(key_grad), _numpy(value_grad)),
+        backward_reference,
+    ):
+        np.testing.assert_allclose(actual, 2.0 * expected, atol=1.6e-3, rtol=2e-3)
+
+
 def test_cuda_rms_tape_and_stable_cross_entropy():
     device = CUDA_DEVICES[0]
     x_values = np.array([[1.0, -2.0, 0.5], [-0.25, 1.5, 2.0]], dtype=np.float32)
@@ -259,3 +382,62 @@ def test_cuda_graph_replays_linear_and_gqa_with_fixed_buffers():
     wp.capture_launch(graph)
     np.testing.assert_array_equal(_numpy(linear_output), linear_reference)
     np.testing.assert_array_equal(_numpy(output), attention_reference)
+
+
+def test_cuda_adamw_master_and_bfloat16_mirror_graph_replay():
+    device = CUDA_DEVICES[0]
+    # Compile the update kernels before capture without advancing the tested plan.
+    warm_parameter = _array([0.0], wp.bfloat16, device)
+    warm_gradient = _array([1.0], wp.float32, device)
+    warm_plan = AdamWPlan([warm_parameter], [warm_gradient], beta1=0.0, beta2=0.0)
+    warm_plan.step()
+    wp.synchronize_device(device)
+
+    initial = np.array([[0.5, -1.0], [2.0, -0.25]], dtype=np.float32)
+    gradient_values = np.array([[1.0, -1.0], [2.0, -2.0]], dtype=np.float32)
+    parameter = _array(initial, wp.bfloat16, device)
+    gradient = _array(gradient_values, wp.float32, device)
+    plan = AdamWPlan(
+        [parameter],
+        [gradient],
+        learning_rate=0.125,
+        beta1=0.0,
+        beta2=0.0,
+        epsilon=1.0e-8,
+    )
+    wp.synchronize_device(device)
+    pointers = (
+        parameter.ptr,
+        gradient.ptr,
+        plan.masters[0].ptr,
+        plan.first_moments[0].ptr,
+        plan.second_moments[0].ptr,
+        plan.step_count.ptr,
+    )
+
+    wp.capture_begin(device=device)
+    try:
+        plan.step()
+        graph = wp.capture_end(device=device)
+    except Exception:
+        wp.capture_end(device=device)
+        raise
+    wp.capture_launch(graph)
+    wp.capture_launch(graph)
+
+    expected_master = initial - np.float32(0.25) * np.sign(gradient_values)
+    np.testing.assert_array_equal(plan.step_count.numpy(), [2])
+    np.testing.assert_array_equal(
+        plan.masters[0].numpy().reshape(initial.shape), expected_master
+    )
+    np.testing.assert_allclose(
+        parameter.numpy(), expected_master, atol=4.0e-3, rtol=0.0
+    )
+    assert pointers == (
+        parameter.ptr,
+        gradient.ptr,
+        plan.masters[0].ptr,
+        plan.first_moments[0].ptr,
+        plan.second_moments[0].ptr,
+        plan.step_count.ptr,
+    )
