@@ -20,6 +20,7 @@ class _RuleKernels:
     log_decay: object
     scalar: object
     chunkwise: object
+    reverse: object
 
 
 @lru_cache(maxsize=None)
@@ -28,6 +29,7 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
     KEY_SIZE = key_size
     VALUE_SIZE = value_size
     VALUE_TILE = value_tile
+    REVERSE_TILE = min(16, VALUE_TILE)
 
     @wp.func
     def to_fp32(value: DTYPE):
@@ -74,7 +76,6 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
         past: wp.array4d(dtype=wp.float32),
         output: wp.array4d(dtype=DTYPE),
         transformed: wp.array4d(dtype=DTYPE),
-        chunk_states: wp.array2d(dtype=wp.float32),
         present: wp.array4d(dtype=wp.float32),
         scale: wp.float32,
     ):
@@ -82,17 +83,6 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
         key_head = value_head * query.shape[1] // value.shape[1]
         length = wp.clamp(lengths[batch], 0, query.shape[2])
         for token in range(query.shape[2]):
-            if token % _CHUNK == 0:
-                chunk = token // _CHUNK
-                state_base = (
-                    (batch * value.shape[1] + value_head)
-                    * ((query.shape[2] + _CHUNK - 1) // _CHUNK + 1)
-                    + chunk
-                ) * KEY_SIZE
-                for column in range(KEY_SIZE):
-                    chunk_states[state_base + column, value_column] = past[
-                        batch, value_head, column, value_column
-                    ]
             if token < length:
                 decay_value = decay[batch, token, value_head]
                 retrieved = wp.float32(0.0)
@@ -105,7 +95,9 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
                     wp.float32(value[batch, value_head, token, value_column])
                     - decay_value * retrieved
                 )
-                transformed[batch, value_head, token, value_column] = DTYPE(delta)
+                stored_delta = DTYPE(delta)
+                transformed[batch, value_head, token, value_column] = stored_delta
+                delta = wp.float32(stored_delta)
                 result = wp.float32(0.0)
                 for column in range(KEY_SIZE):
                     state_value = (
@@ -120,13 +112,8 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
             else:
                 transformed[batch, value_head, token, value_column] = DTYPE(0.0)
                 output[batch, value_head, token, value_column] = DTYPE(0.0)
-        chunks = (query.shape[2] + _CHUNK - 1) // _CHUNK
-        final_base = (
-            (batch * value.shape[1] + value_head) * (chunks + 1) + chunks
-        ) * KEY_SIZE
         for column in range(KEY_SIZE):
             state_value = past[batch, value_head, column, value_column]
-            chunk_states[final_base + column, value_column] = state_value
             present[batch, value_head, column, value_column] = state_value
 
     @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
@@ -140,7 +127,6 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
         past: wp.array2d(dtype=wp.float32),
         output: wp.array2d(dtype=DTYPE),
         transformed: wp.array2d(dtype=DTYPE),
-        chunk_states: wp.array2d(dtype=wp.float32),
         present: wp.array2d(dtype=wp.float32),
         key_heads: wp.int32,
         value_heads: wp.int32,
@@ -164,14 +150,6 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
         )
 
         for chunk in range(chunks):
-            chunk_state_base = (
-                (batch * value_heads + value_head) * (chunks + 1) + chunk
-            ) * KEY_SIZE
-            wp.tile_store(
-                chunk_states,
-                state,
-                offset=(chunk_state_base, value_offset),
-            )
             token_start = chunk * _CHUNK
             key_base = (batch * key_heads + key_head) * sequence + token_start
             value_base = (batch * value_heads + value_head) * sequence + token_start
@@ -290,17 +268,182 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
                 offset=(value_base, value_offset),
             )
 
-        final_state_base = (
-            (batch * value_heads + value_head) * (chunks + 1) + chunks
-        ) * KEY_SIZE
-        wp.tile_store(
-            chunk_states,
-            state,
-            offset=(final_state_base, value_offset),
-        )
         wp.tile_store(present, state, offset=(state_base, value_offset))
 
-    result = _RuleKernels(log_decay, scalar, chunkwise)
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def reverse(
+        query: wp.array2d(dtype=DTYPE),
+        key: wp.array2d(dtype=DTYPE),
+        value: wp.array2d(dtype=DTYPE),
+        decay: wp.array3d(dtype=wp.float32),
+        beta: wp.array3d(dtype=wp.float32),
+        lengths: wp.array1d(dtype=wp.int32),
+        transformed: wp.array2d(dtype=DTYPE),
+        present: wp.array2d(dtype=wp.float32),
+        output_grad: wp.array2d(dtype=wp.float32),
+        present_grad: wp.array2d(dtype=wp.float32),
+        query_grad: wp.array2d(dtype=wp.float32),
+        key_grad: wp.array2d(dtype=wp.float32),
+        value_grad: wp.array2d(dtype=wp.float32),
+        decay_grad: wp.array3d(dtype=wp.float32),
+        beta_grad: wp.array3d(dtype=wp.float32),
+        past_grad: wp.array2d(dtype=wp.float32),
+        key_heads: wp.int32,
+        value_heads: wp.int32,
+        sequence: wp.int32,
+        scale: wp.float32,
+        accumulate: wp.bool,
+    ):
+        item = wp.tid()
+        value_tiles = VALUE_SIZE // REVERSE_TILE
+        value_tile_index = item % value_tiles
+        state_item = item // value_tiles
+        value_head = state_item % value_heads
+        batch = state_item // value_heads
+        key_head = value_head * key_heads // value_heads
+        value_offset = value_tile_index * REVERSE_TILE
+        state_base = (batch * value_heads + value_head) * KEY_SIZE
+        state = wp.tile_load(
+            present,
+            shape=(KEY_SIZE, REVERSE_TILE),
+            offset=(state_base, value_offset),
+        )
+        state_gradient = wp.tile_load(
+            present_grad,
+            shape=(KEY_SIZE, REVERSE_TILE),
+            offset=(state_base, value_offset),
+        )
+        length = wp.clamp(lengths[batch], 0, sequence)
+
+        for reverse_token in range(sequence):
+            token = sequence - 1 - reverse_token
+            if token < length:
+                key_row = (batch * key_heads + key_head) * sequence + token
+                value_row = (batch * value_heads + value_head) * sequence + token
+                queries = wp.tile_load(query, shape=(1, KEY_SIZE), offset=(key_row, 0))
+                keys = wp.tile_load(key, shape=(1, KEY_SIZE), offset=(key_row, 0))
+                values = wp.tile_load(
+                    value,
+                    shape=(1, REVERSE_TILE),
+                    offset=(value_row, value_offset),
+                )
+                deltas = wp.tile_load(
+                    transformed,
+                    shape=(1, REVERSE_TILE),
+                    offset=(value_row, value_offset),
+                )
+                output_gradient = wp.tile_load(
+                    output_grad,
+                    shape=(1, REVERSE_TILE),
+                    offset=(value_row, value_offset),
+                )
+                output_gradient_storage = wp.tile_map(to_storage, output_gradient)
+                state_storage = wp.tile_map(to_storage, state)
+                query_partial = wp.tile_zeros(shape=(KEY_SIZE, 1), dtype=wp.float32)
+                wp.tile_matmul(
+                    state_storage,
+                    wp.tile_transpose(output_gradient_storage),
+                    query_partial,
+                    alpha=scale,
+                )
+                wp.tile_atomic_add(
+                    query_grad,
+                    wp.tile_transpose(query_partial),
+                    offset=(key_row, 0),
+                )
+                wp.tile_matmul(
+                    wp.tile_transpose(queries),
+                    output_gradient_storage,
+                    state_gradient,
+                    alpha=scale,
+                )
+                decay_value = wp.max(
+                    decay[batch, token, value_head], wp.float32(1.0e-30)
+                )
+                state /= decay_value
+                wp.tile_matmul(
+                    wp.tile_transpose(keys),
+                    deltas,
+                    state,
+                    alpha=-wp.float32(1.0) / decay_value,
+                )
+                decay_contribution = wp.tile_extract(
+                    wp.tile_sum(state_gradient * state), 0
+                )
+                gradient_storage = wp.tile_map(to_storage, state_gradient)
+                key_partial = wp.tile_zeros(shape=(KEY_SIZE, 1), dtype=wp.float32)
+                delta_gradient = wp.tile_zeros(
+                    shape=(1, REVERSE_TILE), dtype=wp.float32
+                )
+                wp.tile_matmul(gradient_storage, wp.tile_transpose(deltas), key_partial)
+                wp.tile_matmul(keys, gradient_storage, delta_gradient)
+                state_storage = wp.tile_map(to_storage, state)
+                retrieved = wp.tile_zeros(shape=(1, REVERSE_TILE), dtype=wp.float32)
+                wp.tile_matmul(keys, state_storage, retrieved)
+                beta_value = beta[batch, token, value_head]
+                residual = wp.tile_map(to_fp32, values) - decay_value * retrieved
+                beta_contribution = wp.tile_extract(
+                    wp.tile_sum(delta_gradient * residual), 0
+                )
+                value_gradient = beta_value * delta_gradient
+                decay_contribution += wp.tile_extract(
+                    wp.tile_sum(delta_gradient * (-beta_value * retrieved)), 0
+                )
+                retrieved_gradient = -beta_value * decay_value * delta_gradient
+                retrieved_gradient_storage = wp.tile_map(to_storage, retrieved_gradient)
+                wp.tile_matmul(
+                    state_storage,
+                    wp.tile_transpose(retrieved_gradient_storage),
+                    key_partial,
+                )
+                wp.tile_atomic_add(
+                    key_grad,
+                    wp.tile_transpose(key_partial),
+                    offset=(key_row, 0),
+                )
+                state_gradient *= decay_value
+                wp.tile_matmul(
+                    wp.tile_transpose(keys),
+                    retrieved_gradient_storage,
+                    state_gradient,
+                )
+                if accumulate:
+                    value_gradient += wp.tile_load(
+                        value_grad,
+                        shape=(1, REVERSE_TILE),
+                        offset=(value_row, value_offset),
+                    )
+                wp.tile_store(
+                    value_grad, value_gradient, offset=(value_row, value_offset)
+                )
+                wp.tile_atomic_add(
+                    decay_grad,
+                    wp.tile_full(
+                        shape=(1, 1, 1),
+                        value=decay_contribution,
+                        dtype=wp.float32,
+                    ),
+                    offset=(batch, token, value_head),
+                )
+                wp.tile_atomic_add(
+                    beta_grad,
+                    wp.tile_full(
+                        shape=(1, 1, 1),
+                        value=beta_contribution,
+                        dtype=wp.float32,
+                    ),
+                    offset=(batch, token, value_head),
+                )
+
+        if accumulate:
+            state_gradient += wp.tile_load(
+                past_grad,
+                shape=(KEY_SIZE, REVERSE_TILE),
+                offset=(state_base, value_offset),
+            )
+        wp.tile_store(past_grad, state_gradient, offset=(state_base, value_offset))
+
+    result = _RuleKernels(log_decay, scalar, chunkwise, reverse)
     for kernel in result.__dict__.values():
         kernel.module.options["enable_backward"] = False
     return result
@@ -336,7 +479,7 @@ class GatedDeltaRulePlan:
         if not math.isfinite(self.scale):
             raise ValueError("Gated Delta scale must be finite")
         self.chunks = (sequence + _CHUNK - 1) // _CHUNK
-        self.value_tile = 32 if value_size >= 32 else 1 << (value_size - 1).bit_length()
+        self.value_tile = min(32, value_size & -value_size)
         self._kernels = _kernels(dtype, key_size, value_size, self.value_tile)
         self.local_log_decay = wp.empty(
             (batch, value_heads, sequence), dtype=wp.float32, device=self.device
@@ -345,12 +488,21 @@ class GatedDeltaRulePlan:
         state_shape = (batch, value_heads, key_size, value_size)
         self.output = wp.empty(shape, dtype=dtype, device=self.device)
         self.transformed = wp.empty(shape, dtype=dtype, device=self.device)
-        self.chunk_states = wp.empty(
-            (batch * value_heads, self.chunks + 1, key_size, value_size),
+        self.present = wp.empty(state_shape, dtype=wp.float32, device=self.device)
+        query_shape = (batch, key_heads, sequence, key_size)
+        self.query_grad = wp.empty(query_shape, dtype=wp.float32, device=self.device)
+        self.key_grad = wp.empty(query_shape, dtype=wp.float32, device=self.device)
+        self.value_grad = wp.empty(shape, dtype=wp.float32, device=self.device)
+        self.decay_grad = wp.empty(
+            decay_shape := (batch, sequence, value_heads),
             dtype=wp.float32,
             device=self.device,
         )
-        self.present = wp.empty(state_shape, dtype=wp.float32, device=self.device)
+        self.beta_grad = wp.empty(decay_shape, dtype=wp.float32, device=self.device)
+        self.past_grad = wp.empty(state_shape, dtype=wp.float32, device=self.device)
+        self._terminal_grad = wp.zeros(
+            state_shape, dtype=wp.float32, device=self.device
+        )
 
     @property
     def uses_tensor_cores(self) -> bool:
@@ -365,7 +517,7 @@ class GatedDeltaRulePlan:
         )
 
     def forward(self, query, key, value, decay, beta, lengths, past):
-        """Return output and final state while retaining chunk state for backward."""
+        """Return output and final state while retaining reversible token deltas."""
         self._validate(query, key, value, decay, beta, lengths, past)
         wp.launch(
             self._kernels.log_decay,
@@ -401,15 +553,6 @@ class GatedDeltaRulePlan:
                     self.transformed.reshape(
                         (self.batch * self.value_heads * self.sequence, self.value_size)
                     ),
-                    self.chunk_states.reshape(
-                        (
-                            self.batch
-                            * self.value_heads
-                            * (self.chunks + 1)
-                            * self.key_size,
-                            self.value_size,
-                        )
-                    ),
                     self.present.reshape(
                         (self.batch * self.value_heads * self.key_size, self.value_size)
                     ),
@@ -437,21 +580,99 @@ class GatedDeltaRulePlan:
                     self.present,
                     self.output,
                     self.transformed,
-                    self.chunk_states.reshape(
-                        (
-                            self.batch
-                            * self.value_heads
-                            * (self.chunks + 1)
-                            * self.key_size,
-                            self.value_size,
-                        )
-                    ),
                     self.present,
                     self.scale,
                 ],
                 device=self.device,
             )
         return self.output, self.present
+
+    def backward(
+        self,
+        query,
+        key,
+        value,
+        decay,
+        beta,
+        lengths,
+        past,
+        output_grad,
+        *,
+        present_grad=None,
+        accumulate: bool = False,
+    ):
+        """Reverse the recurrence into FP32 Q/K/V, gate, and past-state gradients."""
+        self._validate(query, key, value, decay, beta, lengths, past)
+        value_shape = (self.batch, self.value_heads, self.sequence, self.value_size)
+        state_shape = (self.batch, self.value_heads, self.key_size, self.value_size)
+        self._validate_gradient(output_grad, value_shape, "output")
+        if present_grad is None:
+            self._terminal_grad.zero_()
+            present_grad = self._terminal_grad
+        else:
+            self._validate_gradient(present_grad, state_shape, "present state")
+        if not accumulate:
+            self.query_grad.zero_()
+            self.key_grad.zero_()
+            self.value_grad.zero_()
+            self.decay_grad.zero_()
+            self.beta_grad.zero_()
+            self.past_grad.zero_()
+
+        query_rows = self.batch * self.key_heads * self.sequence
+        value_rows = self.batch * self.value_heads * self.sequence
+        state_rows = self.batch * self.value_heads * self.key_size
+        value_tiles = self.value_size // min(16, self.value_tile)
+        wp.launch_tiled(
+            self._kernels.reverse,
+            dim=self.batch * self.value_heads * value_tiles,
+            inputs=[
+                query.reshape((query_rows, self.key_size)),
+                key.reshape((query_rows, self.key_size)),
+                value.reshape((value_rows, self.value_size)),
+                decay,
+                beta,
+                lengths,
+                self.transformed.reshape((value_rows, self.value_size)),
+                self.present.reshape((state_rows, self.value_size)),
+                output_grad.reshape((value_rows, self.value_size)),
+                present_grad.reshape((state_rows, self.value_size)),
+                self.query_grad.reshape((query_rows, self.key_size)),
+                self.key_grad.reshape((query_rows, self.key_size)),
+                self.value_grad.reshape((value_rows, self.value_size)),
+                self.decay_grad,
+                self.beta_grad,
+                self.past_grad.reshape((state_rows, self.value_size)),
+                self.key_heads,
+                self.value_heads,
+                self.sequence,
+                self.scale,
+                accumulate,
+            ],
+            block_dim=128,
+            device=self.device,
+        )
+        return (
+            self.query_grad,
+            self.key_grad,
+            self.value_grad,
+            self.decay_grad,
+            self.beta_grad,
+            self.past_grad,
+        )
+
+    def _validate_gradient(self, array, shape, name):
+        if (
+            not isinstance(array, wp.array)
+            or array.shape != shape
+            or array.dtype != wp.float32
+            or array.device != self.device
+            or not array.is_contiguous
+        ):
+            raise ValueError(
+                f"Gated Delta {name} gradient must be contiguous FP32 {shape} "
+                f"on {self.device}"
+            )
 
     def _validate(self, query, key, value, decay, beta, lengths, past):
         expected = (
