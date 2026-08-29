@@ -38,6 +38,8 @@ class Runner(Protocol):
 
     def prefill(self, token_ids: Sequence[int]) -> Any: ...
 
+    def append(self, token_ids: Sequence[int]) -> Any: ...
+
     def decode(self, token_id: int) -> Any: ...
 
     def sample_greedy(self, logits: Any) -> int: ...
@@ -113,9 +115,10 @@ def generate_tokens(
     top_p: float = 1.0,
     presence_penalty: float = 0.0,
     seed: int | None = None,
+    initial_logits: Any | None = None,
 ) -> Iterator[int]:
     """Generate tokens incrementally through the common stateful runner API."""
-    logits = runner.prefill(prompt_ids)
+    logits = runner.prefill(prompt_ids) if initial_logits is None else initial_logits
     generated = []
     rng = np.random.default_rng(seed)
     for _ in range(max_new_tokens):

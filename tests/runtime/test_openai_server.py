@@ -43,6 +43,25 @@ class _Runner:
         return logits
 
 
+class _CachingRunner(_Runner):
+    def __init__(self):
+        self.calls = []
+
+    def prefill(self, token_ids):
+        self.calls.append(("prefill", list(token_ids)))
+        return 1
+
+    def append(self, token_ids):
+        self.calls.append(("append", list(token_ids)))
+        return 1
+
+
+class _CachingTokenizer(_Tokenizer):
+    def encode_chat(self, messages, **kwargs):
+        del kwargs
+        return {"first": [9], "continued": [9, 1, 0, 7], "different": [5]}[messages[-1]["content"]]
+
+
 def _request(server, body, path="/v1/chat/completions"):
     request = Request(
         f"http://127.0.0.1:{server.server_port}{path}",
@@ -61,6 +80,25 @@ def _serve(text, enable_thinking=False):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, thread, tokenizer
+
+
+def test_chat_completions_reuses_exact_runner_prefix():
+    runner = _CachingRunner()
+    completions = ChatCompletions("warp-qwen", runner, _CachingTokenizer("Hi"), max_new_tokens=2)
+    completions.complete(
+        {"model": "warp-qwen", "messages": [{"role": "user", "content": "first"}]}
+    )
+    completions.complete(
+        {"model": "warp-qwen", "messages": [{"role": "user", "content": "continued"}]}
+    )
+    completions.complete(
+        {"model": "warp-qwen", "messages": [{"role": "user", "content": "different"}]}
+    )
+    assert runner.calls == [
+        ("prefill", [9]),
+        ("append", [0, 7]),
+        ("prefill", [5]),
+    ]
 
 
 def test_chat_completions_streams_text_and_usage():

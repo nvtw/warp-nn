@@ -10,7 +10,7 @@ import json
 import threading
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -87,6 +87,7 @@ class ChatCompletions:
         self.reasoning_effort = reasoning_effort
         self.preserve_thinking = preserve_thinking
         self.lock = threading.Lock()
+        self._cached_ids: list[int] = []
 
     def complete(self, request: Mapping[str, object], emit: Callable[[dict[str, object]], None] | None = None):
         if request.get("model") not in (None, self.model):
@@ -190,6 +191,17 @@ class ChatCompletions:
                 emit(self._chunk(completion_id, created, {"reasoning_content": streamable}))
 
         with self.lock:
+            cached_prefix = self._cached_ids
+            self._cached_ids = []
+            if (
+                cached_prefix
+                and len(cached_prefix) < len(prompt_ids)
+                and prompt_ids[: len(cached_prefix)] == cached_prefix
+                and hasattr(self.runner, "append")
+            ):
+                logits = self.runner.append(prompt_ids[len(cached_prefix) :])
+            else:
+                logits = self.runner.prefill(prompt_ids)
             for token_id in generate_tokens(
                 self.runner,
                 self.tokenizer,
@@ -199,6 +211,7 @@ class ChatCompletions:
                 top_k=top_k,
                 top_p=top_p,
                 presence_penalty=presence_penalty,
+                initial_logits=logits,
             ):
                 if emit is not None and not response_started:
                     emit(self._chunk(completion_id, created, {"role": "assistant", "content": ""}))
@@ -212,6 +225,12 @@ class ChatCompletions:
                 if stream_filter:
                     text = stream_filter.feed(text)
                 emit_text(text)
+            cached_completion = (
+                generated[:-1]
+                if generated and is_eos_token(self.tokenizer, generated[-1])
+                else generated
+            )
+            self._cached_ids = [*prompt_ids, *cached_completion]
         tail = decoder.decode(b"", final=True)
         if stream_filter:
             tail = stream_filter.feed(tail, final=True)
