@@ -29,6 +29,7 @@ from warp_nn.runtime.kernels import (
     _get_gated_rms_norm_kernel,
     _get_gqa_attention_kernel,
     _get_greedy_argmax_kernels,
+    _get_top_k_kernels,
     _get_linear_attention_kernel,
     _allocate_partitioned_gqa,
     _launch_partitioned_gqa,
@@ -1114,3 +1115,101 @@ class Qwen35Runner:
         wp.copy(self._sampled_token_host, self._sampled_token, count=1)
         wp.synchronize_stream(self.device)
         return int(self._sampled_token_host_view[0])
+
+    def read_top_k(self, logits: wp.array, top_k: int) -> tuple[np.ndarray, np.ndarray]:
+        """Return exact top-k values and token IDs with a bounded host transfer."""
+        if (
+            logits.device != self.device
+            or logits.dtype != self.dtype
+            or logits.ndim != 3
+            or logits.shape[0] != 1
+            or logits.shape[1] == 0
+        ):
+            raise TypeError("Qwen35Runner.read_top_k expects runner logits")
+        vocabulary = logits.shape[2]
+        if vocabulary != int(self.config["vocab_size"]):
+            raise ValueError(
+                "Qwen35Runner.read_top_k received an unexpected vocabulary"
+            )
+        if not 1 <= top_k <= 32:
+            raise ValueError("top_k must be between 1 and 32")
+        top_k = min(top_k, vocabulary)
+        if not self.device.is_cuda:
+            values = np.asarray(logits.numpy(), dtype=np.float32).reshape(
+                -1, vocabulary
+            )[-1]
+            tokens = np.lexsort((np.arange(vocabulary), -values))[:top_k]
+            return values[tokens], tokens.astype(np.int32)
+
+        tile_width = 512
+        partial_count = (vocabulary + tile_width - 1) // tile_width
+        maximum_k = min(32, vocabulary)
+        state = getattr(self, "_top_k_state", None)
+        if state is None:
+            candidate_count = partial_count * maximum_k
+            merge_count = (partial_count + 15) // 16
+            values = wp.empty(candidate_count, dtype=wp.float32, device=self.device)
+            tokens = wp.empty(candidate_count, dtype=wp.int32, device=self.device)
+            merge_values = wp.empty(
+                merge_count * maximum_k, dtype=wp.float32, device=self.device
+            )
+            merge_tokens = wp.empty(
+                merge_count * maximum_k, dtype=wp.int32, device=self.device
+            )
+            host_values = wp.empty(
+                maximum_k, dtype=wp.float32, device="cpu", pinned=True
+            )
+            host_tokens = wp.empty(maximum_k, dtype=wp.int32, device="cpu", pinned=True)
+            state = self._top_k_state = (
+                _get_top_k_kernels(tile_width, maximum_k, self.dtype),
+                values,
+                tokens,
+                merge_values,
+                merge_tokens,
+                host_values,
+                host_tokens,
+            )
+        (
+            kernels,
+            values,
+            tokens,
+            merge_values,
+            merge_tokens,
+            host_values,
+            host_tokens,
+        ) = state
+        wp.launch_tiled(
+            kernels[0],
+            dim=partial_count,
+            inputs=[logits, values, tokens],
+            block_dim=256,
+            device=self.device,
+        )
+        source_values, source_tokens = values, tokens
+        target_values, target_tokens = merge_values, merge_tokens
+        input_groups = partial_count
+        while input_groups > 1:
+            output_groups = (input_groups + 15) // 16
+            wp.launch_tiled(
+                kernels[1],
+                dim=output_groups,
+                inputs=[
+                    source_values,
+                    source_tokens,
+                    target_values,
+                    target_tokens,
+                    input_groups,
+                ],
+                block_dim=256,
+                device=self.device,
+            )
+            source_values, target_values = target_values, source_values
+            source_tokens, target_tokens = target_tokens, source_tokens
+            input_groups = output_groups
+        wp.copy(host_values, source_values, count=top_k)
+        wp.copy(host_tokens, source_tokens, count=top_k)
+        wp.synchronize_stream(self.device)
+        return (
+            host_values.numpy()[:top_k].copy(),
+            host_tokens.numpy()[:top_k].copy(),
+        )

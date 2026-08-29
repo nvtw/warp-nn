@@ -2769,6 +2769,148 @@ def _get_greedy_argmax_kernels(
     return partial_argmax, store_token, advance_generation
 
 
+@lru_cache(maxsize=None)
+def _get_top_k_kernels(tile_width: int, top_k: int, dtype: type):
+    """Build an exact hierarchical top-k over the final vocabulary row."""
+    TILE_WIDTH = tile_width
+    TOP_K = top_k
+    MERGE_GROUPS = 16
+    MERGE_CANDIDATES = MERGE_GROUPS * top_k
+    DTYPE = dtype
+
+    @wp.func
+    def add_offset(index: wp.int32, offset: wp.int32):
+        return index + offset
+
+    @wp.func
+    def mask_logit(value: DTYPE, index: wp.int32, vocabulary: wp.int32):
+        return wp.float32(DTYPE(value)) if index < vocabulary else wp.float32(-wp.inf)
+
+    @wp.func
+    def mask_token(index: wp.int32, vocabulary: wp.int32):
+        return index if index < vocabulary else wp.int32(2147483647)
+
+    @wp.func
+    def remove_selected(value: wp.float32, index: wp.int32, selected: wp.int32):
+        return wp.float32(-wp.inf) if index == selected else value
+
+    @wp.func
+    def remove_selected_token(token: wp.int32, index: wp.int32, selected: wp.int32):
+        return wp.int32(2147483647) if index == selected else token
+
+    @wp.func
+    def matching_token(value: wp.float32, token: wp.int32, maximum: wp.float32):
+        return token if value == maximum else wp.int32(2147483647)
+
+    @wp.func
+    def mask_merge_value(value: wp.float32, index: wp.int32, count: wp.int32):
+        return value if index < count else wp.float32(-wp.inf)
+
+    @wp.func
+    def mask_merge_token(token: wp.int32, index: wp.int32, count: wp.int32):
+        return token if index < count else wp.int32(2147483647)
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def partial_top_k(
+        logits: wp.array3d(dtype=DTYPE),
+        values: wp.array1d[wp.float32],
+        tokens: wp.array1d[wp.int32],
+    ):
+        """Extract top-k candidates from one contiguous vocabulary tile."""
+        typed_zero = DTYPE(0.0)  # noqa: F841 - retain dtype in the Warp closure
+        partial = wp.tid()
+        offset = partial * TILE_WIDTH
+        vocabulary = logits.shape[2]
+        local_indices = wp.tile_arange(0, TILE_WIDTH, dtype=wp.int32)
+        indices = wp.tile_map(add_offset, local_indices, offset)
+        active_tokens = wp.tile_map(mask_token, indices, vocabulary)
+        candidates = wp.tile_map(
+            mask_logit,
+            wp.tile_load(
+                logits[0, logits.shape[1] - 1], shape=TILE_WIDTH, offset=offset
+            ),
+            indices,
+            vocabulary,
+        )
+        for rank in range(TOP_K):
+            maximum_index = wp.tile_extract(wp.tile_argmax(candidates), 0)
+            maximum = wp.tile_extract(candidates, maximum_index)
+            tied_tokens = wp.tile_map(
+                matching_token, candidates, active_tokens, maximum
+            )
+            local_token = wp.tile_extract(wp.tile_argmin(tied_tokens), 0)
+            wp.tile_store(
+                values,
+                wp.tile_full(
+                    shape=1,
+                    value=wp.tile_extract(candidates, local_token),
+                    dtype=wp.float32,
+                ),
+                offset=partial * TOP_K + rank,
+            )
+            wp.tile_store(
+                tokens,
+                wp.tile_full(
+                    shape=1,
+                    value=wp.tile_extract(active_tokens, local_token),
+                    dtype=wp.int32,
+                ),
+                offset=partial * TOP_K + rank,
+            )
+            candidates = wp.tile_map(
+                remove_selected, candidates, local_indices, local_token
+            )
+            active_tokens = wp.tile_map(
+                remove_selected_token, active_tokens, local_indices, local_token
+            )
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def merge_top_k(
+        values: wp.array1d[wp.float32],
+        tokens: wp.array1d[wp.int32],
+        output_values: wp.array1d[wp.float32],
+        output_tokens: wp.array1d[wp.int32],
+        input_groups: int,
+    ):
+        """Merge up to 16 adjacent top-k groups into one sorted group."""
+        group = wp.tid()
+        offset = group * MERGE_CANDIDATES
+        local_indices = wp.tile_arange(0, MERGE_CANDIDATES, dtype=wp.int32)
+        indices = wp.tile_map(add_offset, local_indices, offset)
+        count = input_groups * TOP_K
+        candidates = wp.tile_map(
+            mask_merge_value,
+            wp.tile_load(values, shape=MERGE_CANDIDATES, offset=offset),
+            indices,
+            count,
+        )
+        active_tokens = wp.tile_map(
+            mask_merge_token,
+            wp.tile_load(tokens, shape=MERGE_CANDIDATES, offset=offset),
+            indices,
+            count,
+        )
+        for rank in range(TOP_K):
+            maximum_index = wp.tile_extract(wp.tile_argmax(candidates), 0)
+            maximum = wp.tile_extract(candidates, maximum_index)
+            tied_tokens = wp.tile_map(
+                matching_token, candidates, active_tokens, maximum
+            )
+            selected = wp.tile_extract(wp.tile_argmin(tied_tokens), 0)
+            output_values[group * TOP_K + rank] = wp.tile_extract(candidates, selected)
+            output_tokens[group * TOP_K + rank] = wp.tile_extract(
+                active_tokens, selected
+            )
+            candidates = wp.tile_map(
+                remove_selected, candidates, local_indices, selected
+            )
+            active_tokens = wp.tile_map(
+                remove_selected_token, active_tokens, local_indices, selected
+            )
+
+    return partial_top_k, merge_top_k
+
+
 def _array_type(dtype: type, ndim: int):
     return wp.array(dtype=dtype, ndim=ndim)
 

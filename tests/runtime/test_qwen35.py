@@ -192,6 +192,17 @@ def test_qwen35_native_prefill_decode_and_graph_replay(tmp_path, use_cublas):
     replayed = runner.prefill([1, 2, 3])
     np.testing.assert_allclose(replayed.numpy(), first, atol=2.0e-2, rtol=2.0e-2)
     assert 0 <= runner.sample_greedy(replayed) < 16
+    top_values, top_tokens = runner.read_top_k(replayed, 8)
+    host_logits = replayed.numpy()[0, -1].astype(np.float32)
+    expected = np.lexsort((np.arange(host_logits.size), -host_logits))[:8]
+    np.testing.assert_array_equal(top_tokens, expected)
+    np.testing.assert_array_equal(top_values, host_logits[expected])
+    state = runner._top_k_state
+    all_values, all_tokens = runner.read_top_k(replayed, 20)
+    assert runner._top_k_state is state
+    assert len(all_tokens) == 16
+    np.testing.assert_array_equal(all_tokens[:8], top_tokens)
+    np.testing.assert_array_equal(all_values[:8], top_values)
     full_chunk = runner.prefill([1, 2, 3, 4]).numpy()
     runner.prefill([1, 2, 3])
     sequential = runner.decode(4).numpy()

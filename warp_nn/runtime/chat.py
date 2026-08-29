@@ -116,6 +116,27 @@ def split_reasoning(text: str, enable_thinking: bool) -> tuple[str, str | None]:
     return (answer.lstrip(), reasoning.strip()) if marker else ("", reasoning.strip())
 
 
+def _sample_candidates(
+    values: np.ndarray,
+    candidates: np.ndarray,
+    temperature: float,
+    top_p: float,
+    rng: np.random.Generator,
+) -> int:
+    """Apply host probability policy to an already selected candidate set."""
+    values = np.asarray(values, dtype=np.float64) / temperature
+    candidates = np.asarray(candidates, dtype=np.int64)
+    probabilities = np.exp(values - np.max(values))
+    probabilities /= probabilities.sum()
+    if top_p < 1.0:
+        order = np.argsort(probabilities)[::-1]
+        keep = np.cumsum(probabilities[order]) - probabilities[order] < top_p
+        candidates = candidates[order[keep]]
+        probabilities = probabilities[order[keep]]
+        probabilities /= probabilities.sum()
+    return int(rng.choice(candidates, p=probabilities))
+
+
 def sample_token(
     logits: Any,
     temperature: float = 1.0,
@@ -142,16 +163,9 @@ def sample_token(
     if 0 < top_k < values.size:
         candidates = np.argpartition(values, -top_k)[-top_k:]
         values = values[candidates]
-    values = values / temperature
-    probabilities = np.exp(values - np.max(values))
-    probabilities /= probabilities.sum()
-    if top_p < 1.0:
-        order = np.argsort(probabilities)[::-1]
-        keep = np.cumsum(probabilities[order]) - probabilities[order] < top_p
-        candidates = candidates[order[keep]]
-        probabilities = probabilities[order[keep]]
-        probabilities /= probabilities.sum()
-    return int((rng or np.random.default_rng()).choice(candidates, p=probabilities))
+    return _sample_candidates(
+        values, candidates, temperature, top_p, rng or np.random.default_rng()
+    )
 
 
 def generate_tokens(
@@ -167,14 +181,22 @@ def generate_tokens(
     initial_logits: Any | None = None,
 ) -> Iterator[int]:
     """Generate tokens incrementally through the common stateful runner API."""
+    if temperature > 0.0 and (
+        top_k < 0 or not 0.0 < top_p <= 1.0 or not -2.0 <= presence_penalty <= 2.0
+    ):
+        raise ValueError("invalid top_k, top_p, or presence_penalty")
     logits = runner.prefill(prompt_ids) if initial_logits is None else initial_logits
     generated = []
     rng = np.random.default_rng(seed)
     for _ in range(max_new_tokens):
-        token_id = (
-            runner.sample_greedy(logits)
-            if temperature <= 0.0
-            else sample_token(
+        read_top_k = getattr(runner, "read_top_k", None)
+        if temperature <= 0.0 or (top_k == 1 and presence_penalty == 0.0):
+            token_id = runner.sample_greedy(logits)
+        elif callable(read_top_k) and presence_penalty == 0.0 and 1 < top_k <= 32:
+            values, candidates = read_top_k(logits, top_k)
+            token_id = _sample_candidates(values, candidates, temperature, top_p, rng)
+        else:
+            token_id = sample_token(
                 logits,
                 temperature=temperature,
                 top_k=top_k,
@@ -183,7 +205,6 @@ def generate_tokens(
                 previous_tokens=generated,
                 rng=rng,
             )
-        )
         generated.append(token_id)
         eos = is_eos_token(tokenizer, token_id)
         next_logits = None if eos else runner.decode(token_id)

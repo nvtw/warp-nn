@@ -19,6 +19,7 @@ from warp_nn.runtime.kernels import (
     _get_gqa_attention_kernel,
     _get_greedy_argmax_kernels,
     _get_grouped_decode_linear_kernel,
+    _get_top_k_kernels,
     _get_matmul_int8_q8_kernel,
     _get_linear_attention_kernel,
     _allocate_partitioned_gqa,
@@ -65,7 +66,6 @@ def test_linear_operation(device, rows):
     )
 
 
-
 @pytest.mark.parametrize("dtype", [wp.float16, wp.bfloat16])
 def test_linear_operation_uses_m64_when_grid_stays_large(dtype):
     if not is_device_available("cuda:0"):
@@ -91,8 +91,9 @@ def test_linear_operation_uses_m64_when_grid_stays_large(dtype):
         x_np @ weight_np.T,
         atol=0.2,
         rtol=0.02,
-
     )
+
+
 @pytest.mark.parametrize("dtype", [wp.float16, wp.bfloat16])
 def test_grouped_decode_linear_kernel(dtype):
     if not is_device_available("cuda:0"):
@@ -678,6 +679,116 @@ def test_head_layout_cache_and_bfloat16_argmax():
         device="cuda:0",
     )
     assert token.numpy()[0] == 7
+
+
+def test_bfloat16_top_k_matches_host():
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(51)
+    vocabulary, tile_width, top_k = 2053, 512, 20
+    logits = wp.array(
+        rng.normal(size=(1, 2, vocabulary)).astype(np.float32),
+        dtype=wp.bfloat16,
+        device="cuda:0",
+    )
+    partial_count = (vocabulary + tile_width - 1) // tile_width
+    partial_values = wp.empty(partial_count * top_k, dtype=wp.float32, device="cuda:0")
+    partial_tokens = wp.empty(partial_count * top_k, dtype=wp.int32, device="cuda:0")
+    values = wp.empty(top_k, dtype=wp.float32, device="cuda:0")
+    tokens = wp.empty(top_k, dtype=wp.int32, device="cuda:0")
+    partial, merge = _get_top_k_kernels(tile_width, top_k, wp.bfloat16)
+    wp.launch_tiled(
+        partial,
+        dim=partial_count,
+        inputs=[logits, partial_values, partial_tokens],
+        block_dim=256,
+        device="cuda:0",
+    )
+    wp.launch_tiled(
+        merge,
+        dim=1,
+        inputs=[partial_values, partial_tokens, values, tokens, partial_count],
+        block_dim=256,
+        device="cuda:0",
+    )
+
+    host_logits = logits.numpy()[0, -1].astype(np.float32)
+    expected = np.lexsort((np.arange(vocabulary), -host_logits))[:top_k]
+    np.testing.assert_array_equal(tokens.numpy(), expected)
+    np.testing.assert_array_equal(values.numpy(), host_logits[expected])
+
+    negative_infinity = wp.array(
+        np.full((1, 1, vocabulary), -np.inf, dtype=np.float32),
+        dtype=wp.bfloat16,
+        device="cuda:0",
+    )
+    wp.launch_tiled(
+        partial,
+        dim=partial_count,
+        inputs=[negative_infinity, partial_values, partial_tokens],
+        block_dim=256,
+        device="cuda:0",
+    )
+    wp.launch_tiled(
+        merge,
+        dim=1,
+        inputs=[partial_values, partial_tokens, values, tokens, partial_count],
+        block_dim=256,
+        device="cuda:0",
+    )
+    np.testing.assert_array_equal(tokens.numpy(), np.arange(top_k))
+    assert np.isneginf(values.numpy()).all()
+
+
+def test_bfloat16_top_k_real_vocabulary_resource_shape():
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    vocabulary, tile_width, top_k = 248_320, 512, 32
+    logits_np = (
+        np.random.default_rng(52).normal(size=(1, 1, vocabulary)).astype(np.float32)
+    )
+    logits_np[0, 0, 7] = 10.0
+    logits_np[0, 0, 5000] = 10.0
+    logits = wp.array(logits_np, dtype=wp.bfloat16, device="cuda:0")
+    partial_count = (vocabulary + tile_width - 1) // tile_width
+    partial_values = wp.empty(partial_count * top_k, dtype=wp.float32, device="cuda:0")
+    partial_tokens = wp.empty(partial_count * top_k, dtype=wp.int32, device="cuda:0")
+    merge_count = (partial_count + 15) // 16
+    merge_values = wp.empty(merge_count * top_k, dtype=wp.float32, device="cuda:0")
+    merge_tokens = wp.empty(merge_count * top_k, dtype=wp.int32, device="cuda:0")
+    partial, merge = _get_top_k_kernels(tile_width, top_k, wp.bfloat16)
+    wp.launch_tiled(
+        partial,
+        dim=partial_count,
+        inputs=[logits, partial_values, partial_tokens],
+        block_dim=256,
+        device="cuda:0",
+    )
+    source_values, source_tokens = partial_values, partial_tokens
+    target_values, target_tokens = merge_values, merge_tokens
+    input_groups = partial_count
+    while input_groups > 1:
+        output_groups = (input_groups + 15) // 16
+        wp.launch_tiled(
+            merge,
+            dim=output_groups,
+            inputs=[
+                source_values,
+                source_tokens,
+                target_values,
+                target_tokens,
+                input_groups,
+            ],
+            block_dim=256,
+            device="cuda:0",
+        )
+        source_values, target_values = target_values, source_values
+        source_tokens, target_tokens = target_tokens, source_tokens
+        input_groups = output_groups
+    host_logits = logits.numpy()[0, 0].astype(np.float32)
+
+    expected = np.lexsort((np.arange(vocabulary), -host_logits))[:top_k]
+    np.testing.assert_array_equal(source_tokens.numpy()[:top_k], expected)
 
 
 @pytest.mark.parametrize("tiled_value_heads", [False, True])
