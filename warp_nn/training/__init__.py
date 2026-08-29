@@ -14,8 +14,10 @@ from .bridges import (
     split_heads,
 )
 from .checkpoint import LoRACheckpoint, load_lora_safetensors, save_lora_safetensors
+from .gated_norm import GatedRMSNormPlan
 from .gated_delta import GatedDeltaInputPlan
 from .gated_delta_rule import GatedDeltaRulePlan
+from .linear_attention import QwenGatedDeltaLoRAAttentionPlan
 from .gqa import GQALoRAAttentionPlan
 from .linear import linear_backward, linear_forward, lora_backward, lora_forward
 from .mlp import LoRASwiGLUPlan
@@ -33,6 +35,7 @@ __all__ = [
     "EmbeddingPlan",
     "GatedDeltaInputPlan",
     "GatedDeltaRulePlan",
+    "GatedRMSNormPlan",
     "GQALoRAAttentionPlan",
     "LoRAAdapterCollection",
     "LoRAAdapterConfig",
@@ -45,6 +48,7 @@ __all__ = [
     "TransformerPrimitivePlan",
     "accumulate_fp32_gradient",
     "add_fp32_gradients",
+    "QwenGatedDeltaLoRAAttentionPlan",
     "cast_from_float32",
     "cast_to_float32",
     "gqa_attention_backward",

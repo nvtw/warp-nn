@@ -1,29 +1,27 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
 # SPDX-License-Identifier: Apache-2.0
 
-"""Exact fixed-buffer Qwen full-attention transformer training composition."""
+"""Exact fixed-buffer Qwen transformer training composition."""
 
 import warp as wp
 
 from .bridges import add_fp32_gradients, cast_from_float32, cast_to_float32
-from .gqa import GQALoRAAttentionPlan
 from .mlp import LoRASwiGLUPlan
 from .primitives import residual_forward
 from .qk import QKTransformPlan
 
 
 class QwenLoRATransformerBlockPlan:
-    """Compose one Qwen pre-norm full-attention/MLP layer.
+    """Compose one Qwen pre-norm attention/MLP layer.
 
-    Qwen's Q projection stores per-head ``[Q, sigmoid-gate]`` pairs; the supplied
-    attention plan must therefore use its packed-query-gate mode. Norm parameters
-    stay frozen and every Linear is trained through LoRA. The complete forward and
-    backward own fixed buffers and are CUDA-graph capturable.
+    Full-attention plans use Qwen's packed ``[Q, sigmoid-gate]`` projection;
+    Gated Delta plans implement the same fixed-buffer forward/backward interface.
+    Norm parameters stay frozen and every Linear is trained through LoRA.
     """
 
     def __init__(
         self,
-        attention: GQALoRAAttentionPlan,
+        attention,
         mlp: LoRASwiGLUPlan,
         *,
         input_norm_weight: wp.array,
@@ -33,7 +31,9 @@ class QwenLoRATransformerBlockPlan:
     ):
         if attention.adapters is not mlp.adapters:
             raise ValueError("Qwen attention and MLP must share one adapter collection")
-        if not attention.packed_query_gate or attention.gate_name is not None:
+        if hasattr(attention, "packed_query_gate") and (
+            not attention.packed_query_gate or attention.gate_name is not None
+        ):
             raise ValueError("Qwen attention requires one packed Q/gate projection")
         if (
             attention.rows != mlp.rows
@@ -97,7 +97,7 @@ class QwenLoRATransformerBlockPlan:
     def forward(
         self, x: wp.array, lengths: wp.array, positions=None, cosine=None, sine=None
     ) -> wp.array:
-        """Execute the exact Qwen full-attention layer."""
+        """Execute the exact Qwen attention layer."""
         normalized = self.input_norm.forward(
             x.reshape(self.shape4), self.weights[0]
         ).reshape(self.shape)
