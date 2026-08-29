@@ -11,10 +11,12 @@ from warp_nn.training.gqa import GQALoRAAttentionPlan
 from warp_nn.training.qk import QKTransformPlan
 
 
-def _fixture(device):
+def _fixture(device, gate=False):
     dtype = wp.bfloat16
     rng = np.random.default_rng(41)
     shapes = {"q": (8, 8), "k": (4, 8), "v": (4, 8), "o": (8, 8)}
+    if gate:
+        shapes["g"] = (8, 8)
     weights = {
         name: wp.array(
             rng.normal(0.0, 0.2, shape).astype(np.float32),
@@ -127,6 +129,32 @@ def test_gqa_lora_attention_composes_qk_norm_and_rope_cpu():
     assert np.isfinite(plan.input_grad.numpy()).all()
     assert np.isfinite(query_transform.input_grad.numpy()).all()
     assert np.isfinite(key_transform.input_grad.numpy()).all()
+
+
+def test_gqa_lora_attention_optional_gate_cpu():
+    adapters, _, x, lengths, grad_output = _fixture("cpu", gate=True)
+    plan = GQALoRAAttentionPlan(
+        adapters,
+        query="q",
+        key="k",
+        value="v",
+        output="o",
+        gate="g",
+        batch=1,
+        sequence=3,
+        query_heads=2,
+        kv_heads=1,
+        head_size=4,
+        window=2,
+    )
+
+    plan.forward(x, lengths)
+    plan.backward(x, lengths, grad_output)
+
+    gate_gradient = adapters.named_gradients["g.lora_B.weight"].numpy()
+    assert np.isfinite(plan.gated.numpy()).all()
+    assert np.isfinite(plan.input_grad.numpy()).all()
+    assert np.any(gate_gradient)
 
 
 CUDA_DEVICES = [device for device in wp.get_devices() if device.is_cuda]
