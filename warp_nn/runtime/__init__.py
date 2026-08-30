@@ -17,6 +17,13 @@ import json
 from pathlib import Path
 
 from warp_nn.runtime.gguf import GGUFArchive, find_gguf_files, gguf_tokenizer_data
+from warp_nn.runtime.kimodo import (
+    KimodoConfig,
+    KimodoRunner,
+    decode_motion_features,
+    save_motion_npz,
+)
+from warp_nn.runtime.llama_encoder import LLM2VecRunner, Llama3Tokenizer
 from warp_nn.runtime.onnx_runtime import OnnxRuntime
 from warp_nn.runtime.openai_server import ChatCompletions, OpenAIHTTPServer
 from warp_nn.runtime.muse_glimmer import (
@@ -82,6 +89,10 @@ def create_tokenizer(path):
 
 __all__ = [
     "GGUFArchive",
+    "KimodoConfig",
+    "KimodoRunner",
+    "LLM2VecRunner",
+    "Llama3Tokenizer",
     "OnnxRuntime",
     "ChatCompletions",
     "OpenAIHTTPServer",
@@ -93,7 +104,9 @@ __all__ = [
     "Qwen3Tokenizer",
     "create_text_runner",
     "create_tokenizer",
+    "decode_motion_features",
     "parse_atem_tool_calls",
     "parse_qwen_tool_calls",
+    "save_motion_npz",
     "sample_token",
 ]

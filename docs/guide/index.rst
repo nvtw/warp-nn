@@ -6,4 +6,5 @@ User Guide
 
     installation
     basics
+    kimodo
     changelog

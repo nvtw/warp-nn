@@ -100,8 +100,8 @@ def _is_number(character: str) -> bool:
     return unicodedata.category(character).startswith("N")
 
 
-def _pretokenize(text: str):
-    """Implement the Unicode split expression stored in Qwen's tokenizer."""
+def _pretokenize_gpt(text: str, number_width: int):
+    """Implement the shared GPT/Qwen/Llama Unicode split expression."""
     index = 0
     contractions = ("'s", "'t", "'re", "'ve", "'m", "'ll", "'d")
     while index < len(text):
@@ -134,8 +134,13 @@ def _pretokenize(text: str):
             index = end
             continue
         if _is_number(character):
-            yield character
-            index += 1
+            end = index + 1
+            while (
+                end < len(text) and end - index < number_width and _is_number(text[end])
+            ):
+                end += 1
+            yield text[index:end]
+            index = end
             continue
 
         symbol_start = index + 1 if character == " " else index
@@ -175,6 +180,16 @@ def _pretokenize(text: str):
 
         yield character
         index += 1
+
+
+def _pretokenize(text: str):
+    """Implement Qwen's one-digit Unicode split expression."""
+    yield from _pretokenize_gpt(text, 1)
+
+
+def _pretokenize_llama3(text: str):
+    """Implement Llama 3's otherwise-shared split with 1-3 digit groups."""
+    yield from _pretokenize_gpt(text, 3)
 
 
 def _pretokenize_o200k(text: str):
@@ -262,7 +277,7 @@ class Qwen3Tokenizer:
 
     tool_call_start = "<tool_call>"
 
-    def __init__(self, path: str | Path | Mapping):
+    def __init__(self, path: str | Path | Mapping, *, pretokenizer=None):
         if isinstance(path, Mapping):
             data = path
             directory = None
@@ -287,9 +302,15 @@ class Qwen3Tokenizer:
             tuple(pair): rank for rank, pair in enumerate(model["merges"])
         }
         self._ignore_merges = bool(model.get("ignore_merges", False))
-        self._pretokenize = (
-            _pretokenize_o200k if data.get("_pretokenizer") == "o200k" else _pretokenize
-        )
+        pretokenizer = pretokenizer or data.get("_pretokenizer")
+        self._pretokenize = {
+            None: _pretokenize,
+            "qwen": _pretokenize,
+            "llama3": _pretokenize_llama3,
+            "o200k": _pretokenize_o200k,
+        }.get(pretokenizer)
+        if self._pretokenize is None:
+            raise ValueError(f"unknown ByteLevel pretokenizer '{pretokenizer}'")
         self._added_tokens = {
             item["content"]: item["id"] for item in data["added_tokens"]
         }

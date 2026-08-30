@@ -134,19 +134,20 @@ def _encoder_kernels(dtype: type, head_size: int):
         token = item % sequence
         head = (item / sequence) % query.shape[1]
         batch = item / (query.shape[1] * sequence)
+        kv_head = head / (query.shape[1] / key.shape[1])
         accumulator = wp.tile_zeros(shape=(HEAD_SIZE,), dtype=wp.float32)
         q = wp.tile_load(query[batch, head, token], shape=(HEAD_SIZE,))
         maximum = wp.float32(-3.402823466e38)
         denominator = wp.float32(0.0)
         for source in range(sequence):
             if valid[batch, source]:
-                k = wp.tile_load(key[batch, head, source], shape=(HEAD_SIZE,))
+                k = wp.tile_load(key[batch, kv_head, source], shape=(HEAD_SIZE,))
                 score = wp.tile_extract(wp.tile_sum(wp.tile_map(dot, q, k)), 0) * scale
                 new_maximum = wp.max(maximum, score)
                 old_scale = wp.exp(maximum - new_maximum)
                 probability = wp.exp(score - new_maximum)
                 denominator = denominator * old_scale + probability
-                v = wp.tile_load(value[batch, head, source], shape=(HEAD_SIZE,))
+                v = wp.tile_load(value[batch, kv_head, source], shape=(HEAD_SIZE,))
                 accumulator = wp.tile_map(
                     update, accumulator, v, old_scale, probability
                 )

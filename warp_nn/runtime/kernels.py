@@ -416,6 +416,29 @@ def _reduce_mean_rows_kernel(x: wp.array2d[Any], out: wp.array2d[Any]):
     out[row, 0] = total / x.dtype(x.shape[1])
 
 
+@lru_cache(maxsize=None)
+def _get_masked_mean_pool_kernel(dtype):
+    """Create a fixed-dtype masked token mean used by encoder models."""
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def masked_mean_pool(
+        hidden: wp.array2d(dtype=DTYPE),
+        mask: wp.array1d[wp.bool],
+        output: wp.array2d(dtype=DTYPE),
+    ):
+        column = wp.tid()
+        total = wp.float32(0.0)
+        count = wp.float32(0.0)
+        for token in range(hidden.shape[0]):
+            if mask[token]:
+                total += wp.float32(hidden[token, column])
+                count += wp.float32(1.0)
+        output[0, column] = DTYPE(total / wp.max(count, wp.float32(1.0)))
+
+    return masked_mean_pool
+
+
 @wp.kernel(enable_backward=False)
 def _reduce_max_1d_kernel(x: wp.array1d[Any], out: wp.array1d[Any]):
     """Reduce a 1-D array to its maximum."""
