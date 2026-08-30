@@ -3117,3 +3117,69 @@ def _rotary_embedding_kernel_for_dtype(dtype: type):
             ],
         )
     return _KERNEL_OVERLOADS[key]
+
+
+@lru_cache(maxsize=None)
+def _get_mrope_embedding_kernel(dtype: type):
+    """Apply split-half Qwen MRoPE using explicit temporal/height/width positions."""
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def kernel(
+        x: wp.array4d(dtype=DTYPE),
+        position_ids: wp.array2d[wp.int64],
+        cos_cache: wp.array2d(dtype=DTYPE),
+        sin_cache: wp.array2d(dtype=DTYPE),
+        output: wp.array4d(dtype=DTYPE),
+        rotary_dim: int,
+    ):
+        batch, head, sequence, column = wp.tid()
+        if column >= rotary_dim:
+            output[batch, head, sequence, column] = x[batch, head, sequence, column]
+            return
+        half = rotary_dim / 2
+        cache_column = column % half
+        partner = column + half if column < half else column - half
+        sign = wp.float32(-1.0) if column < half else wp.float32(1.0)
+        # Qwen3.8 sections [11,11,10] are interleaved T,H,W over 32 frequencies.
+        residue = cache_column % 3
+        axis = residue
+        position = position_ids[axis, sequence]
+        value = wp.float32(x[batch, head, sequence, column])
+        rotated = sign * wp.float32(x[batch, head, sequence, partner])
+        output[batch, head, sequence, column] = DTYPE(
+            value * wp.float32(cos_cache[position, cache_column])
+            + rotated * wp.float32(sin_cache[position, cache_column])
+        )
+
+    return kernel
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _overlay_embedding_rows_kernel(
+    embedding: wp.array2d[Any],
+    visual: wp.array2d[Any],
+    source_indices: wp.array1d[wp.int32],
+):
+    row, column = wp.tid()
+    source = source_indices[row]
+    if source >= 0:
+        embedding[row, column] = visual[source, column]
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _stage_mrope_token_position(
+    input_ids: wp.array2d[wp.int64],
+    cache_positions: wp.array2d[wp.int64],
+    rope_positions: wp.array2d[wp.int64],
+    sequence_end: wp.array1d[wp.int32],
+    token_id: int,
+    cache_position: int,
+    rope_position: int,
+):
+    input_ids[0, 0] = wp.int64(token_id)
+    cache_positions[0, 0] = wp.int64(cache_position)
+    rope_positions[0, 0] = wp.int64(rope_position)
+    rope_positions[1, 0] = wp.int64(rope_position)
+    rope_positions[2, 0] = wp.int64(rope_position)
+    sequence_end[0] = cache_position

@@ -39,6 +39,11 @@ from warp_nn.runtime.qwen3 import (
     sample_token,
 )
 from warp_nn.runtime.qwen35 import Qwen35Runner
+from warp_nn.runtime.qwen_vision import (
+    QwenMultimodalProcessor,
+    QwenMultimodalPrompt,
+    QwenVisionEncoder,
+)
 
 
 def create_text_runner(path, **kwargs):
@@ -87,6 +92,11 @@ def create_tokenizer(path):
     return tokenizer_type(directory)
 
 
+def create_multimodal_processor(path):
+    """Create the dependency-free Qwen multimodal chat processor."""
+    return QwenMultimodalProcessor(create_tokenizer(path))
+
+
 __all__ = [
     "GGUFArchive",
     "KimodoConfig",
@@ -102,6 +112,10 @@ __all__ = [
     "Qwen3OnnxRunner",
     "Qwen35Runner",
     "Qwen3Tokenizer",
+    "QwenMultimodalProcessor",
+    "QwenMultimodalPrompt",
+    "QwenVisionEncoder",
+    "create_multimodal_processor",
     "create_text_runner",
     "create_tokenizer",
     "decode_motion_features",

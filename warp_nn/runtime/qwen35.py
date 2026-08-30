@@ -26,8 +26,10 @@ from warp_nn.runtime.kernels import (
     _causal_conv_rows_kernel,
     _decode_attention_partitions,
     _gather_rows_kernel,
+    _cast_kernel_for_dtypes,
     _get_gated_rms_norm_kernel,
     _get_gather_q8_0_rows_kernel,
+    _get_mrope_embedding_kernel,
     _get_gqa_attention_kernel,
     _get_greedy_argmax_kernels,
     _get_linear_attention_kernel,
@@ -38,10 +40,11 @@ from warp_nn.runtime.kernels import (
     _prepare_gated_delta_kernel,
     _reorder_heads_kernel,
     _reorder_interleaved_heads_kernel,
-    _rotary_embedding_kernel_for_dtype,
+    _overlay_embedding_rows_kernel,
     _set_sequence_end,
     _sigmoid_gate_kernel,
     _split_last_axis_kernel,
+    _stage_mrope_token_position,
     _stage_token_position,
     _unpack_gated_heads_kernel,
     _update_conv_rows_state_kernel,
@@ -334,7 +337,9 @@ def _reuse_layer_linear_outputs(layer: dict, tensors: dict, pool: dict) -> None:
 class _Qwen35Plan:
     """Fixed-row execution plan sharing weights and recurrent state."""
 
-    def __init__(self, runner: Qwen35Runner, rows: int):
+    def __init__(
+        self, runner: Qwen35Runner, rows: int, external_embeddings: bool = False
+    ):
         self.runner = weakref.proxy(runner)
         self.rows = rows
         self.device = runner.device
@@ -344,6 +349,13 @@ class _Qwen35Plan:
         self.shapes = {name: tuple(value.shape) for name, value in self.tensors.items()}
         self.input_ids = wp.zeros((1, rows), dtype=wp.int64, device=self.device)
         self.position_ids = wp.zeros((1, rows), dtype=wp.int64, device=self.device)
+        self.rope_position_ids = wp.zeros((3, rows), dtype=wp.int64, device=self.device)
+        self.external_embeddings = external_embeddings
+        if external_embeddings:
+            self.visual_embeddings = wp.empty(
+                (rows, runner.hidden_size), dtype=self.dtype, device=self.device
+            )
+            self.visual_indices = wp.empty(rows, dtype=wp.int32, device=self.device)
         self.embedding = wp.empty(
             (1, rows, runner.hidden_size), dtype=self.dtype, device=self.device
         )
@@ -793,7 +805,7 @@ class _Qwen35Plan:
             )
         self._execute_op(layer["q_norm"])
         self._execute_op(layer["k_norm"])
-        rotary = _rotary_embedding_kernel_for_dtype(self.dtype)
+        rotary = _get_mrope_embedding_kernel(self.dtype)
         for source, output, heads in (
             (
                 self.tensors[layer["q_norm"].outputs[0]],
@@ -811,13 +823,11 @@ class _Qwen35Plan:
                 dim=(1, heads, self.rows, self.runner.head_size),
                 inputs=[
                     source.reshape((1, heads, self.rows, self.runner.head_size)),
-                    self.position_ids,
+                    self.rope_position_ids,
                     self.runner.cos_cache,
                     self.runner.sin_cache,
                     output.reshape((1, heads, self.rows, self.runner.head_size)),
                     self.runner.rotary_dim,
-                    False,
-                    False,
                 ],
                 device=self.device,
             )
@@ -905,6 +915,17 @@ class _Qwen35Plan:
                 inputs=[embedding_weight, self.input_ids, self.embedding],
                 device=self.device,
             )
+        if self.external_embeddings:
+            wp.launch(
+                _overlay_embedding_rows_kernel,
+                dim=(self.rows, self.runner.hidden_size),
+                inputs=[
+                    self.embedding.reshape((self.rows, self.runner.hidden_size)),
+                    self.visual_embeddings,
+                    self.visual_indices,
+                ],
+                device=self.device,
+            )
         self._execute_op(self.first_norm)
         for index, layer in enumerate(self.layers):
             if layer["type"] == "linear_attention":
@@ -925,7 +946,7 @@ class _Qwen35Plan:
 
 
 class Qwen35Runner:
-    """Run a Qwen 3.5-family text checkpoint entirely with Warp."""
+    """Run a Qwen 3.5-family text or multimodal checkpoint entirely with Warp."""
 
     def __init__(
         self,
@@ -936,8 +957,11 @@ class Qwen35Runner:
         use_cublas: bool = True,
         rope_scaling: Mapping[str, object] | None = None,
         weight_quantization: str | None = None,
+        vision_path: str | Path | None = None,
     ):
         path = Path(path)
+        self.model_path = path
+        self.vision_path = None if vision_path is None else Path(vision_path)
         directory = path if path.is_dir() else path.parent
         if any(directory.glob("*.safetensors")):
             config_data = json.loads(
@@ -1138,6 +1162,7 @@ class Qwen35Runner:
         for state in self.recurrent_states.values():
             state.zero_()
         self.sequence_length = 0
+        self.rope_delta = 0
 
     def _run(self, plan: _Qwen35Plan, graph_key=None) -> wp.array:
         if self.device.is_cuda:
@@ -1179,18 +1204,34 @@ class Qwen35Runner:
 
     def _stage_one(self, token_id: int) -> wp.array:
         position = self.sequence_length
-        wp.launch(
-            _stage_token_position,
-            dim=1,
-            inputs=[
-                self._decode_plan.input_ids,
-                self._decode_plan.position_ids,
-                self.sequence_end,
-                token_id,
-                position,
-            ],
-            device=self.device,
-        )
+        if hasattr(self._decode_plan, "rope_position_ids"):
+            wp.launch(
+                _stage_mrope_token_position,
+                dim=1,
+                inputs=[
+                    self._decode_plan.input_ids,
+                    self._decode_plan.position_ids,
+                    self._decode_plan.rope_position_ids,
+                    self.sequence_end,
+                    token_id,
+                    position,
+                    position + self.rope_delta,
+                ],
+                device=self.device,
+            )
+        else:
+            wp.launch(
+                _stage_token_position,
+                dim=1,
+                inputs=[
+                    self._decode_plan.input_ids,
+                    self._decode_plan.position_ids,
+                    self.sequence_end,
+                    token_id,
+                    position,
+                ],
+                device=self.device,
+            )
         partitions = getattr(self._decode_plan, "attention_partitions", 256)
         logits = self._run(self._decode_plan, partitions)
         self.sequence_length += 1
@@ -1216,6 +1257,17 @@ class Qwen35Runner:
         plan.position_ids.assign(
             np.arange(self.sequence_length, end, dtype=np.int64)[None, :]
         )
+        if hasattr(plan, "rope_position_ids"):
+            plan.rope_position_ids.assign(
+                np.broadcast_to(
+                    np.arange(
+                        self.sequence_length + self.rope_delta,
+                        end + self.rope_delta,
+                        dtype=np.int64,
+                    ),
+                    (3, rows),
+                )
+            )
         wp.launch(
             _set_sequence_end,
             dim=1,
@@ -1419,3 +1471,108 @@ class Qwen35Runner:
             host_values.numpy()[:top_k].copy(),
             host_tokens.numpy()[:top_k].copy(),
         )
+
+    def _multimodal_plan_for_rows(self, rows: int) -> _Qwen35Plan:
+        plans = getattr(self, "_multimodal_plans", None)
+        if plans is None:
+            plans = self._multimodal_plans = {}
+        plan = plans.get(rows)
+        if plan is None:
+            self._require_lazy_plan_headroom(rows)
+            plan = plans[rows] = _Qwen35Plan(self, rows, external_embeddings=True)
+            plan._capture_ready = False
+            self._record_plan_storage(plan)
+        return plan
+
+    def _vision_encoder(self):
+        encoder = getattr(self, "_vision_encoder_instance", None)
+        if encoder is None:
+            from .qwen_vision import QwenVisionEncoder
+
+            encoder = self._vision_encoder_instance = QwenVisionEncoder(
+                self.model_path,
+                device=self.device,
+                cublas=self.cublas,
+                vision_path=self.vision_path,
+            )
+        return encoder
+
+    def prefill_multimodal(self, prompt) -> wp.array:
+        """Reset and prefill a :class:`QwenMultimodalPrompt` entirely on device."""
+        from .qwen_vision import QwenMultimodalPrompt
+
+        if not isinstance(prompt, QwenMultimodalPrompt):
+            raise TypeError("prefill_multimodal expects QwenMultimodalPrompt")
+        if not prompt.media:
+            return self.prefill(prompt.token_ids)
+        if len(prompt.token_ids) >= self.cache_capacity:
+            raise ValueError(
+                "Qwen multimodal prompt must leave room for one decoded token"
+            )
+        self.reset()
+        encoded = []
+        for media in prompt.media:
+            output = self._vision_encoder().encode(media)
+            if output.shape[1] != self.hidden_size:
+                raise ValueError(
+                    "vision encoder output does not match text hidden size"
+                )
+            if output.dtype != self.dtype:
+                converted = wp.empty(output.shape, dtype=self.dtype, device=self.device)
+                wp.launch(
+                    _cast_kernel_for_dtypes(output.dtype, self.dtype),
+                    dim=output.size,
+                    inputs=[output.flatten(), converted.flatten()],
+                    device=self.device,
+                )
+                output = converted
+            encoded.append(output)
+
+        logits = None
+        start = 0
+        while start < len(prompt.token_ids):
+            remaining = len(prompt.token_ids) - start
+            rows = min(self.prefill_chunk_size, 1 << (remaining.bit_length() - 1))
+            plan = self._multimodal_plan_for_rows(rows)
+            end = start + rows
+            plan.input_ids.assign(
+                np.asarray(prompt.token_ids[start:end], dtype=np.int64)[None, :]
+            )
+            plan.position_ids.assign(np.arange(start, end, dtype=np.int64)[None, :])
+            plan.rope_position_ids.assign(prompt.rope_positions[:, start:end])
+            source_indices = np.full(rows, -1, dtype=np.int32)
+            for media_index, (feature_start, media) in enumerate(
+                zip(prompt.feature_starts, prompt.media, strict=True)
+            ):
+                feature_end = feature_start + media.feature_count
+                overlap_start, overlap_end = (
+                    max(start, feature_start),
+                    min(end, feature_end),
+                )
+                if overlap_start >= overlap_end:
+                    continue
+                count = overlap_end - overlap_start
+                destination_row = overlap_start - start
+                source_row = overlap_start - feature_start
+                wp.copy(
+                    plan.visual_embeddings.flatten(),
+                    encoded[media_index].flatten(),
+                    dest_offset=destination_row * self.hidden_size,
+                    src_offset=source_row * self.hidden_size,
+                    count=count * self.hidden_size,
+                )
+                source_indices[destination_row : destination_row + count] = np.arange(
+                    destination_row, destination_row + count, dtype=np.int32
+                )
+            plan.visual_indices.assign(source_indices)
+            wp.launch(
+                _set_sequence_end,
+                dim=1,
+                inputs=[self.sequence_end, end - 1],
+                device=self.device,
+            )
+            logits = self._run(plan)
+            self.sequence_length = end
+            start = end
+        self.rope_delta = int(prompt.rope_delta)
+        return logits
