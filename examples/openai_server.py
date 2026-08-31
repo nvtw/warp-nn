@@ -95,7 +95,7 @@ def main():
         type=int,
         choices=(1, 2, 4, 8),
         default=1,
-        help="Maximum simultaneous Qwen requests (adaptive B1/B2/B4/B8)",
+        help="Maximum simultaneous native-model requests (adaptive B1/B2/B4/B8)",
     )
     parser.add_argument(
         "--batch-wait-ms",

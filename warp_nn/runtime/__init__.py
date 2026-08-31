@@ -76,6 +76,13 @@ def create_tokenizer(path):
     path = Path(path)
     directory = path if path.is_dir() else path.parent
     config_path = directory / "config.json"
+    config = (
+        json.loads(config_path.read_text(encoding="utf-8"))
+        if config_path.is_file()
+        else None
+    )
+    if config is not None and config.get("model_type") == "muse_glimmer":
+        return MuseGlimmerTokenizer(directory)
     if (
         (directory / "tokenizer.json").is_file()
         or (directory / "vocab.json").is_file()
@@ -90,13 +97,7 @@ def create_tokenizer(path):
     if not (directory / "tokenizer.json").is_file():
         archive = GGUFArchive(find_gguf_files(path))
         return Qwen3Tokenizer(gguf_tokenizer_data(archive.metadata))
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    tokenizer_type = (
-        MuseGlimmerTokenizer
-        if config.get("model_type") == "muse_glimmer"
-        else Qwen3Tokenizer
-    )
-    return tokenizer_type(directory)
+    return Qwen3Tokenizer(directory)
 
 
 def create_multimodal_processor(path):

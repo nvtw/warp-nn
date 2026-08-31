@@ -362,3 +362,99 @@ def test_muse_glimmer_prefill_decode_ring_cache_and_graph_replay(tmp_path, use_c
     sequential = runner.decode(4).numpy()
     assert full_chunk.shape == (1, 1, 16)
     np.testing.assert_allclose(full_chunk, sequential, atol=2.0e-2, rtol=2.0e-2)
+
+
+@pytest.mark.parametrize("batch_size", [2, 4, 8])
+def test_muse_batch_decode_matches_sequential_and_isolates_state(tmp_path, batch_size):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    model_path = tmp_path / "tiny-muse-batch"
+    _write_tiny_muse(model_path)
+    runner = MuseGlimmerRunner(
+        model_path,
+        device="cuda:0",
+        cache_capacity=8,
+        prefill_chunk_size=4,
+        use_cublas=False,
+    )
+    batch = runner.create_batch_decoder(batch_size)
+    # Slot zero crosses the six-row sliding-cache ring on its first decode.
+    prompts = ([1, 2, 3, 4, 5, 6], [5, 6], [7, 8, 9], [10, 11])[:batch_size]
+    references = []
+    for slot, prompt in enumerate(prompts):
+        batch.prefill(slot, prompt)
+        runner.prefill(prompt)
+        references.append(runner.decode(4).numpy())
+
+    actual = batch.decode([4] * batch_size).numpy()
+    for slot, expected in enumerate(references):
+        np.testing.assert_allclose(actual[slot], expected[0], atol=2.0e-2, rtol=2.0e-2)
+
+    for key, value in batch.kv_caches.values():
+        rows = key.shape[0] // batch_size
+        key[rows:].zero_()
+        value[rows:].zero_()
+    caches_before = {
+        index: (key.numpy().copy(), value.numpy().copy())
+        for index, (key, value) in batch.kv_caches.items()
+    }
+    batch.decode([3] * batch_size, active=[True] + [False] * (batch_size - 1))
+    for index, (key, value) in batch.kv_caches.items():
+        rows = key.shape[0] // batch_size
+        np.testing.assert_array_equal(
+            key.numpy()[rows:], caches_before[index][0][rows:]
+        )
+        np.testing.assert_array_equal(
+            value.numpy()[rows:], caches_before[index][1][rows:]
+        )
+    assert len(batch.plan.graphs) == 1
+
+
+def test_muse_compact_decode_maps_noncontiguous_slots(tmp_path):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    model_path = tmp_path / "tiny-muse-mapped-batch"
+    _write_tiny_muse(model_path)
+    runner = MuseGlimmerRunner(
+        model_path,
+        device="cuda:0",
+        cache_capacity=8,
+        prefill_chunk_size=4,
+        use_cublas=False,
+    )
+    batch = runner.create_batch_decoder(8)
+    slots = (0, 2, 5, 7)
+    prompts = ([1, 2], [3, 4, 5], [6, 7], [8, 9, 10])
+    references = []
+    for slot, prompt in zip(slots, prompts, strict=True):
+        batch.prefill(slot, prompt)
+        runner.prefill(prompt)
+        references.append(runner.decode(11).numpy())
+
+    untouched = (1, 3, 4, 6)
+    for key, value in batch.kv_caches.values():
+        rows = key.shape[0] // 8
+        for slot in untouched:
+            key[slot * rows : (slot + 1) * rows].zero_()
+            value[slot * rows : (slot + 1) * rows].zero_()
+    caches_before = {
+        index: (key.numpy().copy(), value.numpy().copy())
+        for index, (key, value) in batch.kv_caches.items()
+    }
+    actual = batch.decode_mapped(slots, [11] * 4, [True] * 4, 4).numpy()
+    for lane, expected in enumerate(references):
+        np.testing.assert_allclose(actual[lane], expected[0], atol=2.0e-2, rtol=2.0e-2)
+    for index, (key, value) in batch.kv_caches.items():
+        rows = key.shape[0] // 8
+        for slot in untouched:
+            start = slot * rows
+            end = start + rows
+            np.testing.assert_array_equal(
+                key.numpy()[start:end], caches_before[index][0][start:end]
+            )
+            np.testing.assert_array_equal(
+                value.numpy()[start:end], caches_before[index][1][start:end]
+            )
+    assert batch._batch_views[4].mapped_state
+    batch.decode_mapped(slots, [12] * 4, [True] * 4, 4)
+    assert len(batch._batch_plans[4].graphs) == 1

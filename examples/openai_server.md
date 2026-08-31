@@ -1,6 +1,6 @@
 # OpenAI-compatible server
 
-Start a Qwen server that accepts up to eight simultaneous requests:
+Start a Qwen or Muse server that accepts up to eight simultaneous requests:
 
 ```bash
 cd /home/twidmer/Documents/git/warp-nn

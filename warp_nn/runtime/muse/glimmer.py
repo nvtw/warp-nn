@@ -15,6 +15,7 @@ from pathlib import Path
 import warp as wp
 
 from warp_nn.runtime._cublas import try_create_cublas
+from warp_nn.runtime.batch_decode import NativeBatchDecoder
 from warp_nn.runtime.formats.gguf import (
     BlockQuantizedTensor,
     GGUFArchive,
@@ -26,10 +27,12 @@ from warp_nn.runtime.kernels import (
     _binary_broadcast_kernel,
     _gather_rows_kernel,
     _get_gather_q8_0_rows_kernel,
+    _get_append_head_cache_decode_batch_kernel,
     _get_gqa_attention_kernel,
     _get_greedy_argmax_kernels,
     _logit_softcap_kernel,
     _reorder_heads_kernel,
+    _reorder_heads_decode_batch_kernel,
     _reorder_interleaved_heads_kernel,
     _rotary_embedding_kernel_for_dtype,
     _scale_kernel,
@@ -538,9 +541,15 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
 class _MusePlan:
     """Fixed-row Muse execution plan sharing the runner's persistent caches."""
 
-    def __init__(self, runner: MuseGlimmerRunner, rows: int):
+    def __init__(
+        self, runner: MuseGlimmerRunner, rows: int, decode_batch: bool = False
+    ):
         self.runner = weakref.proxy(runner)
         self.rows = rows
+        self.decode_batch = bool(decode_batch)
+        self.mapped_state = bool(getattr(runner, "mapped_state", False))
+        if self.decode_batch and rows not in (2, 4, 8):
+            raise ValueError("Muse decode batches require 2, 4, or 8 slots")
         self.device = runner.device
         self.dtype = runner.dtype
         self.tensors = dict(runner.weights)
@@ -548,6 +557,10 @@ class _MusePlan:
         self.shapes = {name: tuple(value.shape) for name, value in self.tensors.items()}
         self.input_ids = wp.zeros((1, rows), dtype=wp.int64, device=self.device)
         self.position_ids = wp.zeros((1, rows), dtype=wp.int64, device=self.device)
+        if self.decode_batch:
+            self.rope_position_ids = wp.zeros(
+                (rows, 1), dtype=wp.int64, device=self.device
+            )
         self.embedding = wp.empty(
             (1, rows, runner.hidden_size), dtype=self.dtype, device=self.device
         )
@@ -562,6 +575,8 @@ class _MusePlan:
         self, name: str, x: str, weight: str, q8_activation_cache=None
     ) -> Operation:
         op = Operation("Linear", [x, weight], [name])
+        if self.decode_batch:
+            op.attrs.update(_small_batch_decode=True, _small_batch_outputs_per_group=4)
         plan_linear(
             op,
             self.tensors,
@@ -629,6 +644,21 @@ class _MusePlan:
         else:
             layer["q_ready"] = self.tensors[layer["q_norm"].outputs[0]]
             layer["k_ready"] = self.tensors[layer["k_norm"].outputs[0]]
+        if self.decode_batch:
+            layer["q_heads"] = layer["q"].reshape(
+                (self.rows, self.runner.query_heads, 1, self.runner.head_dim)
+            )
+            for name in ("k", "v"):
+                layer[name + "_heads"] = layer[name].reshape(
+                    (self.rows, self.runner.kv_heads, 1, self.runner.head_dim)
+                )
+            if layer["local"]:
+                layer["q_ready_heads"] = layer["q_ready"].reshape(
+                    (self.rows, self.runner.query_heads, 1, self.runner.head_dim)
+                )
+                layer["k_ready_heads"] = layer["k_ready"].reshape(
+                    (self.rows, self.runner.kv_heads, 1, self.runner.head_dim)
+                )
 
     def _build(self) -> None:
         hidden = "hidden.0"
@@ -712,8 +742,12 @@ class _MusePlan:
             self._reuse_layer_buffers(layer, index)
             self.layers.append(layer)
         final_input = "final.input"
-        self.tensors[final_input] = self.tensors[hidden][self.rows - 1 : self.rows]
-        self.shapes[final_input] = (1, self.runner.hidden_size)
+        if self.decode_batch:
+            self.tensors[final_input] = self.tensors[hidden]
+            self.shapes[final_input] = (self.rows, self.runner.hidden_size)
+        else:
+            self.tensors[final_input] = self.tensors[hidden][self.rows - 1 : self.rows]
+            self.shapes[final_input] = (1, self.runner.hidden_size)
         self.final_norm = self._rms(
             "final.normalized",
             final_input,
@@ -723,7 +757,10 @@ class _MusePlan:
         self.lm_head = self._linear(
             "logits", self.final_norm.outputs[0], "lm_head.weight"
         )
-        self.logits = self.tensors["logits"].reshape((1, 1, self.runner.vocab_size))
+        output_rows = self.rows if self.decode_batch else 1
+        self.logits = self.tensors["logits"].reshape(
+            (output_rows, 1, self.runner.vocab_size)
+        )
 
     def _build_attention(self, layer: dict, index: int, prefix: str, x: str) -> None:
         attention = prefix + "self_attn."
@@ -735,11 +772,33 @@ class _MusePlan:
                 attention + projection + "_proj.weight",
                 projection_q8_cache,
             )
-        q_shape = (self.runner.query_heads * self.rows, self.runner.head_dim)
-        kv_shape = (self.runner.kv_heads * self.rows, self.runner.head_dim)
-        layer["q"] = wp.empty(q_shape, dtype=self.dtype, device=self.device)
-        layer["k"] = wp.empty(kv_shape, dtype=self.dtype, device=self.device)
-        layer["v"] = wp.empty(kv_shape, dtype=self.dtype, device=self.device)
+        if self.decode_batch:
+            layer["q_heads"] = wp.empty(
+                (self.rows, self.runner.query_heads, 1, self.runner.head_dim),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            layer["k_heads"] = wp.empty(
+                (self.rows, self.runner.kv_heads, 1, self.runner.head_dim),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            layer["v_heads"] = wp.empty_like(layer["k_heads"])
+            layer["q"] = layer["q_heads"].reshape(
+                (self.rows * self.runner.query_heads, self.runner.head_dim)
+            )
+            layer["k"] = layer["k_heads"].reshape(
+                (self.rows * self.runner.kv_heads, self.runner.head_dim)
+            )
+            layer["v"] = layer["v_heads"].reshape(
+                (self.rows * self.runner.kv_heads, self.runner.head_dim)
+            )
+        else:
+            q_shape = (self.runner.query_heads * self.rows, self.runner.head_dim)
+            kv_shape = (self.runner.kv_heads * self.rows, self.runner.head_dim)
+            layer["q"] = wp.empty(q_shape, dtype=self.dtype, device=self.device)
+            layer["k"] = wp.empty(kv_shape, dtype=self.dtype, device=self.device)
+            layer["v"] = wp.empty(kv_shape, dtype=self.dtype, device=self.device)
         self._register(f"layer.{index}.q", layer["q"])
         self._register(f"layer.{index}.k", layer["k"])
         layer["q_norm"] = self._rms(
@@ -754,7 +813,12 @@ class _MusePlan:
             "__unit_head",
             self.runner.rms_epsilon,
         )
-        if layer["local"]:
+        if layer["local"] and self.decode_batch:
+            layer["q_ready_heads"] = wp.empty_like(layer["q_heads"])
+            layer["k_ready_heads"] = wp.empty_like(layer["k_heads"])
+            layer["q_ready"] = layer["q_ready_heads"].reshape(layer["q"].shape)
+            layer["k_ready"] = layer["k_ready_heads"].reshape(layer["k"].shape)
+        elif layer["local"]:
             layer["q_ready"] = wp.empty_like(layer["q"])
             layer["k_ready"] = wp.empty_like(layer["k"])
         else:
@@ -776,7 +840,7 @@ class _MusePlan:
         if not hasattr(self, "partitioned_attention"):
             self.attention_partitions = (
                 _decode_attention_partitions(self.runner.head_dim)
-                if self.rows == 1
+                if self.rows == 1 or self.decode_batch
                 else 16
             )
             partitions = self.attention_partitions
@@ -789,16 +853,136 @@ class _MusePlan:
                     partitions,
                     rows=self.rows,
                     kv_heads=self.runner.kv_heads,
+                    mapped=self.mapped_state,
                 )
             }
         layer["partitioned_attention"] = self.partitioned_attention
+        if self.decode_batch:
+            layer["append_cache_kernel"] = _get_append_head_cache_decode_batch_kernel(
+                self.mapped_state, layer["local"]
+            )
 
     def _execute_op(self, op: Operation) -> None:
         execute_operations(
             op.attrs["_sequence"], self.tensors, self.shapes, self.device
         )
 
+    def _execute_attention_batch(self, layer: dict, index: int) -> None:
+        for projection in ("q", "k", "v", "gate"):
+            self._execute_op(layer[projection + "_proj"])
+        for projection in ("q", "k", "v"):
+            heads = (
+                self.runner.query_heads if projection == "q" else self.runner.kv_heads
+            )
+            wp.launch(
+                _reorder_heads_decode_batch_kernel,
+                dim=(self.rows, heads, self.runner.head_dim),
+                inputs=[
+                    self.tensors[layer[projection + "_proj"].outputs[0]],
+                    layer[projection + "_heads"],
+                    self.runner.head_dim,
+                    self.runner.gguf_layout and projection in ("q", "k"),
+                ],
+                device=self.device,
+            )
+        self._execute_op(layer["q_norm"])
+        self._execute_op(layer["k_norm"])
+        q_normalized = self.tensors[layer["q_norm"].outputs[0]]
+        wp.launch(
+            _scale_kernel,
+            dim=q_normalized.shape,
+            inputs=[q_normalized, q_normalized, self.runner.qk_scale],
+            device=self.device,
+        )
+        if layer["local"]:
+            rotary = _rotary_embedding_kernel_for_dtype(self.dtype)
+            for source, output, heads in (
+                (
+                    q_normalized.reshape(
+                        (self.rows, self.runner.query_heads, 1, self.runner.head_dim)
+                    ),
+                    layer["q_ready_heads"],
+                    self.runner.query_heads,
+                ),
+                (
+                    self.tensors[layer["k_norm"].outputs[0]].reshape(
+                        (self.rows, self.runner.kv_heads, 1, self.runner.head_dim)
+                    ),
+                    layer["k_ready_heads"],
+                    self.runner.kv_heads,
+                ),
+            ):
+                wp.launch(
+                    rotary,
+                    dim=(self.rows, heads, 1, self.runner.head_dim),
+                    inputs=[
+                        source,
+                        self.rope_position_ids,
+                        self.runner.cos_cache,
+                        self.runner.sin_cache,
+                        output,
+                        self.runner.head_dim,
+                        False,
+                        False,
+                    ],
+                    device=self.device,
+                )
+        key_cache, value_cache = self.runner.kv_caches[index]
+        cache_capacity = self.runner.cache_capacities[index]
+        for source, cache in (
+            (
+                layer["k_ready"].reshape(
+                    (self.rows, self.runner.kv_heads, 1, self.runner.head_dim)
+                ),
+                key_cache,
+            ),
+            (layer["v_heads"], value_cache),
+        ):
+            wp.launch(
+                layer["append_cache_kernel"],
+                dim=(self.rows, self.runner.kv_heads, self.runner.head_dim),
+                inputs=[
+                    source,
+                    self.runner.positions,
+                    self.runner.active,
+                    self.runner.slot_indices,
+                    cache,
+                    cache_capacity,
+                ],
+                device=self.device,
+            )
+        _launch_partitioned_gqa(
+            layer["partitioned_attention"][self.attention_partitions],
+            layer["q_ready"],
+            key_cache,
+            value_cache,
+            self.runner.sequence_end,
+            layer["core"],
+            self.runner.query_heads,
+            self.runner.kv_heads,
+            cache_capacity,
+            self.runner.head_dim**-0.5,
+            self.runner.local_window if layer["local"] else 0,
+            self.device,
+            sequence_length=1,
+            slot_indices=(self.runner.slot_indices if self.mapped_state else None),
+        )
+        wp.launch(
+            _sigmoid_gate_kernel,
+            dim=layer["core"].shape,
+            inputs=[
+                layer["core"],
+                self.tensors[layer["gate_proj"].outputs[0]],
+                layer["gated"],
+            ],
+            device=self.device,
+        )
+        self._execute_op(layer["attention_output"])
+
     def _execute_attention(self, layer: dict, index: int) -> None:
+        if self.decode_batch:
+            self._execute_attention_batch(layer, index)
+            return
         for projection in ("q", "k", "v", "gate"):
             self._execute_op(layer[projection + "_proj"])
         for projection in ("q", "k", "v"):
@@ -1001,6 +1185,13 @@ class _MusePlan:
         return self.logits
 
 
+class MuseGlimmerBatchDecoder(NativeBatchDecoder):
+    """Muse batch decoder using shared persistent-slot execution."""
+
+    def __init__(self, runner, max_batch_size: int):
+        super().__init__(runner, max_batch_size, _MusePlan, "Muse")
+
+
 class MuseGlimmerRunner(AutoregressiveRunner):
     """Run text-only Muse Glimmer BF16 safetensors or GGUF checkpoints."""
 
@@ -1146,3 +1337,7 @@ class MuseGlimmerRunner(AutoregressiveRunner):
         self._sampled_token_host_view = self._sampled_token_host.numpy()
         self._greedy_argmax_kernels = _get_greedy_argmax_kernels(1024, 128, self.dtype)
         self.sequence_length = 0
+
+    def create_batch_decoder(self, max_batch_size: int = 4) -> MuseGlimmerBatchDecoder:
+        """Allocate independent Muse decode state without duplicating weights."""
+        return MuseGlimmerBatchDecoder(self, max_batch_size)

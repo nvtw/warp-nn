@@ -354,17 +354,19 @@ def test_qwen35_compact_decode_maps_noncontiguous_physical_slots(tmp_path):
 
     recurrent_before = batch.recurrent_states[0].numpy().copy()
     conv_before = batch.conv_states[0].numpy().copy()
+    untouched = (1, 3, 4, 6)
+    cache_rows = batch.kv_caches[1][0].shape[0] // 8
+    for slot in untouched:
+        batch.kv_caches[1][0][slot * cache_rows : (slot + 1) * cache_rows].zero_()
     key_before = batch.kv_caches[1][0].numpy().copy()
     actual = batch.decode_mapped(slots, [11] * 4, [True] * 4, 4).numpy()
     for lane, expected in enumerate(references):
         np.testing.assert_array_equal(actual[lane], expected[0])
 
-    untouched = (1, 3, 4, 6)
     recurrent_after = batch.recurrent_states[0].numpy()
     conv_after = batch.conv_states[0].numpy()
     key_after = batch.kv_caches[1][0].numpy()
     recurrent_rows = recurrent_before.shape[0] // 8
-    cache_rows = key_before.shape[0] // 8
     for slot in untouched:
         np.testing.assert_array_equal(conv_after[slot], conv_before[slot])
         np.testing.assert_array_equal(

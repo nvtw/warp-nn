@@ -1060,9 +1060,12 @@ def _reorder_heads_decode_batch_kernel(
 
 
 @lru_cache(maxsize=None)
-def _get_append_head_cache_decode_batch_kernel(mapped: bool = False):
-    """Build a cache append with statically selected physical-slot indexing."""
+def _get_append_head_cache_decode_batch_kernel(
+    mapped: bool = False, circular: bool = False
+):
+    """Build a cache append with static physical-slot and ring-cache policy."""
     MAPPED = mapped
+    CIRCULAR = circular
 
     @wp.kernel(enable_backward=False, module="unique")
     def kernel(
@@ -1076,7 +1079,10 @@ def _get_append_head_cache_decode_batch_kernel(mapped: bool = False):
         batch, head, column = wp.tid()
         if active[batch]:
             slot = slot_indices[batch] if wp.static(MAPPED) else batch
-            row = (slot * x.shape[1] + head) * capacity + positions[batch]
+            position = (
+                positions[batch] % capacity if wp.static(CIRCULAR) else positions[batch]
+            )
+            row = (slot * x.shape[1] + head) * capacity + position
             cache[row, column] = x[batch, head, 0, column]
 
     return kernel
@@ -3273,26 +3279,38 @@ def _stage_token_position(
     sequence_end[0] = wp.int32(position)
 
 
-@wp.kernel(enable_backward=False, module="unique")
-def _stage_decode_batch_kernel(
-    input_ids: wp.array2d[wp.int64],
-    cache_positions: wp.array1d[wp.int32],
-    rope_positions: wp.array2d[wp.int64],
-    sequence_end: wp.array1d[wp.int32],
-    active: wp.array1d[wp.bool],
-    token_ids: wp.array1d[wp.int64],
-    positions: wp.array1d[wp.int32],
-    rope_deltas: wp.array1d[wp.int32],
-):
-    """Stage one token and independent position for every batch slot."""
-    batch = wp.tid()
-    input_ids[0, batch] = token_ids[batch]
-    cache_positions[batch] = positions[batch]
-    sequence_end[batch] = wp.where(active[batch], positions[batch], wp.int32(-1))
-    rope_position = wp.int64(positions[batch] + rope_deltas[batch])
-    rope_positions[0, batch] = rope_position
-    rope_positions[1, batch] = rope_position
-    rope_positions[2, batch] = rope_position
+@lru_cache(maxsize=None)
+def _get_stage_decode_batch_kernel(mrope: bool = False):
+    """Stage batch tokens with a static standard-RoPE or MRoPE layout."""
+    MROPE = mrope
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def kernel(
+        input_ids: wp.array2d[wp.int64],
+        cache_positions: wp.array1d[wp.int32],
+        rope_positions: wp.array2d[wp.int64],
+        sequence_end: wp.array1d[wp.int32],
+        active: wp.array1d[wp.bool],
+        token_ids: wp.array1d[wp.int64],
+        positions: wp.array1d[wp.int32],
+        rope_deltas: wp.array1d[wp.int32],
+    ):
+        batch = wp.tid()
+        input_ids[0, batch] = token_ids[batch]
+        cache_positions[batch] = positions[batch]
+        sequence_end[batch] = wp.where(active[batch], positions[batch], wp.int32(-1))
+        rope_position = wp.int64(positions[batch] + rope_deltas[batch])
+        if wp.static(MROPE):
+            rope_positions[0, batch] = rope_position
+            rope_positions[1, batch] = rope_position
+            rope_positions[2, batch] = rope_position
+        else:
+            rope_positions[batch, 0] = rope_position
+
+    return kernel
+
+
+_stage_decode_batch_kernel = _get_stage_decode_batch_kernel(True)
 
 
 @wp.kernel(enable_backward=False, module="unique")

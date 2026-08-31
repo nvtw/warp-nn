@@ -29,6 +29,10 @@ from warp_nn.runtime.services.batching import (
     ContinuousBatchScheduler,
     SchedulerOverloadedError,
 )
+from warp_nn.runtime.services.autoregressive_batching import (
+    AutoregressiveBatchExecutor,
+    AutoregressiveBatchPayload,
+)
 
 
 class APIError(Exception):
@@ -182,10 +186,8 @@ class ChatCompletions:
         self._batch_scheduler = None
         if max_batch_size > 1:
             if not callable(getattr(runner, "create_batch_decoder", None)):
-                raise ValueError("continuous batching requires a Qwen batch decoder")
-            from warp_nn.runtime.qwen.batching import QwenBatchExecutor
-
-            executor = QwenBatchExecutor(runner, tokenizer, max_batch_size)
+                raise ValueError("continuous batching requires a native batch decoder")
+            executor = AutoregressiveBatchExecutor(runner, tokenizer, max_batch_size)
             self._batch_scheduler = ContinuousBatchScheduler(
                 executor,
                 max_active=max_batch_size,
@@ -535,12 +537,10 @@ class ChatCompletions:
         if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
             raise APIError("seed must be an integer", param="seed")
 
-        from warp_nn.runtime.qwen.batching import QwenBatchPayload
-
         proxy = _ScheduledRunner(
             self._batch_scheduler,
             self.runner.cache_capacity,
-            lambda prompt_ids: QwenBatchPayload(
+            lambda prompt_ids: AutoregressiveBatchPayload(
                 prompt_ids,
                 temperature,
                 top_k,
