@@ -6,9 +6,125 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import re
+import secrets
 from typing import Any, Protocol
 
 import numpy as np
+
+
+_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+class ChatSessionStore:
+    """Persist portable OpenAI-style chat histories as small JSON documents."""
+
+    def __init__(self, model: str | Path, directory: str | Path | None = None):
+        self.model = str(Path(model).expanduser().resolve())
+        if directory is None:
+            state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+            directory = state / "warp-nn" / "chats"
+        self.directory = Path(directory).expanduser().resolve()
+
+    @staticmethod
+    def new_id() -> str:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return f"{stamp}-{secrets.token_hex(3)}"
+
+    def _path(self, session_id: str) -> Path:
+        if not _SESSION_ID.fullmatch(session_id):
+            raise ValueError("invalid chat session ID")
+        return self.directory / f"{session_id}.json"
+
+    @staticmethod
+    def _title(messages: Sequence[Mapping[str, object]]) -> str:
+        for message in messages:
+            if message.get("role") != "user":
+                continue
+            content = message.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(part.get("text", ""))
+                    for part in content
+                    if isinstance(part, Mapping) and part.get("type") == "text"
+                )
+            title = " ".join(str(content).split())
+            return title[:77] + ("…" if len(title) > 77 else "") or "Untitled chat"
+        return "Untitled chat"
+
+    def save(
+        self, session_id: str, messages: Sequence[Mapping[str, object]]
+    ) -> Path | None:
+        """Atomically save a non-empty conversation and return its path."""
+        if not any(message.get("role") != "system" for message in messages):
+            return None
+        path = self._path(session_id)
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        document = {
+            "version": 1,
+            "id": session_id,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "model": self.model,
+            "title": self._title(messages),
+            "messages": list(messages),
+        }
+        temporary = path.with_suffix(f".{secrets.token_hex(3)}.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            temporary.chmod(0o600)
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return path
+
+    def load(self, session_id: str) -> dict[str, object]:
+        """Load and validate one saved conversation."""
+        path = self._path(session_id)
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raise
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid saved chat '{path}'") from exc
+        if (
+            not isinstance(document, dict)
+            or document.get("version") != 1
+            or document.get("id") != session_id
+            or not isinstance(document.get("messages"), list)
+        ):
+            raise ValueError(f"Invalid saved chat '{path}'")
+        for message in document["messages"]:
+            if not isinstance(message, dict) or not isinstance(
+                message.get("role"), str
+            ):
+                raise ValueError(f"Invalid saved chat '{path}'")
+        return document
+
+    def list_sessions(self) -> list[dict[str, object]]:
+        """Return valid saved-chat summaries, newest first."""
+        if not self.directory.is_dir():
+            return []
+        sessions = []
+        for path in self.directory.glob("*.json"):
+            try:
+                session = self.load(path.stem)
+            except (OSError, ValueError):
+                continue
+            sessions.append(
+                {
+                    key: session.get(key)
+                    for key in ("id", "updated_at", "model", "title")
+                }
+            )
+        return sorted(
+            sessions, key=lambda session: str(session["updated_at"]), reverse=True
+        )
 
 
 class Tokenizer(Protocol):

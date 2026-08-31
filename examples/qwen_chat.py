@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Chat with a supported local ONNX or safetensors model in a terminal."""
+"""Chat with a supported local model in a terminal."""
 
 import argparse
+import atexit
 import codecs
 import json
 import os
@@ -21,6 +22,7 @@ from warp_nn.runtime import (
 )
 from warp_nn.runtime.chat import (
     ChatEncodingCache,
+    ChatSessionStore,
     is_eos_token,
     sample_runner_token,
     split_tool_prefix,
@@ -171,12 +173,58 @@ def _image_message(text, paths):
     ]
 
 
+def _resume_session(store, command):
+    """Resolve ``/resume [ID]``, prompting from recent chats when needed."""
+    requested = command.partition(" ")[2].strip()
+    sessions = store.list_sessions()
+    if not sessions:
+        print(f"No saved chats in {store.directory}.")
+        return None
+    if not requested:
+        print("Saved chats:")
+        for index, session in enumerate(sessions[:20], 1):
+            model = Path(str(session.get("model", ""))).name or "unknown model"
+            updated = str(session.get("updated_at", "")).replace("T", " ")[:19]
+            print(
+                f"  {index:2}. {session.get('title') or 'Untitled chat'} "
+                f"[{model}, {updated}, {session['id']}]"
+            )
+        try:
+            requested = input("Resume number or ID (blank to cancel): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not requested:
+            return None
+    if requested.isdecimal():
+        index = int(requested) - 1
+        if not 0 <= index < min(20, len(sessions)):
+            print("Saved-chat number is outside the displayed list.")
+            return None
+        requested = str(sessions[index]["id"])
+    try:
+        return store.load(requested)
+    except FileNotFoundError:
+        print(f"Saved chat not found: {requested}")
+    except ValueError as error:
+        print(error)
+    return None
+
+
+def _portable_history(document):
+    """Discard tokenizer-specific cached IDs when reloading visible messages."""
+    messages = document["messages"]
+    for message in messages:
+        message.pop("_raw_token_ids", None)
+    return messages
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "model_dir",
         type=Path,
-        help="Directory containing a supported ONNX or safetensors model",
+        help="Directory containing a supported local model",
     )
     parser.add_argument("--system", help="Optional system message")
     parser.add_argument("--max-new-tokens", type=int, default=512)
@@ -218,6 +266,11 @@ def main():
     )
     parser.add_argument("--reasoning-effort", choices=("low", "medium", "xhigh"))
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--chat-dir",
+        type=Path,
+        help="Saved-chat directory (default: XDG state directory)",
+    )
     parser.add_argument(
         "--coding-agent",
         "--tools",
@@ -287,6 +340,24 @@ def main():
             "workspace. Never use tools for conversation, general knowledge, translation, or creative writing."
         )
     messages = [] if system is None else [{"role": "system", "content": system}]
+    session_store = ChatSessionStore(args.model_dir, args.chat_dir)
+    session_id = session_store.new_id()
+    save_warning = None
+
+    def save_session():
+        nonlocal save_warning
+        try:
+            path = session_store.save(session_id, messages)
+        except (OSError, TypeError, ValueError) as error:
+            warning = str(error)
+            if warning != save_warning:
+                print(f"[Could not save chat: {error}]")
+                save_warning = warning
+            return None
+        save_warning = None
+        return path
+
+    atexit.register(save_session)
     pending_images = []
     cached_ids = []
     cached_media_count = 0
@@ -298,7 +369,10 @@ def main():
         CodingTools(args.trusted_folder, shell=shell) if args.coding_agent else None
     )
 
-    print("Enter /clear to forget the conversation or /exit to quit.")
+    print(
+        "Enter /clear for a new conversation, /resume to reopen one, or /exit to quit."
+    )
+    print(f"Chats are saved automatically in {session_store.directory}.")
     if processor:
         print(
             "Use /image PATH to queue an image, or /image PATH QUESTION to ask "
@@ -306,6 +380,7 @@ def main():
         )
         print("Use /images to list queued images or /clear-images to remove them.")
     print("Press Esc to stop a response and return to user input.")
+    print("Press Ctrl-D at an empty prompt to save and close the chat.")
     print(
         "The first response may spend a few minutes compiling Warp kernels with no GPU activity."
     )
@@ -329,13 +404,34 @@ def main():
             continue
         if prompt == "/exit":
             break
+        if prompt == "/resume" or prompt.startswith("/resume "):
+            save_session()
+            document = _resume_session(session_store, prompt)
+            if document is None:
+                continue
+            messages = _portable_history(document)
+            session_id = str(document["id"])
+            pending_images.clear()
+            cached_ids.clear()
+            cached_media_count = 0
+            chat_encoder.reset()
+            saved_model = str(document.get("model", ""))
+            print(f"Resumed: {document.get('title') or session_id}")
+            if saved_model and saved_model != session_store.model:
+                print(
+                    f"Note: this chat was created with {Path(saved_model).name}; "
+                    f"it will continue with {Path(session_store.model).name}."
+                )
+            continue
         if prompt == "/clear":
+            save_session()
+            session_id = session_store.new_id()
             messages = [] if system is None else [{"role": "system", "content": system}]
             pending_images.clear()
             cached_ids.clear()
             cached_media_count = 0
             chat_encoder.reset()
-            print("History cleared.")
+            print("Started a new chat. The previous chat remains saved.")
             continue
 
         if prompt == "/images":
@@ -374,6 +470,7 @@ def main():
         content = _image_message(prompt, pending_images) if pending_images else prompt
         pending_images.clear()
         messages.append({"role": "user", "content": content})
+        save_session()
         with _EscapeMonitor() as cancel:
             for tool_round in range(8):
                 encode_options = {
@@ -394,6 +491,7 @@ def main():
                 if len(token_ids) >= args.cache_capacity:
                     if tool_round == 0:
                         messages.pop()
+                        save_session()
                     print(
                         "The conversation no longer fits in the KV cache; use /clear or a larger --cache-capacity."
                     )
@@ -440,6 +538,7 @@ def main():
                             "content": tokenizer.generation_prefix(thinking) + response,
                         }
                     )
+                    save_session()
                     print("[Cancelled.]")
                     break
                 if not generated or not is_eos_token(tokenizer, generated[-1]):
@@ -452,6 +551,7 @@ def main():
                     if generated and is_eos_token(tokenizer, generated[-1]):
                         message["_raw_token_ids"] = list(generated)
                     messages.append(message)
+                    save_session()
                     break
                 tool_calls = []
                 for index, call in enumerate(calls):
@@ -476,6 +576,7 @@ def main():
                 if generated and is_eos_token(tokenizer, generated[-1]):
                     message["_raw_token_ids"] = list(generated)
                 messages.append(message)
+                save_session()
                 for call, tool_call in zip(calls, tool_calls):
                     print(
                         f"[tool] {call['name']}({json.dumps(call['arguments'], ensure_ascii=False)})"
@@ -494,6 +595,7 @@ def main():
                         cached_ids.clear()
                         cached_media_count = 0
                         chat_encoder.reset()
+                        save_session()
                         print("[Cancelled.]")
                         break
                     _show_tool_result(result)
@@ -504,10 +606,16 @@ def main():
                             "content": result,
                         }
                     )
+                    save_session()
                 if cancel.cancelled.is_set():
                     break
                 if tool_round == 7:
                     print("[Stopped after 8 tool rounds.]")
+
+    saved_path = save_session()
+    atexit.unregister(save_session)
+    if saved_path is not None:
+        print(f"Saved chat {session_id} in {session_store.directory}.")
 
 
 if __name__ == "__main__":
