@@ -40,7 +40,9 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
-    bundle = AceStep15Bundle.discover(args.model, variant=args.variant)
+    bundle = AceStep15Bundle.discover(
+        args.model, variant=args.variant, validate_weights=not args.check
+    )
     if args.check:
         print(
             json.dumps(
