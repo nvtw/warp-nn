@@ -25,9 +25,7 @@ def _reference(logits, targets, ignore_index=-100, reduction="mean"):
     return np.sum(losses), gradient
 
 
-@pytest.mark.parametrize(
-    "dtype,atol", [(wp.float16, 8.0e-4), (wp.bfloat16, 7.0e-3)]
-)
+@pytest.mark.parametrize("dtype,atol", [(wp.float16, 8.0e-4), (wp.bfloat16, 7.0e-3)])
 def test_low_precision_cross_entropy_matches_reference(dtype, atol):
     rng = np.random.default_rng(17)
     values = rng.normal(size=(4, 513)).astype(np.float32) * 2.0
@@ -41,20 +39,18 @@ def test_low_precision_cross_entropy_matches_reference(dtype, atol):
     )
 
     actual_loss = float(plan.forward(logits, targets).numpy()[0])
-    actual_gradient = np.asarray(plan.backward(logits, targets).numpy(), dtype=np.float32)
+    actual_gradient = np.asarray(
+        plan.backward(logits, targets).numpy(), dtype=np.float32
+    )
 
     np.testing.assert_allclose(actual_loss, expected_loss, atol=2.0e-6, rtol=2.0e-6)
-    np.testing.assert_allclose(
-        actual_gradient, expected_gradient, atol=atol, rtol=atol
-    )
+    np.testing.assert_allclose(actual_gradient, expected_gradient, atol=atol, rtol=atol)
     assert int(plan.valid_count.numpy()[0]) == 3
     assert plan.partitions == 3
 
 
 def test_low_precision_cross_entropy_sum_and_in_place_gradient():
-    values = np.array(
-        [[4.0, -1.0, 0.5], [-3.0, 2.0, 1.0]], dtype=np.float32
-    )
+    values = np.array([[4.0, -1.0, 0.5], [-3.0, 2.0, 1.0]], dtype=np.float32)
     targets_np = np.array([2, 1], dtype=np.int32)
     logits = wp.array(values, dtype=wp.float16, device="cpu")
     targets = wp.array(targets_np, dtype=wp.int32, device="cpu")
@@ -77,6 +73,41 @@ def test_low_precision_cross_entropy_sum_and_in_place_gradient():
     )
 
 
+def test_low_precision_cross_entropy_logit_scale_and_softcap_gradient():
+    raw = np.array([[4.0, -2.0, 0.5], [-1.0, 2.5, 0.25]], dtype=np.float32)
+    targets_np = np.array([2, 0], dtype=np.int32)
+    multiplier, cap = 0.75, 2.0
+    transformed = cap * np.tanh(raw * multiplier / cap)
+    expected_loss, expected_gradient = _reference(transformed, targets_np)
+    expected_gradient *= multiplier * (1.0 - (transformed / cap) ** 2)
+    logits = wp.array(raw, dtype=wp.float16, device="cpu")
+    targets = wp.array(targets_np, dtype=wp.int32, device="cpu")
+    plan = LowPrecisionCrossEntropyPlan(
+        2,
+        3,
+        dtype=wp.float16,
+        in_place=True,
+        logit_multiplier=multiplier,
+        softcap=cap,
+        device="cpu",
+    )
+
+    actual_loss = float(plan.forward(logits, targets).numpy()[0])
+    actual_gradient = np.asarray(
+        plan.backward(logits, targets).numpy(), dtype=np.float32
+    )
+
+    # Reference the low-precision transformed logits used by the loss kernels.
+    stored = np.asarray(
+        wp.array(transformed, dtype=wp.float16, device="cpu").numpy(),
+        dtype=np.float32,
+    )
+    expected_loss, expected_gradient = _reference(stored, targets_np)
+    expected_gradient *= multiplier * (1.0 - (stored / cap) ** 2)
+    np.testing.assert_allclose(actual_loss, expected_loss, atol=2.0e-5)
+    np.testing.assert_allclose(actual_gradient, expected_gradient, atol=8.0e-4)
+
+
 CUDA_DEVICES = [device for device in wp.get_devices() if device.is_cuda]
 
 
@@ -88,9 +119,7 @@ def test_low_precision_cross_entropy_cuda_graph_replay():
     targets_np = np.arange(8, dtype=np.int32) * 127
     logits = wp.array(values, dtype=wp.bfloat16, device=device)
     targets = wp.array(targets_np, dtype=wp.int32, device=device)
-    plan = LowPrecisionCrossEntropyPlan(
-        8, 1025, dtype=wp.bfloat16, device=device
-    )
+    plan = LowPrecisionCrossEntropyPlan(8, 1025, dtype=wp.bfloat16, device=device)
     plan.forward(logits, targets)
     plan.backward(logits, targets)
     expected_loss = plan.loss.numpy().copy()

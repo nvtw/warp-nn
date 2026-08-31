@@ -85,9 +85,10 @@ def _gate_kernels(dtype: type):
 
 
 @lru_cache(maxsize=None)
-def _packed_query_gate_kernels(dtype: type):
+def _packed_query_gate_kernels(dtype: type, interleaved: bool = False):
     """Split and reassemble per-head ``[Q, gate]`` projection storage."""
     DTYPE = dtype
+    INTERLEAVED = interleaved
 
     @wp.kernel(enable_backward=False, module="unique")
     def unpack(
@@ -101,7 +102,11 @@ def _packed_query_gate_kernels(dtype: type):
         batch = row // sequence
         token = row % sequence
         source = head * head_size * 2
-        query[batch, head, token, column] = packed[row, source + column]
+        source_column = column
+        if INTERLEAVED:
+            half = head_size // 2
+            source_column = (column % half) * 2 + column // half
+        query[batch, head, token, column] = packed[row, source + source_column]
         gate[row, head * head_size + column] = packed[row, source + head_size + column]
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -116,7 +121,13 @@ def _packed_query_gate_kernels(dtype: type):
         batch = row // sequence
         token = row % sequence
         destination = head * head_size * 2
-        packed[row, destination + column] = query[batch, head, token, column]
+        destination_column = column
+        if INTERLEAVED:
+            half = head_size // 2
+            destination_column = (column % half) * 2 + column // half
+        packed[row, destination + destination_column] = query[
+            batch, head, token, column
+        ]
         packed[row, destination + head_size + column] = gate[
             row, head * head_size + column
         ]
@@ -155,6 +166,7 @@ class GQALoRAAttentionPlan:
         key_transform: QKTransformPlan | None = None,
         query_norm_weight: wp.array | None = None,
         key_norm_weight: wp.array | None = None,
+        interleaved_rope_weights: bool = False,
     ):
         if min(batch, sequence, query_heads, kv_heads, head_size) <= 0:
             raise ValueError("GQA LoRA dimensions must be positive")
@@ -162,6 +174,8 @@ class GQALoRAAttentionPlan:
             raise ValueError("query heads must be divisible by key/value heads")
         if window < 0:
             raise ValueError("GQA window must be non-negative")
+        if interleaved_rope_weights and head_size % 2:
+            raise ValueError("interleaved RoPE weights require an even head size")
         if gate is not None and packed_query_gate:
             raise ValueError("separate and packed GQA gates are mutually exclusive")
         names = (query, key, value, output)
@@ -255,6 +269,7 @@ class GQALoRAAttentionPlan:
         self.kv_heads = kv_heads
         self.head_size = head_size
         self.window = window
+        self.interleaved_rope_weights = bool(interleaved_rope_weights)
         self.scale = head_size**-0.5
         self.query_transform = query_transform
         self.key_transform = key_transform
@@ -318,7 +333,9 @@ class GQALoRAAttentionPlan:
         query_projection = self.adapters.forward(query_name, x)
         if self.packed_query_gate:
             wp.launch(
-                _packed_query_gate_kernels(self.dtype)[0],
+                _packed_query_gate_kernels(self.dtype, self.interleaved_rope_weights)[
+                    0
+                ],
                 dim=(self.rows, self.query_heads, self.head_size),
                 inputs=[query_projection],
                 outputs=[self.query, self.packed_gate],
@@ -326,8 +343,16 @@ class GQALoRAAttentionPlan:
             )
             gate_values = self.packed_gate
         else:
-            split_heads(query_projection, self.query)
-        split_heads(self.adapters.forward(key_name, x), self.key)
+            split_heads(
+                query_projection,
+                self.query,
+                interleaved=self.interleaved_rope_weights,
+            )
+        split_heads(
+            self.adapters.forward(key_name, x),
+            self.key,
+            interleaved=self.interleaved_rope_weights,
+        )
         split_heads(self.adapters.forward(value_name, x), self.value)
         query_ready, key_ready = self.query, self.key
         if self.query_transform is not None:
@@ -453,7 +478,9 @@ class GQALoRAAttentionPlan:
             cast_from_float32(gradient, storage)
         if self.packed_query_gate:
             wp.launch(
-                _packed_query_gate_kernels(self.dtype)[1],
+                _packed_query_gate_kernels(self.dtype, self.interleaved_rope_weights)[
+                    1
+                ],
                 dim=(self.rows, self.query_heads, self.head_size),
                 inputs=[self.query_grad_storage, self.packed_gate_grad],
                 outputs=[self.adapters.targets[query_name].plan.output.grad],
@@ -463,9 +490,12 @@ class GQALoRAAttentionPlan:
             merge_heads(
                 self.query_grad_storage,
                 self.adapters.targets[query_name].plan.output.grad,
+                interleaved=self.interleaved_rope_weights,
             )
         merge_heads(
-            self.key_grad_storage, self.adapters.targets[key_name].plan.output.grad
+            self.key_grad_storage,
+            self.adapters.targets[key_name].plan.output.grad,
+            interleaved=self.interleaved_rope_weights,
         )
         merge_heads(
             self.value_grad_storage,

@@ -18,6 +18,7 @@ _STORAGE_DTYPES = (wp.float16, wp.bfloat16)
 
 @dataclass(frozen=True)
 class _CrossEntropyKernels:
+    transform: object
     partition_maximum: object
     reduce_maximum: object
     partition_sum: object
@@ -30,6 +31,18 @@ def _get_cross_entropy_kernels(dtype: type) -> _CrossEntropyKernels:
     if dtype not in _STORAGE_DTYPES:
         raise TypeError("large-vocabulary cross-entropy supports FP16 and BF16")
     DTYPE = dtype
+
+    @wp.kernel(module="unique")
+    def transform(
+        logits: wp.array2d(dtype=DTYPE),
+        multiplier: wp.float32,
+        softcap: wp.float32,
+    ):
+        row, column = wp.tid()
+        value = wp.float32(logits[row, column]) * multiplier
+        if softcap > wp.float32(0.0):
+            value = softcap * wp.tanh(value / softcap)
+        logits[row, column] = DTYPE(value)
 
     @wp.kernel(module="unique")
     def partition_maximum(
@@ -104,11 +117,7 @@ def _get_cross_entropy_kernels(dtype: type) -> _CrossEntropyKernels:
             exponential_sum += partials[row, partition]
         shifted_logsumexp = wp.log(exponential_sum)
         logsumexp[row] = shifted_logsumexp
-        losses[row] = (
-            maximum[row]
-            - wp.float32(logits[row, target])
-            + shifted_logsumexp
-        )
+        losses[row] = maximum[row] - wp.float32(logits[row, target]) + shifted_logsumexp
         valid[row] = 1
 
     @wp.kernel(module="unique")
@@ -121,6 +130,8 @@ def _get_cross_entropy_kernels(dtype: type) -> _CrossEntropyKernels:
         ignore_index: int,
         loss_scale: wp.float32,
         normalize: bool,
+        logit_multiplier: wp.float32,
+        softcap: wp.float32,
         gradient: wp.array2d(dtype=DTYPE),
     ):
         row, column = wp.tid()
@@ -129,15 +140,18 @@ def _get_cross_entropy_kernels(dtype: type) -> _CrossEntropyKernels:
         if target == ignore_index or count == 0:
             gradient[row, column] = DTYPE(0.0)
             return
-        value = wp.exp(
-            wp.float32(logits[row, column]) - maximum[row] - logsumexp[row]
-        )
+        value = wp.exp(wp.float32(logits[row, column]) - maximum[row] - logsumexp[row])
         if column == target:
             value -= wp.float32(1.0)
         divisor = wp.float32(count) if normalize else wp.float32(1.0)
-        gradient[row, column] = DTYPE(value * loss_scale / divisor)
+        derivative = logit_multiplier
+        if softcap > wp.float32(0.0):
+            normalized = wp.float32(logits[row, column]) / softcap
+            derivative *= wp.float32(1.0) - normalized * normalized
+        gradient[row, column] = DTYPE(value * derivative * loss_scale / divisor)
 
     return _CrossEntropyKernels(
+        transform,
         partition_maximum,
         reduce_maximum,
         partition_sum,
@@ -164,18 +178,26 @@ class LowPrecisionCrossEntropyPlan:
         dtype: type = wp.bfloat16,
         ignore_index: int = -100,
         in_place: bool = False,
+        logit_multiplier: float = 1.0,
+        softcap: float = 0.0,
         device: object | None = None,
     ):
         if rows <= 0 or classes <= 0:
             raise ValueError("rows and classes must be positive")
         if dtype not in _STORAGE_DTYPES:
             raise TypeError("dtype must be wp.float16 or wp.bfloat16")
+        if not math.isfinite(logit_multiplier) or logit_multiplier <= 0.0:
+            raise ValueError("logit_multiplier must be positive and finite")
+        if not math.isfinite(softcap) or softcap < 0.0:
+            raise ValueError("softcap must be non-negative and finite")
         self.device = wp.get_device(device)
         self.rows = rows
         self.classes = classes
         self.dtype = dtype
         self.ignore_index = ignore_index
         self.in_place = bool(in_place)
+        self.logit_multiplier = float(logit_multiplier)
+        self.softcap = float(softcap)
         self.partitions = (classes + _PARTITION_SIZE - 1) // _PARTITION_SIZE
         self._kernels = _get_cross_entropy_kernels(dtype)
         self.partials = wp.empty(
@@ -189,9 +211,7 @@ class LowPrecisionCrossEntropyPlan:
         self.valid_count = wp.empty(1, dtype=wp.int32, device=self.device)
         self.gradient = None
         if not self.in_place:
-            self.gradient = wp.empty(
-                (rows, classes), dtype=dtype, device=self.device
-            )
+            self.gradient = wp.empty((rows, classes), dtype=dtype, device=self.device)
 
     def _inputs(self, logits: wp.array, targets: wp.array) -> None:
         if not isinstance(logits, wp.array) or logits.ndim != 2:
@@ -225,6 +245,13 @@ class LowPrecisionCrossEntropyPlan:
     ) -> wp.array:
         self._inputs(logits, targets)
         normalize = self._reduction(reduction)
+        if self.logit_multiplier != 1.0 or self.softcap > 0.0:
+            wp.launch(
+                self._kernels.transform,
+                dim=logits.shape,
+                inputs=[logits, self.logit_multiplier, self.softcap],
+                device=self.device,
+            )
         wp.launch(
             self._kernels.partition_maximum,
             dim=(self.rows, self.partitions),
@@ -293,6 +320,8 @@ class LowPrecisionCrossEntropyPlan:
                 self.ignore_index,
                 float(loss_scale),
                 normalize,
+                self.logit_multiplier,
+                self.softcap,
             ],
             outputs=[gradient],
             device=self.device,

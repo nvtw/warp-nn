@@ -157,15 +157,32 @@ def test_gqa_lora_attention_optional_gate_cpu():
     assert np.any(gate_gradient)
 
 
-def test_gqa_lora_attention_packed_query_gate_matches_separate_gate_cpu():
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_gqa_lora_attention_packed_query_gate_matches_separate_gate_cpu(
+    interleaved,
+):
     rng = np.random.default_rng(103)
     dtype = wp.bfloat16
     rows, hidden, heads, head_size = 3, 8, 2, 4
     query = rng.normal(0.0, 0.2, (heads * head_size, hidden)).astype(np.float32)
     gate = rng.normal(0.0, 0.2, query.shape).astype(np.float32)
+
+    def stored_rope_rows(values, count):
+        if not interleaved:
+            return values
+        inverse = np.concatenate(
+            [
+                np.arange(head_size).reshape(2, head_size // 2).T.reshape(-1)
+                + head * head_size
+                for head in range(count)
+            ]
+        )
+        return values[inverse]
+
+    stored_query = stored_rope_rows(query, heads)
     packed = np.empty((2 * heads * head_size, hidden), dtype=np.float32)
     for head in range(heads):
-        packed[head * 2 * head_size : head * 2 * head_size + head_size] = query[
+        packed[head * 2 * head_size : head * 2 * head_size + head_size] = stored_query[
             head * head_size : (head + 1) * head_size
         ]
         packed[head * 2 * head_size + head_size : (head + 1) * 2 * head_size] = gate[
@@ -190,7 +207,9 @@ def test_gqa_lora_attention_packed_query_gate_matches_separate_gate_cpu():
         )
 
     separate = collection({"q": query, "g": gate, **common})
-    packed_adapters = collection({"q": packed, **common})
+    packed_common = dict(common)
+    packed_common["k"] = stored_rope_rows(common["k"], 1)
+    packed_adapters = collection({"q": packed, **packed_common})
     separate_plan = GQALoRAAttentionPlan(
         separate,
         query="q",
@@ -218,6 +237,7 @@ def test_gqa_lora_attention_packed_query_gate_matches_separate_gate_cpu():
         kv_heads=1,
         head_size=head_size,
         window=2,
+        interleaved_rope_weights=interleaved,
     )
     x = wp.array(rng.normal(0.0, 0.2, (rows, hidden)), dtype=dtype, device="cpu")
     lengths = wp.array([rows], dtype=wp.int32, device="cpu")
@@ -234,9 +254,12 @@ def test_gqa_lora_attention_packed_query_gate_matches_separate_gate_cpu():
     q_grad = separate.targets["q"].plan.output.grad.numpy()
     g_grad = separate.targets["g"].plan.output.grad.numpy()
     for head in range(heads):
-        expected[:, head * 2 * head_size : head * 2 * head_size + head_size] = q_grad[
-            :, head * head_size : (head + 1) * head_size
-        ]
+        head_gradient = q_grad[:, head * head_size : (head + 1) * head_size]
+        if interleaved:
+            head_gradient = head_gradient[:, [0, 2, 1, 3]]
+        expected[:, head * 2 * head_size : head * 2 * head_size + head_size] = (
+            head_gradient
+        )
         expected[:, head * 2 * head_size + head_size : (head + 1) * 2 * head_size] = (
             g_grad[:, head * head_size : (head + 1) * head_size]
         )

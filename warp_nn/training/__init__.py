@@ -22,12 +22,13 @@ from .linear_attention import QwenGatedDeltaLoRAAttentionPlan
 from .loss import LowPrecisionCrossEntropyPlan
 from .linear import linear_backward, linear_forward, lora_backward, lora_forward
 from .mlp import LoRASwiGLUPlan
-from .muse import MuseLoRATransformerBlockPlan
+from .model import CausalLMTrainingPlan
+from .muse import MuseLoRATransformerBlockPlan, build_muse_lora_training_plan
 from .optimizer import AdamWPlan
 from .output import CausalLMOutputPlan
 from .primitives import CrossEntropyPlan, EmbeddingPlan, TransformerPrimitivePlan
 from .qk import QKTransformPlan
-from .qwen import QwenLoRATransformerBlockPlan
+from .qwen import QwenLoRATransformerBlockPlan, build_qwen_lora_training_plan
 from .step import LoRALinearTrainingPlan
 from .stack import LoRATransformerStackPlan
 
@@ -36,6 +37,7 @@ __all__ = [
     "AdamWPlan",
     "CrossEntropyPlan",
     "CausalLMOutputPlan",
+    "CausalLMTrainingPlan",
     "EmbeddingPlan",
     "GatedDeltaInputPlan",
     "GatedDeltaRulePlan",
@@ -49,8 +51,10 @@ __all__ = [
     "LoRATransformerStackPlan",
     "LowPrecisionCrossEntropyPlan",
     "MuseLoRATransformerBlockPlan",
+    "build_muse_lora_training_plan",
     "QKTransformPlan",
     "QwenLoRATransformerBlockPlan",
+    "build_qwen_lora_training_plan",
     "TransformerPrimitivePlan",
     "accumulate_fp32_gradient",
     "add_fp32_gradients",

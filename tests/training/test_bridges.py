@@ -54,6 +54,21 @@ def test_split_merge_heads_are_exact_inverses(dtype):
     np.testing.assert_array_equal(restored.numpy(), packed.numpy())
 
 
+def test_interleaved_rope_head_layout_roundtrip():
+    values = np.arange(16, dtype=np.float32).reshape(2, 8)
+    packed = wp.array(values, dtype=wp.bfloat16, device="cpu")
+    heads = wp.empty((1, 2, 2, 4), dtype=wp.bfloat16, device="cpu")
+    restored = wp.empty_like(packed)
+
+    split_heads(packed, heads, interleaved=True)
+    merge_heads(heads, restored, interleaved=True)
+
+    expected = values.reshape(2, 2, 4)[..., [0, 2, 1, 3]]
+    expected = expected.transpose(1, 0, 2)[None]
+    np.testing.assert_array_equal(heads.numpy(), expected)
+    np.testing.assert_array_equal(restored.numpy(), values)
+
+
 def test_fp32_gradient_add_and_accumulate_are_allocation_free():
     left_values = np.arange(12, dtype=np.float32).reshape(2, 2, 3)
     right_values = np.full((2, 2, 3), 0.25, dtype=np.float32)

@@ -30,10 +30,11 @@ class _BridgeKernels:
 
 
 @lru_cache(maxsize=None)
-def _get_bridge_kernels(dtype: type) -> _BridgeKernels:
+def _get_bridge_kernels(dtype: type, interleaved: bool = False) -> _BridgeKernels:
     if dtype not in _STORAGE_DTYPES:
         raise TypeError("training bridges support FP16 and BF16 storage")
     DTYPE = dtype
+    INTERLEAVED = interleaved
 
     @wp.kernel(enable_backward=False, module="unique")
     def to_float32(
@@ -53,7 +54,11 @@ def _get_bridge_kernels(dtype: type) -> _BridgeKernels:
     def split_heads(packed: wp.array2d(dtype=DTYPE), heads: wp.array4d(dtype=DTYPE)):
         batch, head, token, column = wp.tid()
         packed_row = batch * heads.shape[2] + token
-        packed_column = head * heads.shape[3] + column
+        source_column = column
+        if INTERLEAVED:
+            half = heads.shape[3] // 2
+            source_column = (column % half) * 2 + column // half
+        packed_column = head * heads.shape[3] + source_column
         heads[batch, head, token, column] = packed[packed_row, packed_column]
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -63,7 +68,11 @@ def _get_bridge_kernels(dtype: type) -> _BridgeKernels:
         batch = packed_row // heads.shape[2]
         column = packed_column % heads.shape[3]
         head = packed_column // heads.shape[3]
-        packed[packed_row, packed_column] = heads[batch, head, token, column]
+        source_column = column
+        if INTERLEAVED:
+            half = heads.shape[3] // 2
+            source_column = column // 2 + (column % 2) * half
+        packed[packed_row, packed_column] = heads[batch, head, token, source_column]
 
     return _BridgeKernels(to_float32, from_float32, split_heads, merge_heads)
 
@@ -137,7 +146,9 @@ def cast_from_float32(source: wp.array, output: wp.array) -> None:
     )
 
 
-def split_heads(packed: wp.array, heads: wp.array) -> None:
+def split_heads(
+    packed: wp.array, heads: wp.array, *, interleaved: bool = False
+) -> None:
     """Permute packed ``[B*S, H*D]`` storage into GQA ``[B, H, S, D]``."""
     _check_array("packed", packed, ndim=2)
     _check_array("heads", heads, ndim=4)
@@ -149,8 +160,10 @@ def split_heads(packed: wp.array, heads: wp.array) -> None:
     expected = (batch * sequence, head_count * head_size)
     if packed.shape != expected:
         raise ValueError(f"packed must have shape {expected}, got {packed.shape}")
+    if interleaved and head_size % 2:
+        raise ValueError("interleaved head storage requires an even head size")
     wp.launch(
-        _get_bridge_kernels(packed.dtype).split_heads,
+        _get_bridge_kernels(packed.dtype, bool(interleaved)).split_heads,
         dim=heads.shape,
         inputs=[packed],
         outputs=[heads],
@@ -158,7 +171,9 @@ def split_heads(packed: wp.array, heads: wp.array) -> None:
     )
 
 
-def merge_heads(heads: wp.array, packed: wp.array) -> None:
+def merge_heads(
+    heads: wp.array, packed: wp.array, *, interleaved: bool = False
+) -> None:
     """Inverse-permute GQA ``[B, H, S, D]`` into packed ``[B*S, H*D]``."""
     _check_array("heads", heads, ndim=4)
     _check_array("packed", packed, ndim=2)
@@ -170,8 +185,10 @@ def merge_heads(heads: wp.array, packed: wp.array) -> None:
     expected = (batch * sequence, head_count * head_size)
     if packed.shape != expected:
         raise ValueError(f"packed must have shape {expected}, got {packed.shape}")
+    if interleaved and head_size % 2:
+        raise ValueError("interleaved head storage requires an even head size")
     wp.launch(
-        _get_bridge_kernels(heads.dtype).merge_heads,
+        _get_bridge_kernels(heads.dtype, bool(interleaved)).merge_heads,
         dim=packed.shape,
         inputs=[heads],
         outputs=[packed],

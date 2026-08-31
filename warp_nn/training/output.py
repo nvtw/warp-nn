@@ -29,7 +29,10 @@ class CausalLMOutputPlan:
         lm_head: wp.array,
         *,
         epsilon: float = 1.0e-6,
+        norm_weight_offset: float = 0.0,
         ignore_index: int = -100,
+        logit_multiplier: float = 1.0,
+        softcap: float = 0.0,
         cublas=None,
     ):
         if rows <= 0:
@@ -66,6 +69,7 @@ class CausalLMOutputPlan:
             self.dtype,
             rotary_dim=0,
             epsilon=epsilon,
+            weight_offset=norm_weight_offset,
             device=self.device,
         )
         self.normalized = self.norm.output.reshape((rows, self.hidden))
@@ -78,6 +82,8 @@ class CausalLMOutputPlan:
             dtype=self.dtype,
             ignore_index=ignore_index,
             in_place=True,
+            logit_multiplier=logit_multiplier,
+            softcap=softcap,
             device=self.device,
         )
         self.normalized_grad = wp.empty(
@@ -104,9 +110,7 @@ class CausalLMOutputPlan:
         """Compute and return the scalar loss in fixed storage."""
         self._inputs(x, targets)
         self.norm.forward(x.reshape(self.norm.shape), self.norm_weight)
-        linear_forward(
-            self.normalized, self.lm_head, self.logits, cublas=self.cublas
-        )
+        linear_forward(self.normalized, self.lm_head, self.logits, cublas=self.cublas)
         return self.loss_plan.forward(self.logits, targets, reduction=reduction)
 
     def backward(

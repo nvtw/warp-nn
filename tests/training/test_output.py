@@ -65,9 +65,7 @@ def _reference(plan, x, targets):
     return loss, dx
 
 
-@pytest.mark.parametrize(
-    "dtype,atol", [(wp.float16, 4.0e-3), (wp.bfloat16, 3.0e-2)]
-)
+@pytest.mark.parametrize("dtype,atol", [(wp.float16, 4.0e-3), (wp.bfloat16, 3.0e-2)])
 def test_causal_lm_output_matches_reference(dtype, atol):
     plan, x, targets = _fixture("cpu", dtype)
     expected_loss, expected_gradient = _reference(plan, x, targets)
@@ -76,9 +74,7 @@ def test_causal_lm_output_matches_reference(dtype, atol):
     actual_gradient = np.asarray(plan.backward(x, targets).numpy(), dtype=np.float32)
 
     np.testing.assert_allclose(actual_loss, expected_loss, atol=2.0e-5, rtol=2.0e-5)
-    np.testing.assert_allclose(
-        actual_gradient, expected_gradient, atol=atol, rtol=atol
-    )
+    np.testing.assert_allclose(actual_gradient, expected_gradient, atol=atol, rtol=atol)
     assert plan.loss_plan.gradient is None
     assert plan.logits.ptr == plan.loss_plan.backward(plan.logits, targets).ptr
 
