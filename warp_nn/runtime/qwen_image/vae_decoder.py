@@ -270,6 +270,9 @@ class QwenImage2512VAEDecoder(_QwenImageVAEDecoderPlan):
     executions; captured graphs retain the fixed buffers and geometry.
     """
 
+    approximate = False
+    mode = "exact_untiled"
+
     def __init__(self, config, weights, latent_height, latent_width, *, batch_size=1):
         qwen_image_2512_vae_decoder_weight_specs(config)
         super().__init__(
@@ -278,6 +281,37 @@ class QwenImage2512VAEDecoder(_QwenImageVAEDecoderPlan):
             latent_height,
             latent_width,
             batch_size=batch_size,
+        )
+
+    @property
+    def tiling_recommended(self):
+        """Whether 32x32 overlap tiling avoids impractical attention."""
+        return self.input.shape[2] > 32 or self.input.shape[3] > 32
+
+    @classmethod
+    def tiled(
+        cls,
+        config,
+        weights,
+        latent_height,
+        latent_width,
+        *,
+        batch_size=1,
+        tile=32,
+        stride=24,
+    ):
+        """Explicitly select the official practical overlap approximation."""
+        from .vae_tiling import QwenImage2512VAETiledDecoder
+
+        qwen_image_2512_vae_decoder_weight_specs(config)
+        return QwenImage2512VAETiledDecoder(
+            config,
+            weights,
+            latent_height,
+            latent_width,
+            batch_size=batch_size,
+            tile=tile,
+            stride=stride,
         )
 
     @classmethod
@@ -289,6 +323,9 @@ class QwenImage2512VAEDecoder(_QwenImageVAEDecoderPlan):
         *,
         batch_size=1,
         device=None,
+        tiling=False,
+        tile=32,
+        stride=24,
     ):
         """Load a local Diffusers VAE directory or its safetensors file."""
         path = Path(path)
@@ -301,10 +338,13 @@ class QwenImage2512VAEDecoder(_QwenImageVAEDecoderPlan):
         weights = load_qwen_image_2512_vae_decoder_weights(
             archive, config, device=device
         )
-        return cls(
+        constructor = cls.tiled if tiling else cls
+        options = {"tile": tile, "stride": stride} if tiling else {}
+        return constructor(
             config,
             weights,
             latent_height,
             latent_width,
             batch_size=batch_size,
+            **options,
         )

@@ -36,6 +36,7 @@ from .vae import (
     qwen_image_2512_vae_decoder_weight_specs,
 )
 from .vae_decoder import QwenImage2512VAEDecoder
+from .vae_tiling import QwenImage2512VAETiledDecoder, QwenImageVAETilingConfig
 
 __all__ = [
     "QWEN_IMAGE_PREFIX_TOKENS",
@@ -48,6 +49,7 @@ __all__ = [
     "QwenImage2512VAEDecoder",
     "QwenImage2512Bundle",
     "QwenImageMMDiTLayerPlan",
+    "QwenImage2512VAETiledDecoder",
     "QwenImageMMDiTPlan",
     "QwenImageTensorSpec",
     "QwenImageTransformerConfig",
@@ -56,6 +58,7 @@ __all__ = [
     "TensorMetadataArchive",
     "QwenImageVAEWeightSpec",
     "load_qwen_image_2512_vae_decoder_weights",
+    "QwenImageVAETilingConfig",
     "load_qwen_image_transformer_weights",
     "prepare_qwen_image_vae_decoder_weights",
     "qwen_image_rotary_coordinates",
