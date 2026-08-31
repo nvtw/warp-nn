@@ -1156,6 +1156,35 @@ class _Qwen35BatchPlanState:
         return getattr(self._decoder.runner, name)
 
 
+class _Qwen35SlotPlanState:
+    """Mutable zero-copy view selecting one persistent batch slot."""
+
+    def __init__(self, decoder):
+        self._decoder = decoder
+        self.select(0)
+
+    def select(self, slot: int) -> None:
+        decoder = self._decoder
+        self.sequence_end = decoder.sequence_end[slot : slot + 1]
+        self.conv_states = {
+            index: value[slot] for index, value in decoder.conv_states.items()
+        }
+        self.recurrent_states = {}
+        for index, value in decoder.recurrent_states.items():
+            rows = value.shape[0] // decoder.max_batch_size
+            self.recurrent_states[index] = value[slot * rows : (slot + 1) * rows]
+        self.kv_caches = {}
+        for index, (key, value) in decoder.kv_caches.items():
+            rows = key.shape[0] // decoder.max_batch_size
+            self.kv_caches[index] = (
+                key[slot * rows : (slot + 1) * rows],
+                value[slot * rows : (slot + 1) * rows],
+            )
+
+    def __getattr__(self, name):
+        return getattr(self._decoder.runner, name)
+
+
 class Qwen35BatchDecoder:
     """Independent Qwen decode slots sharing one runner's immutable weights."""
 
@@ -1194,6 +1223,14 @@ class Qwen35BatchDecoder:
             )
         self._lengths = [0] * rows
         self._rope_delta_values = [0] * rows
+        self._slot_prefill_open = [False] * rows
+        self.prefill_outputs = wp.empty(
+            (rows, 1, runner.config["vocab_size"]),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self._slot_view = _Qwen35SlotPlanState(self)
+        self._incremental_plans = {}
         self._view = _Qwen35BatchPlanState(self, rows)
         self.plan = _Qwen35Plan(self._view, rows, decode_batch=True)
         runner._record_plan_storage(self.plan)
@@ -1249,7 +1286,102 @@ class Qwen35BatchDecoder:
                 )
         self._lengths[slot] = len(tokens)
         self._rope_delta_values[slot] = int(rope_delta)
-        return logits
+        self._slot_prefill_open[slot] = False
+        wp.copy(
+            self.prefill_outputs.flatten(),
+            logits.flatten(),
+            dest_offset=slot * logits.size,
+            count=logits.size,
+        )
+        return self.prefill_outputs[slot : slot + 1]
+
+    def begin_prefill(self, slot: int, *, rope_delta: int = 0) -> None:
+        """Reset one slot for state-aware incremental prompt ingestion."""
+        self._validate_slot(slot)
+        for state in self.conv_states.values():
+            state[slot].zero_()
+        for state in self.recurrent_states.values():
+            rows = state.shape[0] // self.max_batch_size
+            state[slot * rows : (slot + 1) * rows].zero_()
+        self._lengths[slot] = 0
+        self._rope_delta_values[slot] = int(rope_delta)
+        self._slot_prefill_open[slot] = True
+
+    def _incremental_plan_for_rows(self, rows: int):
+        plan = self._incremental_plans.get(rows)
+        if plan is None:
+            self.runner._require_lazy_plan_headroom(rows)
+            plan = _Qwen35Plan(self._slot_view, rows)
+            plan._capture_ready = False
+            self.runner._record_plan_storage(plan)
+            self._incremental_plans[rows] = plan
+        return plan
+
+    def append_prefill(self, slot: int, token_ids) -> wp.array:
+        """Append prompt tokens directly to a slot without moving its prior KV state."""
+        self._validate_slot(slot)
+        if not self._slot_prefill_open[slot]:
+            raise RuntimeError("begin_prefill must precede append_prefill")
+        tokens = tuple(int(token) for token in token_ids)
+        if not tokens:
+            raise ValueError("append_prefill requires at least one token")
+        if self._lengths[slot] + len(tokens) >= self.runner.cache_capacity:
+            raise ValueError("Qwen prompt must leave room for one decoded token")
+        logits = None
+        start = 0
+        while start < len(tokens):
+            remaining = len(tokens) - start
+            rows = min(
+                self.runner.prefill_chunk_size,
+                1 << (remaining.bit_length() - 1),
+            )
+            plan = self._incremental_plan_for_rows(rows)
+            end = self._lengths[slot] + rows
+            plan.input_ids.assign(
+                np.asarray(tokens[start : start + rows], dtype=np.int64)[None, :]
+            )
+            plan.position_ids.assign(
+                np.arange(self._lengths[slot], end, dtype=np.int64)[None, :]
+            )
+            plan.rope_position_ids.assign(
+                np.broadcast_to(
+                    np.arange(
+                        self._lengths[slot] + self._rope_delta_values[slot],
+                        end + self._rope_delta_values[slot],
+                        dtype=np.int64,
+                    ),
+                    (3, rows),
+                )
+            )
+            self._slot_view.select(slot)
+            wp.launch(
+                _set_sequence_end,
+                dim=1,
+                inputs=[self._slot_view.sequence_end, end - 1],
+                device=self.device,
+            )
+            if self.device.is_cuda and plan.graphs and slot not in plan.graphs:
+                # CUDA cannot begin a second pointer-specialized capture while a
+                # graph using the shared workspace is still pending on the stream.
+                wp.synchronize_stream(self.device)
+            logits = self.runner._run(plan, graph_key=slot)
+            self._lengths[slot] = end
+            start += rows
+        wp.copy(
+            self.prefill_outputs.flatten(),
+            logits.flatten(),
+            dest_offset=slot * logits.size,
+            count=logits.size,
+        )
+        return self.prefill_outputs[slot : slot + 1]
+
+    def end_prefill(self, slot: int) -> wp.array:
+        """Close incremental prefill and return its stable per-slot logits."""
+        self._validate_slot(slot)
+        if not self._slot_prefill_open[slot] or self._lengths[slot] == 0:
+            raise RuntimeError("incremental prefill has no prompt tokens")
+        self._slot_prefill_open[slot] = False
+        return self.prefill_outputs[slot : slot + 1]
 
     def decode(self, token_ids, active=None) -> wp.array:
         """Append one token to each active slot and return batch-major logits."""
@@ -1297,6 +1429,7 @@ class Qwen35BatchDecoder:
         self._validate_slot(slot)
         self._lengths[slot] = 0
         self._rope_delta_values[slot] = 0
+        self._slot_prefill_open[slot] = False
 
     def _validate_slot(self, slot: int) -> None:
         if not 0 <= int(slot) < self.max_batch_size:

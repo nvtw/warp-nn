@@ -329,3 +329,47 @@ def test_qwen35_independent_batch_decode_matches_sequential_and_captures(
     np.testing.assert_array_equal(conv_after[1:], conv_before[1:])
     np.testing.assert_array_equal(key_after[cache_rows:], key_before[cache_rows:])
     assert len(batch.plan.graphs) == 1
+
+
+def test_qwen35_incremental_prefill_interleaves_slots_without_state_copies(tmp_path):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    model_path = tmp_path / "tiny-qwen35-incremental"
+    _write_tiny_qwen35(model_path)
+    runner = Qwen35Runner(
+        model_path,
+        device="cuda:0",
+        cache_capacity=8,
+        prefill_chunk_size=2,
+        use_cublas=False,
+    )
+    batch = runner.create_batch_decoder(2)
+    prompts = ([1, 2, 3, 4], [5, 6, 7, 8])
+    expected = [runner.prefill(prompt).numpy().copy() for prompt in prompts]
+
+    for _ in range(2):
+        for slot in range(2):
+            batch.begin_prefill(slot)
+        batch.append_prefill(0, prompts[0][:2])
+        batch.append_prefill(1, prompts[1][:2])
+        actual0 = batch.append_prefill(0, prompts[0][2:])
+        actual1 = batch.append_prefill(1, prompts[1][2:])
+        np.testing.assert_array_equal(actual0.numpy(), expected[0])
+        np.testing.assert_array_equal(actual1.numpy(), expected[1])
+        batch.end_prefill(0)
+        batch.end_prefill(1)
+
+    assert set(batch._incremental_plans) == {2}
+    plan = batch._incremental_plans[2]
+    assert set(plan.graphs) == {0, 1}
+    assert plan.tensors["lm_head.weight"].ptr == runner.weights["lm_head.weight"].ptr
+
+    actual = batch.decode([9, 9]).numpy()
+    for slot, prompt in enumerate(prompts):
+        runner.prefill(prompt)
+        expected_decode = runner.decode(9).numpy()
+        np.testing.assert_array_equal(actual[slot], expected_decode[0])
+
+    batch.release(0)
+    with pytest.raises(RuntimeError, match="begin_prefill"):
+        batch.append_prefill(0, [1])
