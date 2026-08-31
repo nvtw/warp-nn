@@ -274,7 +274,9 @@ def test_pipeline_orchestrates_minimal_turbo_path_on_device(monkeypatch):
         def __init__(self, frames):
             self.device = wp.get_device("cpu")
             self.input = wp.empty((1, frames, 64), dtype=dtype, device="cpu")
-            self.output = wp.zeros((1, frames * 1920, 2), dtype=dtype, device="cpu")
+            self.output = wp.zeros(
+                (1, frames * 1920, 2), dtype=wp.bfloat16, device="cpu"
+            )
 
         def execute(self):
             return self.output
@@ -312,6 +314,7 @@ def test_pipeline_orchestrates_minimal_turbo_path_on_device(monkeypatch):
         steps=4,
     )
     assert audio.shape == (1, 6 * 1920, 2)
+    assert audio.dtype == wp.float32
 
 
 def test_load_silence_latent_transposes_official_layout(monkeypatch):

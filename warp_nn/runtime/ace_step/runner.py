@@ -22,6 +22,7 @@ import numpy as np
 import warp as wp
 
 from ..formats.pytorch import load_pytorch_zip
+from ..kernels import _cast_kernel_for_dtypes
 from ..qwen.encoder import Qwen3Encoder
 from ..tokenizers import Qwen3Tokenizer
 from .._cublas import try_create_cublas
@@ -783,4 +784,14 @@ class AceStep15Pipeline:
         if decoder.device.is_cuda:
             wp.synchronize_stream(wp.get_stream(decoder.device))
             decoder.capture()
-        return decoder.execute()
+        audio = decoder.execute()
+        if audio.dtype == wp.float32:
+            return audio
+        output = wp.empty(audio.shape, dtype=wp.float32, device=audio.device)
+        wp.launch(
+            _cast_kernel_for_dtypes(audio.dtype, wp.float32),
+            dim=audio.size,
+            inputs=[audio.flatten(), output.flatten()],
+            device=audio.device,
+        )
+        return output
