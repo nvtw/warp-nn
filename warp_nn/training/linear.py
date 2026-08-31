@@ -203,10 +203,14 @@ _TILE_BLOCK_DIM = 128
 
 
 @lru_cache(maxsize=None)
-def _get_native_linear_kernel(dtype: type, tile_m: int, tile_n: int):
+def _get_native_linear_kernel(
+    dtype: type, tile_m: int, tile_n: int, *, transposed_right: bool = True
+):
     # Wrap the shared SM80+ pipelined MMA projection primitive.
     DTYPE = dtype
-    project = get_prefill_mma_projection(dtype, tile_m, tile_n)
+    project = get_prefill_mma_projection(
+        dtype, tile_m, tile_n, transposed_right=transposed_right
+    )
 
     @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
     def kernel(
@@ -485,7 +489,7 @@ def _linear_shapes(x: wp.array, weight: wp.array) -> tuple[int, int, int]:
     return rows, columns, inner
 
 
-def _native_forward_geometry(
+def _native_linear_geometry(
     rows: int,
     columns: int,
     reduction: int,
@@ -618,7 +622,7 @@ def linear_forward(
     """Launch ``output = x @ weight.T`` into a preallocated low-precision array."""
     rows, columns, inner = _linear_shapes(x, weight)
     _check_array("output", output, (rows, columns), x.dtype, x.device)
-    native_geometry = _native_forward_geometry(
+    native_geometry = _native_linear_geometry(
         rows, columns, inner, x.dtype, x.device, x, weight, output
     )
     if cublas is not None and x.device.is_cuda:
@@ -689,6 +693,27 @@ def linear_backward(
             columns,
             wp.get_stream(x.device).cuda_stream,
             2 if x.dtype == wp.float16 else 14,
+        )
+    elif (
+        native_geometry := _native_linear_geometry(
+            rows,
+            inner,
+            columns,
+            x.dtype,
+            x.device,
+            grad_output,
+            weight,
+            grad_input,
+        )
+    ) is not None:
+        tile_m, tile_n = native_geometry
+        block_dim = tile_m * tile_n // 8
+        wp.launch(
+            _get_native_linear_kernel(x.dtype, tile_m, tile_n, transposed_right=False),
+            dim=(rows // tile_m) * (inner // tile_n) * block_dim,
+            inputs=[grad_output, weight, grad_input, inner, columns],
+            block_dim=block_dim,
+            device=x.device,
         )
     elif _use_tiled(
         rows, inner, columns, x.dtype, x.device, grad_output, weight, grad_input

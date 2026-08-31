@@ -132,6 +132,31 @@ def test_cuda_bfloat16_linear_forward_backward():
     )
 
 
+@pytest.mark.parametrize("rows", [32, 64])
+def test_cuda_bfloat16_native_regular_right_linear_graph_replay(rows):
+    device = CUDA_DEVICES[0]
+    if device.arch < 80:
+        pytest.skip("BF16 native Linear requires SM80 or newer")
+
+    columns, inner = 96, 64
+    rng = np.random.default_rng(113 + rows)
+    x = wp.zeros((rows, inner), dtype=wp.bfloat16, device=device)
+    weight = _array(rng.normal(0.0, 0.2, (columns, inner)), wp.bfloat16, device)
+    grad_output = _array(rng.normal(0.0, 0.2, (rows, columns)), wp.bfloat16, device)
+    grad_input = wp.empty_like(x)
+
+    linear_backward(x, weight, grad_output, grad_input)
+    expected = _numpy(grad_output) @ _numpy(weight)
+    np.testing.assert_allclose(_numpy(grad_input), expected, atol=0.15, rtol=0.02)
+    reference = _numpy(grad_input).copy()
+
+    with wp.ScopedCapture(device) as capture:
+        linear_backward(x, weight, grad_output, grad_input)
+    wp.capture_launch(capture.graph)
+    wp.capture_launch(capture.graph)
+    np.testing.assert_array_equal(_numpy(grad_input), reference)
+
+
 def test_cuda_bfloat16_tiled_linear_tails_and_graph_replay():
     device = CUDA_DEVICES[0]
     if device.arch < 80:

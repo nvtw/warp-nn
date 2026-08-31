@@ -322,8 +322,9 @@ _PREFILL_MMA_PROJECTION = r"""
     const int warp_row = warp / WARP_COLUMNS;
     const int warp_column = warp % WARP_COLUMNS;
     constexpr int LD = 40;
+    constexpr int B_LD = B_STRIDE;
     constexpr int A_SIZE = TILE_M * LD;
-    constexpr int B_SIZE = TILE_N * LD;
+    constexpr int B_SIZE = B_ROWS * B_LD;
     constexpr int STAGE_SIZE = A_SIZE + B_SIZE;
     __shared__ __align__(16) unsigned short smem[2 * STAGE_SIZE];
     const NATIVE_TYPE* xp = x.data;
@@ -341,15 +342,7 @@ _PREFILL_MMA_PROJECTION = r"""
         const unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
         asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
     }
-    #pragma unroll
-    for (int copy = threadIdx.x; copy < TILE_N * 4; copy += BLOCK_DIM) {
-        const int row = copy >> 2;
-        const int segment = copy & 3;
-        unsigned short* dst = smem + A_SIZE + row * LD + segment * 8;
-        const NATIVE_TYPE* src = weightp + (column + row) * inner + segment * 8;
-        const unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
-    }
+    B_INITIAL_LOAD
     asm volatile("cp.async.commit_group;");
     asm volatile("cp.async.wait_group 0;");
     __syncthreads();
@@ -366,30 +359,22 @@ _PREFILL_MMA_PROJECTION = r"""
                 const unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
                 asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
             }
-            #pragma unroll
-            for (int copy = threadIdx.x; copy < TILE_N * 4; copy += BLOCK_DIM) {
-                const int row = copy >> 2;
-                const int segment = copy & 3;
-                unsigned short* dst = next + A_SIZE + row * LD + segment * 8;
-                const NATIVE_TYPE* src = weightp + (column + row) * inner + k + 32 + segment * 8;
-                const unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
-            }
+            B_NEXT_LOAD
             asm volatile("cp.async.commit_group;");
         }
 
         unsigned short* current = smem + stage * STAGE_SIZE;
         unsigned short* sa = current + warp_row * 16 * LD;
-        unsigned short* sb = current + A_SIZE + warp_column * 16 * LD;
+        unsigned short* sb = current + A_SIZE;
         const int quadrant = lane >> 3;
         const int local_row = lane & 7;
         #pragma unroll
         for (int part = 0; part < 2; ++part) {
             unsigned a0, a1, a2, a3, b0, b1, b2, b3;
             const unsigned pa = static_cast<unsigned>(__cvta_generic_to_shared(sa + (local_row + ((quadrant & 1) * 8)) * LD + part * 16 + ((quadrant >> 1) * 8)));
-            const unsigned pb = static_cast<unsigned>(__cvta_generic_to_shared(sb + (local_row + ((quadrant >> 1) * 8)) * LD + part * 16 + ((quadrant & 1) * 8)));
+            B_FRAGMENT_ADDRESS
             asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(pa) : "memory");
-            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3) : "r"(pb) : "memory");
+            B_FRAGMENT_LOAD
             asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.PTX_TYPE.PTX_TYPE.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};" : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
             asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.PTX_TYPE.PTX_TYPE.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};" : "+f"(c4), "+f"(c5), "+f"(c6), "+f"(c7) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b2), "r"(b3));
         }
@@ -413,9 +398,83 @@ _PREFILL_MMA_PROJECTION = r"""
 """
 
 
+_PREFILL_MMA_TRANSPOSED_RIGHT = {
+    "B_STRIDE": "40",
+    "B_ROWS": "TILE_N",
+    "B_INITIAL_LOAD": r"""
+    #pragma unroll
+    for (int copy = threadIdx.x; copy < TILE_N * 4; copy += BLOCK_DIM) {
+        const int row = copy >> 2;
+        const int segment = copy & 3;
+        unsigned short* dst = smem + A_SIZE + row * B_LD + segment * 8;
+        const NATIVE_TYPE* src = weightp + (column + row) * inner + segment * 8;
+        const unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
+    }
+""",
+    "B_NEXT_LOAD": r"""
+            #pragma unroll
+            for (int copy = threadIdx.x; copy < TILE_N * 4; copy += BLOCK_DIM) {
+                const int row = copy >> 2;
+                const int segment = copy & 3;
+                unsigned short* dst = next + A_SIZE + row * B_LD + segment * 8;
+                const NATIVE_TYPE* src = weightp + (column + row) * inner + k + 32 + segment * 8;
+                const unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
+            }
+""",
+    "B_FRAGMENT_ADDRESS": r"""
+            const unsigned pb = static_cast<unsigned>(__cvta_generic_to_shared(
+                sb + (warp_column * 16 + local_row + ((quadrant >> 1) * 8)) * B_LD
+                + part * 16 + ((quadrant & 1) * 8)));
+""",
+    "B_FRAGMENT_LOAD": r"""
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3) : "r"(pb) : "memory");
+""",
+}
+
+
+_PREFILL_MMA_REGULAR_RIGHT = {
+    "B_STRIDE": "TILE_N + 8",
+    "B_ROWS": "32",
+    "B_INITIAL_LOAD": r"""
+    #pragma unroll
+    for (int copy = threadIdx.x; copy < TILE_N * 4; copy += BLOCK_DIM) {
+        const int row = copy / (TILE_N / 8);
+        const int segment = copy % (TILE_N / 8);
+        unsigned short* dst = smem + A_SIZE + row * B_LD + segment * 8;
+        const NATIVE_TYPE* src = weightp + row * columns + column + segment * 8;
+        const unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
+    }
+""",
+    "B_NEXT_LOAD": r"""
+            #pragma unroll
+            for (int copy = threadIdx.x; copy < TILE_N * 4; copy += BLOCK_DIM) {
+                const int row = copy / (TILE_N / 8);
+                const int segment = copy % (TILE_N / 8);
+                unsigned short* dst = next + A_SIZE + row * B_LD + segment * 8;
+                const NATIVE_TYPE* src = weightp + (k + 32 + row) * columns + column + segment * 8;
+                const unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src));
+            }
+""",
+    "B_FRAGMENT_ADDRESS": r"""
+            const unsigned pb = static_cast<unsigned>(__cvta_generic_to_shared(
+                sb + (part * 16 + (lane & 15)) * B_LD
+                + warp_column * 16 + (lane >> 4) * 8));
+""",
+    "B_FRAGMENT_LOAD": r"""
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3) : "r"(pb) : "memory");
+""",
+}
+
+
 @lru_cache(maxsize=None)
-def get_prefill_mma_projection(dtype: type, tile_m: int, tile_n: int):
-    """Return an SM80+ projection primitive for one supported tile geometry."""
+def get_prefill_mma_projection(
+    dtype: type, tile_m: int, tile_n: int, *, transposed_right: bool = True
+):
+    """Return an SM80+ GEMM primitive for either right-operand storage layout."""
     if (tile_m, tile_n) not in ((16, 64), (64, 64), (64, 32), (128, 32)):
         raise ValueError("Unsupported prefill MMA tile geometry")
     block_dim = tile_m * tile_n // 8
@@ -425,8 +484,16 @@ def get_prefill_mma_projection(dtype: type, tile_m: int, tile_n: int):
         native_type, ptx_type = "wp::bfloat16", "bf16"
     else:
         raise TypeError("Prefill MMA projection requires FP16 or BF16")
+    layout = (
+        _PREFILL_MMA_TRANSPOSED_RIGHT
+        if transposed_right
+        else _PREFILL_MMA_REGULAR_RIGHT
+    )
+    snippet = _PREFILL_MMA_PROJECTION
+    for marker, replacement in layout.items():
+        snippet = snippet.replace(marker, replacement)
     snippet = (
-        _PREFILL_MMA_PROJECTION.replace("NATIVE_TYPE", native_type)
+        snippet.replace("NATIVE_TYPE", native_type)
         .replace("PTX_TYPE", ptx_type)
         .replace("TILE_M", str(tile_m))
         .replace("TILE_N", str(tile_n))
