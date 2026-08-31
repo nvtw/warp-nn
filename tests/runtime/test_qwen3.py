@@ -8,7 +8,12 @@ from pathlib import Path
 import numpy as np
 
 from examples.qwen_chat import _generate, _image_message, _parse_image_command
-from warp_nn.runtime import Qwen3Tokenizer, parse_qwen_tool_calls, sample_token
+from warp_nn.runtime import (
+    Qwen3Tokenizer,
+    create_tokenizer,
+    parse_qwen_tool_calls,
+    sample_token,
+)
 from warp_nn.runtime.chat import ChatEncodingCache
 from warp_nn.runtime.tokenizers import _BYTE_ENCODER
 
@@ -133,7 +138,7 @@ def test_qwen_tokenizer_loads_vocab_and_merges_layout(tmp_path):
     )
 
     reference = Qwen3Tokenizer(consolidated)
-    tokenizer = Qwen3Tokenizer(split)
+    tokenizer = create_tokenizer(split)
     text = "hello  Café\n你好 👋"
     assert tokenizer.encode(text) == reference.encode(text)
     assert tokenizer.decode(tokenizer.encode(text)) == text

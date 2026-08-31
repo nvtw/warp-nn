@@ -76,6 +76,12 @@ def create_tokenizer(path):
     path = Path(path)
     directory = path if path.is_dir() else path.parent
     config_path = directory / "config.json"
+    if (
+        (directory / "tokenizer.json").is_file()
+        or (directory / "vocab.json").is_file()
+        and (directory / "merges.txt").is_file()
+    ):
+        return Qwen3Tokenizer(directory)
     if not config_path.is_file():
         archive = GGUFArchive(find_gguf_files(path))
         if archive.metadata.get("general.architecture") == "muse-glimmer":
