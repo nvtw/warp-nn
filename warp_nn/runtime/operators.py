@@ -36,6 +36,8 @@ from warp_nn.runtime.kernels import (
     _gqa_prepare_fp16_kernel,
     _linear_kernel,
     _audio_kernels,
+    _audio_conv1d_mma_kernels,
+    _audio_conv_transpose1d_mma_kernels,
     _adaptive_rms_modulation_kernel,
     _encoder_kernels,
     _modulated_residual_kernel,
@@ -1969,7 +1971,6 @@ class Conv1dPlan:
                 "Conv1D bias must match output channels, dtype, and device"
             )
         self.input = x
-        self.weight = weight
         self.stride = int(stride)
         self.padding = int(padding)
         self.dilation = int(dilation)
@@ -1998,8 +1999,172 @@ class Conv1dPlan:
         self._use_bias = bias is not None
         kernels = _audio_kernels(x.dtype)
         self._kernel = kernels[1 if self.transposed else 0]
+        self._use_mma = False
+        if (
+            x.device.is_cuda
+            and not self.transposed
+            and self.stride == 1
+            and x.dtype in (wp.float16, wp.bfloat16)
+            and x.shape[2] % 16 == 0
+            and out_channels % 32 == 0
+        ):
+            tile_m = 16
+            first_tile = (self.padding + tile_m - 1) // tile_m
+            maximum_start = (
+                x.shape[1]
+                - 1
+                + self.padding
+                - (weight.shape[2] - 1) * self.dilation
+                - (tile_m - 1)
+            )
+            last_tile = min(
+                output_length // tile_m,
+                maximum_start // tile_m + 1,
+            )
+            if last_tile > first_tile:
+                self._use_mma = True
+                self._first_tile = first_tile
+                self._interior_begin = first_tile * tile_m
+                self._interior_end = last_tile * tile_m
+                self._boundary_count = (
+                    self._interior_begin + output_length - self._interior_end
+                )
+                self._packed_weight = wp.empty(
+                    (weight.shape[2], out_channels, in_channels),
+                    dtype=x.dtype,
+                    device=x.device,
+                )
+                mma_kernels = _audio_conv1d_mma_kernels(
+                    x.dtype, weight.shape[2], tile_m, 32
+                )
+                self._pack_kernel, self._mma_kernel, self._boundary_kernel = mma_kernels
+                wp.launch(
+                    self._pack_kernel,
+                    dim=weight.shape,
+                    inputs=[weight, self._packed_weight],
+                    device=x.device,
+                )
+        self._use_transpose_mma = False
+        if (
+            x.device.is_cuda
+            and self.transposed
+            and self.dilation == 1
+            and x.dtype in (wp.float16, wp.bfloat16)
+            and x.shape[2] % 16 == 0
+            and out_channels % 32 == 0
+        ):
+            self._use_transpose_mma = True
+            residue_rows = (output_length + self.stride - 1) // self.stride
+            self._transpose_rows = ((residue_rows + 15) // 16) * 16
+            self._packed_weight = wp.empty(
+                (weight.shape[2], out_channels, in_channels),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            self._padded_input = wp.zeros(
+                (x.shape[0], self._transpose_rows + 2, in_channels),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            self._transpose_scratch = wp.empty(
+                (x.shape[0], self.stride, self._transpose_rows, out_channels),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            transpose_kernels = _audio_conv_transpose1d_mma_kernels(
+                x.dtype, weight.shape[2], 16, 32
+            )
+            (
+                self._pack_kernel,
+                self._pack_input_kernel,
+                self._transpose_mma_kernel,
+                self._unpack_kernel,
+            ) = transpose_kernels
+            wp.launch(
+                self._pack_kernel,
+                dim=weight.shape,
+                inputs=[weight, self._packed_weight],
+                device=x.device,
+            )
+        self.weight = None if (self._use_mma or self._use_transpose_mma) else weight
 
     def execute(self):
+        if self._use_transpose_mma:
+            wp.launch(
+                self._pack_input_kernel,
+                dim=self.input.shape,
+                inputs=[self.input, self._padded_input],
+                device=self.input.device,
+            )
+            wp.launch_tiled(
+                self._transpose_mma_kernel,
+                dim=(
+                    self._transpose_rows // 16,
+                    self.output.shape[2] // 32,
+                    self.output.shape[0] * self.stride,
+                ),
+                inputs=[
+                    self._padded_input,
+                    self._packed_weight,
+                    self.bias,
+                    self._transpose_scratch,
+                    self.stride,
+                    self.padding,
+                    self._use_bias,
+                ],
+                block_dim=128,
+                device=self.input.device,
+            )
+            wp.launch(
+                self._unpack_kernel,
+                dim=self.output.shape,
+                inputs=[self._transpose_scratch, self.output],
+                device=self.input.device,
+            )
+            return self.output
+        if self._use_mma:
+            wp.launch_tiled(
+                self._mma_kernel,
+                dim=(
+                    (self._interior_end - self._interior_begin) // 16,
+                    self.output.shape[2] // 32,
+                    self.output.shape[0],
+                ),
+                inputs=[
+                    self.input,
+                    self._packed_weight,
+                    self.bias,
+                    self.output,
+                    self._first_tile,
+                    self.padding,
+                    self.dilation,
+                    self._use_bias,
+                ],
+                block_dim=128,
+                device=self.input.device,
+            )
+            if self._boundary_count:
+                wp.launch(
+                    self._boundary_kernel,
+                    dim=(
+                        self.output.shape[0],
+                        self._boundary_count,
+                        self.output.shape[2],
+                    ),
+                    inputs=[
+                        self.input,
+                        self._packed_weight,
+                        self.bias,
+                        self.output,
+                        self._interior_begin,
+                        self._interior_end,
+                        self.padding,
+                        self.dilation,
+                        self._use_bias,
+                    ],
+                    device=self.input.device,
+                )
+            return self.output
         wp.launch(
             self._kernel,
             dim=self.output.shape,

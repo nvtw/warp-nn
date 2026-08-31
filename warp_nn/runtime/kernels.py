@@ -3436,3 +3436,177 @@ def _audio_kernels(dtype: type):
         )
 
     return conv1d_nlc, conv_transpose1d_nlc, snake1d
+
+
+@lru_cache(maxsize=None)
+def _audio_conv1d_mma_kernels(
+    dtype: type, kernel_size: int, tile_m: int = 16, tile_n: int = 32
+):
+    """Return packed-weight tensor-core Conv1D kernels and edge fallback."""
+    DTYPE = dtype
+    KERNEL_SIZE = kernel_size
+    TILE_M = tile_m
+    TILE_N = tile_n
+    TILE_K = 16
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def pack_weight(weight: wp.array3d(dtype=DTYPE), packed: wp.array3d(dtype=DTYPE)):
+        out_channel, in_channel, tap = wp.tid()
+        packed[tap, out_channel, in_channel] = DTYPE(
+            weight[out_channel, in_channel, tap]
+        )
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def interior(
+        x: wp.array3d(dtype=DTYPE),
+        packed_weight: wp.array3d(dtype=DTYPE),
+        bias: wp.array1d(dtype=DTYPE),
+        output: wp.array3d(dtype=DTYPE),
+        first_tile: int,
+        padding: int,
+        dilation: int,
+        use_bias: bool,
+    ):
+        tile_row, tile_column, batch = wp.tid()
+        output_row = (tile_row + first_tile) * TILE_M
+        accumulator = wp.tile_zeros(shape=(TILE_M, TILE_N), dtype=wp.float32)
+        for tap in range(KERNEL_SIZE):
+            source_row = output_row - padding + tap * dilation
+            for inner_tile in range((x.shape[2] + TILE_K - 1) / TILE_K):
+                inner = inner_tile * TILE_K
+                activation = wp.tile_load(
+                    x[batch], shape=(TILE_M, TILE_K), offset=(source_row, inner)
+                )
+                weights = wp.tile_load(
+                    packed_weight[tap],
+                    shape=(TILE_N, TILE_K),
+                    offset=(tile_column * TILE_N, inner),
+                )
+                wp.tile_matmul(activation, wp.tile_transpose(weights), accumulator)
+        if use_bias:
+            tiled_bias = wp.tile_load(
+                bias, shape=(TILE_N,), offset=(tile_column * TILE_N,)
+            )
+            accumulator += wp.tile_astype(
+                wp.tile_broadcast(tiled_bias, shape=(TILE_M, TILE_N)),
+                dtype=wp.float32,
+            )
+        wp.tile_store(
+            output[batch],
+            wp.tile_astype(accumulator, dtype=DTYPE),
+            offset=(output_row, tile_column * TILE_N),
+        )
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def boundary(
+        x: wp.array3d(dtype=DTYPE),
+        packed_weight: wp.array3d(dtype=DTYPE),
+        bias: wp.array1d(dtype=DTYPE),
+        output: wp.array3d(dtype=DTYPE),
+        interior_begin: int,
+        interior_end: int,
+        padding: int,
+        dilation: int,
+        use_bias: bool,
+    ):
+        batch, boundary_position, out_channel = wp.tid()
+        position = boundary_position
+        if boundary_position >= interior_begin:
+            position = interior_end + boundary_position - interior_begin
+        total = wp.float32(0.0)
+        if use_bias:
+            total = wp.float32(bias[out_channel])
+        for tap in range(KERNEL_SIZE):
+            source = position - padding + tap * dilation
+            if source >= 0 and source < x.shape[1]:
+                for in_channel in range(x.shape[2]):
+                    total += wp.float32(x[batch, source, in_channel]) * wp.float32(
+                        packed_weight[tap, out_channel, in_channel]
+                    )
+        output[batch, position, out_channel] = DTYPE(total)
+
+    for kernel in (pack_weight, interior, boundary):
+        kernel.module.options["enable_backward"] = False
+    return pack_weight, interior, boundary
+
+
+@lru_cache(maxsize=None)
+def _audio_conv_transpose1d_mma_kernels(
+    dtype: type, kernel_size: int, tile_m: int = 16, tile_n: int = 32
+):
+    """Return tensor-core ConvTranspose1D kernels using residue-class GEMMs."""
+    DTYPE = dtype
+    KERNEL_SIZE = kernel_size
+    TILE_M = tile_m
+    TILE_N = tile_n
+    TILE_K = 16
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def pack_weight(weight: wp.array3d(dtype=DTYPE), packed: wp.array3d(dtype=DTYPE)):
+        in_channel, out_channel, tap = wp.tid()
+        packed[tap, out_channel, in_channel] = DTYPE(
+            weight[in_channel, out_channel, tap]
+        )
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def pack_input(x: wp.array3d(dtype=DTYPE), padded: wp.array3d(dtype=DTYPE)):
+        batch, position, channel = wp.tid()
+        padded[batch, position + 1, channel] = DTYPE(x[batch, position, channel])
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def project(
+        padded_input: wp.array3d(dtype=DTYPE),
+        packed_weight: wp.array3d(dtype=DTYPE),
+        bias: wp.array1d(dtype=DTYPE),
+        scratch: wp.array4d(dtype=DTYPE),
+        stride: int,
+        padding: int,
+        use_bias: bool,
+    ):
+        tile_row, tile_column, batch_residue = wp.tid()
+        residue = batch_residue % stride
+        batch = batch_residue / stride
+        quotient = tile_row * TILE_M
+        accumulator = wp.tile_zeros(shape=(TILE_M, TILE_N), dtype=wp.float32)
+        tap = (residue + padding) % stride
+        while tap < KERNEL_SIZE:
+            source_row = quotient + (residue + padding - tap) / stride + 1
+            for inner_tile in range((padded_input.shape[2] + TILE_K - 1) / TILE_K):
+                inner = inner_tile * TILE_K
+                activation = wp.tile_load(
+                    padded_input[batch],
+                    shape=(TILE_M, TILE_K),
+                    offset=(source_row, inner),
+                )
+                weights = wp.tile_load(
+                    packed_weight[tap],
+                    shape=(TILE_N, TILE_K),
+                    offset=(tile_column * TILE_N, inner),
+                )
+                wp.tile_matmul(activation, wp.tile_transpose(weights), accumulator)
+            tap += stride
+        if use_bias:
+            tiled_bias = wp.tile_load(
+                bias, shape=(TILE_N,), offset=(tile_column * TILE_N,)
+            )
+            accumulator += wp.tile_astype(
+                wp.tile_broadcast(tiled_bias, shape=(TILE_M, TILE_N)),
+                dtype=wp.float32,
+            )
+        wp.tile_store(
+            scratch[batch, residue],
+            wp.tile_astype(accumulator, dtype=DTYPE),
+            offset=(quotient, tile_column * TILE_N),
+        )
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def unpack(scratch: wp.array4d(dtype=DTYPE), output: wp.array3d(dtype=DTYPE)):
+        batch, position, channel = wp.tid()
+        stride = scratch.shape[1]
+        output[batch, position, channel] = DTYPE(
+            scratch[batch, position % stride, position / stride, channel]
+        )
+
+    for kernel in (pack_weight, pack_input, project, unpack):
+        kernel.module.options["enable_backward"] = False
+    return pack_weight, pack_input, project, unpack

@@ -91,3 +91,70 @@ def test_snake1d_matches_reference_and_cuda_graph():
     b = np.exp(beta)
     expected = x + np.sin(x * a) ** 2 / (b + 1.0e-9)
     np.testing.assert_allclose(actual, expected, rtol=2.0e-5, atol=2.0e-5)
+
+
+def test_conv1d_mma_matches_reference_and_cuda_graph():
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is unavailable")
+    rng = np.random.default_rng(53)
+    x = rng.normal(size=(2, 37, 32)).astype(np.float16)
+    weight = rng.normal(scale=0.1, size=(32, 32, 7)).astype(np.float16)
+    bias = rng.normal(scale=0.1, size=32).astype(np.float16)
+    plan = Conv1dPlan(
+        wp.array(x, device="cuda:0"),
+        wp.array(weight, device="cuda:0"),
+        wp.array(bias, device="cuda:0"),
+        padding=3,
+    )
+    assert plan._use_mma
+    wp.synchronize_device("cuda:0")
+    wp.capture_begin(device="cuda:0")
+    plan.execute()
+    graph = wp.capture_end(device="cuda:0")
+    wp.capture_launch(graph)
+    actual = plan.output.numpy().astype(np.float32)
+    expected = _conv_reference(
+        x.astype(np.float32),
+        weight.astype(np.float32),
+        bias.astype(np.float32),
+        1,
+        3,
+        1,
+        False,
+    )
+    np.testing.assert_allclose(actual, expected, rtol=2.0e-3, atol=2.0e-3)
+
+
+@pytest.mark.parametrize("stride", [2, 6, 10])
+def test_conv_transpose1d_mma_matches_reference(stride):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is unavailable")
+    rng = np.random.default_rng(59 + stride)
+    x = rng.normal(size=(2, 7, 32)).astype(np.float16)
+    weight = rng.normal(scale=0.05, size=(32, 32, 2 * stride)).astype(np.float16)
+    bias = rng.normal(scale=0.1, size=32).astype(np.float16)
+    plan = Conv1dPlan(
+        wp.array(x, device="cuda:0"),
+        wp.array(weight, device="cuda:0"),
+        wp.array(bias, device="cuda:0"),
+        stride=stride,
+        padding=(stride + 1) // 2,
+        transposed=True,
+    )
+    assert plan._use_transpose_mma
+    wp.synchronize_device("cuda:0")
+    wp.capture_begin(device="cuda:0")
+    plan.execute()
+    graph = wp.capture_end(device="cuda:0")
+    wp.capture_launch(graph)
+    actual = plan.output.numpy().astype(np.float32)
+    expected = _conv_reference(
+        x.astype(np.float32),
+        weight.astype(np.float32),
+        bias.astype(np.float32),
+        stride,
+        (stride + 1) // 2,
+        1,
+        True,
+    )
+    np.testing.assert_allclose(actual, expected, rtol=2.0e-3, atol=2.0e-3)
