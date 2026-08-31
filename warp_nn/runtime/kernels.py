@@ -3519,6 +3519,179 @@ def _channels_last_1d_kernels(dtype: type):
 
 
 @lru_cache(maxsize=None)
+def _channels_last_2d_kernels(dtype: type):
+    """Return a reusable general channels-last Conv2D fallback."""
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def conv2d_nhwc(
+        x: wp.array4d(dtype=DTYPE),
+        weight: wp.array4d(dtype=DTYPE),
+        bias: wp.array1d(dtype=DTYPE),
+        output: wp.array4d(dtype=DTYPE),
+        stride_y: int,
+        stride_x: int,
+        padding_top: int,
+        padding_left: int,
+        dilation_y: int,
+        dilation_x: int,
+        use_bias: bool,
+    ):
+        batch, row, column, out_channel = wp.tid()
+        total = wp.float32(0.0)
+        if use_bias:
+            total = wp.float32(bias[out_channel])
+        for kernel_y in range(weight.shape[2]):
+            source_y = row * stride_y - padding_top + kernel_y * dilation_y
+            if source_y >= 0 and source_y < x.shape[1]:
+                for kernel_x in range(weight.shape[3]):
+                    source_x = column * stride_x - padding_left + kernel_x * dilation_x
+                    if source_x >= 0 and source_x < x.shape[2]:
+                        for in_channel in range(x.shape[3]):
+                            total += wp.float32(
+                                x[batch, source_y, source_x, in_channel]
+                            ) * wp.float32(
+                                weight[out_channel, in_channel, kernel_y, kernel_x]
+                            )
+        output[batch, row, column, out_channel] = DTYPE(total)
+
+    return (conv2d_nhwc,)
+
+
+@lru_cache(maxsize=None)
+def _conv2d_mma_kernels(
+    dtype: type,
+    kernel_height: int,
+    kernel_width: int,
+    tile_m: int = 16,
+    tile_n: int = 32,
+):
+    """Return packed-weight tensor-core NHWC Conv2D kernels and edge fallback."""
+    DTYPE = dtype
+    KERNEL_HEIGHT = kernel_height
+    KERNEL_WIDTH = kernel_width
+    TILE_M = tile_m
+    TILE_N = tile_n
+    TILE_K = 16
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def pack_weight(
+        weight: wp.array4d(dtype=DTYPE),
+        packed: wp.array4d(dtype=DTYPE),
+    ):
+        out_channel, in_channel, kernel_y, kernel_x = wp.tid()
+        packed[kernel_y, kernel_x, out_channel, in_channel] = DTYPE(
+            weight[out_channel, in_channel, kernel_y, kernel_x]
+        )
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def interior(
+        x: wp.array4d(dtype=DTYPE),
+        packed_weight: wp.array4d(dtype=DTYPE),
+        bias: wp.array1d(dtype=DTYPE),
+        output: wp.array4d(dtype=DTYPE),
+        first_x_tile: int,
+        first_y: int,
+        padding_top: int,
+        padding_left: int,
+        use_bias: bool,
+    ):
+        x_tile, y_offset, batch_channel_tile = wp.tid()
+        out_channel_tiles = output.shape[3] / TILE_N
+        out_channel_tile = batch_channel_tile % out_channel_tiles
+        batch = batch_channel_tile / out_channel_tiles
+        output_x = (x_tile + first_x_tile) * TILE_M
+        output_y = y_offset + first_y
+        accumulator = wp.tile_zeros(shape=(TILE_M, TILE_N), dtype=wp.float32)
+        for kernel_y in range(KERNEL_HEIGHT):
+            source_y = output_y - padding_top + kernel_y
+            for kernel_x in range(KERNEL_WIDTH):
+                source_x = output_x - padding_left + kernel_x
+                for inner_tile in range((x.shape[3] + TILE_K - 1) / TILE_K):
+                    inner = inner_tile * TILE_K
+                    activation = wp.tile_load(
+                        x[batch, source_y],
+                        shape=(TILE_M, TILE_K),
+                        offset=(source_x, inner),
+                    )
+                    weights = wp.tile_load(
+                        packed_weight[kernel_y, kernel_x],
+                        shape=(TILE_N, TILE_K),
+                        offset=(out_channel_tile * TILE_N, inner),
+                    )
+                    wp.tile_matmul(activation, wp.tile_transpose(weights), accumulator)
+        if use_bias:
+            tiled_bias = wp.tile_load(
+                bias, shape=(TILE_N,), offset=(out_channel_tile * TILE_N,)
+            )
+            accumulator += wp.tile_astype(
+                wp.tile_broadcast(tiled_bias, shape=(TILE_M, TILE_N)),
+                dtype=wp.float32,
+            )
+        wp.tile_store(
+            output[batch, output_y],
+            wp.tile_astype(accumulator, dtype=DTYPE),
+            offset=(output_x, out_channel_tile * TILE_N),
+        )
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def boundary(
+        x: wp.array4d(dtype=DTYPE),
+        packed_weight: wp.array4d(dtype=DTYPE),
+        bias: wp.array1d(dtype=DTYPE),
+        output: wp.array4d(dtype=DTYPE),
+        interior_x_begin: int,
+        interior_x_end: int,
+        interior_y_begin: int,
+        interior_y_end: int,
+        padding_top: int,
+        padding_left: int,
+        use_bias: bool,
+    ):
+        batch, boundary_position, out_channel = wp.tid()
+        width = output.shape[2]
+        top_count = interior_y_begin * width
+        bottom_count = (output.shape[1] - interior_y_end) * width
+        if boundary_position < top_count:
+            row = boundary_position / width
+            column = boundary_position % width
+        elif boundary_position < top_count + bottom_count:
+            offset = boundary_position - top_count
+            row = interior_y_end + offset / width
+            column = offset % width
+        else:
+            offset = boundary_position - top_count - bottom_count
+            edge_width = interior_x_begin + output.shape[2] - interior_x_end
+            row = interior_y_begin + offset / edge_width
+            edge_column = offset % edge_width
+            column = edge_column
+            if edge_column >= interior_x_begin:
+                column = interior_x_end + edge_column - interior_x_begin
+        total = wp.float32(0.0)
+        if use_bias:
+            total = wp.float32(bias[out_channel])
+        for kernel_y in range(KERNEL_HEIGHT):
+            source_y = row - padding_top + kernel_y
+            if source_y >= 0 and source_y < x.shape[1]:
+                for kernel_x in range(KERNEL_WIDTH):
+                    source_x = column - padding_left + kernel_x
+                    if source_x >= 0 and source_x < x.shape[2]:
+                        for in_channel in range(x.shape[3]):
+                            total += wp.float32(
+                                x[batch, source_y, source_x, in_channel]
+                            ) * wp.float32(
+                                packed_weight[
+                                    kernel_y, kernel_x, out_channel, in_channel
+                                ]
+                            )
+        output[batch, row, column, out_channel] = DTYPE(total)
+
+    for kernel in (pack_weight, interior, boundary):
+        kernel.module.options["enable_backward"] = False
+    return pack_weight, interior, boundary
+
+
+@lru_cache(maxsize=None)
 def _conv1d_mma_kernels(
     dtype: type, kernel_size: int, tile_m: int = 16, tile_n: int = 32
 ):

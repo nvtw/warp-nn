@@ -36,7 +36,9 @@ from warp_nn.runtime.kernels import (
     _gqa_prepare_fp16_kernel,
     _linear_kernel,
     _channels_last_1d_kernels,
+    _channels_last_2d_kernels,
     _conv1d_mma_kernels,
+    _conv2d_mma_kernels,
     _conv_transpose1d_mma_kernels,
     _adaptive_rms_modulation_kernel,
     _encoder_kernels,
@@ -2093,6 +2095,233 @@ _OP_DISPATCH: dict[str, Any] = {
     "Unsqueeze": _exec_squeeze,
     "Where": _exec_where,
 }
+
+
+def _spatial_pair(value, label):
+    if isinstance(value, int):
+        result = (value, value)
+    else:
+        result = tuple(int(item) for item in value)
+    if len(result) != 2 or any(item <= 0 for item in result):
+        raise ValueError(f"{label} must contain two positive integers")
+    return result
+
+
+def _spatial_padding(value):
+    if isinstance(value, int):
+        result = (value, value, value, value)
+    else:
+        result = tuple(int(item) for item in value)
+        if len(result) == 2:
+            result = (result[0], result[0], result[1], result[1])
+    if len(result) != 4 or any(item < 0 for item in result):
+        raise ValueError("Conv2D padding must be nonnegative (top,bottom,left,right)")
+    return result
+
+
+def conv2d_output_shape(
+    height,
+    width,
+    kernel_shape,
+    *,
+    stride=1,
+    padding=0,
+    dilation=1,
+):
+    """Return the channels-last Conv2D output height and width."""
+    height, width = int(height), int(width)
+    kernel_y, kernel_x = _spatial_pair(kernel_shape, "kernel shape")
+    stride_y, stride_x = _spatial_pair(stride, "stride")
+    dilation_y, dilation_x = _spatial_pair(dilation, "dilation")
+    top, bottom, left, right = _spatial_padding(padding)
+    if min(height, width) <= 0:
+        raise ValueError("Conv2D input dimensions must be positive")
+    output_y = (height + top + bottom - dilation_y * (kernel_y - 1) - 1) // stride_y + 1
+    output_x = (width + left + right - dilation_x * (kernel_x - 1) - 1) // stride_x + 1
+    if min(output_y, output_x) <= 0:
+        raise ValueError("Conv2D geometry produces an empty output")
+    return output_y, output_x
+
+
+class Conv2dPlan:
+    """Fixed-shape NHWC Conv2D with tensor-core interiors and FP32 accumulation."""
+
+    def __init__(
+        self,
+        x,
+        weight,
+        bias=None,
+        *,
+        stride=1,
+        padding=0,
+        dilation=1,
+        tensor_cores=True,
+    ):
+        if not isinstance(tensor_cores, bool):
+            raise TypeError("tensor_cores must be boolean")
+        if x.ndim != 4 or weight.ndim != 4:
+            raise ValueError("Conv2D input and weight must be rank four")
+        if x.dtype != weight.dtype or x.device != weight.device:
+            raise ValueError("Conv2D input and weight must share dtype and device")
+        if x.dtype not in (wp.float16, wp.bfloat16, wp.float32):
+            raise TypeError("Conv2D requires FP16, BF16, or FP32 tensors")
+        out_channels, in_channels, kernel_y, kernel_x = weight.shape
+        if x.shape[3] != in_channels:
+            raise ValueError("Conv2D OIHW weight channels do not match NHWC input")
+        if bias is not None and (
+            bias.shape != (out_channels,)
+            or bias.dtype != x.dtype
+            or bias.device != x.device
+        ):
+            raise ValueError(
+                "Conv2D bias must match output channels, dtype, and device"
+            )
+        self.input = x
+        self.stride = _spatial_pair(stride, "stride")
+        self.padding = _spatial_padding(padding)
+        self.dilation = _spatial_pair(dilation, "dilation")
+        output_y, output_x = conv2d_output_shape(
+            x.shape[1],
+            x.shape[2],
+            (kernel_y, kernel_x),
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+        )
+        self.output = wp.empty(
+            (x.shape[0], output_y, output_x, out_channels),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        self.bias = (
+            bias
+            if bias is not None
+            else wp.zeros(out_channels, dtype=x.dtype, device=x.device)
+        )
+        self._use_bias = bias is not None
+        self._kernel = _channels_last_2d_kernels(x.dtype)[0]
+        self._use_mma = False
+        if (
+            tensor_cores
+            and x.device.is_cuda
+            and self.stride == (1, 1)
+            and self.dilation == (1, 1)
+            and x.dtype in (wp.float16, wp.bfloat16)
+            and in_channels % 16 == 0
+            and out_channels % 32 == 0
+        ):
+            tile_m = 16
+            top, _, left, _ = self.padding
+            first_x_tile = (left + tile_m - 1) // tile_m
+            maximum_start = x.shape[2] - 1 + left - (kernel_x - 1) - (tile_m - 1)
+            last_x_tile = min(
+                output_x // tile_m,
+                maximum_start // tile_m + 1,
+            )
+            first_y = min(output_y, top)
+            last_y = min(output_y, x.shape[1] + top - kernel_y + 1)
+            if last_x_tile > first_x_tile and last_y > first_y:
+                self._use_mma = True
+                self._first_x_tile = first_x_tile
+                self._x_tiles = last_x_tile - first_x_tile
+                self._interior_x_begin = first_x_tile * tile_m
+                self._interior_x_end = last_x_tile * tile_m
+                self._interior_y_begin = first_y
+                self._interior_y_end = last_y
+                self._boundary_count = (
+                    first_y * output_x
+                    + (output_y - last_y) * output_x
+                    + (last_y - first_y)
+                    * (self._interior_x_begin + output_x - self._interior_x_end)
+                )
+                self._packed_weight = wp.empty(
+                    (kernel_y, kernel_x, out_channels, in_channels),
+                    dtype=x.dtype,
+                    device=x.device,
+                )
+                (
+                    self._pack_kernel,
+                    self._mma_kernel,
+                    self._boundary_kernel,
+                ) = _conv2d_mma_kernels(x.dtype, kernel_y, kernel_x, tile_m, 32)
+                wp.launch(
+                    self._pack_kernel,
+                    dim=weight.shape,
+                    inputs=[weight, self._packed_weight],
+                    device=x.device,
+                )
+        self.weight = None if self._use_mma else weight
+
+    @property
+    def uses_tensor_cores(self):
+        return self._use_mma
+
+    def execute(self):
+        if self._use_mma:
+            wp.launch_tiled(
+                self._mma_kernel,
+                dim=(
+                    self._x_tiles,
+                    self._interior_y_end - self._interior_y_begin,
+                    self.output.shape[0] * (self.output.shape[3] // 32),
+                ),
+                inputs=[
+                    self.input,
+                    self._packed_weight,
+                    self.bias,
+                    self.output,
+                    self._first_x_tile,
+                    self._interior_y_begin,
+                    self.padding[0],
+                    self.padding[2],
+                    self._use_bias,
+                ],
+                block_dim=128,
+                device=self.input.device,
+            )
+            if self._boundary_count:
+                wp.launch(
+                    self._boundary_kernel,
+                    dim=(
+                        self.output.shape[0],
+                        self._boundary_count,
+                        self.output.shape[3],
+                    ),
+                    inputs=[
+                        self.input,
+                        self._packed_weight,
+                        self.bias,
+                        self.output,
+                        self._interior_x_begin,
+                        self._interior_x_end,
+                        self._interior_y_begin,
+                        self._interior_y_end,
+                        self.padding[0],
+                        self.padding[2],
+                        self._use_bias,
+                    ],
+                    device=self.input.device,
+                )
+            return self.output
+        wp.launch(
+            self._kernel,
+            dim=self.output.shape,
+            inputs=[
+                self.input,
+                self.weight,
+                self.bias,
+                self.output,
+                self.stride[0],
+                self.stride[1],
+                self.padding[0],
+                self.padding[2],
+                self.dilation[0],
+                self.dilation[1],
+                self._use_bias,
+            ],
+            device=self.input.device,
+        )
+        return self.output
 
 
 def conv1d_output_length(
