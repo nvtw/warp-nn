@@ -108,6 +108,7 @@ def _load_png(path: Path) -> np.ndarray:
         raise ValueError(f"'{path}' is not a PNG image")
     offset = 8
     payload = []
+    palette = None
     width = height = color = None
     while offset + 12 <= len(data):
         length = struct.unpack_from(">I", data, offset)[0]
@@ -121,12 +122,16 @@ def _load_png(path: Path) -> np.ndarray:
             )
             if (
                 depth != 8
-                or color not in (2, 6)
+                or color not in (0, 2, 3, 4, 6)
                 or compression
                 or filtering
                 or interlace
             ):
-                raise ValueError("only non-interlaced 8-bit RGB/RGBA PNG is supported")
+                raise ValueError("only non-interlaced 8-bit PNG images are supported")
+        elif kind == b"PLTE":
+            if not chunk or len(chunk) % 3 or len(chunk) > 256 * 3:
+                raise ValueError(f"PNG {path!r} has an invalid palette")
+            palette = np.frombuffer(chunk, dtype=np.uint8).reshape(-1, 3).copy()
         elif kind == b"IDAT":
             payload.append(chunk)
         elif kind == b"IEND":
@@ -134,7 +139,7 @@ def _load_png(path: Path) -> np.ndarray:
         offset += 12 + length
     if width is None or not payload:
         raise ValueError(f"PNG '{path}' has no image data")
-    channels = 3 if color == 2 else 4
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color]
     stride = width * channels
     raw = zlib.decompress(b"".join(payload))
     if len(raw) != height * (stride + 1):
@@ -164,7 +169,17 @@ def _load_png(path: Path) -> np.ndarray:
                 raise ValueError(f"PNG '{path}' uses invalid filter {filter_type}")
         rows[row] = scan
         previous = scan
-    return rows.reshape(height, width, channels)[..., :3].copy()
+    pixels = rows.reshape(height, width, channels)
+    if color == 3:
+        if palette is None:
+            raise ValueError(f"indexed PNG {path!r} has no palette")
+        indices = pixels[..., 0]
+        if int(indices.max(initial=0)) >= len(palette):
+            raise ValueError(f"indexed PNG {path!r} references a missing color")
+        return palette[indices].copy()
+    if color in (0, 4):
+        return np.repeat(pixels[..., :1], 3, axis=2)
+    return pixels[..., :3].copy()
 
 
 def load_rgb_image(path: str | Path) -> np.ndarray:
