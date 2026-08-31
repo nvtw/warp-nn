@@ -35,9 +35,9 @@ from warp_nn.runtime.kernels import (
     _gqa_copy_past_fp16_kernel,
     _gqa_prepare_fp16_kernel,
     _linear_kernel,
-    _audio_kernels,
-    _audio_conv1d_mma_kernels,
-    _audio_conv_transpose1d_mma_kernels,
+    _channels_last_1d_kernels,
+    _conv1d_mma_kernels,
+    _conv_transpose1d_mma_kernels,
     _adaptive_rms_modulation_kernel,
     _encoder_kernels,
     _modulated_residual_kernel,
@@ -1997,7 +1997,7 @@ class Conv1dPlan:
             else wp.zeros(out_channels, dtype=x.dtype, device=x.device)
         )
         self._use_bias = bias is not None
-        kernels = _audio_kernels(x.dtype)
+        kernels = _channels_last_1d_kernels(x.dtype)
         self._kernel = kernels[1 if self.transposed else 0]
         self._use_mma = False
         if (
@@ -2034,9 +2034,7 @@ class Conv1dPlan:
                     dtype=x.dtype,
                     device=x.device,
                 )
-                mma_kernels = _audio_conv1d_mma_kernels(
-                    x.dtype, weight.shape[2], tile_m, 32
-                )
+                mma_kernels = _conv1d_mma_kernels(x.dtype, weight.shape[2], tile_m, 32)
                 self._pack_kernel, self._mma_kernel, self._boundary_kernel = mma_kernels
                 wp.launch(
                     self._pack_kernel,
@@ -2071,7 +2069,7 @@ class Conv1dPlan:
                 dtype=x.dtype,
                 device=x.device,
             )
-            transpose_kernels = _audio_conv_transpose1d_mma_kernels(
+            transpose_kernels = _conv_transpose1d_mma_kernels(
                 x.dtype, weight.shape[2], 16, 32
             )
             (
@@ -2199,7 +2197,7 @@ class Snake1dPlan:
         self.beta = beta
         self.output = wp.empty_like(x)
         self.logscale = bool(logscale)
-        self._kernel = _audio_kernels(x.dtype)[2]
+        self._kernel = _channels_last_1d_kernels(x.dtype)[2]
 
     def execute(self):
         wp.launch(

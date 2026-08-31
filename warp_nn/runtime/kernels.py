@@ -3361,8 +3361,8 @@ def _encoder_kernels(dtype: type, head_size: int):
 
 
 @lru_cache(maxsize=None)
-def _audio_kernels(dtype: type):
-    """Return reusable channels-last audio kernels for one compute dtype."""
+def _channels_last_1d_kernels(dtype: type):
+    """Return reusable general channels-last 1D kernels for one compute dtype."""
     DTYPE = dtype
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -3439,7 +3439,7 @@ def _audio_kernels(dtype: type):
 
 
 @lru_cache(maxsize=None)
-def _audio_conv1d_mma_kernels(
+def _conv1d_mma_kernels(
     dtype: type, kernel_size: int, tile_m: int = 16, tile_n: int = 32
 ):
     """Return packed-weight tensor-core Conv1D kernels and edge fallback."""
@@ -3531,7 +3531,7 @@ def _audio_conv1d_mma_kernels(
 
 
 @lru_cache(maxsize=None)
-def _audio_conv_transpose1d_mma_kernels(
+def _conv_transpose1d_mma_kernels(
     dtype: type, kernel_size: int, tile_m: int = 16, tile_n: int = 32
 ):
     """Return tensor-core ConvTranspose1D kernels using residue-class GEMMs."""
