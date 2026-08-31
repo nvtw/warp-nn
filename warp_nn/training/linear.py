@@ -184,6 +184,7 @@ class _TiledLinearKernels:
 @dataclass(frozen=True)
 class _TiledLoRAKernels:
     transposed_right: object
+    regular_right: object
 
 
 @dataclass(frozen=True)
@@ -350,7 +351,10 @@ def _get_tiled_lora_kernels(dtype: type) -> _TiledLoRAKernels:
         kernel.module.options["enable_backward"] = False
         return kernel
 
-    return _TiledLoRAKernels(transposed_right=create_kernel(True))
+    return _TiledLoRAKernels(
+        transposed_right=create_kernel(True),
+        regular_right=create_kernel(False),
+    )
 
 
 @lru_cache(maxsize=None)
@@ -478,16 +482,28 @@ def _use_tiled(
     )
 
 
+def _use_skinny_tiled(
+    rows: int,
+    reduction: int,
+    dtype: type,
+    device,
+    *arrays: wp.array,
+) -> bool:
+    """Use boundary-masked tensor-core tiles even when LoRA rank is below 16."""
+    minimum_arch = 80 if dtype == wp.bfloat16 else 70
+    return (
+        device.is_cuda
+        and device.arch >= minimum_arch
+        and rows >= 16
+        and reduction >= 16
+        and all(array.is_contiguous for array in arrays)
+    )
+
+
 def _lora_split_count(rows: int, rank: int, reduction: int, dtype: type, device) -> int:
     """Choose bounded split-K parallelism from geometry and available SMs."""
     minimum_arch = 80 if dtype == wp.bfloat16 else 70
-    if (
-        not device.is_cuda
-        or device.arch < minimum_arch
-        or rows < 16
-        or rank < 16
-        or reduction < 16
-    ):
+    if not device.is_cuda or device.arch < minimum_arch or rows < 16 or reduction < 16:
         return 1
     output_tiles = ((rows + _TILE_M - 1) // _TILE_M) * ((rank + _TILE_N - 1) // _TILE_N)
     inner_tiles = (reduction + _TILE_K - 1) // _TILE_K
@@ -717,7 +733,7 @@ def lora_forward(
             1.0,
             transposed_right=True,
         )
-    elif _use_tiled(rows, rank, x.shape[1], x.dtype, x.device, x, lora_a, hidden):
+    elif _use_skinny_tiled(rows, x.shape[1], x.dtype, x.device, x, lora_a, hidden):
         _launch_tiled(
             _get_tiled_lora_kernels(x.dtype).transposed_right,
             x,
@@ -800,6 +816,25 @@ def lora_backward(
             rank,
             columns,
             matmul_splits,
+            float(scale),
+        )
+    elif _use_skinny_tiled(
+        rows,
+        columns,
+        x.dtype,
+        x.device,
+        grad_output,
+        lora_b,
+        grad_hidden,
+    ):
+        _launch_tiled(
+            _get_tiled_lora_kernels(x.dtype).regular_right,
+            grad_output,
+            lora_b,
+            grad_hidden,
+            rows,
+            rank,
+            columns,
             float(scale),
         )
     else:

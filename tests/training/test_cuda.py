@@ -191,8 +191,9 @@ def test_cuda_bfloat16_tiled_linear_tails_and_graph_replay():
     np.testing.assert_array_equal(_numpy(grad_weight), grad_weight_reference)
 
 
+@pytest.mark.parametrize("rank", [2, 16])
 @pytest.mark.parametrize("use_cublas", [False, True])
-def test_cuda_lora_split_k_tensor_cores_and_graph_replay(use_cublas):
+def test_cuda_lora_split_k_tensor_cores_and_graph_replay(use_cublas, rank):
     device = CUDA_DEVICES[0]
     if device.arch < 80:
         pytest.skip("BF16 split-K LoRA requires SM80 or newer")
@@ -200,7 +201,7 @@ def test_cuda_lora_split_k_tensor_cores_and_graph_replay(use_cublas):
     if use_cublas and cublas is None:
         pytest.skip("cuBLAS is unavailable")
 
-    rows, columns, inner, rank = 32, 64, 64, 16
+    rows, columns, inner = 32, 64, 64
     scale = 0.25
     rng = np.random.default_rng(109)
     x = _array(rng.normal(0.0, 0.2, (rows, inner)), wp.bfloat16, device)
