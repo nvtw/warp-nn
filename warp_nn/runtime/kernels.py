@@ -3093,6 +3093,86 @@ def _cast_kernel_for_dtypes(source_dtype: type, target_dtype: type):
 
 
 @lru_cache(maxsize=None)
+def _spatial_diffusion_kernels(dtype: type):
+    """Reusable spatial patch, channel-affine, and Euler update kernels."""
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def pack_patches(
+        x: wp.array4d(dtype=DTYPE),
+        output: wp.array3d(dtype=DTYPE),
+        patch_size: int,
+    ):
+        batch, token, packed_channel = wp.tid()
+        patch_area = patch_size * patch_size
+        channel = packed_channel / patch_area
+        patch_index = packed_channel % patch_area
+        patch_y = patch_index / patch_size
+        patch_x = patch_index % patch_size
+        grid_width = x.shape[3] / patch_size
+        grid_y = token / grid_width
+        grid_x = token % grid_width
+        output[batch, token, packed_channel] = DTYPE(
+            wp.float32(
+                x[
+                    batch,
+                    channel,
+                    grid_y * patch_size + patch_y,
+                    grid_x * patch_size + patch_x,
+                ]
+            )
+        )
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def unpack_patches(
+        x: wp.array3d(dtype=DTYPE),
+        output: wp.array4d(dtype=DTYPE),
+        patch_size: int,
+    ):
+        batch, channel, row, column = wp.tid()
+        grid_width = output.shape[3] / patch_size
+        grid_y = row / patch_size
+        grid_x = column / patch_size
+        patch_y = row % patch_size
+        patch_x = column % patch_size
+        packed_channel = (
+            channel * patch_size * patch_size + patch_y * patch_size + patch_x
+        )
+        output[batch, channel, row, column] = DTYPE(
+            wp.float32(x[batch, grid_y * grid_width + grid_x, packed_channel])
+        )
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def channel_affine(
+        x: wp.array4d(dtype=DTYPE),
+        scale: wp.array1d(dtype=wp.float32),
+        bias: wp.array1d(dtype=wp.float32),
+        output: wp.array4d(dtype=DTYPE),
+    ):
+        batch, channel, row, column = wp.tid()
+        output[batch, channel, row, column] = DTYPE(
+            wp.float32(x[batch, channel, row, column]) * wp.float32(scale[channel])
+            + wp.float32(bias[channel])
+        )
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def flow_euler_step(
+        sample: wp.array3d(dtype=DTYPE),
+        velocity: wp.array3d(dtype=DTYPE),
+        sigma: wp.array1d(dtype=wp.float32),
+        next_sigma: wp.array1d(dtype=wp.float32),
+    ):
+        batch, token, channel = wp.tid()
+        dt = wp.float32(next_sigma[batch]) - wp.float32(sigma[batch])
+        sample[batch, token, channel] = DTYPE(
+            wp.float32(sample[batch, token, channel])
+            + dt * wp.float32(velocity[batch, token, channel])
+        )
+
+    return pack_patches, unpack_patches, channel_affine, flow_euler_step
+
+
+@lru_cache(maxsize=None)
 def _merge_lora_kernel(dtype: type):
     """Return an in-place LoRA merge kernel specialized for one weight dtype."""
     DTYPE = dtype

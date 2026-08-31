@@ -42,6 +42,7 @@ from warp_nn.runtime.kernels import (
     _encoder_kernels,
     _modulated_residual_kernel,
     _quantize_activation_int8_kernel,
+    _spatial_diffusion_kernels,
 )
 from warp_nn.utils.ops import resolve_dim
 
@@ -1745,6 +1746,191 @@ class ModulatedResidualPlan:
             device=self.residual.device,
         )
         return self.output
+
+
+class SpatialPatchPackPlan:
+    """Graph-safe NCHW to spatial-token patch packing."""
+
+    def __init__(self, x, patch_size):
+        if x.ndim != 4 or x.dtype not in (wp.float16, wp.bfloat16, wp.float32):
+            raise TypeError("spatial patch input must be rank-four FP16/BF16/FP32")
+        self.patch_size = int(patch_size)
+        if self.patch_size <= 0:
+            raise ValueError("spatial patch size must be positive")
+        if x.shape[2] % self.patch_size or x.shape[3] % self.patch_size:
+            raise ValueError("spatial dimensions must be divisible by patch size")
+        self.input = x
+        sequence = (x.shape[2] // self.patch_size) * (x.shape[3] // self.patch_size)
+        channels = x.shape[1] * self.patch_size * self.patch_size
+        self.output = wp.empty(
+            (x.shape[0], sequence, channels), dtype=x.dtype, device=x.device
+        )
+        self._kernel = _spatial_diffusion_kernels(x.dtype)[0]
+
+    def execute(self):
+        wp.launch(
+            self._kernel,
+            dim=self.output.shape,
+            inputs=[self.input, self.output, self.patch_size],
+            device=self.input.device,
+        )
+        return self.output
+
+
+class SpatialPatchUnpackPlan:
+    """Graph-safe spatial-token patches to NCHW unpacking."""
+
+    def __init__(self, x, height, width, patch_size):
+        if x.ndim != 3 or x.dtype not in (wp.float16, wp.bfloat16, wp.float32):
+            raise TypeError("spatial patch input must be rank-three FP16/BF16/FP32")
+        self.patch_size = int(patch_size)
+        self.height, self.width = int(height), int(width)
+        if min(self.patch_size, self.height, self.width) <= 0:
+            raise ValueError("spatial patch geometry must be positive")
+        patch_area = self.patch_size * self.patch_size
+        if (
+            self.height % self.patch_size
+            or self.width % self.patch_size
+            or x.shape[1]
+            != (self.height // self.patch_size) * (self.width // self.patch_size)
+            or x.shape[2] % patch_area
+        ):
+            raise ValueError("packed spatial-token geometry is inconsistent")
+        self.input = x
+        self.output = wp.empty(
+            (x.shape[0], x.shape[2] // patch_area, self.height, self.width),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        self._kernel = _spatial_diffusion_kernels(x.dtype)[1]
+
+    def execute(self):
+        wp.launch(
+            self._kernel,
+            dim=self.output.shape,
+            inputs=[self.input, self.output, self.patch_size],
+            device=self.input.device,
+        )
+        return self.output
+
+
+class ChannelAffinePlan:
+    """Graph-safe per-channel affine transform for NCHW tensors."""
+
+    def __init__(self, x, scale, bias):
+        if x.ndim != 4 or x.dtype not in (wp.float16, wp.bfloat16, wp.float32):
+            raise TypeError("channel affine input must be rank-four FP16/BF16/FP32")
+        if (
+            scale.shape != (x.shape[1],)
+            or bias.shape != scale.shape
+            or scale.dtype != wp.float32
+            or bias.dtype != wp.float32
+            or scale.device != x.device
+            or bias.device != x.device
+        ):
+            raise ValueError(
+                "channel affine scale/bias must be matching device FP32 vectors"
+            )
+        self.input, self.scale, self.bias = x, scale, bias
+        self.output = wp.empty_like(x)
+        self._kernel = _spatial_diffusion_kernels(x.dtype)[2]
+
+    def execute(self):
+        wp.launch(
+            self._kernel,
+            dim=self.output.shape,
+            inputs=[self.input, self.scale, self.bias, self.output],
+            device=self.input.device,
+        )
+        return self.output
+
+
+class FlowEulerPlan:
+    """In-place graph-safe deterministic flow-matching Euler update."""
+
+    def __init__(self, sample, velocity, sigma, next_sigma):
+        if (
+            sample.ndim != 3
+            or velocity.shape != sample.shape
+            or velocity.dtype != sample.dtype
+            or velocity.device != sample.device
+        ):
+            raise ValueError(
+                "flow sample and velocity must be matching rank-three arrays"
+            )
+        if sample.dtype not in (wp.float16, wp.bfloat16, wp.float32):
+            raise TypeError("flow Euler update requires FP16/BF16/FP32 samples")
+        if (
+            sigma.shape != (sample.shape[0],)
+            or next_sigma.shape != sigma.shape
+            or sigma.dtype != wp.float32
+            or next_sigma.dtype != wp.float32
+            or sigma.device != sample.device
+            or next_sigma.device != sample.device
+        ):
+            raise ValueError("flow sigmas must be matching device FP32 batch vectors")
+        self.sample, self.velocity = sample, velocity
+        self.sigma, self.next_sigma = sigma, next_sigma
+        self._kernel = _spatial_diffusion_kernels(sample.dtype)[3]
+
+    def execute(self):
+        wp.launch(
+            self._kernel,
+            dim=self.sample.shape,
+            inputs=[self.sample, self.velocity, self.sigma, self.next_sigma],
+            device=self.sample.device,
+        )
+        return self.sample
+
+
+def flow_match_euler_schedule(
+    steps,
+    image_sequence_length,
+    *,
+    base_sequence_length=256,
+    maximum_sequence_length=4096,
+    base_shift=0.5,
+    maximum_shift=1.15,
+    terminal_shift=None,
+    time_shift_type="exponential",
+):
+    """Build the deterministic dynamic-shift FlowMatch Euler sigma schedule."""
+    steps = int(steps)
+    image_sequence_length = int(image_sequence_length)
+    base_sequence_length = int(base_sequence_length)
+    maximum_sequence_length = int(maximum_sequence_length)
+    if steps <= 0 or image_sequence_length <= 0:
+        raise ValueError("flow steps and image sequence length must be positive")
+    if (
+        base_sequence_length <= 0
+        or maximum_sequence_length <= base_sequence_length
+        or maximum_shift < base_shift
+    ):
+        raise ValueError("invalid dynamic flow-shift geometry")
+    slope = (maximum_shift - base_shift) / (
+        maximum_sequence_length - base_sequence_length
+    )
+    mu = base_shift + (image_sequence_length - base_sequence_length) * slope
+    sigmas = np.linspace(1.0, 1.0 / steps, steps, dtype=np.float64)
+    odds = 1.0 / sigmas - 1.0
+    if time_shift_type == "exponential":
+        factor = math.exp(mu)
+    elif time_shift_type == "linear":
+        factor = mu
+        if factor <= 0.0:
+            raise ValueError("linear dynamic flow shift must be positive")
+    else:
+        raise ValueError("flow time_shift_type must be exponential or linear")
+    sigmas = factor / (factor + odds)
+    if terminal_shift is not None:
+        terminal_shift = float(terminal_shift)
+        if not 0.0 <= terminal_shift < 1.0:
+            raise ValueError("flow terminal shift must be in [0, 1)")
+        scale = (1.0 - sigmas[-1]) / (1.0 - terminal_shift)
+        if scale <= 0.0:
+            raise ValueError("flow schedule cannot be stretched to its terminal")
+        sigmas = 1.0 - (1.0 - sigmas) / scale
+    return np.concatenate((sigmas, np.zeros(1))).astype(np.float32)
 
 
 def resolve_rope_parameters(
