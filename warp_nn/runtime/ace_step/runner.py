@@ -12,9 +12,11 @@ constructing it never implies that an incomplete model can generate audio.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
+from functools import lru_cache
 
 import numpy as np
 import warp as wp
@@ -481,6 +483,80 @@ class AceStepConditioning:
     lyric_prompts: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class AceStepTextToMusicInputs:
+    """Host-side fixed-shape inputs for ordinary turbo text-to-music."""
+
+    source_latents: np.ndarray
+    chunk_mask: np.ndarray
+    context_latents: np.ndarray
+    timbre_latents: np.ndarray
+
+
+@lru_cache(maxsize=None)
+def _normal_fill_kernel(dtype):
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def fill(output: wp.array1d(dtype=DTYPE), seed: int):
+        index = wp.tid()
+        state = wp.rand_init(seed, index)
+        output[index] = DTYPE(wp.randn(state))
+
+    return fill
+
+
+def seeded_normal(shape, *, seed=0, dtype=wp.bfloat16, device=None):
+    """Fill a GPU tensor with deterministic independent standard-normal noise."""
+    if not shape or any(int(value) <= 0 for value in shape):
+        raise ValueError("ACE-Step noise shape must be positive")
+    output = wp.empty(tuple(map(int, shape)), dtype=dtype, device=device)
+    wp.launch(
+        _normal_fill_kernel(dtype),
+        dim=output.size,
+        inputs=[output.flatten(), int(seed)],
+        device=output.device,
+    )
+    return output
+
+
+def text_to_music_inputs(
+    silence: np.ndarray,
+    duration_seconds: float,
+    *,
+    batch_size: int = 1,
+    latent_rate: int = 25,
+    timbre_frames: int = 750,
+) -> AceStepTextToMusicInputs:
+    """Construct the official non-cover source, context, and silence timbre."""
+    if not np.isfinite(duration_seconds) or duration_seconds <= 0.0:
+        raise ValueError("ACE-Step duration must be a positive finite value")
+    if batch_size <= 0 or latent_rate <= 0 or timbre_frames <= 0:
+        raise ValueError("ACE-Step batch and frame rates must be positive")
+    values = np.asarray(silence)
+    if values.ndim == 3:
+        if values.shape[0] != 1:
+            raise ValueError("silence latent batch dimension must be one")
+        values = values[0]
+    if values.ndim != 2 or values.shape[1] != 64:
+        raise ValueError("ACE-Step silence latent must have 64 channels")
+    frames = max(1, int(math.ceil(duration_seconds * latent_rate)))
+    source_row = tile_silence_latent(values, frames).astype(np.float32, copy=False)
+    timbre_row = tile_silence_latent(values, timbre_frames).astype(
+        np.float32, copy=False
+    )
+    source = np.broadcast_to(source_row, (batch_size, *source_row.shape)).copy()
+    timbre = np.broadcast_to(timbre_row, (batch_size, *timbre_row.shape)).copy()
+    chunk = np.ones_like(source)
+    context = np.concatenate((source, chunk), axis=-1)
+    return AceStepTextToMusicInputs(
+        source_latents=source,
+        chunk_mask=chunk,
+        context_latents=context,
+        timbre_latents=timbre,
+    )
+
+
 class AceStep15Pipeline:
     """Composition root for ACE-Step 1.5 executors.
 
@@ -494,12 +570,14 @@ class AceStep15Pipeline:
         bundle: AceStep15Bundle,
         *,
         text_executor: Qwen3Encoder | None = None,
+        condition_executor: Callable | None = None,
         dit_executor: Callable | None = None,
         vae_decoder: Callable | None = None,
     ):
         self.bundle = bundle
         self.tokenizer = Qwen3Tokenizer(bundle.text_encoder_path)
         self.text_executor = text_executor
+        self.condition_executor = condition_executor
         self.dit_executor = dit_executor
         self.vae_decoder = vae_decoder
 
@@ -591,6 +669,7 @@ class AceStep15Pipeline:
             name
             for name, value in (
                 ("Qwen3 embedding encoder", self.text_executor),
+                ("ACE-Step condition encoder", self.condition_executor),
                 ("ACE-Step DiT", self.dit_executor),
                 ("Oobleck VAE decoder", self.vae_decoder),
             )

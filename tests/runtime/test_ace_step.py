@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import warp as wp
 
 from warp_nn.runtime.ace_step.runner import (
     AceStep15Bundle,
@@ -18,6 +19,8 @@ from warp_nn.runtime.ace_step.runner import (
     load_silence_latent,
     pack_conditioning_sequences,
     prepare_conditioning_tokens,
+    seeded_normal,
+    text_to_music_inputs,
     tile_silence_latent,
 )
 from warp_nn.runtime.tokenizers import Qwen3Tokenizer, _BYTE_ENCODER
@@ -208,12 +211,32 @@ def test_silence_latent_slicing_and_tiling():
         tile_silence_latent(silence, 0)
 
 
+def test_text_to_music_inputs_use_exact_25hz_context():
+    silence = np.arange(3 * 64, dtype=np.float32).reshape(1, 3, 64)
+    first = text_to_music_inputs(silence, 0.101, batch_size=2)
+    assert first.source_latents.shape == (2, 3, 64)
+    assert first.context_latents.shape == (2, 3, 128)
+    assert first.timbre_latents.shape == (2, 750, 64)
+    np.testing.assert_array_equal(first.chunk_mask, 1.0)
+    np.testing.assert_array_equal(first.context_latents[..., :64], first.source_latents)
+    np.testing.assert_array_equal(first.context_latents[..., 64:], 1.0)
+
+
+def test_seeded_normal_is_deterministic_on_cpu():
+    first = seeded_normal((2, 7), seed=41, dtype=wp.float32, device="cpu")
+    second = seeded_normal((2, 7), seed=41, dtype=wp.float32, device="cpu")
+    third = seeded_normal((2, 7), seed=42, dtype=wp.float32, device="cpu")
+    np.testing.assert_array_equal(first.numpy(), second.numpy())
+    assert not np.array_equal(first.numpy(), third.numpy())
+
+
 def test_pipeline_never_claims_incomplete_execution_is_ready(tmp_path):
     _write_bundle(tmp_path)
     pipeline = AceStep15Pipeline(AceStep15Bundle.discover(tmp_path))
     assert not pipeline.ready
     assert pipeline.missing_components == (
         "Qwen3 embedding encoder",
+        "ACE-Step condition encoder",
         "ACE-Step DiT",
         "Oobleck VAE decoder",
     )
@@ -315,8 +338,9 @@ def test_ace_cli_writes_stereo_pcm16_only_after_ready_generation(tmp_path, monke
         def prepare_conditioning(self, *args, **kwargs):
             return "conditioning"
 
-        def generate(self, *, conditioning):
+        def generate(self, *, conditioning, duration_seconds, seed, steps):
             assert conditioning == "conditioning"
+            assert (duration_seconds, seed, steps) == (30.0, 0, 8)
             return generated
 
     monkeypatch.setattr(cli, "AceStep15Pipeline", Pipeline)

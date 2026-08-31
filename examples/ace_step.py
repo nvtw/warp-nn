@@ -32,6 +32,21 @@ def _parser() -> argparse.ArgumentParser:
         "--device", default=None, help="Warp device, for example cuda:0"
     )
     parser.add_argument("--output", default="ace-step.wav")
+    parser.add_argument(
+        "--duration-seconds",
+        type=float,
+        default=30.0,
+        help="requested audio duration (converted to ceil(seconds * 25) latents)",
+    )
+    parser.add_argument("--seed", type=int, default=0, help="diffusion noise seed")
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=8,
+        choices=range(1, 9),
+        metavar="[1-8]",
+        help="turbo diffusion steps (default: 8)",
+    )
     parser.add_argument("--no-cublas", action="store_true")
     parser.add_argument(
         "--normalize-output",
@@ -84,7 +99,12 @@ def main(argv=None) -> int:
         raise RuntimeError(
             f"ACE-Step bundle and Qwen conditioning are ready; generation still needs {missing}"
         )
-    audio = pipeline.generate(conditioning=conditioning)
+    audio = pipeline.generate(
+        conditioning=conditioning,
+        duration_seconds=args.duration_seconds,
+        seed=args.seed,
+        steps=args.steps,
+    )
     if hasattr(audio, "numpy"):
         audio = audio.numpy()
     audio = np.asarray(audio)
