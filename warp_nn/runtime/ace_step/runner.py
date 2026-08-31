@@ -17,8 +17,10 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 import numpy as np
+import warp as wp
 
 from ..formats.pytorch import load_pytorch_zip
+from ..qwen.encoder import Qwen3Encoder
 from ..tokenizers import Qwen3Tokenizer
 
 
@@ -462,19 +464,36 @@ def tile_silence_latent(silence: np.ndarray, frames: int) -> np.ndarray:
     return np.tile(silence, (repeats, 1))[:frames]
 
 
+@dataclass(frozen=True)
+class AceStepConditioning:
+    """GPU-resident raw inputs for ACE's model-owned condition encoder.
+
+    Caption states have passed through the complete causal Qwen3 model. Lyric
+    states are input embeddings only; the DiT checkpoint's lyric encoder must
+    process them before condition packing and cross-attention.
+    """
+
+    text_hidden_states: wp.array
+    text_attention_mask: wp.array
+    lyric_hidden_states: wp.array
+    lyric_attention_mask: wp.array
+    prompts: tuple[str, ...]
+    lyric_prompts: tuple[str, ...]
+
+
 class AceStep15Pipeline:
     """Composition root for ACE-Step 1.5 executors.
 
-    The caption executor must return the final hidden state of the complete
-    causal Qwen3-Embedding model.  The lyric executor must gather only that
-    checkpoint's input embeddings; ACE's own lyric encoder processes them next.
+    Construction validates paths but does not upload weights. Attach the exact
+    Qwen3 encoder with :meth:`load_text_encoder`; DiT and VAE executors remain
+    explicit so ``ready`` never overstates end-to-end support.
     """
 
     def __init__(
         self,
         bundle: AceStep15Bundle,
         *,
-        text_executor: Callable | None = None,
+        text_executor: Qwen3Encoder | None = None,
         dit_executor: Callable | None = None,
         vae_decoder: Callable | None = None,
     ):
@@ -483,6 +502,88 @@ class AceStep15Pipeline:
         self.text_executor = text_executor
         self.dit_executor = dit_executor
         self.vae_decoder = vae_decoder
+
+    def load_text_encoder(
+        self,
+        *,
+        dtype=wp.bfloat16,
+        device=None,
+        use_cublas: bool = True,
+    ) -> Qwen3Encoder:
+        """Load and attach ACE's exact caption/lyric Qwen3 executor."""
+        encoder = Qwen3Encoder(
+            self.bundle.text_encoder_path,
+            dtype=dtype,
+            device=device,
+            use_cublas=use_cublas,
+        )
+        self.text_executor = encoder
+        return encoder
+
+    def prepare_gpu_conditioning(
+        self, tokens: AceStepTokenBatch
+    ) -> AceStepConditioning:
+        """Encode one padded conditioning batch entirely on the target GPU.
+
+        Qwen's reusable executor is currently optimized for one causal sequence,
+        so batch rows execute through one graph-cached plan and are copied into
+        a contiguous output. No hidden states round-trip through host memory.
+        """
+        encoder = self.text_executor
+        if encoder is None:
+            raise RuntimeError("ACE-Step Qwen3 embedding encoder is not loaded")
+        if not isinstance(encoder, Qwen3Encoder):
+            raise TypeError("ACE-Step GPU conditioning requires Qwen3Encoder")
+        text_ids = np.asarray(tokens.text_ids, dtype=np.int64)
+        lyric_ids = np.asarray(tokens.lyric_ids, dtype=np.int64)
+        text_mask = np.asarray(tokens.text_mask, dtype=bool)
+        lyric_mask = np.asarray(tokens.lyric_mask, dtype=bool)
+        if text_ids.ndim != 2 or lyric_ids.ndim != 2:
+            raise ValueError("ACE-Step token batches must be rank two")
+        if text_mask.shape != text_ids.shape or lyric_mask.shape != lyric_ids.shape:
+            raise ValueError("ACE-Step token masks must match token IDs")
+        if text_ids.shape[0] != lyric_ids.shape[0]:
+            raise ValueError("ACE-Step caption and lyric batch sizes must match")
+        batch, text_length = text_ids.shape
+        text_hidden = wp.empty(
+            (batch, text_length, encoder.hidden_size),
+            dtype=encoder.dtype,
+            device=encoder.device,
+        )
+        row_values = text_length * encoder.hidden_size
+        for row in range(batch):
+            encoded = encoder.encode_ids(text_ids[row])
+            wp.copy(
+                text_hidden.flatten(),
+                encoded.flatten(),
+                dest_offset=row * row_values,
+                count=row_values,
+            )
+        lyric_hidden = encoder.embed_ids(lyric_ids)
+        return AceStepConditioning(
+            text_hidden_states=text_hidden,
+            text_attention_mask=wp.array(
+                text_mask, dtype=wp.bool, device=encoder.device
+            ),
+            lyric_hidden_states=lyric_hidden,
+            lyric_attention_mask=wp.array(
+                lyric_mask, dtype=wp.bool, device=encoder.device
+            ),
+            prompts=tokens.prompts,
+            lyric_prompts=tokens.lyric_prompts,
+        )
+
+    def prepare_conditioning(
+        self,
+        captions: Sequence[str],
+        lyrics: Sequence[str],
+        **token_options,
+    ) -> AceStepConditioning:
+        """Tokenize and encode caption/lyric inputs into GPU-resident tensors."""
+        tokens = prepare_conditioning_tokens(
+            self.tokenizer, captions, lyrics, **token_options
+        )
+        return self.prepare_gpu_conditioning(tokens)
 
     @property
     def missing_components(self) -> tuple[str, ...]:

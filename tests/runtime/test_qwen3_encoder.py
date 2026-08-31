@@ -55,7 +55,7 @@ def _tiny_checkpoint(path: Path) -> tuple[dict, dict[str, np.ndarray]]:
         "num_key_value_heads": 1,
         "head_dim": 2,
         "vocab_size": vocabulary_size,
-        "max_position_embeddings": 16,
+        "max_position_embeddings": 256,
         "rms_norm_eps": 1.0e-6,
         "rope_theta": 1000.0,
         "layer_types": ["full_attention"],
@@ -204,9 +204,41 @@ def test_official_qwen3_embedding_checkpoint_contract():
     config = load_qwen3_encoder_config(path)
     archive = SafeTensorArchive(path)
     names = qwen3_encoder_weight_names(config)
-    assert not (set(names) - set(archive.names))
-    assert archive.metadata("model.embed_tokens.weight").shape == (151669, 1024)
-    assert archive.metadata("model.layers.0.self_attn.q_proj.weight").shape == (
+    assert not ({name.removeprefix("model.") for name in names} - set(archive.names))
+    assert archive.metadata("embed_tokens.weight").shape == (151669, 1024)
+    assert archive.metadata("layers.0.self_attn.q_proj.weight").shape == (
         2048,
         1024,
     )
+
+
+@pytest.mark.skipif(not wp.is_cuda_available(), reason="CUDA is not available")
+def test_qwen3_encoder_cuda_graph_replay(tmp_path):
+    config, weights = _tiny_checkpoint(tmp_path / "qwen")
+    runner = Qwen3Encoder(
+        tmp_path / "qwen", dtype=wp.float16, device="cuda:0", use_cublas=False
+    )
+    runner.encode_ids([3, 9, 4]).numpy()
+    second = runner.encode_ids([4, 9, 3]).numpy()[0].copy()
+    first = runner.encode_ids([3, 9, 4]).numpy()[0].copy()
+    np.testing.assert_allclose(
+        second, _reference([4, 9, 3], config, weights), rtol=3.0e-3, atol=3.0e-3
+    )
+    np.testing.assert_allclose(
+        first, _reference([3, 9, 4], config, weights), rtol=3.0e-3, atol=3.0e-3
+    )
+    assert not np.allclose(first, second)
+
+
+def test_official_qwen3_embedding_finite_bf16_cuda():
+    path = Path(
+        "/home/twidmer/.cache/warp-nn/models/ACE-Step/Ace-Step1.5/Qwen3-Embedding-0.6B"
+    )
+    if not (path / "model.safetensors").is_file():
+        pytest.skip("official ACE-Step Qwen3 embedding tensors are still downloading")
+    if not wp.is_cuda_available():
+        pytest.skip("CUDA is not available")
+    runner = Qwen3Encoder(path, dtype=wp.bfloat16, device="cuda:0", use_cublas=False)
+    output = runner.encode_ids([10, 20, 30]).numpy()
+    assert output.shape == (1, 3, 1024)
+    assert np.isfinite(output).all()

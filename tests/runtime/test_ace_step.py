@@ -234,3 +234,62 @@ def test_load_silence_latent_transposes_official_layout(monkeypatch):
 
     with pytest.raises(ValueError, match="expected 4"):
         load_silence_latent("silence_latent.pt", channels=4)
+
+
+def test_pipeline_prepares_exact_gpu_conditioning_boundary(tmp_path):
+    from types import SimpleNamespace
+
+    import warp as wp
+
+    from tests.runtime.test_qwen3_encoder import _tiny_checkpoint
+    from warp_nn.runtime.qwen.encoder import Qwen3Encoder
+
+    path = tmp_path / "qwen"
+    _, weights = _tiny_checkpoint(path)
+    bundle = SimpleNamespace(text_encoder_path=path)
+    pipeline = AceStep15Pipeline(bundle)
+    with pytest.raises(RuntimeError, match="not loaded"):
+        tokens = prepare_conditioning_tokens(pipeline.tokenizer, ["first"], ["la"])
+        pipeline.prepare_gpu_conditioning(tokens)
+
+    encoder = Qwen3Encoder(path, dtype=wp.float16, device="cpu", use_cublas=False)
+    pipeline.text_executor = encoder
+    tokens = prepare_conditioning_tokens(
+        pipeline.tokenizer,
+        ["short", "a longer caption"],
+        ["la", "la la"],
+    )
+    condition = pipeline.prepare_gpu_conditioning(tokens)
+    assert condition.text_hidden_states.shape == (
+        2,
+        tokens.text_ids.shape[1],
+        4,
+    )
+    assert condition.lyric_hidden_states.shape == (
+        2,
+        tokens.lyric_ids.shape[1],
+        4,
+    )
+    np.testing.assert_array_equal(
+        condition.text_attention_mask.numpy(), tokens.text_mask
+    )
+    np.testing.assert_array_equal(
+        condition.lyric_attention_mask.numpy(), tokens.lyric_mask
+    )
+    np.testing.assert_allclose(
+        condition.lyric_hidden_states.numpy(),
+        weights["model.embed_tokens.weight"][tokens.lyric_ids],
+        rtol=5.0e-4,
+        atol=1.0e-4,
+    )
+
+
+def test_ace_cli_check_validates_without_loading_weights(tmp_path, capsys):
+    from examples.ace_step import main
+
+    _write_bundle(tmp_path)
+    assert main([str(tmp_path), "--check"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["variant"] == "acestep-v15-turbo"
+    assert report["sample_rate"] == 48000
+    assert report["samples_per_latent"] == 1920

@@ -32,7 +32,7 @@ from ..operators import (
     rotary_cache_values,
 )
 from ..tokenizers import Qwen3Tokenizer
-from ..weights import load_cast_weights
+from ..weights import MappedWeightArchive, load_cast_weights
 from ...utils.device import parse_device
 
 
@@ -426,6 +426,13 @@ class Qwen3Encoder:
         archive = SafeTensorArchive(path)
         names = qwen3_encoder_weight_names(self.config)
         missing = set(names) - set(archive.names)
+        if missing and all(
+            name.removeprefix("model.") in archive.names for name in names
+        ):
+            archive = MappedWeightArchive(
+                archive, {name: name.removeprefix("model.") for name in names}
+            )
+            missing = set()
         if missing:
             raise ValueError(
                 f"Qwen3 encoder checkpoint is missing {sorted(missing)[:5]}"
