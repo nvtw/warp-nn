@@ -119,7 +119,29 @@ def _vae_kernels(dtype, source_dtype):
             wp.float32(vector[channel, inner, kernel]) * multiplier
         )
 
-    return add, weight_norm, fuse_weight_norm
+    @wp.kernel
+    def posterior(
+        moments: wp.array3d(dtype=DTYPE),
+        noise: wp.array3d(dtype=DTYPE),
+        sample: bool,
+        output: wp.array3d(dtype=DTYPE),
+    ):
+        batch, frame, channel = wp.tid()
+        mean = wp.float32(moments[batch, frame, channel])
+        if sample:
+            scale = wp.float32(moments[batch, frame, channel + output.shape[2]])
+            standard_deviation = scale
+            if scale <= wp.float32(20.0):
+                standard_deviation = wp.log(wp.float32(1.0) + wp.exp(scale))
+            output[batch, frame, channel] = DTYPE(
+                mean
+                + (standard_deviation + wp.float32(1.0e-4))
+                * wp.float32(noise[batch, frame, channel])
+            )
+        else:
+            output[batch, frame, channel] = DTYPE(mean)
+
+    return add, weight_norm, fuse_weight_norm, posterior
 
 
 class _AddPlan:
@@ -203,6 +225,37 @@ class _DecoderBlockPlan:
         return self.output
 
 
+class _EncoderBlockPlan:
+    def __init__(self, x, weights, prefix, stride):
+        self._plans = []
+        output = x
+        for index, dilation in enumerate((1, 3, 9), 1):
+            unit = _ResidualUnitPlan(
+                output, weights, f"{prefix}.res_unit{index}", dilation
+            )
+            self._plans.append(unit)
+            output = unit.output
+        snake = Snake1dPlan(
+            output,
+            weights[f"{prefix}.snake1.alpha"],
+            weights[f"{prefix}.snake1.beta"],
+        )
+        downsample = Conv1dPlan(
+            snake.output,
+            weights[f"{prefix}.conv1.weight"],
+            weights.get(f"{prefix}.conv1.bias"),
+            stride=stride,
+            padding=math.ceil(stride / 2),
+        )
+        self._plans.extend((snake, downsample))
+        self.output = downsample.output
+
+    def execute(self):
+        for plan in self._plans:
+            plan.execute()
+        return self.output
+
+
 def _canonical_parameter_names(config: OobleckVAEConfig) -> tuple[str, ...]:
     names = ["decoder.conv1.weight", "decoder.conv1.bias"]
     for block in range(len(config.downsampling_ratios)):
@@ -232,6 +285,40 @@ def _canonical_parameter_names(config: OobleckVAEConfig) -> tuple[str, ...]:
     return tuple(names)
 
 
+def _canonical_encoder_parameter_names(config: OobleckVAEConfig) -> tuple[str, ...]:
+    names = ["encoder.conv1.weight", "encoder.conv1.bias"]
+    for block in range(len(config.downsampling_ratios)):
+        prefix = f"encoder.block.{block}"
+        for unit in range(1, 4):
+            residual = f"{prefix}.res_unit{unit}"
+            for layer in range(1, 3):
+                names.extend(
+                    (
+                        f"{residual}.snake{layer}.alpha",
+                        f"{residual}.snake{layer}.beta",
+                        f"{residual}.conv{layer}.weight",
+                        f"{residual}.conv{layer}.bias",
+                    )
+                )
+        names.extend(
+            (
+                f"{prefix}.snake1.alpha",
+                f"{prefix}.snake1.beta",
+                f"{prefix}.conv1.weight",
+                f"{prefix}.conv1.bias",
+            )
+        )
+    names.extend(
+        (
+            "encoder.snake1.alpha",
+            "encoder.snake1.beta",
+            "encoder.conv2.weight",
+            "encoder.conv2.bias",
+        )
+    )
+    return tuple(names)
+
+
 def _weight_norm_sources(archive, name):
     base = name[: -len(".weight")]
     candidates = (
@@ -247,9 +334,9 @@ def _weight_norm_sources(archive, name):
     )
 
 
-def _load_decoder_weights(archive, config, device, dtype):
+def _load_oobleck_weights(archive, names, device, dtype):
     weights = {}
-    for name in _canonical_parameter_names(config):
+    for name in names:
         if name.endswith(".weight") and name not in archive.names:
             sources = _weight_norm_sources(archive, name)
             if sources is None:
@@ -282,6 +369,14 @@ def _load_decoder_weights(archive, config, device, dtype):
     if wp.get_device(device).is_cuda:
         wp.synchronize_stream(wp.get_stream(device))
     return weights
+
+
+def _checkpoint_archive(path):
+    path = Path(path)
+    archive_path = (
+        path / "diffusion_pytorch_model.safetensors" if path.is_dir() else path
+    )
+    return SafeTensorArchive(archive_path)
 
 
 class OobleckVAEDecoder:
@@ -349,11 +444,10 @@ class OobleckVAEDecoder:
     ):
         path = Path(path)
         config = OobleckVAEConfig.from_file(path)
-        archive_path = (
-            path / "diffusion_pytorch_model.safetensors" if path.is_dir() else path
+        archive = _checkpoint_archive(path)
+        weights = _load_oobleck_weights(
+            archive, _canonical_parameter_names(config), device, dtype
         )
-        archive = SafeTensorArchive(archive_path)
-        weights = _load_decoder_weights(archive, config, device, dtype)
         return cls(
             config,
             weights,
@@ -378,5 +472,128 @@ class OobleckVAEDecoder:
         wp.capture_begin(device=self.device)
         for plan in self._plans:
             plan.execute()
+        self.graph = wp.capture_end(device=self.device)
+        return self.graph
+
+
+class OobleckVAEEncoder:
+    """Fixed-length, graph-safe ACE-Step audio posterior encoder.
+
+    Input and output use channels-last layouts. ``output`` is the posterior
+    mean unless ``execute(sample=True)`` is used after filling ``noise`` with
+    independent standard-normal samples on the device.
+    """
+
+    def __init__(
+        self,
+        config,
+        weights,
+        audio_samples,
+        *,
+        batch_size=1,
+        device=None,
+        dtype=wp.float16,
+    ):
+        self.config = config
+        self.device = wp.get_device(device)
+        self.input = wp.empty(
+            (batch_size, audio_samples, config.audio_channels),
+            dtype=dtype,
+            device=self.device,
+        )
+        first = Conv1dPlan(
+            self.input,
+            weights["encoder.conv1.weight"],
+            weights.get("encoder.conv1.bias"),
+            padding=3,
+        )
+        self._plans = [first]
+        output = first.output
+        multiples = (1, *config.channel_multiples)
+        for index, stride in enumerate(config.downsampling_ratios):
+            expected_channels = config.encoder_hidden_size * multiples[index]
+            if output.shape[2] != expected_channels:
+                raise ValueError(
+                    "Oobleck encoder channel layout does not match its config"
+                )
+            block = _EncoderBlockPlan(output, weights, f"encoder.block.{index}", stride)
+            self._plans.append(block)
+            output = block.output
+        snake = Snake1dPlan(
+            output,
+            weights["encoder.snake1.alpha"],
+            weights["encoder.snake1.beta"],
+        )
+        moments = Conv1dPlan(
+            snake.output,
+            weights["encoder.conv2.weight"],
+            weights.get("encoder.conv2.bias"),
+            padding=1,
+        )
+        if moments.output.shape[2] % 2:
+            raise ValueError("Oobleck encoder moments must contain mean and scale")
+        self._plans.extend((snake, moments))
+        self.moments = moments.output
+        latent_channels = self.moments.shape[2] // 2
+        self.noise = wp.empty(
+            (batch_size, self.moments.shape[1], latent_channels),
+            dtype=dtype,
+            device=self.device,
+        )
+        self.output = wp.empty_like(self.noise)
+        self._posterior_kernel = _vae_kernels(dtype, dtype)[3]
+        self.graph = None
+        self._graph_samples = False
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        path,
+        audio_samples,
+        *,
+        batch_size=1,
+        device=None,
+        dtype=wp.float16,
+    ):
+        path = Path(path)
+        config = OobleckVAEConfig.from_file(path)
+        archive = _checkpoint_archive(path)
+        weights = _load_oobleck_weights(
+            archive, _canonical_encoder_parameter_names(config), device, dtype
+        )
+        return cls(
+            config,
+            weights,
+            audio_samples,
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
+        )
+
+    def _execute_uncaptured(self, sample):
+        for plan in self._plans:
+            plan.execute()
+        wp.launch(
+            self._posterior_kernel,
+            dim=self.output.shape,
+            inputs=[self.moments, self.noise, sample, self.output],
+            device=self.device,
+        )
+
+    def execute(self, *, sample=False):
+        if self.graph is not None:
+            if bool(sample) != self._graph_samples:
+                raise ValueError("sample mode must match the captured encoder graph")
+            wp.capture_launch(self.graph)
+        else:
+            self._execute_uncaptured(bool(sample))
+        return self.output
+
+    def capture(self, *, sample=False):
+        if not self.device.is_cuda:
+            raise RuntimeError("CUDA graph capture requires a CUDA device")
+        self._graph_samples = bool(sample)
+        wp.capture_begin(device=self.device)
+        self._execute_uncaptured(self._graph_samples)
         self.graph = wp.capture_end(device=self.device)
         return self.graph
