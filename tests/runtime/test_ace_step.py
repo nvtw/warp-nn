@@ -15,6 +15,7 @@ from warp_nn.runtime.ace_step.runner import (
     Qwen3EmbeddingConfig,
     format_lyrics,
     format_text_prompt,
+    load_silence_latent,
     pack_conditioning_sequences,
     prepare_conditioning_tokens,
     tile_silence_latent,
@@ -218,3 +219,18 @@ def test_pipeline_never_claims_incomplete_execution_is_ready(tmp_path):
     )
     with pytest.raises(RuntimeError, match="not ready"):
         pipeline.generate("prompt")
+
+
+def test_load_silence_latent_transposes_official_layout(monkeypatch):
+    channel_first = np.arange(24, dtype=np.float32).reshape(1, 3, 8)
+    monkeypatch.setattr(
+        "warp_nn.runtime.ace_step.runner.load_pytorch_zip",
+        lambda _path: channel_first,
+    )
+    loaded = load_silence_latent("silence_latent.pt", channels=3)
+    assert loaded.shape == (1, 8, 3)
+    assert loaded.flags.c_contiguous
+    np.testing.assert_array_equal(loaded, channel_first.transpose(0, 2, 1))
+
+    with pytest.raises(ValueError, match="expected 4"):
+        load_silence_latent("silence_latent.pt", channels=4)

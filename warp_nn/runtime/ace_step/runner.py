@@ -18,6 +18,7 @@ from typing import Callable, Sequence
 
 import numpy as np
 
+from ..formats.pytorch import load_pytorch_zip
 from ..tokenizers import Qwen3Tokenizer
 
 
@@ -430,6 +431,20 @@ def pack_conditioning_sequences(
     lengths = mask.sum(axis=1)
     packed_mask = np.arange(mask.shape[1])[None, :] < lengths[:, None]
     return packed, packed_mask
+
+
+def load_silence_latent(path: str | Path, *, channels: int | None = None) -> np.ndarray:
+    """Load ACE's channel-first ``.pt`` tensor as ``[1, frames, channels]``."""
+    silence = load_pytorch_zip(path)
+    if not isinstance(silence, np.ndarray) or silence.ndim != 3:
+        raise ValueError("ACE-Step silence latent must be one tensor with three axes")
+    if silence.shape[0] != 1:
+        raise ValueError("ACE-Step silence latent batch dimension must be one")
+    if channels is not None and silence.shape[1] != channels:
+        raise ValueError(
+            f"ACE-Step silence latent has {silence.shape[1]} channels, expected {channels}"
+        )
+    return np.ascontiguousarray(silence.transpose(0, 2, 1))
 
 
 def tile_silence_latent(silence: np.ndarray, frames: int) -> np.ndarray:
