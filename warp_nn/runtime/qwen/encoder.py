@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import weakref
+from functools import lru_cache
 from pathlib import Path
 from typing import Sequence
 
@@ -36,41 +37,101 @@ from ..weights import MappedWeightArchive, load_cast_weights
 from ...utils.device import parse_device
 
 
-def qwen3_encoder_weight_names(config: dict) -> tuple[str, ...]:
-    """Return the exact weights used by a standard Qwen3 base model."""
+def qwen_encoder_weight_names(config: dict) -> tuple[str, ...]:
+    """Return weights used by a supported Qwen language backbone."""
     names = ["model.embed_tokens.weight", "model.norm.weight"]
+    qk_norm = bool(config.get("qk_norm", config.get("model_type") == "qwen3"))
+    attention_bias = bool(config.get("attention_bias", False))
     for index in range(int(config["num_hidden_layers"])):
         prefix = f"model.layers.{index}."
-        names.extend(
-            prefix + suffix
-            for suffix in (
-                "input_layernorm.weight",
-                "post_attention_layernorm.weight",
-                "self_attn.q_proj.weight",
-                "self_attn.k_proj.weight",
-                "self_attn.v_proj.weight",
-                "self_attn.q_norm.weight",
-                "self_attn.k_norm.weight",
-                "self_attn.o_proj.weight",
-                "mlp.gate_proj.weight",
-                "mlp.up_proj.weight",
-                "mlp.down_proj.weight",
-            )
-        )
+        suffixes = [
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+        ]
+        if qk_norm:
+            suffixes += ["self_attn.q_norm.weight", "self_attn.k_norm.weight"]
+        if attention_bias:
+            suffixes += [
+                "self_attn.q_proj.bias",
+                "self_attn.k_proj.bias",
+                "self_attn.v_proj.bias",
+            ]
+        names.extend(prefix + suffix for suffix in suffixes)
     return tuple(names)
 
 
-def load_qwen3_encoder_config(path: str | Path) -> dict:
-    """Load and validate the standard full-attention Qwen3 shape contract."""
-    path = Path(path)
-    config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+def qwen3_encoder_weight_names(config: dict) -> tuple[str, ...]:
+    """Return the exact weights used by a standard Qwen3 base model."""
+    return qwen_encoder_weight_names(config)
+
+
+def load_qwen_encoder_config(path: str | Path) -> dict:
+    """Load a Qwen3 or language-only Qwen2.5-VL shape contract."""
+    config = json.loads((Path(path) / "config.json").read_text(encoding="utf-8"))
+    if "text_config" in config:
+        config = dict(config["text_config"])
     required = (
         "hidden_size",
         "intermediate_size",
         "num_hidden_layers",
         "num_attention_heads",
         "num_key_value_heads",
-        "head_dim",
+        "vocab_size",
+        "max_position_embeddings",
+    )
+    missing = [name for name in required if name not in config]
+    if missing:
+        raise ValueError(f"Qwen encoder config is missing {missing}")
+    if config.get("model_type") not in ("qwen3", "qwen2_5_vl"):
+        raise ValueError("Qwen encoder requires Qwen3 or Qwen2.5-VL text config")
+    layers = int(config["num_hidden_layers"])
+    layer_types = config.get("layer_types", ["full_attention"] * layers)
+    if len(layer_types) != layers or set(layer_types) != {"full_attention"}:
+        raise ValueError("Qwen encoder supports full-attention layers only")
+    query_heads = int(config["num_attention_heads"])
+    kv_heads = int(config["num_key_value_heads"])
+    if query_heads <= 0 or kv_heads <= 0 or query_heads % kv_heads:
+        raise ValueError("Qwen query heads must be a positive multiple of KV heads")
+    if "head_dim" in config:
+        head_dim = int(config["head_dim"])
+    else:
+        hidden = int(config["hidden_size"])
+        if hidden % query_heads:
+            raise ValueError("Qwen hidden size must divide evenly across query heads")
+        head_dim = hidden // query_heads
+    if head_dim <= 0:
+        raise ValueError("Qwen head geometry is inconsistent")
+    config["head_dim"] = head_dim
+    if config.get("hidden_act", "silu") != "silu":
+        raise ValueError("Qwen encoder requires SiLU-gated MLPs")
+    rope_scaling = config.get("rope_scaling")
+    if rope_scaling not in (None, {}):
+        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
+        if config.get("model_type") != "qwen2_5_vl" or rope_type != "mrope":
+            raise ValueError("Qwen encoder requires default or text-only M-RoPE")
+    return config
+
+
+def load_qwen3_encoder_config(path: str | Path) -> dict:
+    """Load and validate the standard full-attention Qwen3 shape contract."""
+    path = Path(path)
+    raw_config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    if "head_dim" not in raw_config:
+        raise ValueError("Qwen3 encoder config is missing ['head_dim']")
+    config = load_qwen_encoder_config(path)
+    required = (
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
         "vocab_size",
         "max_position_embeddings",
     )
@@ -97,6 +158,20 @@ def load_qwen3_encoder_config(path: str | Path) -> dict:
     if config.get("rope_scaling") not in (None, {}):
         raise ValueError("Qwen3 encoder currently supports default RoPE only")
     return config
+
+
+@lru_cache(maxsize=None)
+def _projection_bias_kernel(dtype):
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def add_bias(values: wp.array2d(dtype=DTYPE), bias: wp.array1d(dtype=DTYPE)):
+        row, column = wp.tid()
+        values[row, column] = DTYPE(
+            wp.float32(values[row, column]) + wp.float32(bias[column])
+        )
+
+    return add_bias
 
 
 class _Qwen3EncoderPlan:
@@ -148,7 +223,9 @@ class _Qwen3EncoderPlan:
             runner.head_dim, self.dtype
         )
 
-    def _linear(self, name: str, source: str, weight: str) -> Operation:
+    def _linear(
+        self, name: str, source: str, weight: str, bias: str | None = None
+    ) -> Operation:
         op = Operation("Linear", [source, weight], [name])
         plan_linear(
             op,
@@ -158,6 +235,7 @@ class _Qwen3EncoderPlan:
             cublas=self.runner.cublas,
         )
         op.attrs["_sequence"] = (op,)
+        op.attrs["_bias"] = bias
         return op
 
     def _rms(self, name: str, source: str, scale: str) -> Operation:
@@ -210,21 +288,29 @@ class _Qwen3EncoderPlan:
                     f"layer.{index}.{projection}",
                     normalized,
                     attention + f"{projection}_proj.weight",
+                    (
+                        attention + f"{projection}_proj.bias"
+                        if self.runner.attention_bias
+                        else None
+                    ),
                 )
             self.tensors[f"layer.{index}.query"] = self.query
             self.shapes[f"layer.{index}.query"] = tuple(self.query.shape)
             self.tensors[f"layer.{index}.key"] = self.key
             self.shapes[f"layer.{index}.key"] = tuple(self.key.shape)
-            layer["q_norm"] = self._rms(
-                f"layer.{index}.q_norm",
-                f"layer.{index}.query",
-                attention + "q_norm.weight",
-            )
-            layer["k_norm"] = self._rms(
-                f"layer.{index}.k_norm",
-                f"layer.{index}.key",
-                attention + "k_norm.weight",
-            )
+            if self.runner.qk_norm:
+                layer["q_norm"] = self._rms(
+                    f"layer.{index}.q_norm",
+                    f"layer.{index}.query",
+                    attention + "q_norm.weight",
+                )
+                layer["k_norm"] = self._rms(
+                    f"layer.{index}.k_norm",
+                    f"layer.{index}.key",
+                    attention + "k_norm.weight",
+                )
+            else:
+                layer["q_norm"] = layer["k_norm"] = None
             self.tensors[f"layer.{index}.attention"] = self.attention
             self.shapes[f"layer.{index}.attention"] = tuple(self.attention.shape)
             layer["output"] = self._linear(
@@ -281,6 +367,15 @@ class _Qwen3EncoderPlan:
         execute_operations(
             operation.attrs["_sequence"], self.tensors, self.shapes, self.device
         )
+        bias = operation.attrs.get("_bias")
+        if bias is not None:
+            output = self.tensors[operation.outputs[0]]
+            wp.launch(
+                _projection_bias_kernel(self.dtype),
+                dim=output.shape,
+                inputs=[output, self.runner.weights[bias]],
+                device=self.device,
+            )
 
     def execute(self) -> wp.array:
         wp.launch(
@@ -313,19 +408,17 @@ class _Qwen3EncoderPlan:
                     ],
                     device=self.device,
                 )
-            self._execute(layer["q_norm"])
-            self._execute(layer["k_norm"])
+            if self.runner.qk_norm:
+                self._execute(layer["q_norm"])
+                self._execute(layer["k_norm"])
+                query = self.tensors[layer["q_norm"].outputs[0]]
+                key = self.tensors[layer["k_norm"].outputs[0]]
+            else:
+                query = self.query
+                key = self.key
             for source, output, heads in (
-                (
-                    self.tensors[layer["q_norm"].outputs[0]],
-                    self.query_rotated,
-                    self.runner.query_heads,
-                ),
-                (
-                    self.tensors[layer["k_norm"].outputs[0]],
-                    self.key_rotated,
-                    self.runner.kv_heads,
-                ),
+                (query, self.query_rotated, self.runner.query_heads),
+                (key, self.key_rotated, self.runner.kv_heads),
             ):
                 wp.launch(
                     rotary,
@@ -395,8 +488,8 @@ class _Qwen3EncoderPlan:
         return self.output
 
 
-class Qwen3Encoder:
-    """Return standard Qwen3 final hidden states or input token embeddings.
+class QwenEncoder:
+    """Return final hidden states or embeddings from a Qwen language backbone.
 
     Caption encoding is causal, matching Hugging Face ``Qwen3Model``.  Lyric
     conditioning can call :meth:`embed_ids` to bypass all transformer layers,
@@ -410,9 +503,10 @@ class Qwen3Encoder:
         dtype=wp.bfloat16,
         device=None,
         use_cublas: bool = True,
+        tokenizer_path: str | Path | None = None,
     ):
         path = Path(path)
-        self.config = load_qwen3_encoder_config(path)
+        self.config = self.config_loader(path)
         self.device = parse_device(device)
         self.dtype = dtype
         if dtype not in (wp.float16, wp.bfloat16):
@@ -423,8 +517,12 @@ class Qwen3Encoder:
         self.kv_heads = int(self.config["num_key_value_heads"])
         self.head_dim = int(self.config["head_dim"])
         self.epsilon = float(self.config.get("rms_norm_eps", 1.0e-6))
+        self.qk_norm = bool(
+            self.config.get("qk_norm", self.config.get("model_type") == "qwen3")
+        )
+        self.attention_bias = bool(self.config.get("attention_bias", False))
         archive = SafeTensorArchive(path)
-        names = qwen3_encoder_weight_names(self.config)
+        names = qwen_encoder_weight_names(self.config)
         missing = set(names) - set(archive.names)
         if missing and all(
             name.removeprefix("model.") in archive.names for name in names
@@ -435,10 +533,12 @@ class Qwen3Encoder:
             missing = set()
         if missing:
             raise ValueError(
-                f"Qwen3 encoder checkpoint is missing {sorted(missing)[:5]}"
+                f"Qwen encoder checkpoint is missing {sorted(missing)[:5]}"
             )
         self.weights = load_cast_weights(archive, names, self.device, dtype)
-        self.tokenizer = Qwen3Tokenizer(path)
+        self.tokenizer = Qwen3Tokenizer(
+            path if tokenizer_path is None else tokenizer_path
+        )
         self.cublas = (
             try_create_cublas() if use_cublas and self.device.is_cuda else None
         )
@@ -455,10 +555,12 @@ class Qwen3Encoder:
         self.sin_cache = wp.array(sin, dtype=dtype, device=self.device)
         self._plans = {}
 
+    config_loader = staticmethod(load_qwen_encoder_config)
+
     def _plan(self, sequence: int) -> _Qwen3EncoderPlan:
         maximum = int(self.config["max_position_embeddings"])
         if sequence <= 0 or sequence > maximum:
-            raise ValueError(f"Qwen3 sequence length must be between 1 and {maximum}")
+            raise ValueError(f"Qwen sequence length must be between 1 and {maximum}")
         plan = self._plans.get(sequence)
         if plan is None:
             plan = self._plans[sequence] = _Qwen3EncoderPlan(self, sequence)
@@ -468,11 +570,11 @@ class Qwen3Encoder:
         """Return ``[1, sequence, hidden]`` final hidden states."""
         values = np.asarray(token_ids, dtype=np.int64)
         if values.ndim != 1:
-            raise ValueError("Qwen3 caption token IDs must be one-dimensional")
+            raise ValueError("Qwen token IDs must be one-dimensional")
         if values.size == 0:
-            raise ValueError("Qwen3 caption token IDs must not be empty")
+            raise ValueError("Qwen token IDs must not be empty")
         if values.min() < 0 or values.max() >= int(self.config["vocab_size"]):
-            raise ValueError("Qwen3 token ID is outside the vocabulary")
+            raise ValueError("Qwen token ID is outside the vocabulary")
         plan = self._plan(values.size)
         plan.input_ids.assign(values[None, :])
         return plan.run()
@@ -506,3 +608,9 @@ class Qwen3Encoder:
             device=self.device,
         )
         return output
+
+
+class Qwen3Encoder(QwenEncoder):
+    """Strict standard Qwen3 encoder API used by ACE-Step."""
+
+    config_loader = staticmethod(load_qwen3_encoder_config)
