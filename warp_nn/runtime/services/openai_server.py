@@ -174,8 +174,8 @@ class ChatCompletions:
         self._cached_ids: list[int] = []
         self._cache_serial = 0
         self._continuation = None
-        if max_batch_size not in (1, 2, 4):
-            raise ValueError("max_batch_size must be 1, 2, or 4")
+        if max_batch_size not in (1, 2, 4, 8):
+            raise ValueError("max_batch_size must be 1, 2, 4, or 8")
         if batch_wait_ms < 0.0:
             raise ValueError("batch_wait_ms must be non-negative")
         self.max_batch_size = max_batch_size

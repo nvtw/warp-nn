@@ -217,6 +217,22 @@ def test_single_request_uses_optimized_decode_one_bucket():
     assert runner.batch.decodes == []
 
 
+def test_eight_request_executor_uses_one_shared_batch_decoder():
+    runner = _Runner()
+    executor = QwenBatchExecutor(runner, _Tokenizer(), 8)
+    with ContinuousBatchScheduler(
+        executor, max_active=8, idle_wait_ms=20
+    ) as scheduler:
+        handles = [
+            scheduler.submit(BatchRequest(_payload([index + 1]), 1, 2))
+            for index in range(8)
+        ]
+        assert [handle.result(2).tokens for handle in handles] == [(1, 0)] * 8
+
+    assert runner.batch.size == 8
+    assert any(active == (True,) * 8 for _, active in runner.batch.decodes)
+
+
 def test_public_endpoint_maps_batch_queue_overload_to_429():
     backend = ChatCompletions("warp-qwen", _Runner(), _Tokenizer(), max_batch_size=2)
 

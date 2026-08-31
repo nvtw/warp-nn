@@ -36,7 +36,7 @@ def main():
     parser.add_argument(
         "--max-batch-size",
         type=int,
-        choices=(1, 2, 4),
+        choices=(1, 2, 4, 8),
         default=1,
         help="Opt-in Qwen continuous decode batching",
     )

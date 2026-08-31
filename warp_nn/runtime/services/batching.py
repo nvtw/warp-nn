@@ -147,8 +147,8 @@ class ContinuousBatchScheduler:
         active_prefill_chunk: int = 64,
         stream_queue_size: int = 32,
     ):
-        if not 0 < max_active <= 4:
-            raise ValueError("max_active must be between one and four")
+        if not 0 < max_active <= 8:
+            raise ValueError("max_active must be between one and eight")
         if queue_size <= 0 or stream_queue_size <= 0:
             raise ValueError("scheduler capacities must be positive")
         if idle_wait_ms < 0.0 or active_prefill_chunk <= 0:

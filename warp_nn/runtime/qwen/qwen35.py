@@ -265,8 +265,8 @@ class _Qwen35Plan:
         self.runner = weakref.proxy(runner)
         self.rows = rows
         self.decode_batch = bool(decode_batch)
-        if self.decode_batch and (external_embeddings or rows not in (2, 4)):
-            raise ValueError("Qwen decode batches require 2 or 4 text-only slots")
+        if self.decode_batch and (external_embeddings or rows not in (2, 4, 8)):
+            raise ValueError("Qwen decode batches require 2, 4, or 8 text-only slots")
         self.device = runner.device
         self.dtype = runner.dtype
         self.config = runner.config
@@ -1189,8 +1189,8 @@ class Qwen35BatchDecoder:
     """Independent Qwen decode slots sharing one runner's immutable weights."""
 
     def __init__(self, runner, max_batch_size: int):
-        if max_batch_size not in (2, 4):
-            raise ValueError("Qwen batch size must be 2 or 4")
+        if max_batch_size not in (2, 4, 8):
+            raise ValueError("Qwen batch size must be 2, 4, or 8")
         self.runner = runner
         self.max_batch_size = max_batch_size
         self.device = runner.device

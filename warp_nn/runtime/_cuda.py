@@ -280,15 +280,17 @@ _SMALL_BATCH_GROUPED_PROJECTION = r"""
 def get_small_batch_grouped_projection(
     dtype: type, batch_rows: int, group_outputs: int
 ):
-    """Return a projection that shares each weight load across 2 or 4 rows."""
+    """Return a projection that shares each weight load across small batches."""
     if dtype == wp.float16:
         native_type, native_bf16 = "wp::float16", "0"
     elif dtype == wp.bfloat16:
         native_type, native_bf16 = "wp::bfloat16", "1"
     else:
         raise TypeError("Small-batch grouped projection requires FP16 or BF16")
-    if batch_rows not in (2, 4) or group_outputs not in (4, 8):
-        raise ValueError("Small-batch grouped projection requires 2/4 rows and 4/8 outputs")
+    if batch_rows not in (2, 4, 8) or group_outputs not in (4, 8):
+        raise ValueError(
+            "Small-batch grouped projection requires 2/4/8 rows and 4/8 outputs"
+        )
     snippet = (
         _SMALL_BATCH_GROUPED_PROJECTION.replace("NATIVE_TYPE", native_type)
         .replace("NATIVE_BF16", native_bf16)

@@ -498,7 +498,7 @@ def plan_linear(
     small_batch_grouped = (
         bool(op.attrs.get("_small_batch_decode"))
         and device.is_cuda
-        and rows in (2, 4)
+        and rows in (2, 4, 8)
         and dtype in (wp.float16, wp.bfloat16)
         and columns % 8 == 0
         and inner % 8 == 0

@@ -257,7 +257,10 @@ def test_qwen35_low_memory_tail_falls_back_to_decode(tmp_path, monkeypatch):
     np.testing.assert_allclose(uncaptured, warm, atol=2.0e-2, rtol=2.0e-2)
 
 
-@pytest.mark.parametrize("rows,outputs_per_group", [(2, 4), (2, 8), (4, 4), (4, 8)])
+@pytest.mark.parametrize(
+    "rows,outputs_per_group",
+    [(2, 4), (2, 8), (4, 4), (4, 8), (8, 4)],
+)
 def test_small_batch_grouped_projection_matches_numpy(rows, outputs_per_group):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
@@ -282,7 +285,7 @@ def test_small_batch_grouped_projection_matches_numpy(rows, outputs_per_group):
     )
 
 
-@pytest.mark.parametrize("batch_size", [2, 4])
+@pytest.mark.parametrize("batch_size", [2, 4, 8])
 def test_qwen35_independent_batch_decode_matches_sequential_and_captures(
     tmp_path, batch_size
 ):

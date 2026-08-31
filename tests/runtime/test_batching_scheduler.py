@@ -61,7 +61,7 @@ class FakeExecutor:
         return counts
 
     def select_decode_bucket(self, active_count):
-        return next(size for size in (1, 2, 4) if size >= active_count)
+        return next(size for size in (1, 2, 4, 8) if size >= active_count)
 
     def decode(self, slots, bucket_size):
         self.calls.append(("decode", tuple(slots), bucket_size))
@@ -96,6 +96,19 @@ def test_idle_requests_coalesce_and_executor_selects_bucket():
     decode = next(call for call in executor.calls if call[0] == "decode")
     assert len(decode[1]) == 4
     assert decode[2] == 4
+
+
+def test_eight_requests_coalesce_into_the_extended_bucket():
+    executor = FakeExecutor()
+    with ContinuousBatchScheduler(
+        executor, max_active=8, idle_wait_ms=20
+    ) as scheduler:
+        handles = [scheduler.submit(request(str(index))) for index in range(8)]
+        assert [handle.result(2).tokens for handle in handles] == [(1,)] * 8
+
+    decode = next(call for call in executor.calls if call[0] == "decode")
+    assert len(decode[1]) == 8
+    assert decode[2] == 8
 
 
 def test_decode_is_prioritized_and_active_prefill_is_chunked():
