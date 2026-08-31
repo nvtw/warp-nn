@@ -34,6 +34,7 @@ from warp_nn.runtime.kernels import (
     _GEMM_TRANSB_TILED_KERNEL,
     _gather_block_quantized_int8_kernel,
     _get_grouped_decode_linear_kernel,
+    _get_small_batch_grouped_linear_kernel,
     _get_bidirectional_gqa_attention_kernel,
     _get_linear_tiled_kernel,
     _get_prefill_mma_linear_kernel,
@@ -147,6 +148,7 @@ def _launch_partitioned_gqa(
     scale: float,
     window: int,
     device,
+    sequence_length: int | None = None,
 ):
     """Launch partitioned decode attention using a reusable workspace."""
     (
@@ -163,7 +165,7 @@ def _launch_partitioned_gqa(
     groups_per_batch = kv_heads * (
         (queries_per_kv + heads_per_group - 1) // heads_per_group
     )
-    sequence_length = output.shape[0]
+    sequence_length = output.shape[0] if sequence_length is None else sequence_length
     row_groups = (sequence_length + rows_per_group - 1) // rows_per_group
     batches = query.shape[0] // (query_heads * sequence_length)
     wp.launch_tiled(
@@ -336,6 +338,15 @@ def _exec_linear(op, tensors, shapes, device):
                 block_dim=128,
                 device=device,
             )
+        elif op.attrs.get("_small_batch_grouped_kernel"):
+            outputs_per_group = op.attrs["_small_batch_outputs_per_group"]
+            wp.launch(
+                op.attrs["_kernel"],
+                dim=(weight.shape[0] // outputs_per_group) * 32,
+                inputs=[x, weight, output, op.attrs["_inner"]],
+                block_dim=128,
+                device=device,
+            )
         elif op.attrs.get("_vector_kernel"):
             wp.launch_tiled(
                 op.attrs["_kernel"],
@@ -484,9 +495,31 @@ def plan_linear(
         and weight.ptr % 16 == 0
         and output.ptr % 16 == 0
     )
+    small_batch_grouped = (
+        bool(op.attrs.get("_small_batch_decode"))
+        and device.is_cuda
+        and rows in (2, 4)
+        and dtype in (wp.float16, wp.bfloat16)
+        and columns % 8 == 0
+        and inner % 8 == 0
+        and (columns + 31) // 32 >= device.sm_count
+        and activation.is_contiguous
+        and weight.is_contiguous
+        and output.is_contiguous
+        and activation.ptr % 16 == 0
+        and weight.ptr % 16 == 0
+        and output.ptr % 16 == 0
+    )
     if grouped_decode:
         op.attrs["_kernel"] = _get_grouped_decode_linear_kernel(dtype)
         op.attrs["_grouped_decode_kernel"] = True
+    elif small_batch_grouped:
+        outputs_per_group = int(op.attrs.get("_small_batch_outputs_per_group", 8))
+        op.attrs["_kernel"] = _get_small_batch_grouped_linear_kernel(
+            dtype, rows, outputs_per_group
+        )
+        op.attrs["_small_batch_grouped_kernel"] = True
+        op.attrs["_small_batch_outputs_per_group"] = outputs_per_group
     elif cublas is not None and device.is_cuda and dtype in (wp.float16, wp.bfloat16):
         op.attrs["_cublas"] = cublas
     elif device.is_cuda:

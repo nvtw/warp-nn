@@ -21,12 +21,17 @@ from warp_nn.runtime.formats.gguf import (
 )
 from warp_nn.runtime.kernels import (
     _append_head_cache_kernel,
+    _append_head_cache_decode_batch_kernel,
     _causal_conv_rows_kernel,
+    _causal_conv_decode_batch_kernel,
     _gather_rows_kernel,
     _cast_kernel_for_dtypes,
+    _copy_head_cache_prefix_slot_kernel,
     _get_gated_rms_norm_kernel,
+    _get_gated_delta_decode_batch_kernel,
     _get_gather_q8_0_rows_kernel,
     _get_mrope_embedding_kernel,
+    _get_mrope_decode_batch_kernel,
     _get_gqa_attention_kernel,
     _get_greedy_argmax_kernels,
     _get_linear_attention_kernel,
@@ -34,13 +39,17 @@ from warp_nn.runtime.kernels import (
     _linear_attention_value_blocks,
     _prepare_gated_delta_kernel,
     _reorder_heads_kernel,
+    _reorder_heads_decode_batch_kernel,
     _reorder_interleaved_heads_kernel,
     _overlay_embedding_rows_kernel,
     _set_sequence_end,
+    _stage_decode_batch_kernel,
     _sigmoid_gate_kernel,
     _split_last_axis_kernel,
     _unpack_gated_heads_kernel,
+    _unpack_gated_heads_decode_batch_kernel,
     _update_conv_rows_state_kernel,
+    _update_conv_decode_batch_state_kernel,
 )
 from warp_nn.runtime.operators import (
     Operation,
@@ -247,10 +256,17 @@ class _Qwen35Plan:
     """Fixed-row execution plan sharing weights and recurrent state."""
 
     def __init__(
-        self, runner: Qwen35Runner, rows: int, external_embeddings: bool = False
+        self,
+        runner: Qwen35Runner,
+        rows: int,
+        external_embeddings: bool = False,
+        decode_batch: bool = False,
     ):
         self.runner = weakref.proxy(runner)
         self.rows = rows
+        self.decode_batch = bool(decode_batch)
+        if self.decode_batch and (external_embeddings or rows not in (2, 4)):
+            raise ValueError("Qwen decode batches require 2 or 4 text-only slots")
         self.device = runner.device
         self.dtype = runner.dtype
         self.config = runner.config
@@ -279,6 +295,10 @@ class _Qwen35Plan:
         self, name: str, x: str, weight: str, q8_activation_cache=None
     ) -> Operation:
         op = Operation("Linear", [x, weight], [name])
+        if self.decode_batch:
+            op.attrs.update(
+                _small_batch_decode=True, _small_batch_outputs_per_group=4
+            )
         plan_linear(
             op,
             self.tensors,
@@ -393,12 +413,19 @@ class _Qwen35Plan:
             self.layers.append(layer)
 
         last_normalized = "final.last_normalized"
-        self.tensors[last_normalized] = self.tensors[normalized_name][
-            self.rows - 1 : self.rows
-        ]
-        self.shapes[last_normalized] = (1, self.runner.hidden_size)
+        if self.decode_batch:
+            self.tensors[last_normalized] = self.tensors[normalized_name]
+            self.shapes[last_normalized] = (self.rows, self.runner.hidden_size)
+        else:
+            self.tensors[last_normalized] = self.tensors[normalized_name][
+                self.rows - 1 : self.rows
+            ]
+            self.shapes[last_normalized] = (1, self.runner.hidden_size)
         self.lm_head = self._linear("logits", last_normalized, "lm_head.weight")
-        self.logits = self.tensors["logits"].reshape((1, 1, self.config["vocab_size"]))
+        output_rows = self.rows if self.decode_batch else 1
+        self.logits = self.tensors["logits"].reshape(
+            (output_rows, 1, self.config["vocab_size"])
+        )
 
     def _build_linear_attention(
         self, layer: dict, index: int, prefix: str, x: str
@@ -460,6 +487,12 @@ class _Qwen35Plan:
             wp.float32,
             scalar_gated_delta=True,
         )
+        if self.decode_batch:
+            layer["attention_kernel_batch"] = _get_gated_delta_decode_batch_kernel(
+                self.runner.linear_key_size,
+                self.runner.linear_value_size,
+                self.dtype,
+            )
         scale_dtype = self.runner.weights[attn + "norm.weight"].dtype
         layer["gated_block"], layer["gated_kernel"] = _get_gated_rms_norm_kernel(
             self.runner.linear_value_size,
@@ -502,20 +535,42 @@ class _Qwen35Plan:
             attn + "v_proj.weight",
             projection_q8_cache,
         )
-        layer["q"] = wp.empty(
-            (self.runner.query_heads * self.rows, self.runner.head_size),
-            dtype=self.dtype,
-            device=self.device,
-        )
+        if self.decode_batch:
+            layer["q_heads"] = wp.empty(
+                (self.rows, self.runner.query_heads, 1, self.runner.head_size),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            layer["k_heads"] = wp.empty(
+                (self.rows, self.runner.kv_heads, 1, self.runner.head_size),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            layer["v_heads"] = wp.empty_like(layer["k_heads"])
+            layer["q"] = layer["q_heads"].reshape(
+                (self.rows * self.runner.query_heads, self.runner.head_size)
+            )
+            layer["k"] = layer["k_heads"].reshape(
+                (self.rows * self.runner.kv_heads, self.runner.head_size)
+            )
+            layer["v"] = layer["v_heads"].reshape(
+                (self.rows * self.runner.kv_heads, self.runner.head_size)
+            )
+        else:
+            layer["q"] = wp.empty(
+                (self.runner.query_heads * self.rows, self.runner.head_size),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            layer["k"] = wp.empty(
+                (self.runner.kv_heads * self.rows, self.runner.head_size),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            layer["v"] = wp.empty_like(layer["k"])
         layer["attention_gate"] = wp.empty(
             (self.rows, attention_width), dtype=self.dtype, device=self.device
         )
-        layer["k"] = wp.empty(
-            (self.runner.kv_heads * self.rows, self.runner.head_size),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        layer["v"] = wp.empty_like(layer["k"])
         self.tensors[f"layer.{index}.q"] = layer["q"]
         self.shapes[f"layer.{index}.q"] = tuple(layer["q"].shape)
         self.tensors[f"layer.{index}.k"] = layer["k"]
@@ -526,8 +581,18 @@ class _Qwen35Plan:
         layer["k_norm"] = self._rms(
             f"layer.{index}.k_norm", f"layer.{index}.k", attn + "k_norm.weight"
         )
-        layer["q_rotated"] = wp.empty_like(layer["q"])
-        layer["k_rotated"] = wp.empty_like(layer["k"])
+        if self.decode_batch:
+            layer["q_rotated_heads"] = wp.empty_like(layer["q_heads"])
+            layer["k_rotated_heads"] = wp.empty_like(layer["k_heads"])
+            layer["q_rotated"] = layer["q_rotated_heads"].reshape(
+                layer["q"].shape
+            )
+            layer["k_rotated"] = layer["k_rotated_heads"].reshape(
+                layer["k"].shape
+            )
+        else:
+            layer["q_rotated"] = wp.empty_like(layer["q"])
+            layer["k_rotated"] = wp.empty_like(layer["k"])
         layer["core"] = wp.empty(
             (self.rows, attention_width), dtype=self.dtype, device=self.device
         )
@@ -538,7 +603,7 @@ class _Qwen35Plan:
         if not hasattr(self, "partitioned_attention"):
             self.attention_partitions = (
                 _decode_attention_partitions(self.runner.head_size)
-                if self.rows == 1
+                if self.rows == 1 or self.decode_batch
                 else 16
             )
             partitions = self.attention_partitions
@@ -567,7 +632,117 @@ class _Qwen35Plan:
             op.attrs["_sequence"], self.tensors, self.shapes, self.device
         )
 
+    def _execute_linear_attention_batch(self, layer: dict, index: int) -> None:
+        for name in ("qkv", "z", "a", "b"):
+            self._execute_op(layer[name])
+        qkv = self.tensors[layer["qkv"].outputs[0]]
+        wp.launch(
+            _causal_conv_decode_batch_kernel,
+            dim=layer["conv"].shape,
+            inputs=[
+                qkv,
+                self.runner.weights[
+                    f"model.language_model.layers.{index}.linear_attn.conv1d.weight"
+                ],
+                self.runner.conv_states[index],
+                self.runner.active,
+                layer["conv"],
+            ],
+            device=self.device,
+        )
+        offset = 0
+        for output in (layer["q"], layer["k"], layer["v"]):
+            wp.launch(
+                _split_last_axis_kernel,
+                dim=output.shape,
+                inputs=[layer["conv"], output, offset],
+                device=self.device,
+            )
+            offset += output.shape[1]
+        wp.launch(
+            _update_conv_decode_batch_state_kernel,
+            dim=qkv.shape,
+            inputs=[qkv, self.runner.conv_states[index], self.runner.active],
+            device=self.device,
+        )
+        for source, output in (
+            (layer["q"], layer["q_norm"]),
+            (layer["k"], layer["k_norm"]),
+        ):
+            wp.launch_tiled(
+                layer["lp_kernel"],
+                dim=self.rows * self.runner.linear_key_heads,
+                inputs=[
+                    source.reshape((-1, self.runner.linear_key_size)),
+                    output.reshape((-1, self.runner.linear_key_size)),
+                    1.0e-6,
+                ],
+                block_dim=layer["lp_block"],
+                device=self.device,
+            )
+        wp.launch(
+            _prepare_gated_delta_kernel,
+            dim=layer["decay"].shape,
+            inputs=[
+                self.tensors[layer["a"].outputs[0]],
+                self.tensors[layer["b"].outputs[0]],
+                self.runner.weights[
+                    f"model.language_model.layers.{index}.linear_attn.A_log"
+                ],
+                self.runner.weights[
+                    f"model.language_model.layers.{index}.linear_attn.dt_bias"
+                ],
+                self.runner.ssm_a_is_decay,
+                layer["decay"],
+                layer["beta"],
+            ],
+            device=self.device,
+        )
+        wp.launch_tiled(
+            layer["attention_kernel_batch"],
+            dim=self.rows
+            * self.runner.linear_value_heads
+            * _linear_attention_value_blocks(self.runner.linear_value_size),
+            inputs=[
+                layer["q_norm"],
+                layer["k_norm"],
+                layer["v"],
+                self.runner.recurrent_states[index],
+                layer["decay"],
+                layer["beta"],
+                self.runner.active,
+                layer["core"],
+                self.runner.linear_key_heads,
+                self.runner.linear_key_heads,
+                self.runner.linear_value_heads,
+                self.runner.linear_key_size**-0.5,
+            ],
+            block_dim=32,
+            device=self.device,
+        )
+        wp.launch_tiled(
+            layer["gated_kernel"],
+            dim=self.rows * self.runner.linear_value_heads,
+            inputs=[
+                layer["core"].reshape((-1, self.runner.linear_value_size)),
+                self.tensors[layer["z"].outputs[0]].reshape(
+                    (-1, self.runner.linear_value_size)
+                ),
+                self.runner.weights[
+                    f"model.language_model.layers.{index}.linear_attn.norm.weight"
+                ].reshape((1, self.runner.linear_value_size)),
+                layer["gated"].reshape((-1, self.runner.linear_value_size)),
+                self.runner.epsilon,
+            ],
+            block_dim=layer["gated_block"],
+            device=self.device,
+        )
+        self._execute_op(layer["output"])
+
     def _execute_linear_attention(self, layer: dict, index: int) -> None:
+        if self.decode_batch:
+            self._execute_linear_attention_batch(layer, index)
+            return
         for name in ("qkv", "z", "a", "b"):
             self._execute_op(layer[name])
         qkv = self.tensors[layer["qkv"].outputs[0]]
@@ -681,7 +856,106 @@ class _Qwen35Plan:
         )
         self._execute_op(layer["output"])
 
+    def _execute_full_attention_batch(self, layer: dict, index: int) -> None:
+        for name in ("q_proj", "k_proj", "v_proj"):
+            self._execute_op(layer[name])
+        wp.launch(
+            _unpack_gated_heads_decode_batch_kernel,
+            dim=(self.rows, self.runner.query_heads, self.runner.head_size),
+            inputs=[
+                self.tensors[layer["q_proj"].outputs[0]],
+                layer["q_heads"],
+                layer["attention_gate"],
+                self.runner.head_size,
+                self.runner.gguf_layout,
+            ],
+            device=self.device,
+        )
+        for projected, output, interleaved in (
+            (layer["k_proj"], layer["k_heads"], self.runner.gguf_layout),
+            (layer["v_proj"], layer["v_heads"], False),
+        ):
+            wp.launch(
+                _reorder_heads_decode_batch_kernel,
+                dim=(self.rows, self.runner.kv_heads, self.runner.head_size),
+                inputs=[
+                    self.tensors[projected.outputs[0]],
+                    output,
+                    self.runner.head_size,
+                    interleaved,
+                ],
+                device=self.device,
+            )
+        self._execute_op(layer["q_norm"])
+        self._execute_op(layer["k_norm"])
+        rotary = _get_mrope_decode_batch_kernel(self.dtype)
+        for source, output, heads in (
+            (
+                self.tensors[layer["q_norm"].outputs[0]].reshape(
+                    (self.rows, self.runner.query_heads, 1, self.runner.head_size)
+                ),
+                layer["q_rotated_heads"],
+                self.runner.query_heads,
+            ),
+            (
+                self.tensors[layer["k_norm"].outputs[0]].reshape(
+                    (self.rows, self.runner.kv_heads, 1, self.runner.head_size)
+                ),
+                layer["k_rotated_heads"],
+                self.runner.kv_heads,
+            ),
+        ):
+            wp.launch(
+                rotary,
+                dim=(self.rows, heads, self.runner.head_size),
+                inputs=[
+                    source,
+                    self.rope_position_ids,
+                    self.runner.cos_cache,
+                    self.runner.sin_cache,
+                    output,
+                    self.runner.rotary_dim,
+                ],
+                device=self.device,
+            )
+        key_cache, value_cache = self.runner.kv_caches[index]
+        for source, cache in (
+            (layer["k_rotated_heads"], key_cache),
+            (layer["v_heads"], value_cache),
+        ):
+            wp.launch(
+                _append_head_cache_decode_batch_kernel,
+                dim=(self.rows, self.runner.kv_heads, self.runner.head_size),
+                inputs=[source, self.runner.positions, self.runner.active, cache],
+                device=self.device,
+            )
+        _launch_partitioned_gqa(
+            layer["partitioned_attention"][self.attention_partitions],
+            layer["q_rotated"],
+            key_cache,
+            value_cache,
+            self.runner.sequence_end,
+            layer["core"],
+            self.runner.query_heads,
+            self.runner.kv_heads,
+            self.runner.cache_capacity,
+            self.runner.head_size**-0.5,
+            0,
+            self.device,
+            sequence_length=1,
+        )
+        wp.launch(
+            _sigmoid_gate_kernel,
+            dim=layer["core"].shape,
+            inputs=[layer["core"], layer["attention_gate"], layer["gated"]],
+            device=self.device,
+        )
+        self._execute_op(layer["output"])
+
     def _execute_full_attention(self, layer: dict, index: int) -> None:
+        if self.decode_batch:
+            self._execute_full_attention_batch(layer, index)
+            return
         for name in ("q_proj", "k_proj", "v_proj"):
             self._execute_op(layer[name])
         wp.launch(
@@ -854,6 +1128,181 @@ class _Qwen35Plan:
         return self.logits
 
 
+class _Qwen35BatchPlanState:
+    """Fixed-size view of a batch decoder's shared persistent state."""
+
+    def __init__(self, decoder, rows: int):
+        self._decoder = decoder
+        self.rows = rows
+        self.active = decoder.active[:rows]
+        self.positions = decoder.positions[:rows]
+        self.sequence_end = decoder.sequence_end[:rows]
+        self.conv_states = {
+            index: value[:rows] for index, value in decoder.conv_states.items()
+        }
+        self.recurrent_states = {}
+        for index, value in decoder.recurrent_states.items():
+            per_slot = value.shape[0] // decoder.max_batch_size
+            self.recurrent_states[index] = value[: rows * per_slot]
+        self.kv_caches = {}
+        for index, (key, value) in decoder.kv_caches.items():
+            per_slot = key.shape[0] // decoder.max_batch_size
+            self.kv_caches[index] = (
+                key[: rows * per_slot],
+                value[: rows * per_slot],
+            )
+
+    def __getattr__(self, name):
+        return getattr(self._decoder.runner, name)
+
+
+class Qwen35BatchDecoder:
+    """Independent Qwen decode slots sharing one runner's immutable weights."""
+
+    def __init__(self, runner, max_batch_size: int):
+        if max_batch_size not in (2, 4):
+            raise ValueError("Qwen batch size must be 2 or 4")
+        self.runner = runner
+        self.max_batch_size = max_batch_size
+        self.device = runner.device
+        self.dtype = runner.dtype
+        self._preflight_memory()
+        rows = max_batch_size
+        self.active = wp.zeros(rows, dtype=wp.bool, device=self.device)
+        self.positions = wp.zeros(rows, dtype=wp.int32, device=self.device)
+        self.sequence_end = wp.zeros(rows, dtype=wp.int32, device=self.device)
+        self.token_ids = wp.zeros(rows, dtype=wp.int64, device=self.device)
+        self.rope_deltas = wp.zeros(rows, dtype=wp.int32, device=self.device)
+        self.conv_states = {}
+        self.recurrent_states = {}
+        self.kv_caches = {}
+        for index, state in runner.conv_states.items():
+            self.conv_states[index] = wp.zeros(
+                (rows, *state.shape), dtype=state.dtype, device=self.device
+            )
+        for index, state in runner.recurrent_states.items():
+            self.recurrent_states[index] = wp.zeros(
+                (rows * state.shape[0], state.shape[1]),
+                dtype=state.dtype,
+                device=self.device,
+            )
+        for index, (key, value) in runner.kv_caches.items():
+            shape = (rows * key.shape[0], key.shape[1])
+            self.kv_caches[index] = (
+                wp.empty(shape, dtype=key.dtype, device=self.device),
+                wp.empty(shape, dtype=value.dtype, device=self.device),
+            )
+        self._lengths = [0] * rows
+        self._rope_delta_values = [0] * rows
+        self._view = _Qwen35BatchPlanState(self, rows)
+        self.plan = _Qwen35Plan(self._view, rows, decode_batch=True)
+        runner._record_plan_storage(self.plan)
+
+    def _preflight_memory(self) -> None:
+        if not self.device.is_cuda:
+            return
+        state_bytes = 0
+        for state in self.runner.conv_states.values():
+            state_bytes += state.capacity
+        for state in self.runner.recurrent_states.values():
+            state_bytes += state.capacity
+        for key, value in self.runner.kv_caches.values():
+            state_bytes += key.capacity + value.capacity
+        plan_bytes = getattr(self.runner._decode_plan, "_owned_storage_bytes", 0)
+        required = self.max_batch_size * (state_bytes + plan_bytes)
+        free = self.device.free_memory
+        if required > free * 0.95:
+            raise MemoryError(
+                f"Qwen batch state and workspace need {required / 2**30:.1f} GiB; "
+                f"only {free / 2**30:.1f} GiB is free"
+            )
+
+    def prefill(self, slot: int, token_ids, *, rope_delta: int = 0) -> wp.array:
+        """Prefill one slot sequentially, then copy only mutable state."""
+        self._validate_slot(slot)
+        tokens = tuple(int(token) for token in token_ids)
+        logits = self.runner.prefill(tokens)
+        for index, source in self.runner.conv_states.items():
+            destination = self.conv_states[index]
+            wp.copy(destination.flatten(), source.flatten(), dest_offset=slot * source.size)
+        for index, source in self.runner.recurrent_states.items():
+            destination = self.recurrent_states[index]
+            wp.copy(destination.flatten(), source.flatten(), dest_offset=slot * source.size)
+        for index, (source_key, source_value) in self.runner.kv_caches.items():
+            destination_key, destination_value = self.kv_caches[index]
+            for source, destination in (
+                (source_key, destination_key),
+                (source_value, destination_value),
+            ):
+                wp.launch(
+                    _copy_head_cache_prefix_slot_kernel,
+                    dim=(self.runner.kv_heads, len(tokens), self.runner.head_size),
+                    inputs=[
+                        source,
+                        destination,
+                        slot,
+                        len(tokens),
+                        self.runner.kv_heads,
+                        self.runner.cache_capacity,
+                    ],
+                    device=self.device,
+                )
+        self._lengths[slot] = len(tokens)
+        self._rope_delta_values[slot] = int(rope_delta)
+        return logits
+
+    def decode(self, token_ids, active=None) -> wp.array:
+        """Append one token to each active slot and return batch-major logits."""
+        tokens = tuple(int(token) for token in token_ids)
+        if len(tokens) != self.max_batch_size:
+            raise ValueError("decode token_ids must match max_batch_size")
+        if active is None:
+            active_values = [length > 0 for length in self._lengths]
+        else:
+            active_values = [bool(value) for value in active]
+            if len(active_values) != self.max_batch_size:
+                raise ValueError("decode active mask must match max_batch_size")
+        for slot, enabled in enumerate(active_values):
+            if enabled and self._lengths[slot] == 0:
+                raise RuntimeError(f"Qwen batch slot {slot} has not been prefilled")
+            if enabled and self._lengths[slot] >= self.runner.cache_capacity:
+                raise ValueError(f"Qwen batch slot {slot} cache is full")
+        self.token_ids.assign(np.asarray(tokens, dtype=np.int64))
+        self.positions.assign(np.asarray(self._lengths, dtype=np.int32))
+        self.rope_deltas.assign(np.asarray(self._rope_delta_values, dtype=np.int32))
+        self.active.assign(np.asarray(active_values, dtype=np.bool_))
+        wp.launch(
+            _stage_decode_batch_kernel,
+            dim=self.max_batch_size,
+            inputs=[
+                self.plan.input_ids,
+                self.positions,
+                self.plan.rope_position_ids,
+                self.sequence_end,
+                self.active,
+                self.token_ids,
+                self.positions,
+                self.rope_deltas,
+            ],
+            device=self.device,
+        )
+        logits = self.runner._run(self.plan, self.plan.attention_partitions)
+        for slot, enabled in enumerate(active_values):
+            if enabled:
+                self._lengths[slot] += 1
+        return logits
+
+    def release(self, slot: int) -> None:
+        """Mark a slot reusable; cache storage is overwritten on its next prefill."""
+        self._validate_slot(slot)
+        self._lengths[slot] = 0
+        self._rope_delta_values[slot] = 0
+
+    def _validate_slot(self, slot: int) -> None:
+        if not 0 <= int(slot) < self.max_batch_size:
+            raise IndexError("Qwen batch slot is out of range")
+
+
 class Qwen35Runner(AutoregressiveRunner):
     """Run a Qwen 3.5-family text or multimodal checkpoint entirely with Warp."""
 
@@ -1019,6 +1468,10 @@ class Qwen35Runner(AutoregressiveRunner):
         self._sampled_token_host_view = self._sampled_token_host.numpy()
         self._greedy_argmax_kernels = _get_greedy_argmax_kernels(1024, 128, self.dtype)
         self.sequence_length = 0
+
+    def create_batch_decoder(self, max_batch_size: int = 4) -> Qwen35BatchDecoder:
+        """Allocate opt-in independent decode state without duplicating weights."""
+        return Qwen35BatchDecoder(self, max_batch_size)
 
     def _multimodal_plan_for_rows(self, rows: int) -> _Qwen35Plan:
         plans = getattr(self, "_multimodal_plans", None)

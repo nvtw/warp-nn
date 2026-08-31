@@ -6,8 +6,10 @@ import pytest
 import json
 
 import numpy as np
+import warp as wp
 
 from tests.utilities import is_device_available, write_safetensors
+from warp_nn.runtime.kernels import _get_small_batch_grouped_linear_kernel
 from warp_nn.runtime.autoregressive import _PlanMemoryError, _union_storage_bytes
 from warp_nn.runtime.qwen.qwen35 import (
     Qwen35Runner,
@@ -253,3 +255,77 @@ def test_qwen35_low_memory_tail_falls_back_to_decode(tmp_path, monkeypatch):
     assert runner._chunk_plan._capture_disabled
     assert not runner._chunk_plan.graphs
     np.testing.assert_allclose(uncaptured, warm, atol=2.0e-2, rtol=2.0e-2)
+
+
+@pytest.mark.parametrize("rows,outputs_per_group", [(2, 4), (2, 8), (4, 4), (4, 8)])
+def test_small_batch_grouped_projection_matches_numpy(rows, outputs_per_group):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(113 + rows + outputs_per_group)
+    x = rng.normal(0.0, 0.2, (rows, 32)).astype(np.float32)
+    weight = rng.normal(0.0, 0.2, (16, 32)).astype(np.float32)
+    x_device = wp.array(x, dtype=wp.bfloat16, device="cuda:0")
+    weight_device = wp.array(weight, dtype=wp.bfloat16, device="cuda:0")
+    output = wp.empty((rows, 16), dtype=wp.bfloat16, device="cuda:0")
+    wp.launch(
+        _get_small_batch_grouped_linear_kernel(
+            wp.bfloat16, rows, outputs_per_group
+        ),
+        dim=(16 // outputs_per_group) * 32,
+        inputs=[x_device, weight_device, output, 32],
+        block_dim=128,
+        device="cuda:0",
+    )
+    expected = x @ weight.T
+    np.testing.assert_allclose(
+        output.numpy().astype(np.float32), expected, atol=6.0e-3, rtol=2.0e-2
+    )
+
+
+@pytest.mark.parametrize("batch_size", [2, 4])
+def test_qwen35_independent_batch_decode_matches_sequential_and_captures(
+    tmp_path, batch_size
+):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    model_path = tmp_path / "tiny-qwen35-batch"
+    _write_tiny_qwen35(model_path)
+    runner = Qwen35Runner(
+        model_path,
+        device="cuda:0",
+        cache_capacity=8,
+        prefill_chunk_size=4,
+        use_cublas=False,
+    )
+    batch = runner.create_batch_decoder(batch_size)
+    assert (
+        batch.plan.tensors["lm_head.weight"].ptr
+        == runner.weights["lm_head.weight"].ptr
+    )
+    references = []
+    prompts = ([1, 2, 3], [5, 6], [7, 8, 9], [10, 11])[:batch_size]
+    for slot, prompt in enumerate(prompts):
+        batch.prefill(slot, prompt)
+        runner.prefill(prompt)
+        references.append(runner.decode(4).numpy())
+
+    actual = batch.decode([4] * batch_size).numpy()
+    for slot, expected in enumerate(references):
+        np.testing.assert_array_equal(actual[slot], expected[0])
+    assert len(batch.plan.graphs) == 0
+
+    recurrent_before = batch.recurrent_states[0].numpy().copy()
+    conv_before = batch.conv_states[0].numpy().copy()
+    key_before = batch.kv_caches[1][0].numpy().copy()
+    batch.decode([3] * batch_size, active=[True] + [False] * (batch_size - 1))
+    recurrent_after = batch.recurrent_states[0].numpy()
+    conv_after = batch.conv_states[0].numpy()
+    key_after = batch.kv_caches[1][0].numpy()
+    recurrent_rows = recurrent_before.shape[0] // batch_size
+    cache_rows = key_before.shape[0] // batch_size
+    np.testing.assert_array_equal(
+        recurrent_after[recurrent_rows:], recurrent_before[recurrent_rows:]
+    )
+    np.testing.assert_array_equal(conv_after[1:], conv_before[1:])
+    np.testing.assert_array_equal(key_after[cache_rows:], key_before[cache_rows:])
+    assert len(batch.plan.graphs) == 1

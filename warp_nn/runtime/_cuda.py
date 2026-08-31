@@ -186,6 +186,128 @@ def get_grouped_decode_projection(dtype: type):
     return project
 
 
+_SMALL_BATCH_GROUPED_PROJECTION = r"""
+#if defined(__CUDA_ARCH__)
+    const int lane = tid & 31;
+    constexpr int rows = BATCH_ROWS;
+    constexpr int outputs = GROUP_OUTPUTS;
+    const int column = (tid >> 5) * outputs;
+    const NATIVE_TYPE* activations = x.data;
+    const NATIVE_TYPE* weights = weight.data;
+    float totals[rows][outputs] = {};
+
+    for (int k = lane * 8; k < inner; k += 256) {
+        uint4 packed_activations[rows];
+        #pragma unroll
+        for (int row = 0; row < rows; ++row)
+            packed_activations[row] = *reinterpret_cast<const uint4*>(
+                activations + row * inner + k);
+        uint4 packed_weights[outputs];
+        #pragma unroll
+        for (int output_index = 0; output_index < outputs; ++output_index) {
+            const uint4* address = reinterpret_cast<const uint4*>(
+                weights + (column + output_index) * inner + k);
+            #if NATIVE_BF16
+            packed_weights[output_index] = __ldcs(address);
+            #else
+            packed_weights[output_index] = *address;
+            #endif
+        }
+        #if NATIVE_BF16
+        #pragma unroll
+        for (int row = 0; row < rows; ++row) {
+            const unsigned* activation_words =
+                reinterpret_cast<const unsigned*>(&packed_activations[row]);
+            #pragma unroll
+            for (int word = 0; word < 4; ++word) {
+                float low = __uint_as_float(activation_words[word] << 16);
+                float high = __uint_as_float(activation_words[word] & 0xffff0000u);
+                #pragma unroll
+                for (int output_index = 0; output_index < outputs; ++output_index) {
+                    const unsigned packed = reinterpret_cast<const unsigned*>(
+                        &packed_weights[output_index])[word];
+                    totals[row][output_index] = fmaf(
+                        low, __uint_as_float(packed << 16), totals[row][output_index]);
+                    totals[row][output_index] = fmaf(
+                        high, __uint_as_float(packed & 0xffff0000u),
+                        totals[row][output_index]);
+                }
+            }
+        }
+        #else
+        #pragma unroll
+        for (int row = 0; row < rows; ++row) {
+            const NATIVE_TYPE* activation_values =
+                reinterpret_cast<const NATIVE_TYPE*>(&packed_activations[row]);
+            #pragma unroll
+            for (int component = 0; component < 8; ++component) {
+                const float value = float(activation_values[component]);
+                #pragma unroll
+                for (int output_index = 0; output_index < outputs; ++output_index) {
+                    const NATIVE_TYPE* values = reinterpret_cast<const NATIVE_TYPE*>(
+                        &packed_weights[output_index]);
+                    totals[row][output_index] = fmaf(
+                        value, float(values[component]), totals[row][output_index]);
+                }
+            }
+        }
+        #endif
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (int row = 0; row < rows; ++row) {
+            #pragma unroll
+            for (int output_index = 0; output_index < outputs; ++output_index)
+                totals[row][output_index] += __shfl_down_sync(
+                    0xffffffffu, totals[row][output_index], offset);
+        }
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (int row = 0; row < rows; ++row) {
+            NATIVE_TYPE* destination = output.data + row * output.shape[1] + column;
+            #pragma unroll
+            for (int output_index = 0; output_index < outputs; ++output_index)
+                destination[output_index] = NATIVE_TYPE(totals[row][output_index]);
+        }
+    }
+#endif
+"""
+
+
+@lru_cache(maxsize=None)
+def get_small_batch_grouped_projection(
+    dtype: type, batch_rows: int, group_outputs: int
+):
+    """Return a projection that shares each weight load across 2 or 4 rows."""
+    if dtype == wp.float16:
+        native_type, native_bf16 = "wp::float16", "0"
+    elif dtype == wp.bfloat16:
+        native_type, native_bf16 = "wp::bfloat16", "1"
+    else:
+        raise TypeError("Small-batch grouped projection requires FP16 or BF16")
+    if batch_rows not in (2, 4) or group_outputs not in (4, 8):
+        raise ValueError("Small-batch grouped projection requires 2/4 rows and 4/8 outputs")
+    snippet = (
+        _SMALL_BATCH_GROUPED_PROJECTION.replace("NATIVE_TYPE", native_type)
+        .replace("NATIVE_BF16", native_bf16)
+        .replace("BATCH_ROWS", str(batch_rows))
+        .replace("GROUP_OUTPUTS", str(group_outputs))
+    )
+
+    @wp.func_native(snippet)
+    def project(
+        x: wp.array2d[dtype],
+        weight: wp.array2d[dtype],
+        output: wp.array2d[dtype],
+        tid: int,
+        inner: int,
+    ): ...
+
+    return project
+
+
 _PREFILL_MMA_PROJECTION = r"""
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     const int lane = threadIdx.x & 31;

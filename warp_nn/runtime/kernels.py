@@ -28,6 +28,7 @@ from warp_nn.runtime._cuda import (
     expand_int4x4_high,
     expand_int4x4_low,
     get_grouped_decode_projection,
+    get_small_batch_grouped_projection,
     get_prefill_mma_projection,
     get_q8_grouped_decode_projection,
     get_q8_prefill_mma_projection,
@@ -168,6 +169,34 @@ def _create_grouped_decode_linear_kernel(dtype: type):
 def _get_grouped_decode_linear_kernel(dtype: type):
     """Return the cached eight-output single-token projection kernel."""
     return _create_grouped_decode_linear_kernel(dtype)
+
+
+def _create_small_batch_grouped_linear_kernel(
+    dtype: type, rows: int, outputs_per_group: int
+):
+    """Build a small-batch projection that reuses weights across rows."""
+    DTYPE = dtype
+    project = get_small_batch_grouped_projection(dtype, rows, outputs_per_group)
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(
+        x: wp.array2d(dtype=DTYPE),
+        weight: wp.array2d(dtype=DTYPE),
+        output: wp.array2d(dtype=DTYPE),
+        inner: int,
+    ):
+        typed_zero = DTYPE(0.0)  # noqa: F841 - retain dtype in the Warp closure
+        wp.static(project)(x, weight, output, wp.tid(), inner)
+
+    kernel.module.options["enable_backward"] = False
+    return kernel
+
+
+@lru_cache(maxsize=None)
+def _get_small_batch_grouped_linear_kernel(
+    dtype: type, rows: int, outputs_per_group: int = 8
+):
+    return _create_small_batch_grouped_linear_kernel(dtype, rows, outputs_per_group)
 
 
 def _create_prefill_mma_linear_kernel(dtype: type, tile_m: int, tile_n: int):
@@ -999,6 +1028,70 @@ def _unpack_gated_heads_kernel(
 
 
 @wp.kernel(enable_backward=False, module="unique")
+def _unpack_gated_heads_decode_batch_kernel(
+    x: wp.array2d[Any],
+    values: wp.array4d[Any],
+    gate: wp.array2d[Any],
+    head_size: int,
+    interleaved: bool,
+):
+    """Split gated heads into batch-major one-token storage."""
+    batch, head, column = wp.tid()
+    offset = head * head_size * 2
+    half = head_size / 2
+    source = column
+    if interleaved:
+        source = (column % half) * 2 + column / half
+    values[batch, head, 0, column] = x[batch, offset + source]
+    gate[batch, head * head_size + column] = x[batch, offset + head_size + column]
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _reorder_heads_decode_batch_kernel(
+    x: wp.array2d[Any], output: wp.array4d[Any], head_size: int, interleaved: bool
+):
+    """Convert packed rows to batch-major one-token heads."""
+    batch, head, column = wp.tid()
+    half = head_size / 2
+    source = column
+    if interleaved:
+        source = (column % half) * 2 + column / half
+    output[batch, head, 0, column] = x[batch, head * head_size + source]
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _append_head_cache_decode_batch_kernel(
+    x: wp.array4d[Any],
+    positions: wp.array1d[wp.int32],
+    active: wp.array1d[wp.bool],
+    cache: wp.array2d[Any],
+):
+    """Append one head-major token for each independent active sequence."""
+    batch, head, column = wp.tid()
+    if active[batch]:
+        capacity = cache.shape[0] / (x.shape[0] * x.shape[1])
+        row = (batch * x.shape[1] + head) * capacity + positions[batch]
+        cache[row, column] = x[batch, head, 0, column]
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _copy_head_cache_prefix_slot_kernel(
+    source: wp.array2d[Any],
+    destination: wp.array2d[Any],
+    slot: int,
+    prefix_length: int,
+    heads: int,
+    capacity: int,
+):
+    """Copy initialized head-major prefix rows into one batched cache slot."""
+    head, position, column = wp.tid()
+    source_row = head * capacity + position
+    destination_row = (slot * heads + head) * capacity + position
+    if position < prefix_length:
+        destination[destination_row, column] = source[source_row, column]
+
+
+@wp.kernel(enable_backward=False, module="unique")
 def _append_head_cache_kernel(
     x: wp.array2d[Any],
     positions: wp.array2d[wp.int64],
@@ -1515,6 +1608,43 @@ def _update_conv_rows_state_kernel(x: wp.array2d[Any], state: wp.array2d[Any]):
             state[channel, state_index] = state[channel, source]
         else:
             state[channel, state_index] = x[source - state.shape[1], channel]
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _causal_conv_decode_batch_kernel(
+    x: wp.array2d[Any],
+    weight: wp.array3d[Any],
+    state: wp.array3d[Any],
+    active: wp.array1d[wp.bool],
+    output: wp.array2d[Any],
+):
+    """Apply one causal-convolution token for each independent active sequence."""
+    batch, channel = wp.tid()
+    if not active[batch]:
+        output[batch, channel] = x.dtype(0.0)
+        return
+    total = wp.float32(0.0)
+    width = state.shape[2]
+    for kernel_index in range(weight.shape[2]):
+        value = (
+            wp.float32(state[batch, channel, kernel_index])
+            if kernel_index < width
+            else wp.float32(x[batch, channel])
+        )
+        total += value * wp.float32(weight[channel, 0, kernel_index])
+    output[batch, channel] = x.dtype(total / (wp.float32(1.0) + wp.exp(-total)))
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _update_conv_decode_batch_state_kernel(
+    x: wp.array2d[Any], state: wp.array3d[Any], active: wp.array1d[wp.bool]
+):
+    """Advance independent one-token convolution states without touching inactive slots."""
+    batch, channel = wp.tid()
+    if active[batch]:
+        for index in range(state.shape[2] - 1):
+            state[batch, channel, index] = state[batch, channel, index + 1]
+        state[batch, channel, state.shape[2] - 1] = x[batch, channel]
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -2183,6 +2313,103 @@ def _get_linear_attention_kernel(
     if key not in _linear_attention_kernel_cache:
         _linear_attention_kernel_cache[key] = _create_linear_attention_kernel(*key)
     return _linear_attention_kernel_cache[key]
+
+
+@lru_cache(maxsize=None)
+def _get_gated_delta_decode_batch_kernel(
+    key_size: int, value_size: int, dtype: type
+):
+    """Build masked one-token scalar gated-delta attention for a batch."""
+    KEY_SIZE = key_size
+    VALUE_SIZE = value_size
+    VALUE_TILE = min(32, value_size & -value_size)
+    VALUE_BLOCKS = _linear_attention_value_blocks(value_size)
+    DTYPE = dtype
+
+    @wp.func
+    def to_state(value: dtype):
+        return wp.float32(dtype(value))
+
+    @wp.func
+    def to_output(value: wp.float32):
+        return dtype(value)
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(
+        query: wp.array2d(dtype=DTYPE),
+        key: wp.array2d(dtype=DTYPE),
+        value: wp.array2d(dtype=DTYPE),
+        state: wp.array2d[wp.float32],
+        decay: wp.array2d[wp.float32],
+        beta: wp.array2d[wp.float32],
+        active: wp.array1d[wp.bool],
+        output: wp.array2d(dtype=DTYPE),
+        query_heads: int,
+        key_heads: int,
+        value_heads: int,
+        scale: float,
+    ):
+        item = wp.tid()
+        value_block = item % VALUE_BLOCKS
+        state_item = item / VALUE_BLOCKS
+        batch = state_item / value_heads
+        value_head = state_item % value_heads
+        value_offset = value_block * VALUE_TILE
+        if not active[batch]:
+            for column in range(VALUE_TILE):
+                output[batch, value_head * VALUE_SIZE + value_offset + column] = DTYPE(0.0)
+            return
+        key_head = value_head % key_heads
+        state_offset = state_item * KEY_SIZE
+        state_tile = wp.tile_load(
+            state, shape=(KEY_SIZE, VALUE_TILE), offset=(state_offset, value_offset)
+        )
+        key_row = wp.tile_map(
+            to_state,
+            wp.tile_load(key, shape=(1, KEY_SIZE), offset=(batch, key_head * KEY_SIZE)),
+        )
+        value_row = wp.tile_map(
+            to_state,
+            wp.tile_load(
+                value,
+                shape=(1, VALUE_TILE),
+                offset=(batch, value_head * VALUE_SIZE + value_offset),
+            ),
+        )
+        query_head = key_head * query_heads / key_heads
+        query_row = wp.tile_map(
+            to_state,
+            wp.tile_load(
+                query, shape=(1, KEY_SIZE), offset=(batch, query_head * KEY_SIZE)
+            ),
+        )
+        decay_value = decay[batch, value_head]
+        beta_value = beta[batch, value_head]
+        probes = wp.tile_zeros(shape=(2, KEY_SIZE), dtype=wp.float32)
+        wp.tile_assign(probes, key_row, offset=(0, 0))
+        wp.tile_assign(probes, query_row, offset=(1, 0))
+        projections = wp.tile_zeros(shape=(2, VALUE_TILE), dtype=wp.float32)
+        wp.tile_matmul(probes, state_tile, projections)
+        retrieved = wp.tile_view(projections, offset=(0, 0), shape=(1, VALUE_TILE))
+        query_result = wp.tile_view(projections, offset=(1, 0), shape=(1, VALUE_TILE))
+        delta = beta_value * (value_row - decay_value * retrieved)
+        query_key = wp.tile_extract(wp.tile_sum(query_row * key_row), 0)
+        wp.tile_matmul(
+            wp.tile_transpose(key_row),
+            delta,
+            state_tile,
+            alpha=wp.float32(1.0),
+            beta=decay_value,
+        )
+        result = decay_value * query_result + query_key * delta
+        wp.tile_store(
+            output,
+            wp.tile_map(to_output, wp.float32(scale) * result),
+            offset=(batch, value_head * VALUE_SIZE + value_offset),
+        )
+        wp.tile_store(state, state_tile, offset=(state_offset, value_offset))
+
+    return kernel
 
 
 def _create_mamba2_decode_kernel(
@@ -3036,6 +3263,28 @@ def _stage_token_position(
 
 
 @wp.kernel(enable_backward=False, module="unique")
+def _stage_decode_batch_kernel(
+    input_ids: wp.array2d[wp.int64],
+    cache_positions: wp.array1d[wp.int32],
+    rope_positions: wp.array2d[wp.int64],
+    sequence_end: wp.array1d[wp.int32],
+    active: wp.array1d[wp.bool],
+    token_ids: wp.array1d[wp.int64],
+    positions: wp.array1d[wp.int32],
+    rope_deltas: wp.array1d[wp.int32],
+):
+    """Stage one token and independent position for every batch slot."""
+    batch = wp.tid()
+    input_ids[0, batch] = token_ids[batch]
+    cache_positions[batch] = positions[batch]
+    sequence_end[batch] = wp.where(active[batch], positions[batch], wp.int32(-1))
+    rope_position = wp.int64(positions[batch] + rope_deltas[batch])
+    rope_positions[0, batch] = rope_position
+    rope_positions[1, batch] = rope_position
+    rope_positions[2, batch] = rope_position
+
+
+@wp.kernel(enable_backward=False, module="unique")
 def _set_sequence_end(sequence_end: wp.array1d[wp.int32], position: int):
     """Update the inclusive device-side sequence end."""
     sequence_end[0] = wp.int32(position)
@@ -3581,6 +3830,39 @@ def _rotary_embedding_kernel_for_dtype(dtype: type):
             ],
         )
     return _KERNEL_OVERLOADS[key]
+
+
+@lru_cache(maxsize=None)
+def _get_mrope_decode_batch_kernel(dtype: type):
+    """Apply Qwen MRoPE to batch-major one-token heads."""
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def kernel(
+        x: wp.array4d(dtype=DTYPE),
+        position_ids: wp.array2d[wp.int64],
+        cos_cache: wp.array2d(dtype=DTYPE),
+        sin_cache: wp.array2d(dtype=DTYPE),
+        output: wp.array4d(dtype=DTYPE),
+        rotary_dim: int,
+    ):
+        batch, head, column = wp.tid()
+        if column >= rotary_dim:
+            output[batch, head, 0, column] = x[batch, head, 0, column]
+            return
+        half = rotary_dim / 2
+        cache_column = column % half
+        partner = column + half if column < half else column - half
+        sign = wp.float32(-1.0) if column < half else wp.float32(1.0)
+        position = position_ids[cache_column % 3, batch]
+        value = wp.float32(x[batch, head, 0, column])
+        rotated = sign * wp.float32(x[batch, head, 0, partner])
+        output[batch, head, 0, column] = DTYPE(
+            value * wp.float32(cos_cache[position, cache_column])
+            + rotated * wp.float32(sin_cache[position, cache_column])
+        )
+
+    return kernel
 
 
 @lru_cache(maxsize=None)
