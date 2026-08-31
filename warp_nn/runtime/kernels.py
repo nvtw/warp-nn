@@ -1059,19 +1059,27 @@ def _reorder_heads_decode_batch_kernel(
     output[batch, head, 0, column] = x[batch, head * head_size + source]
 
 
-@wp.kernel(enable_backward=False, module="unique")
-def _append_head_cache_decode_batch_kernel(
-    x: wp.array4d[Any],
-    positions: wp.array1d[wp.int32],
-    active: wp.array1d[wp.bool],
-    cache: wp.array2d[Any],
-):
-    """Append one head-major token for each independent active sequence."""
-    batch, head, column = wp.tid()
-    if active[batch]:
-        capacity = cache.shape[0] / (x.shape[0] * x.shape[1])
-        row = (batch * x.shape[1] + head) * capacity + positions[batch]
-        cache[row, column] = x[batch, head, 0, column]
+@lru_cache(maxsize=None)
+def _get_append_head_cache_decode_batch_kernel(mapped: bool = False):
+    """Build a cache append with statically selected physical-slot indexing."""
+    MAPPED = mapped
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def kernel(
+        x: wp.array4d[Any],
+        positions: wp.array1d[wp.int32],
+        active: wp.array1d[wp.bool],
+        slot_indices: wp.array1d[wp.int32],
+        cache: wp.array2d[Any],
+        capacity: int,
+    ):
+        batch, head, column = wp.tid()
+        if active[batch]:
+            slot = slot_indices[batch] if wp.static(MAPPED) else batch
+            row = (slot * x.shape[1] + head) * capacity + positions[batch]
+            cache[row, column] = x[batch, head, 0, column]
+
+    return kernel
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -1593,41 +1601,51 @@ def _update_conv_rows_state_kernel(x: wp.array2d[Any], state: wp.array2d[Any]):
             state[channel, state_index] = x[source - state.shape[1], channel]
 
 
-@wp.kernel(enable_backward=False, module="unique")
-def _causal_conv_decode_batch_kernel(
-    x: wp.array2d[Any],
-    weight: wp.array3d[Any],
-    state: wp.array3d[Any],
-    active: wp.array1d[wp.bool],
-    output: wp.array2d[Any],
-):
-    """Apply one causal-convolution token for each independent active sequence."""
-    batch, channel = wp.tid()
-    if not active[batch]:
-        output[batch, channel] = x.dtype(0.0)
-        return
-    total = wp.float32(0.0)
-    width = state.shape[2]
-    for kernel_index in range(weight.shape[2]):
-        value = (
-            wp.float32(state[batch, channel, kernel_index])
-            if kernel_index < width
-            else wp.float32(x[batch, channel])
-        )
-        total += value * wp.float32(weight[channel, 0, kernel_index])
-    output[batch, channel] = x.dtype(total / (wp.float32(1.0) + wp.exp(-total)))
+@lru_cache(maxsize=None)
+def _get_causal_conv_decode_batch_kernels(mapped: bool = False):
+    """Build convolution kernels with statically selected slot indexing."""
+    MAPPED = mapped
 
+    @wp.kernel(enable_backward=False, module="unique")
+    def causal(
+        x: wp.array2d[Any],
+        weight: wp.array3d[Any],
+        state: wp.array3d[Any],
+        active: wp.array1d[wp.bool],
+        slot_indices: wp.array1d[wp.int32],
+        output: wp.array2d[Any],
+    ):
+        batch, channel = wp.tid()
+        if not active[batch]:
+            output[batch, channel] = x.dtype(0.0)
+            return
+        slot = slot_indices[batch] if wp.static(MAPPED) else batch
+        total = wp.float32(0.0)
+        width = state.shape[2]
+        for kernel_index in range(weight.shape[2]):
+            value = (
+                wp.float32(state[slot, channel, kernel_index])
+                if kernel_index < width
+                else wp.float32(x[batch, channel])
+            )
+            total += value * wp.float32(weight[channel, 0, kernel_index])
+        output[batch, channel] = x.dtype(total / (wp.float32(1.0) + wp.exp(-total)))
 
-@wp.kernel(enable_backward=False, module="unique")
-def _update_conv_decode_batch_state_kernel(
-    x: wp.array2d[Any], state: wp.array3d[Any], active: wp.array1d[wp.bool]
-):
-    """Advance independent one-token convolution states without touching inactive slots."""
-    batch, channel = wp.tid()
-    if active[batch]:
-        for index in range(state.shape[2] - 1):
-            state[batch, channel, index] = state[batch, channel, index + 1]
-        state[batch, channel, state.shape[2] - 1] = x[batch, channel]
+    @wp.kernel(enable_backward=False, module="unique")
+    def update(
+        x: wp.array2d[Any],
+        state: wp.array3d[Any],
+        active: wp.array1d[wp.bool],
+        slot_indices: wp.array1d[wp.int32],
+    ):
+        batch, channel = wp.tid()
+        if active[batch]:
+            slot = slot_indices[batch] if wp.static(MAPPED) else batch
+            for index in range(state.shape[2] - 1):
+                state[slot, channel, index] = state[slot, channel, index + 1]
+            state[slot, channel, state.shape[2] - 1] = x[batch, channel]
+
+    return causal, update
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -2300,7 +2318,7 @@ def _get_linear_attention_kernel(
 
 @lru_cache(maxsize=None)
 def _get_gated_delta_decode_batch_kernel(
-    key_size: int, value_size: int, dtype: type
+    key_size: int, value_size: int, dtype: type, mapped: bool = False
 ):
     """Build masked one-token scalar gated-delta attention for a batch."""
     KEY_SIZE = key_size
@@ -2308,6 +2326,7 @@ def _get_gated_delta_decode_batch_kernel(
     VALUE_TILE = min(32, value_size & -value_size)
     VALUE_BLOCKS = _linear_attention_value_blocks(value_size)
     DTYPE = dtype
+    MAPPED = mapped
 
     @wp.func
     def to_state(value: dtype):
@@ -2326,6 +2345,7 @@ def _get_gated_delta_decode_batch_kernel(
         decay: wp.array2d[wp.float32],
         beta: wp.array2d[wp.float32],
         active: wp.array1d[wp.bool],
+        slot_indices: wp.array1d[wp.int32],
         output: wp.array2d(dtype=DTYPE),
         query_heads: int,
         key_heads: int,
@@ -2340,10 +2360,13 @@ def _get_gated_delta_decode_batch_kernel(
         value_offset = value_block * VALUE_TILE
         if not active[batch]:
             for column in range(VALUE_TILE):
-                output[batch, value_head * VALUE_SIZE + value_offset + column] = DTYPE(0.0)
+                output[batch, value_head * VALUE_SIZE + value_offset + column] = DTYPE(
+                    0.0
+                )
             return
         key_head = value_head % key_heads
-        state_offset = state_item * KEY_SIZE
+        slot = slot_indices[batch] if wp.static(MAPPED) else batch
+        state_offset = (slot * value_heads + value_head) * KEY_SIZE
         state_tile = wp.tile_load(
             state, shape=(KEY_SIZE, VALUE_TILE), offset=(state_offset, value_offset)
         )
@@ -2829,6 +2852,7 @@ def _create_partitioned_gqa_attention_kernels(
     partitions: int,
     rows_per_group: int,
     heads_per_group: int,
+    mapped: bool = False,
 ):
     """Build blockwise parallel decode attention and its softmax reduction."""
     DTYPE = dtype
@@ -2837,6 +2861,7 @@ def _create_partitioned_gqa_attention_kernels(
     ROWS_PER_GROUP = rows_per_group
     QUERY_GROUP = GROUP * ROWS_PER_GROUP
     KEY_TILE = 32
+    MAPPED = mapped
 
     @wp.func
     def maximum_value(left: wp.float32, right: wp.float32):
@@ -2928,6 +2953,7 @@ def _create_partitioned_gqa_attention_kernels(
         key: wp.array2d(dtype=DTYPE),
         value: wp.array2d(dtype=DTYPE),
         sequence_lengths_minus_one: wp.array1d[wp.int32],
+        slot_indices: wp.array1d[wp.int32],
         partial_maximum: wp.array1d[wp.float32],
         partial_denominator: wp.array1d[wp.float32],
         partial_output: wp.array2d[wp.float32],
@@ -2950,6 +2976,7 @@ def _create_partitioned_gqa_attention_kernels(
         query_token_0 = row_group * ROWS_PER_GROUP
         valid_rows = wp.min(ROWS_PER_GROUP, sequence_length - query_token_0)
         batch = sequence_item / row_groups
+        cache_batch = slot_indices[batch] if wp.static(MAPPED) else batch
         group = group_item % groups_per_batch
         kv_head = group / groups_per_kv
         subgroup = group % groups_per_kv
@@ -3013,7 +3040,7 @@ def _create_partitioned_gqa_attention_kernels(
 
         for key_start in range(partition_start, partition_end, KEY_TILE):
             valid_tile_keys = wp.min(KEY_TILE, partition_end - key_start)
-            cache_base = (batch * kv_heads + kv_head) * total_length
+            cache_base = (cache_batch * kv_heads + kv_head) * total_length
             cache_row = cache_base + key_start
             cache_indices = wp.tile_map(
                 circular_cache_index, key_offsets, key_start, total_length, cache_base
@@ -3199,9 +3226,10 @@ def _get_partitioned_gqa_attention_kernels(
     partitions: int = 256,
     rows_per_group: int = 1,
     heads_per_group: int = 4,
+    mapped: bool = False,
 ):
     """Return cached partitioned decode attention kernels and their launch dimensions."""
-    key = (head_size, dtype, partitions, rows_per_group, heads_per_group)
+    key = (head_size, dtype, partitions, rows_per_group, heads_per_group, mapped)
     if key not in _partitioned_gqa_attention_kernel_cache:
         _partitioned_gqa_attention_kernel_cache[key] = (
             _create_partitioned_gqa_attention_kernels(*key)

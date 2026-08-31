@@ -61,8 +61,13 @@ class _BatchDecoder:
         self.prefill_buffers = {}
         self.decodes = []
         self.decode_ones = []
+        self.mapped_decodes = []
         self.releases = []
         self.resumes = []
+        self.warmups = 0
+
+    def warmup_decode_buckets(self):
+        self.warmups += 1
 
     def begin_prefill(self, slot):
         self.prefill_buffers[slot] = []
@@ -82,6 +87,12 @@ class _BatchDecoder:
     def decode(self, token_ids, active=None):
         self.decodes.append((tuple(token_ids), tuple(active)))
         return _logits(self.size, 0)
+
+    def decode_mapped(self, slots, token_ids, active, bucket_size):
+        self.mapped_decodes.append(
+            (tuple(slots), tuple(token_ids), tuple(active), bucket_size)
+        )
+        return _logits(bucket_size, 0)
 
     def decode_one(self, slot, token_id):
         self.decode_ones.append((slot, token_id))
@@ -124,6 +135,7 @@ def test_qwen_executor_batches_decode_and_reuses_exact_state():
         assert continued.result(2).tokens == (1, 0)
         assert runner.batch.prefills[-1] == (0, (4,))
         assert runner.batch.resumes == [0]
+    assert runner.batch.warmups == 1
 
 
 def test_opt_in_chat_completions_preserves_concurrent_response_path():
@@ -217,12 +229,25 @@ def test_single_request_uses_optimized_decode_one_bucket():
     assert runner.batch.decodes == []
 
 
+def test_four_requests_on_b8_use_the_compact_mapped_bucket():
+    runner = _Runner()
+    executor = QwenBatchExecutor(runner, _Tokenizer(), 8)
+    with ContinuousBatchScheduler(executor, max_active=8, idle_wait_ms=20) as scheduler:
+        handles = [
+            scheduler.submit(BatchRequest(_payload([index + 1]), 1, 2))
+            for index in range(4)
+        ]
+        assert [handle.result(2).tokens for handle in handles] == [(1, 0)] * 4
+
+    assert runner.batch.decodes == []
+    assert runner.batch.mapped_decodes
+    assert runner.batch.mapped_decodes[0][3] == 4
+
+
 def test_eight_request_executor_uses_one_shared_batch_decoder():
     runner = _Runner()
     executor = QwenBatchExecutor(runner, _Tokenizer(), 8)
-    with ContinuousBatchScheduler(
-        executor, max_active=8, idle_wait_ms=20
-    ) as scheduler:
+    with ContinuousBatchScheduler(executor, max_active=8, idle_wait_ms=20) as scheduler:
         handles = [
             scheduler.submit(BatchRequest(_payload([index + 1]), 1, 2))
             for index in range(8)

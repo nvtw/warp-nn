@@ -21,9 +21,9 @@ from warp_nn.runtime.formats.gguf import (
 )
 from warp_nn.runtime.kernels import (
     _append_head_cache_kernel,
-    _append_head_cache_decode_batch_kernel,
+    _get_append_head_cache_decode_batch_kernel,
     _causal_conv_rows_kernel,
-    _causal_conv_decode_batch_kernel,
+    _get_causal_conv_decode_batch_kernels,
     _gather_rows_kernel,
     _cast_kernel_for_dtypes,
     _get_gated_rms_norm_kernel,
@@ -49,7 +49,6 @@ from warp_nn.runtime.kernels import (
     _unpack_gated_heads_kernel,
     _unpack_gated_heads_decode_batch_kernel,
     _update_conv_rows_state_kernel,
-    _update_conv_decode_batch_state_kernel,
 )
 from warp_nn.runtime.operators import (
     Operation,
@@ -265,6 +264,7 @@ class _Qwen35Plan:
         self.runner = weakref.proxy(runner)
         self.rows = rows
         self.decode_batch = bool(decode_batch)
+        self.mapped_state = bool(getattr(runner, "mapped_state", False))
         if self.decode_batch and (external_embeddings or rows not in (2, 4, 8)):
             raise ValueError("Qwen decode batches require 2, 4, or 8 text-only slots")
         self.device = runner.device
@@ -296,9 +296,7 @@ class _Qwen35Plan:
     ) -> Operation:
         op = Operation("Linear", [x, weight], [name])
         if self.decode_batch:
-            op.attrs.update(
-                _small_batch_decode=True, _small_batch_outputs_per_group=4
-            )
+            op.attrs.update(_small_batch_decode=True, _small_batch_outputs_per_group=4)
         plan_linear(
             op,
             self.tensors,
@@ -492,6 +490,10 @@ class _Qwen35Plan:
                 self.runner.linear_key_size,
                 self.runner.linear_value_size,
                 self.dtype,
+                self.mapped_state,
+            )
+            layer["conv_batch_kernels"] = _get_causal_conv_decode_batch_kernels(
+                self.mapped_state
             )
         scale_dtype = self.runner.weights[attn + "norm.weight"].dtype
         layer["gated_block"], layer["gated_kernel"] = _get_gated_rms_norm_kernel(
@@ -584,12 +586,8 @@ class _Qwen35Plan:
         if self.decode_batch:
             layer["q_rotated_heads"] = wp.empty_like(layer["q_heads"])
             layer["k_rotated_heads"] = wp.empty_like(layer["k_heads"])
-            layer["q_rotated"] = layer["q_rotated_heads"].reshape(
-                layer["q"].shape
-            )
-            layer["k_rotated"] = layer["k_rotated_heads"].reshape(
-                layer["k"].shape
-            )
+            layer["q_rotated"] = layer["q_rotated_heads"].reshape(layer["q"].shape)
+            layer["k_rotated"] = layer["k_rotated_heads"].reshape(layer["k"].shape)
         else:
             layer["q_rotated"] = wp.empty_like(layer["q"])
             layer["k_rotated"] = wp.empty_like(layer["k"])
@@ -616,9 +614,14 @@ class _Qwen35Plan:
                     partitions,
                     rows=self.rows,
                     kv_heads=self.runner.kv_heads,
+                    mapped=self.mapped_state,
                 )
             }
         layer["partitioned_attention"] = self.partitioned_attention
+        if self.decode_batch:
+            layer["append_cache_kernel"] = _get_append_head_cache_decode_batch_kernel(
+                self.mapped_state
+            )
         self.tensors[f"layer.{index}.gated"] = layer["gated"]
         self.shapes[f"layer.{index}.gated"] = tuple(layer["gated"].shape)
         layer["output"] = self._linear(
@@ -637,7 +640,7 @@ class _Qwen35Plan:
             self._execute_op(layer[name])
         qkv = self.tensors[layer["qkv"].outputs[0]]
         wp.launch(
-            _causal_conv_decode_batch_kernel,
+            layer["conv_batch_kernels"][0],
             dim=layer["conv"].shape,
             inputs=[
                 qkv,
@@ -646,6 +649,7 @@ class _Qwen35Plan:
                 ],
                 self.runner.conv_states[index],
                 self.runner.active,
+                self.runner.slot_indices,
                 layer["conv"],
             ],
             device=self.device,
@@ -660,9 +664,14 @@ class _Qwen35Plan:
             )
             offset += output.shape[1]
         wp.launch(
-            _update_conv_decode_batch_state_kernel,
+            layer["conv_batch_kernels"][1],
             dim=qkv.shape,
-            inputs=[qkv, self.runner.conv_states[index], self.runner.active],
+            inputs=[
+                qkv,
+                self.runner.conv_states[index],
+                self.runner.active,
+                self.runner.slot_indices,
+            ],
             device=self.device,
         )
         for source, output in (
@@ -711,6 +720,7 @@ class _Qwen35Plan:
                 layer["decay"],
                 layer["beta"],
                 self.runner.active,
+                self.runner.slot_indices,
                 layer["core"],
                 self.runner.linear_key_heads,
                 self.runner.linear_key_heads,
@@ -924,9 +934,16 @@ class _Qwen35Plan:
             (layer["v_heads"], value_cache),
         ):
             wp.launch(
-                _append_head_cache_decode_batch_kernel,
+                layer["append_cache_kernel"],
                 dim=(self.rows, self.runner.kv_heads, self.runner.head_size),
-                inputs=[source, self.runner.positions, self.runner.active, cache],
+                inputs=[
+                    source,
+                    self.runner.positions,
+                    self.runner.active,
+                    self.runner.slot_indices,
+                    cache,
+                    self.runner.cache_capacity,
+                ],
                 device=self.device,
             )
         _launch_partitioned_gqa(
@@ -943,6 +960,7 @@ class _Qwen35Plan:
             0,
             self.device,
             sequence_length=1,
+            slot_indices=(self.runner.slot_indices if self.mapped_state else None),
         )
         wp.launch(
             _sigmoid_gate_kernel,
@@ -1129,28 +1147,43 @@ class _Qwen35Plan:
 
 
 class _Qwen35BatchPlanState:
-    """Fixed-size view of a batch decoder's shared persistent state."""
+    """Compact execution view over persistent physical batch slots."""
 
-    def __init__(self, decoder, rows: int):
+    def __init__(self, decoder, rows: int, mapped: bool = False):
         self._decoder = decoder
         self.rows = rows
-        self.active = decoder.active[:rows]
-        self.positions = decoder.positions[:rows]
-        self.sequence_end = decoder.sequence_end[:rows]
-        self.conv_states = {
-            index: value[:rows] for index, value in decoder.conv_states.items()
-        }
-        self.recurrent_states = {}
-        for index, value in decoder.recurrent_states.items():
-            per_slot = value.shape[0] // decoder.max_batch_size
-            self.recurrent_states[index] = value[: rows * per_slot]
-        self.kv_caches = {}
-        for index, (key, value) in decoder.kv_caches.items():
-            per_slot = key.shape[0] // decoder.max_batch_size
-            self.kv_caches[index] = (
-                key[: rows * per_slot],
-                value[: rows * per_slot],
-            )
+        self.mapped_state = bool(mapped)
+        if mapped:
+            self.active = wp.zeros(rows, dtype=wp.bool, device=decoder.device)
+            self.positions = wp.zeros(rows, dtype=wp.int32, device=decoder.device)
+            self.sequence_end = wp.zeros(rows, dtype=wp.int32, device=decoder.device)
+            self.token_ids = wp.zeros(rows, dtype=wp.int64, device=decoder.device)
+            self.rope_deltas = wp.zeros(rows, dtype=wp.int32, device=decoder.device)
+            self.slot_indices = wp.empty(rows, dtype=wp.int32, device=decoder.device)
+            self.conv_states = decoder.conv_states
+            self.recurrent_states = decoder.recurrent_states
+            self.kv_caches = decoder.kv_caches
+        else:
+            self.active = decoder.active[:rows]
+            self.positions = decoder.positions[:rows]
+            self.sequence_end = decoder.sequence_end[:rows]
+            self.token_ids = decoder.token_ids[:rows]
+            self.rope_deltas = decoder.rope_deltas[:rows]
+            self.slot_indices = decoder.slot_indices[:rows]
+            self.conv_states = {
+                index: value[:rows] for index, value in decoder.conv_states.items()
+            }
+            self.recurrent_states = {}
+            for index, value in decoder.recurrent_states.items():
+                per_slot = value.shape[0] // decoder.max_batch_size
+                self.recurrent_states[index] = value[: rows * per_slot]
+            self.kv_caches = {}
+            for index, (key, value) in decoder.kv_caches.items():
+                per_slot = key.shape[0] // decoder.max_batch_size
+                self.kv_caches[index] = (
+                    key[: rows * per_slot],
+                    value[: rows * per_slot],
+                )
 
     def __getattr__(self, name):
         return getattr(self._decoder.runner, name)
@@ -1202,6 +1235,9 @@ class Qwen35BatchDecoder:
         self.sequence_end = wp.zeros(rows, dtype=wp.int32, device=self.device)
         self.token_ids = wp.zeros(rows, dtype=wp.int64, device=self.device)
         self.rope_deltas = wp.zeros(rows, dtype=wp.int32, device=self.device)
+        self.slot_indices = wp.array(
+            np.arange(rows, dtype=np.int32), device=self.device
+        )
         self.conv_states = {}
         self.recurrent_states = {}
         self.kv_caches = {}
@@ -1233,7 +1269,29 @@ class Qwen35BatchDecoder:
         self._incremental_plans = {}
         self._view = _Qwen35BatchPlanState(self, rows)
         self.plan = _Qwen35Plan(self._view, rows, decode_batch=True)
+        self._batch_views = {rows: self._view}
+        self._batch_plans = {rows: self.plan}
         runner._record_plan_storage(self.plan)
+
+    def warmup_decode_buckets(self) -> None:
+        """Prepare every multi-request graph before the server accepts traffic."""
+        if any(self._lengths):
+            raise RuntimeError("Qwen decode buckets must be warmed before admission")
+        self._lengths[:] = [1] * self.max_batch_size
+        for rows in (2, 4, 8):
+            if rows > self.max_batch_size:
+                break
+            if rows == self.max_batch_size:
+                self.decode([0] * rows, [True] * rows)
+            else:
+                self.decode_mapped(range(rows), [0] * rows, [True] * rows, rows)
+        wp.synchronize_device(self.device)
+        for state in self.conv_states.values():
+            state.zero_()
+        for state in self.recurrent_states.values():
+            state.zero_()
+        self._lengths[:] = [0] * self.max_batch_size
+        wp.synchronize_device(self.device)
 
     def _preflight_memory(self) -> None:
         if not self.device.is_cuda:
@@ -1393,6 +1451,71 @@ class Qwen35BatchDecoder:
             count=logits.size,
         )
         return self.prefill_outputs[slot : slot + 1]
+
+    def _batch_plan(self, rows: int):
+        plan = self._batch_plans.get(rows)
+        if plan is None:
+            if rows not in (2, 4) or rows >= self.max_batch_size:
+                raise ValueError("invalid compact Qwen decode bucket")
+            self.runner._require_lazy_plan_headroom(rows)
+            view = _Qwen35BatchPlanState(self, rows, mapped=True)
+            plan = _Qwen35Plan(view, rows, decode_batch=True)
+            self.runner._record_plan_storage(plan)
+            self._batch_views[rows] = view
+            self._batch_plans[rows] = plan
+        return self._batch_views[rows], plan
+
+    def decode_mapped(self, slots, token_ids, active, bucket_size: int) -> wp.array:
+        """Decode compact lanes mapped onto arbitrary persistent physical slots."""
+        slots = tuple(int(slot) for slot in slots)
+        tokens = tuple(int(token) for token in token_ids)
+        active_values = tuple(bool(value) for value in active)
+        if not (len(slots) == len(tokens) == len(active_values) <= bucket_size):
+            raise ValueError("mapped Qwen decode inputs do not match the bucket")
+        view, plan = self._batch_plan(bucket_size)
+        padded_slots = [0] * bucket_size
+        padded_tokens = [0] * bucket_size
+        padded_active = [False] * bucket_size
+        padded_positions = [0] * bucket_size
+        padded_deltas = [0] * bucket_size
+        for lane, (slot, token, enabled) in enumerate(
+            zip(slots, tokens, active_values, strict=True)
+        ):
+            self._validate_slot(slot)
+            if enabled and self._lengths[slot] == 0:
+                raise RuntimeError(f"Qwen batch slot {slot} has not been prefilled")
+            if enabled and self._lengths[slot] >= self.runner.cache_capacity:
+                raise ValueError(f"Qwen batch slot {slot} cache is full")
+            padded_slots[lane] = slot
+            padded_tokens[lane] = token
+            padded_active[lane] = enabled
+            padded_positions[lane] = self._lengths[slot]
+            padded_deltas[lane] = self._rope_delta_values[slot]
+        view.slot_indices.assign(np.asarray(padded_slots, dtype=np.int32))
+        view.token_ids.assign(np.asarray(padded_tokens, dtype=np.int64))
+        view.positions.assign(np.asarray(padded_positions, dtype=np.int32))
+        view.rope_deltas.assign(np.asarray(padded_deltas, dtype=np.int32))
+        view.active.assign(np.asarray(padded_active, dtype=np.bool_))
+        wp.launch(
+            _stage_decode_batch_kernel,
+            dim=bucket_size,
+            inputs=[
+                plan.input_ids,
+                view.positions,
+                plan.rope_position_ids,
+                view.sequence_end,
+                view.active,
+                view.token_ids,
+                view.positions,
+                view.rope_deltas,
+            ],
+            device=self.device,
+        )
+        logits = self.runner._run(plan, plan.attention_partitions)
+        for slot, enabled in zip(slots, active_values, strict=True):
+            if enabled:
+                self._lengths[slot] += 1
+        return logits
 
     def decode(self, token_ids, active=None) -> wp.array:
         """Append one token to each active slot and return batch-major logits."""

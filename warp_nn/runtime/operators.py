@@ -110,6 +110,7 @@ def _allocate_partitioned_gqa(
     rows_per_group: int | None = None,
     heads_per_group: int | None = None,
     kv_heads: int | None = None,
+    mapped: bool = False,
 ):
     """Allocate one reusable workspace for partitioned decode attention."""
     default_rows, default_heads = _attention_group_geometry(
@@ -120,7 +121,7 @@ def _allocate_partitioned_gqa(
     if heads_per_group is None:
         heads_per_group = default_heads
     block_dim, partitions, kernels = _get_partitioned_gqa_attention_kernels(
-        head_size, dtype, partitions, rows_per_group, heads_per_group
+        head_size, dtype, partitions, rows_per_group, heads_per_group, mapped
     )
     items = rows * heads * partitions
     return (
@@ -149,6 +150,7 @@ def _launch_partitioned_gqa(
     window: int,
     device,
     sequence_length: int | None = None,
+    slot_indices=None,
 ):
     """Launch partitioned decode attention using a reusable workspace."""
     (
@@ -176,6 +178,7 @@ def _launch_partitioned_gqa(
             key,
             value,
             sequence_end,
+            sequence_end if slot_indices is None else slot_indices,
             partial_maximum,
             partial_denominator,
             partial_output,

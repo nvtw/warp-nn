@@ -271,9 +271,7 @@ def test_small_batch_grouped_projection_matches_numpy(rows, outputs_per_group):
     weight_device = wp.array(weight, dtype=wp.bfloat16, device="cuda:0")
     output = wp.empty((rows, 16), dtype=wp.bfloat16, device="cuda:0")
     wp.launch(
-        _get_small_batch_grouped_linear_kernel(
-            wp.bfloat16, rows, outputs_per_group
-        ),
+        _get_small_batch_grouped_linear_kernel(wp.bfloat16, rows, outputs_per_group),
         dim=(16 // outputs_per_group) * 32,
         inputs=[x_device, weight_device, output, 32],
         block_dim=128,
@@ -302,8 +300,7 @@ def test_qwen35_independent_batch_decode_matches_sequential_and_captures(
     )
     batch = runner.create_batch_decoder(batch_size)
     assert (
-        batch.plan.tensors["lm_head.weight"].ptr
-        == runner.weights["lm_head.weight"].ptr
+        batch.plan.tensors["lm_head.weight"].ptr == runner.weights["lm_head.weight"].ptr
     )
     references = []
     prompts = ([1, 2, 3], [5, 6], [7, 8, 9], [10, 11])[:batch_size]
@@ -332,6 +329,56 @@ def test_qwen35_independent_batch_decode_matches_sequential_and_captures(
     np.testing.assert_array_equal(conv_after[1:], conv_before[1:])
     np.testing.assert_array_equal(key_after[cache_rows:], key_before[cache_rows:])
     assert len(batch.plan.graphs) == 1
+
+
+def test_qwen35_compact_decode_maps_noncontiguous_physical_slots(tmp_path):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    model_path = tmp_path / "tiny-qwen35-mapped-batch"
+    _write_tiny_qwen35(model_path)
+    runner = Qwen35Runner(
+        model_path,
+        device="cuda:0",
+        cache_capacity=8,
+        prefill_chunk_size=4,
+        use_cublas=False,
+    )
+    batch = runner.create_batch_decoder(8)
+    slots = (0, 2, 5, 7)
+    prompts = ([1, 2], [3, 4, 5], [6, 7], [8, 9, 10])
+    references = []
+    for slot, prompt in zip(slots, prompts, strict=True):
+        batch.prefill(slot, prompt)
+        runner.prefill(prompt)
+        references.append(runner.decode(11).numpy())
+
+    recurrent_before = batch.recurrent_states[0].numpy().copy()
+    conv_before = batch.conv_states[0].numpy().copy()
+    key_before = batch.kv_caches[1][0].numpy().copy()
+    actual = batch.decode_mapped(slots, [11] * 4, [True] * 4, 4).numpy()
+    for lane, expected in enumerate(references):
+        np.testing.assert_array_equal(actual[lane], expected[0])
+
+    untouched = (1, 3, 4, 6)
+    recurrent_after = batch.recurrent_states[0].numpy()
+    conv_after = batch.conv_states[0].numpy()
+    key_after = batch.kv_caches[1][0].numpy()
+    recurrent_rows = recurrent_before.shape[0] // 8
+    cache_rows = key_before.shape[0] // 8
+    for slot in untouched:
+        np.testing.assert_array_equal(conv_after[slot], conv_before[slot])
+        np.testing.assert_array_equal(
+            recurrent_after[slot * recurrent_rows : (slot + 1) * recurrent_rows],
+            recurrent_before[slot * recurrent_rows : (slot + 1) * recurrent_rows],
+        )
+        np.testing.assert_array_equal(
+            key_after[slot * cache_rows : (slot + 1) * cache_rows],
+            key_before[slot * cache_rows : (slot + 1) * cache_rows],
+        )
+    assert batch._batch_views[4].mapped_state
+    assert len(batch._batch_plans[4].graphs) == 0
+    batch.decode_mapped(slots, [12] * 4, [True] * 4, 4)
+    assert len(batch._batch_plans[4].graphs) == 1
 
 
 def test_qwen35_incremental_prefill_interleaves_slots_without_state_copies(tmp_path):
@@ -385,7 +432,6 @@ def test_qwen35_incremental_prefill_interleaves_slots_without_state_copies(tmp_p
         batch.append_prefill(0, [1])
     with pytest.raises(RuntimeError, match="empty"):
         batch.resume_prefill(0)
-
 
 
 def test_qwen35_single_slot_decode_uses_batch_one_plan_and_isolates_state(tmp_path):

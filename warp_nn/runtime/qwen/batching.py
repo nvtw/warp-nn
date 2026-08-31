@@ -45,6 +45,7 @@ class QwenBatchExecutor:
         self.runner = runner
         self.tokenizer = tokenizer
         self.decoder = runner.create_batch_decoder(max_batch_size)
+        self.decoder.warmup_decode_buckets()
         self.max_batch_size = max_batch_size
         self._slots: list[_Slot | None] = [None] * max_batch_size
 
@@ -109,11 +110,11 @@ class QwenBatchExecutor:
     def select_decode_bucket(self, active_count: int) -> int:
         if not 0 < active_count <= self.max_batch_size:
             raise ValueError("invalid Qwen decode batch size")
-        return 1 if active_count == 1 else self.max_batch_size
+        return 1 << (active_count - 1).bit_length()
 
     def decode(self, slots: list[int], bucket_size: int):
-        if bucket_size not in (1, self.max_batch_size):
-            raise ValueError("Qwen decoder bucket does not match its fixed batch size")
+        if bucket_size not in (1, 2, 4, 8) or bucket_size > self.max_batch_size:
+            raise ValueError("Qwen decoder bucket is unsupported")
         if bucket_size == 1 and len(slots) != 1:
             raise ValueError("Qwen single-slot bucket requires one active request")
         tokens = [0] * self.max_batch_size
@@ -142,11 +143,20 @@ class QwenBatchExecutor:
             if bucket_size == 1:
                 slot = slots[0]
                 self._state(slot).logits = self.decoder.decode_one(slot, tokens[slot])
-            else:
+            elif bucket_size == self.max_batch_size:
                 logits = self.decoder.decode(tokens, active)
                 for slot in slots:
                     if active[slot]:
                         self._state(slot).logits = logits[slot : slot + 1]
+            else:
+                lane_tokens = [tokens[slot] for slot in slots]
+                lane_active = [active[slot] for slot in slots]
+                logits = self.decoder.decode_mapped(
+                    slots, lane_tokens, lane_active, bucket_size
+                )
+                for lane, slot in enumerate(slots):
+                    if active[slot]:
+                        self._state(slot).logits = logits[lane : lane + 1]
         return results
 
     def release(self, slot: int, retain_prefix: bool) -> None:
