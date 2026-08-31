@@ -4,6 +4,7 @@
 """Serve a supported local checkpoint through OpenAI Chat Completions."""
 
 import argparse
+import socket
 from pathlib import Path
 
 from warp_nn.runtime import (
@@ -14,12 +15,68 @@ from warp_nn.runtime import (
 )
 
 
+def _lan_ipv4() -> str | None:
+    """Return the preferred LAN address without sending network traffic."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("192.0.2.1", 80))
+            preferred = probe.getsockname()[0]
+            if not preferred.startswith("127."):
+                return preferred
+    except OSError:
+        pass
+    try:
+        candidates = {
+            address[4][0]
+            for address in socket.getaddrinfo(
+                socket.gethostname(), None, socket.AF_INET, socket.SOCK_DGRAM
+            )
+        }
+    except OSError:
+        return None
+    return next(
+        (address for address in sorted(candidates) if not address.startswith("127.")),
+        None,
+    )
+
+
+def _print_connection_info(server, model_id: str, host: str, api_key: str | None):
+    port = server.server_port
+    wildcard = host in ("", "0.0.0.0", "::")
+    local_url = f"http://127.0.0.1:{port}/v1"
+    print(f"Serving {model_id}", flush=True)
+    print(f"  Local:  {local_url}", flush=True)
+    remote_url = None
+    if wildcard:
+        address = _lan_ipv4()
+        if address:
+            remote_url = f"http://{address}:{port}/v1"
+            print(f"  LAN:    {remote_url}", flush=True)
+        else:
+            print("  LAN:    bound to all interfaces; IP detection failed", flush=True)
+    elif not host.startswith("127.") and host != "localhost":
+        remote_url = f"http://{host}:{port}/v1"
+        print(f"  LAN:    {remote_url}", flush=True)
+    else:
+        print(
+            "  LAN:    disabled; use --host 0.0.0.0 to allow other computers",
+            flush=True,
+        )
+    if remote_url:
+        key_option = " --api-key YOUR_API_KEY" if api_key else ""
+        print(
+            "  Client: python openai_client.py"
+            f" --url {remote_url} --model {model_id}{key_option}",
+            flush=True,
+        )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "model_dir",
         type=Path,
-        help="Directory containing a supported ONNX or safetensors model",
+        help="Supported model checkpoint or directory",
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -38,7 +95,7 @@ def main():
         type=int,
         choices=(1, 2, 4, 8),
         default=1,
-        help="Opt-in Qwen continuous decode batching",
+        help="Maximum simultaneous Qwen requests (adaptive B1/B2/B4/B8)",
     )
     parser.add_argument(
         "--batch-wait-ms",
@@ -112,8 +169,21 @@ def main():
         batch_wait_ms=args.batch_wait_ms,
     )
     server = OpenAIHTTPServer((args.host, args.port), backend, args.api_key)
-    print(f"Serving {model_id} at http://{args.host}:{args.port}/v1")
-    print("The first request may compile Warp kernels before it starts generating.")
+    _print_connection_info(server, model_id, args.host, args.api_key)
+    print(
+        "  Authentication: "
+        + ("bearer token required" if args.api_key else "disabled"),
+        flush=True,
+    )
+    print(
+        f"  Parallel requests: {args.max_batch_size} maximum; decode width adapts"
+        " to active requests",
+        flush=True,
+    )
+    print(
+        "The first request may compile Warp kernels before it starts generating.",
+        flush=True,
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
