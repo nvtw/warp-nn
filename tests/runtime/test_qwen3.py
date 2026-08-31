@@ -106,6 +106,40 @@ def test_qwen_tokenizer_and_chat_template(tmp_path):
     )
 
 
+def test_qwen_tokenizer_loads_vocab_and_merges_layout(tmp_path):
+    consolidated = tmp_path / "consolidated.json"
+    _write_tokenizer(consolidated)
+    data = json.loads(consolidated.read_text(encoding="utf-8"))
+    split = tmp_path / "split"
+    split.mkdir()
+    (split / "vocab.json").write_text(
+        json.dumps(data["model"]["vocab"]), encoding="utf-8"
+    )
+    (split / "merges.txt").write_text(
+        "#version: 0.2\n"
+        + "\n".join(" ".join(pair) for pair in data["model"]["merges"]),
+        encoding="utf-8",
+    )
+    (split / "tokenizer_config.json").write_text(
+        json.dumps(
+            {
+                "eos_token": "<|im_end|>",
+                "added_tokens_decoder": {
+                    str(item["id"]): item for item in data["added_tokens"]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    reference = Qwen3Tokenizer(consolidated)
+    tokenizer = Qwen3Tokenizer(split)
+    text = "hello  Café\n你好 👋"
+    assert tokenizer.encode(text) == reference.encode(text)
+    assert tokenizer.decode(tokenizer.encode(text)) == text
+    assert tokenizer.eos_token_id == reference.eos_token_id
+
+
 def test_incremental_chat_encoding_matches_full_history(tmp_path):
     path = tmp_path / "tokenizer.json"
     _write_tokenizer(path)

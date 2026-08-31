@@ -260,6 +260,62 @@ def _pretokenize_o200k(text: str):
         index += 1
 
 
+def _load_byte_bpe_files(directory: Path) -> dict:
+    """Load the standard Hugging Face vocab/merges tokenizer layout."""
+    vocab_path = directory / "vocab.json"
+    merges_path = directory / "merges.txt"
+    if not vocab_path.is_file() or not merges_path.is_file():
+        raise FileNotFoundError(directory / "tokenizer.json")
+    vocabulary = json.loads(vocab_path.read_text(encoding="utf-8"))
+    if not isinstance(vocabulary, dict):
+        raise ValueError("ByteLevel-BPE vocab.json must contain an object")
+    merges = []
+    for line in merges_path.read_text(encoding="utf-8").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        pair = line.split()
+        if len(pair) != 2:
+            raise ValueError(f"invalid ByteLevel-BPE merge line: {line!r}")
+        merges.append(pair)
+
+    config_path = directory / "tokenizer_config.json"
+    config = (
+        json.loads(config_path.read_text(encoding="utf-8"))
+        if config_path.is_file()
+        else {}
+    )
+    decoder = config.get("added_tokens_decoder", {})
+    added_tokens = []
+    if isinstance(decoder, dict) and decoder:
+        for token_id, item in decoder.items():
+            if not isinstance(item, dict) or "content" not in item:
+                raise ValueError("invalid tokenizer added_tokens_decoder entry")
+            added_tokens.append(
+                {
+                    "id": int(token_id),
+                    "content": str(item["content"]),
+                    "special": bool(item.get("special", False)),
+                }
+            )
+    else:
+        added_path = directory / "added_tokens.json"
+        if added_path.is_file():
+            added = json.loads(added_path.read_text(encoding="utf-8"))
+            if not isinstance(added, dict):
+                raise ValueError("added_tokens.json must contain an object")
+            added_tokens = [
+                {"id": int(token_id), "content": token, "special": True}
+                for token, token_id in added.items()
+            ]
+    return {
+        "normalizer": None,
+        "added_tokens": sorted(added_tokens, key=lambda item: item["id"]),
+        "model": {"type": "BPE", "vocab": vocabulary, "merges": merges},
+        "tokenizer_config": config,
+        "_pretokenizer": "qwen",
+    }
+
+
 class Qwen3Tokenizer:
     """Dependency-free ByteLevel-BPE tokenizer for Qwen and Nemotron chat models."""
 
@@ -273,10 +329,15 @@ class Qwen3Tokenizer:
             path = Path(path)
             if path.is_dir():
                 directory = path
-                path /= "tokenizer.json"
+                tokenizer_path = path / "tokenizer.json"
+                data = (
+                    json.loads(tokenizer_path.read_text(encoding="utf-8"))
+                    if tokenizer_path.is_file()
+                    else _load_byte_bpe_files(path)
+                )
             else:
                 directory = path.parent
-            data = json.loads(path.read_text(encoding="utf-8"))
+                data = json.loads(path.read_text(encoding="utf-8"))
         model = data["model"]
         normalizer = data.get("normalizer")
         if model["type"] != "BPE" or normalizer not in (None, {"type": "NFC"}):
