@@ -7,7 +7,11 @@ import math
 
 import warp as wp
 
-from warp_nn.runtime.kernels import _cast_kernel_for_dtypes, _merge_lora_kernel
+from warp_nn.runtime.kernels import (
+    _cast_kernel_for_dtypes,
+    _merge_lora_kernel,
+    _temporal_conv2d_slice_kernel,
+)
 
 
 class MappedWeightArchive:
@@ -89,4 +93,29 @@ def load_cast_weights(archive, names, device, dtype=None):
         if device.is_cuda:
             wp.synchronize_stream(wp.get_stream(device))
         output[name] = converted
+    return output
+
+
+def extract_temporal_conv2d_weight(source, shape, temporal_index):
+    """Extract an OIHW plane from a flat contiguous OITHW weight on-device."""
+    shape = tuple(int(dimension) for dimension in shape)
+    if len(shape) != 5 or any(dimension <= 0 for dimension in shape):
+        raise ValueError("causal convolution weight shape must be positive OITHW")
+    if source.ndim != 1 or source.size != math.prod(shape):
+        raise ValueError(
+            "flat causal convolution weight does not match its OITHW shape"
+        )
+    if not 0 <= temporal_index < shape[2]:
+        raise ValueError("temporal index is outside the causal convolution weight")
+    output = wp.empty(
+        (shape[0], shape[1], shape[3], shape[4]),
+        dtype=source.dtype,
+        device=source.device,
+    )
+    wp.launch(
+        _temporal_conv2d_slice_kernel(source.dtype),
+        dim=output.shape,
+        inputs=[source, output, shape[2], temporal_index],
+        device=source.device,
+    )
     return output

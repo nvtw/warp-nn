@@ -45,6 +45,7 @@ from warp_nn.runtime.kernels import (
     _modulated_residual_kernel,
     _quantize_activation_int8_kernel,
     _spatial_diffusion_kernels,
+    _spatial_vae_kernels,
 )
 from warp_nn.utils.ops import resolve_dim
 
@@ -2322,6 +2323,185 @@ class Conv2dPlan:
             device=self.input.device,
         )
         return self.output
+
+
+class SpatialRMSNormPlan:
+    """Graph-safe channels-last spatial RMSNorm with optional fused SiLU."""
+
+    def __init__(self, x, gamma, *, epsilon=1.0e-12, silu=False):
+        if x.ndim != 4 or x.dtype not in (wp.float16, wp.bfloat16, wp.float32):
+            raise TypeError("spatial RMSNorm input must be rank-four FP16/BF16/FP32")
+        if (
+            gamma.size != x.shape[3]
+            or gamma.dtype != x.dtype
+            or gamma.device != x.device
+        ):
+            raise ValueError("spatial RMSNorm scale must match the input channels")
+        if not math.isfinite(epsilon) or epsilon < 0.0:
+            raise ValueError("spatial RMSNorm epsilon must be finite and nonnegative")
+        self.input = x
+        self.gamma = gamma.flatten()
+        self.epsilon = float(epsilon)
+        self.silu = bool(silu)
+        self.output = wp.empty_like(x)
+        self._kernel = _spatial_vae_kernels(x.dtype, x.shape[3])[0]
+
+    def execute(self):
+        wp.launch_tiled(
+            self._kernel,
+            dim=self.input.shape[0] * self.input.shape[1] * self.input.shape[2],
+            inputs=[
+                self.input,
+                self.gamma,
+                self.output,
+                wp.float32(self.epsilon),
+                int(self.silu),
+            ],
+            block_dim=min(128, self.input.shape[3]),
+            device=self.input.device,
+        )
+        return self.output
+
+
+class NearestUpsample2dPlan:
+    """Graph-safe integer nearest-neighbor upsampling for NHWC tensors."""
+
+    def __init__(self, x, scale=2):
+        if x.ndim != 4 or x.dtype not in (wp.float16, wp.bfloat16, wp.float32):
+            raise TypeError("nearest upsample input must be rank-four FP16/BF16/FP32")
+        self.scale = int(scale)
+        if self.scale <= 0:
+            raise ValueError("nearest upsample scale must be positive")
+        self.input = x
+        self.output = wp.empty(
+            (x.shape[0], x.shape[1] * self.scale, x.shape[2] * self.scale, x.shape[3]),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        self._kernel = _spatial_vae_kernels(x.dtype, x.shape[3])[1]
+
+    def execute(self):
+        wp.launch(
+            self._kernel,
+            dim=self.output.shape,
+            inputs=[self.input, self.output, self.scale],
+            device=self.input.device,
+        )
+        return self.output
+
+
+class ResidualAddPlan:
+    """Graph-safe FP32-accumulating residual addition for NHWC tensors."""
+
+    def __init__(self, left, right):
+        if (
+            left.ndim != 4
+            or right.shape != left.shape
+            or right.dtype != left.dtype
+            or right.device != left.device
+        ):
+            raise ValueError("residual operands must be matching rank-four arrays")
+        self.left, self.right = left, right
+        self.output = wp.empty_like(left)
+        self._kernel = _spatial_vae_kernels(left.dtype, left.shape[3])[2]
+
+    def execute(self):
+        wp.launch(
+            self._kernel,
+            dim=self.output.shape,
+            inputs=[self.left, self.right, self.output],
+            device=self.left.device,
+        )
+        return self.output
+
+
+class _SpatialQKVPlan:
+    def __init__(self, packed, channels):
+        if packed.ndim != 4 or packed.shape[3] != channels * 3:
+            raise ValueError("packed spatial QKV geometry is inconsistent")
+        self.input = packed
+        shape = (packed.shape[0], 1, packed.shape[1] * packed.shape[2], channels)
+        self.query = wp.empty(shape, dtype=packed.dtype, device=packed.device)
+        self.key = wp.empty_like(self.query)
+        self.value = wp.empty_like(self.query)
+        self._kernel = _spatial_vae_kernels(packed.dtype, channels)[3]
+
+    def execute(self):
+        wp.launch(
+            self._kernel,
+            dim=(self.query.shape[0], self.query.shape[2], self.query.shape[3]),
+            inputs=[self.input, self.query, self.key, self.value],
+            device=self.input.device,
+        )
+
+
+class _SpatialAttentionMergePlan:
+    def __init__(self, x, height, width):
+        if x.ndim != 4 or x.shape[1] != 1 or x.shape[2] != height * width:
+            raise ValueError("spatial attention output geometry is inconsistent")
+        self.input = x
+        self.output = wp.empty(
+            (x.shape[0], height, width, x.shape[3]),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        self._kernel = _spatial_vae_kernels(x.dtype, x.shape[3])[4]
+
+    def execute(self):
+        wp.launch(
+            self._kernel,
+            dim=(self.input.shape[0], self.input.shape[2], self.input.shape[3]),
+            inputs=[self.input, self.output],
+            device=self.input.device,
+        )
+        return self.output
+
+
+class SpatialSelfAttentionPlan:
+    """Graph-safe one-head spatial attention composed from shared operators."""
+
+    def __init__(
+        self,
+        x,
+        norm_weight,
+        qkv_weight,
+        qkv_bias,
+        projection_weight,
+        projection_bias,
+        *,
+        epsilon=1.0e-12,
+    ):
+        channels = x.shape[3]
+        if qkv_weight.shape != (channels * 3, channels, 1, 1):
+            raise ValueError("spatial attention QKV weight shape is inconsistent")
+        if projection_weight.shape != (channels, channels, 1, 1):
+            raise ValueError("spatial attention projection shape is inconsistent")
+        self.input = x
+        self.norm = SpatialRMSNormPlan(x, norm_weight, epsilon=epsilon)
+        self.qkv_projection = Conv2dPlan(
+            self.norm.output, qkv_weight, qkv_bias, tensor_cores=True
+        )
+        self.qkv = _SpatialQKVPlan(self.qkv_projection.output, channels)
+        self.attention = BidirectionalGQAPlan(
+            self.qkv.query, self.qkv.key, self.qkv.value
+        )
+        self.merge = _SpatialAttentionMergePlan(
+            self.attention.output, x.shape[1], x.shape[2]
+        )
+        self.projection = Conv2dPlan(
+            self.merge.output, projection_weight, projection_bias, tensor_cores=True
+        )
+        self.residual = ResidualAddPlan(x, self.projection.output)
+        self.output = self.residual.output
+
+    def execute(self):
+        self.norm.execute()
+        self.qkv_projection.execute()
+        self.qkv.execute()
+        self.attention.execute()
+        self.merge.execute()
+        self.projection.execute()
+        return self.residual.execute()
 
 
 def conv1d_output_length(

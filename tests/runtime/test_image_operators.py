@@ -6,7 +6,14 @@ import pytest
 import warp as wp
 
 from tests.utilities import is_device_available
-from warp_nn.runtime.operators import Conv2dPlan, conv2d_output_shape
+from warp_nn.runtime.operators import (
+    Conv2dPlan,
+    NearestUpsample2dPlan,
+    ResidualAddPlan,
+    SpatialRMSNormPlan,
+    SpatialSelfAttentionPlan,
+    conv2d_output_shape,
+)
 
 
 def _reference(x, weight, bias, stride=(1, 1), padding=(0, 0, 0, 0)):
@@ -104,3 +111,77 @@ def test_conv2d_rejects_channel_mismatch():
     weight = wp.zeros((4, 2, 3, 3), dtype=wp.float32, device="cpu")
     with pytest.raises(ValueError, match="weight channels"):
         Conv2dPlan(x, weight)
+
+
+def test_spatial_vae_primitives_cpu():
+    rng = np.random.default_rng(913)
+    values = rng.normal(size=(1, 2, 3, 4)).astype(np.float32)
+    gamma = rng.normal(size=4).astype(np.float32)
+    x = wp.array(values, device="cpu")
+    norm = SpatialRMSNormPlan(x, wp.array(gamma, device="cpu"), silu=True)
+    normalized = values / np.sqrt(
+        np.mean(values * values, axis=-1, keepdims=True) + 1.0e-12
+    )
+    normalized *= gamma
+    expected_norm = normalized / (1.0 + np.exp(-normalized))
+    np.testing.assert_allclose(norm.execute().numpy(), expected_norm, atol=2.0e-6)
+
+    upsample = NearestUpsample2dPlan(x, 2)
+    expected_up = np.repeat(np.repeat(values, 2, axis=1), 2, axis=2)
+    np.testing.assert_array_equal(upsample.execute().numpy(), expected_up)
+
+    residual = ResidualAddPlan(x, x)
+    np.testing.assert_array_equal(residual.execute().numpy(), values * 2.0)
+
+
+def test_spatial_self_attention_matches_reference_and_captures():
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is unavailable")
+    rng = np.random.default_rng(914)
+    batch, height, width, channels = 1, 2, 3, 32
+    values = rng.normal(0.0, 0.08, size=(batch, height, width, channels)).astype(
+        np.float32
+    )
+    gamma = rng.normal(1.0, 0.05, size=channels).astype(np.float32)
+    qkv_weight = rng.normal(0.0, 0.08, size=(channels * 3, channels, 1, 1)).astype(
+        np.float32
+    )
+    qkv_bias = rng.normal(0.0, 0.02, size=channels * 3).astype(np.float32)
+    projection_weight = rng.normal(0.0, 0.08, size=(channels, channels, 1, 1)).astype(
+        np.float32
+    )
+    projection_bias = rng.normal(0.0, 0.02, size=channels).astype(np.float32)
+    arrays = [
+        wp.array(value, dtype=wp.bfloat16, device="cuda:0")
+        for value in (
+            values,
+            gamma,
+            qkv_weight,
+            qkv_bias,
+            projection_weight,
+            projection_bias,
+        )
+    ]
+    plan = SpatialSelfAttentionPlan(*arrays)
+    plan.execute()
+    wp.synchronize_device("cuda:0")
+    wp.capture_begin(device="cuda:0")
+    plan.execute()
+    graph = wp.capture_end(device="cuda:0")
+    wp.capture_launch(graph)
+
+    normalized = values / np.sqrt(
+        np.mean(values * values, axis=-1, keepdims=True) + 1.0e-12
+    )
+    normalized *= gamma
+    tokens = normalized.reshape(-1, channels)
+    qkv = tokens @ qkv_weight[:, :, 0, 0].T + qkv_bias
+    query, key, value = np.split(qkv, 3, axis=-1)
+    scores = query @ key.T / np.sqrt(channels)
+    scores -= np.max(scores, axis=-1, keepdims=True)
+    probabilities = np.exp(scores)
+    probabilities /= np.sum(probabilities, axis=-1, keepdims=True)
+    attended = probabilities @ value
+    projected = attended @ projection_weight[:, :, 0, 0].T + projection_bias
+    expected = values + projected.reshape(values.shape)
+    np.testing.assert_allclose(plan.output.numpy(), expected, rtol=0.055, atol=0.025)

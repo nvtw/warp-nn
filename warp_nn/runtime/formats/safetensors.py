@@ -217,9 +217,18 @@ class SafeTensorArchive:
         return self._metadata[name]
 
     def load(
-        self, device=None, names: Iterable[str] | None = None
+        self,
+        device=None,
+        names: Iterable[str] | None = None,
+        *,
+        flatten: bool = False,
     ) -> dict[str, wp.array]:
-        """Upload selected weights and release file mappings after the copies finish."""
+        """Upload selected weights and release file mappings after the copies finish.
+
+        ``flatten`` uploads each tensor as a contiguous one-dimensional array. This
+        permits format-neutral conversion of checkpoints containing tensors above
+        Warp's rank-four array limit without a CPU copy.
+        """
         device = wp.get_device(device)
         selected = self.names if names is None else tuple(names)
         unknown = set(selected) - self._metadata.keys()
@@ -245,10 +254,19 @@ class SafeTensorArchive:
                 raw = np.ndarray(
                     (info.nbytes,), dtype=np.uint8, buffer=mapping, offset=info.offset
                 )
+                shape = (
+                    (int(np.prod(info.shape, dtype=np.int64)),)
+                    if flatten
+                    else info.shape
+                )
+                if len(shape) > 4:
+                    raise ValueError(
+                        f"Safetensor '{name}' has rank {len(shape)}; load it with flatten=True"
+                    )
                 host = wp.array(
                     ptr=raw.ctypes.data,
                     dtype=info.dtype,
-                    shape=info.shape,
+                    shape=shape,
                     capacity=info.nbytes,
                     device="cpu",
                 )

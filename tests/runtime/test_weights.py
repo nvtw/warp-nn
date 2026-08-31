@@ -8,7 +8,10 @@ import warp as wp
 
 from tests.utilities import write_safetensors
 from warp_nn.runtime.llama.encoder import merge_lora_adapter
-from warp_nn.runtime.weights import merge_lora_weight
+from warp_nn.runtime.weights import (
+    extract_temporal_conv2d_weight,
+    merge_lora_weight,
+)
 
 
 def test_merge_lora_weight_and_peft_adapter_cpu(tmp_path):
@@ -45,3 +48,13 @@ def test_merge_lora_weight_and_peft_adapter_cpu(tmp_path):
     weights = {name: wp.zeros((2, 2), dtype=wp.float32, device="cpu")}
     merge_lora_adapter(weights, adapter, wp.float32, wp.get_device("cpu"))
     np.testing.assert_allclose(weights[name].numpy(), 2.0 * b_values @ a_values)
+
+
+def test_extract_temporal_conv2d_weight_cpu():
+    values = np.arange(2 * 3 * 3 * 2 * 2, dtype=np.float32).reshape(2, 3, 3, 2, 2)
+    source = wp.array(values.reshape(-1), device="cpu")
+
+    extracted = extract_temporal_conv2d_weight(source, values.shape, 2)
+
+    assert extracted.shape == (2, 3, 2, 2)
+    np.testing.assert_array_equal(extracted.numpy(), values[:, :, 2])

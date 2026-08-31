@@ -3093,6 +3093,35 @@ def _cast_kernel_for_dtypes(source_dtype: type, target_dtype: type):
 
 
 @lru_cache(maxsize=None)
+def _temporal_conv2d_slice_kernel(dtype: type):
+    """Extract one OITHW temporal plane into a contiguous OIHW weight."""
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def extract(
+        source: wp.array1d(dtype=DTYPE),
+        output: wp.array4d(dtype=DTYPE),
+        temporal_size: int,
+        temporal_index: int,
+    ):
+        out_channel, in_channel, row, column = wp.tid()
+        source_index = (
+            (
+                (
+                    (out_channel * output.shape[1] + in_channel) * temporal_size
+                    + temporal_index
+                )
+                * output.shape[2]
+                + row
+            )
+            * output.shape[3]
+        ) + column
+        output[out_channel, in_channel, row, column] = DTYPE(source[source_index])
+
+    return extract
+
+
+@lru_cache(maxsize=None)
 def _spatial_diffusion_kernels(dtype: type):
     """Reusable spatial patch, channel-affine, and Euler update kernels."""
     DTYPE = dtype
@@ -3516,6 +3545,100 @@ def _channels_last_1d_kernels(dtype: type):
         )
 
     return conv1d_nlc, conv_transpose1d_nlc, snake1d
+
+
+@lru_cache(maxsize=None)
+def _spatial_vae_kernels(dtype: type, channels: int):
+    """Return reusable channels-last VAE normalization and layout kernels."""
+    DTYPE = dtype
+    CHANNELS = int(channels)
+
+    @wp.func
+    def square(value: dtype):
+        value_fp32 = wp.float32(dtype(value))
+        return value_fp32 * value_fp32
+
+    @wp.func
+    def normalize(value: dtype, gamma: dtype, inverse_rms: wp.float32, activate: int):
+        result = wp.float32(value) * wp.float32(gamma) * inverse_rms
+        if activate != 0:
+            result = result / (wp.float32(1.0) + wp.exp(-result))
+        return dtype(result)
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def rms_norm(
+        x: wp.array4d(dtype=DTYPE),
+        gamma: wp.array1d(dtype=DTYPE),
+        output: wp.array4d(dtype=DTYPE),
+        epsilon: wp.float32,
+        activate: int,
+    ):
+        pixel = wp.tid()
+        image_area = x.shape[1] * x.shape[2]
+        batch = pixel / image_area
+        position = pixel % image_area
+        row = position / x.shape[2]
+        column = position % x.shape[2]
+        values = wp.tile_load(x[batch, row, column], shape=(CHANNELS,))
+        scales = wp.tile_load(gamma, shape=(CHANNELS,))
+        inverse_rms = wp.float32(1.0) / wp.sqrt(
+            wp.tile_extract(wp.tile_sum(wp.tile_map(square, values)), 0)
+            / wp.float32(CHANNELS)
+            + epsilon
+            + wp.float32(DTYPE(0.0))
+        )
+        wp.tile_store(
+            output[batch, row, column],
+            wp.tile_map(normalize, values, scales, inverse_rms, activate),
+        )
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def nearest_upsample(
+        x: wp.array4d(dtype=DTYPE), output: wp.array4d(dtype=DTYPE), scale: int
+    ):
+        batch, row, column, channel = wp.tid()
+        output[batch, row, column, channel] = DTYPE(
+            x[batch, row / scale, column / scale, channel]
+        )
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def residual_add(
+        left: wp.array4d(dtype=DTYPE),
+        right: wp.array4d(dtype=DTYPE),
+        output: wp.array4d(dtype=DTYPE),
+    ):
+        batch, row, column, channel = wp.tid()
+        output[batch, row, column, channel] = DTYPE(
+            wp.float32(left[batch, row, column, channel])
+            + wp.float32(right[batch, row, column, channel])
+        )
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def split_qkv(
+        packed: wp.array4d(dtype=DTYPE),
+        query: wp.array4d(dtype=DTYPE),
+        key: wp.array4d(dtype=DTYPE),
+        value: wp.array4d(dtype=DTYPE),
+    ):
+        batch, token, channel = wp.tid()
+        row = token / packed.shape[2]
+        column = token % packed.shape[2]
+        query[batch, 0, token, channel] = DTYPE(packed[batch, row, column, channel])
+        key[batch, 0, token, channel] = DTYPE(
+            packed[batch, row, column, channel + CHANNELS]
+        )
+        value[batch, 0, token, channel] = DTYPE(
+            packed[batch, row, column, channel + CHANNELS * 2]
+        )
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def merge_attention(x: wp.array4d(dtype=DTYPE), output: wp.array4d(dtype=DTYPE)):
+        batch, token, channel = wp.tid()
+        row = token / output.shape[2]
+        column = token % output.shape[2]
+        output[batch, row, column, channel] = DTYPE(x[batch, 0, token, channel])
+
+    return rms_norm, nearest_upsample, residual_add, split_qkv, merge_attention
 
 
 @lru_cache(maxsize=None)
