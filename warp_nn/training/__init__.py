@@ -14,15 +14,17 @@ from .bridges import (
     split_heads,
 )
 from .checkpoint import LoRACheckpoint, load_lora_safetensors, save_lora_safetensors
-from .gated_norm import GatedRMSNormPlan
 from .gated_delta import GatedDeltaInputPlan
 from .gated_delta_rule import GatedDeltaRulePlan
-from .linear_attention import QwenGatedDeltaLoRAAttentionPlan
+from .gated_norm import GatedRMSNormPlan
 from .gqa import GQALoRAAttentionPlan
+from .linear_attention import QwenGatedDeltaLoRAAttentionPlan
+from .loss import LowPrecisionCrossEntropyPlan
 from .linear import linear_backward, linear_forward, lora_backward, lora_forward
 from .mlp import LoRASwiGLUPlan
 from .muse import MuseLoRATransformerBlockPlan
 from .optimizer import AdamWPlan
+from .output import CausalLMOutputPlan
 from .primitives import CrossEntropyPlan, EmbeddingPlan, TransformerPrimitivePlan
 from .qk import QKTransformPlan
 from .qwen import QwenLoRATransformerBlockPlan
@@ -33,6 +35,7 @@ from .stack import LoRATransformerStackPlan
 __all__ = [
     "AdamWPlan",
     "CrossEntropyPlan",
+    "CausalLMOutputPlan",
     "EmbeddingPlan",
     "GatedDeltaInputPlan",
     "GatedDeltaRulePlan",
@@ -44,6 +47,7 @@ __all__ = [
     "LoRALinearTrainingPlan",
     "LoRASwiGLUPlan",
     "LoRATransformerStackPlan",
+    "LowPrecisionCrossEntropyPlan",
     "MuseLoRATransformerBlockPlan",
     "QKTransformPlan",
     "QwenLoRATransformerBlockPlan",
