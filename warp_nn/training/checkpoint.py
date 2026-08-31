@@ -400,3 +400,27 @@ def load_lora_safetensors(path: str | Path, *, as_warp: bool = False) -> LoRAChe
         metadata["base_identifier"],
         metadata["caller_metadata"],
     )
+
+
+def save_lora_collection(
+    path: str | Path,
+    collection,
+    *,
+    base_identifier: str | None = None,
+    caller_metadata: Mapping[str, str | int | float | bool | None] | None = None,
+) -> None:
+    """Save one live collection's authoritative FP32 masters atomically."""
+    save_lora_safetensors(
+        path,
+        collection.named_masters,
+        configs=collection.configs,
+        base_identifier=base_identifier,
+        caller_metadata=caller_metadata,
+    )
+
+
+def restore_lora_collection(path: str | Path, collection) -> LoRACheckpoint:
+    """Restore adapter weights into fixed buffers and reset AdamW state."""
+    checkpoint = load_lora_safetensors(path)
+    collection.load_fp32_state(checkpoint.tensors, checkpoint.configs)
+    return checkpoint

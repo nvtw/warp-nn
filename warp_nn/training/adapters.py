@@ -13,6 +13,7 @@ import warp as wp
 
 from warp_nn.runtime._cublas import try_create_cublas
 
+from .bridges import cast_from_float32
 from .optimizer import AdamWPlan
 from .step import LoRALinearTrainingPlan
 
@@ -216,3 +217,29 @@ class LoRAAdapterCollection:
     def step(self) -> None:
         """Update all adapters through their authoritative FP32 AdamW masters."""
         self.optimizer.step()
+
+    def load_fp32_state(
+        self,
+        tensors: Mapping[str, np.ndarray | wp.array],
+        configs: Mapping[str, LoRAAdapterConfig],
+    ) -> None:
+        """Restore adapter masters/mirrors and reset optimizer trajectory state."""
+        if set(tensors) != set(self.named_masters):
+            raise ValueError("checkpoint tensor names do not match adapter targets")
+        if set(configs) != set(self.configs):
+            raise ValueError("checkpoint configs do not match adapter targets")
+        for name, config in configs.items():
+            current = self.configs[name]
+            if config.rank != current.rank or config.scale != current.scale:
+                raise ValueError(f"checkpoint config does not match target {name!r}")
+        for name, master in self.named_masters.items():
+            source = tensors[name]
+            values = source.numpy() if isinstance(source, wp.array) else source
+            if not isinstance(values, np.ndarray) or values.dtype != np.float32:
+                raise TypeError("checkpoint adapter tensors must use FP32")
+            if values.shape != master.shape:
+                raise ValueError(f"checkpoint shape does not match {name!r}")
+            master.assign(values)
+            cast_from_float32(master, self.named_parameters[name])
+        self.optimizer.reset_state()
+        self.zero_grad()

@@ -13,7 +13,13 @@ from .bridges import (
     merge_heads,
     split_heads,
 )
-from .checkpoint import LoRACheckpoint, load_lora_safetensors, save_lora_safetensors
+from .checkpoint import (
+    LoRACheckpoint,
+    load_lora_safetensors,
+    restore_lora_collection,
+    save_lora_collection,
+    save_lora_safetensors,
+)
 from .data import SFTBatch, SFTExample, prepare_sft_batch
 from .gated_delta import GatedDeltaInputPlan
 from .gated_delta_rule import GatedDeltaRulePlan
@@ -32,6 +38,7 @@ from .qk import QKTransformPlan
 from .qwen import QwenLoRATransformerBlockPlan, build_qwen_lora_training_plan
 from .step import LoRALinearTrainingPlan
 from .stack import LoRATransformerStackPlan
+from .trainer import LoRATrainer
 
 
 __all__ = [
@@ -50,6 +57,7 @@ __all__ = [
     "LoRALinearTrainingPlan",
     "LoRASwiGLUPlan",
     "LoRATransformerStackPlan",
+    "LoRATrainer",
     "LowPrecisionCrossEntropyPlan",
     "MuseLoRATransformerBlockPlan",
     "build_muse_lora_training_plan",
@@ -69,10 +77,12 @@ __all__ = [
     "linear_backward",
     "linear_forward",
     "load_lora_safetensors",
+    "restore_lora_collection",
     "lora_backward",
     "lora_forward",
     "merge_heads",
     "prepare_sft_batch",
     "save_lora_safetensors",
+    "save_lora_collection",
     "split_heads",
 ]

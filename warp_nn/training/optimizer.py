@@ -344,3 +344,13 @@ class AdamWPlan:
                 ],
                 device=self.device,
             )
+
+    def reset_state(self) -> None:
+        """Reset moments, step, and accumulation state without replacing buffers."""
+        self.step_count.zero_()
+        self.valid_token_count.zero_()
+        self.all_finite.fill_(1)
+        self.step_enabled.fill_(1)
+        for slot in self._slots:
+            slot.first_moment.zero_()
+            slot.second_moment.zero_()
