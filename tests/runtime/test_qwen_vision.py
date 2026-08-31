@@ -185,3 +185,30 @@ def test_tiny_qwen_multimodal_prefill_and_graph_replay(tmp_path):
     np.testing.assert_allclose(replay, first, atol=2.0e-2, rtol=2.0e-2)
     assert runner.sequence_length == 3
     assert runner.rope_delta == -1
+
+
+def test_qwen_runner_lazily_constructs_real_vision_encoder(monkeypatch):
+    sentinel = object()
+    received = {}
+
+    def encoder(path, *, device, cublas, vision_path):
+        received.update(
+            path=path, device=device, cublas=cublas, vision_path=vision_path
+        )
+        return sentinel
+
+    monkeypatch.setattr("warp_nn.runtime.qwen.vision.QwenVisionEncoder", encoder)
+    runner = Qwen35Runner.__new__(Qwen35Runner)
+    runner.model_path = Path("text.gguf")
+    runner.device = "cuda:0"
+    runner.cublas = "cublas-handle"
+    runner.vision_path = Path("mmproj.gguf")
+
+    assert runner._vision_encoder() is sentinel
+    assert runner._vision_encoder() is sentinel
+    assert received == {
+        "path": Path("text.gguf"),
+        "device": "cuda:0",
+        "cublas": "cublas-handle",
+        "vision_path": Path("mmproj.gguf"),
+    }

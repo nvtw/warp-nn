@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from examples.qwen_chat import _generate
+from examples.qwen_chat import _generate, _image_message, _parse_image_command
 from warp_nn.runtime import Qwen3Tokenizer, parse_qwen_tool_calls, sample_token
 from warp_nn.runtime.chat import ChatEncodingCache
 from warp_nn.runtime.tokenizers import _BYTE_ENCODER
@@ -377,3 +377,23 @@ def test_qwen38_reasoning_template_controls(tmp_path):
         reasoning_effort="medium",
         preserve_thinking=False,
     )
+
+
+def test_interactive_image_command_parsing():
+    path, question = _parse_image_command(
+        '/image "photos/space cat.png" What is shown?'
+    )
+    assert path == Path("photos/space cat.png")
+    assert question == "What is shown?"
+
+    path, question = _parse_image_command("/image image.png")
+    assert path == Path("image.png")
+    assert question == ""
+
+
+def test_interactive_image_message_keeps_all_attachments():
+    assert _image_message("Compare them", [Path("one.png"), Path("two.png")]) == [
+        {"type": "image", "image": "one.png"},
+        {"type": "image", "image": "two.png"},
+        {"type": "text", "text": "Compare them"},
+    ]

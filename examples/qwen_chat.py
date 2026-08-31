@@ -7,13 +7,18 @@ import argparse
 import codecs
 import json
 import os
+import shlex
 import sys
 import threading
 from pathlib import Path
 
 import numpy as np
 
-from warp_nn.runtime import create_text_runner, create_tokenizer
+from warp_nn.runtime import (
+    create_multimodal_processor,
+    create_text_runner,
+    create_tokenizer,
+)
 from warp_nn.runtime.chat import (
     ChatEncodingCache,
     is_eos_token,
@@ -146,6 +151,26 @@ def _show_tool_result(result):
     print(result)
 
 
+def _parse_image_command(command):
+    """Return an image path and optional same-turn question."""
+    try:
+        parts = shlex.split(command)
+    except ValueError as error:
+        raise ValueError(f"invalid /image command: {error}") from error
+    if not parts or parts[0] != "/image" or len(parts) < 2:
+        raise ValueError(
+            "usage: /image PATH [question] (quote paths containing spaces)"
+        )
+    return Path(parts[1]).expanduser(), " ".join(parts[2:])
+
+
+def _image_message(text, paths):
+    return [
+        *({"type": "image", "image": str(path)} for path in paths),
+        {"type": "text", "text": text},
+    ]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -161,6 +186,19 @@ def main():
         "--weight-quantization",
         choices=("q8_0",),
         help="Opt-in projection-weight compression during model loading",
+    )
+    parser.add_argument(
+        "--vision-path",
+        type=Path,
+        help="Qwen3.8 mmproj GGUF; enables /image commands",
+    )
+    parser.add_argument(
+        "--multimodal",
+        action="store_true",
+        help=(
+            "Enable /image commands when vision weights are embedded in the "
+            "model directory"
+        ),
     )
     parser.add_argument(
         "--yarn",
@@ -198,7 +236,9 @@ def main():
         help="Allow shell commands without containment",
     )
     args = parser.parse_args()
-    tokenizer = create_tokenizer(args.model_dir)
+    multimodal = args.multimodal or args.vision_path is not None
+    processor = create_multimodal_processor(args.model_dir) if multimodal else None
+    tokenizer = processor.tokenizer if processor else create_tokenizer(args.model_dir)
     thinking = (
         tokenizer.default_enable_thinking if args.thinking is None else args.thinking
     )
@@ -231,6 +271,8 @@ def main():
     runner_options = {"rope_scaling": rope_scaling} if rope_scaling else {}
     if args.weight_quantization:
         runner_options["weight_quantization"] = args.weight_quantization
+    if args.vision_path is not None:
+        runner_options["vision_path"] = args.vision_path
     runner = create_text_runner(
         args.model_dir,
         device=args.device,
@@ -245,6 +287,7 @@ def main():
             "workspace. Never use tools for conversation, general knowledge, translation, or creative writing."
         )
     messages = [] if system is None else [{"role": "system", "content": system}]
+    pending_images = []
     cached_ids = []
     chat_encoder = ChatEncodingCache(tokenizer)
     if args.unsafe_shell and not args.coding_agent:
@@ -255,6 +298,12 @@ def main():
     )
 
     print("Enter /clear to forget the conversation or /exit to quit.")
+    if processor:
+        print(
+            "Use /image PATH to queue an image, or /image PATH QUESTION to ask "
+            "about it immediately."
+        )
+        print("Use /images to list queued images or /clear-images to remove them.")
     print("Press Esc to stop a response and return to user input.")
     print(
         "The first response may spend a few minutes compiling Warp kernels with no GPU activity."
@@ -281,19 +330,64 @@ def main():
             break
         if prompt == "/clear":
             messages = [] if system is None else [{"role": "system", "content": system}]
+            pending_images.clear()
             cached_ids.clear()
             chat_encoder.reset()
             print("History cleared.")
             continue
 
-        messages.append({"role": "user", "content": prompt})
+        if prompt == "/images":
+            if pending_images:
+                print("Images queued for the next message:")
+                for path in pending_images:
+                    print(f"  {path}")
+            else:
+                print("No images are queued.")
+            continue
+        if prompt == "/clear-images":
+            pending_images.clear()
+            print("Queued images cleared.")
+            continue
+        if prompt == "/image" or prompt.startswith("/image "):
+            if processor is None:
+                print(
+                    "Image input is disabled; restart with --vision-path "
+                    "MMPROJ.gguf or --multimodal."
+                )
+                continue
+            try:
+                image_path, question = _parse_image_command(prompt)
+            except ValueError as error:
+                print(error)
+                continue
+            if not image_path.is_file():
+                print(f"Image not found: {image_path}")
+                continue
+            pending_images.append(image_path.resolve())
+            if not question:
+                print(f"Queued image: {pending_images[-1]}")
+                continue
+            prompt = question
+
+        content = _image_message(prompt, pending_images) if pending_images else prompt
+        pending_images.clear()
+        messages.append({"role": "user", "content": content})
         with _EscapeMonitor() as cancel:
             for tool_round in range(8):
-                token_ids = chat_encoder.encode_chat(
-                    messages,
-                    enable_thinking=thinking,
-                    tools=coding_tools.schemas if coding_tools else None,
-                    reasoning_effort=args.reasoning_effort,
+                encode_options = {
+                    "enable_thinking": thinking,
+                    "tools": coding_tools.schemas if coding_tools else None,
+                    "reasoning_effort": args.reasoning_effort,
+                }
+                multimodal_prompt = (
+                    processor.encode_chat(messages, **encode_options)
+                    if processor
+                    else None
+                )
+                token_ids = (
+                    list(multimodal_prompt.token_ids)
+                    if multimodal_prompt
+                    else chat_encoder.encode_chat(messages, **encode_options)
                 )
                 if len(token_ids) >= args.cache_capacity:
                     if tool_round == 0:
@@ -303,7 +397,9 @@ def main():
                     )
                     break
                 print("Assistant: ", end="", flush=True)
-                if cached_ids and token_ids[: len(cached_ids)] == cached_ids:
+                if multimodal_prompt is not None:
+                    logits = runner.prefill_multimodal(multimodal_prompt)
+                elif cached_ids and token_ids[: len(cached_ids)] == cached_ids:
                     logits = runner.append(token_ids[len(cached_ids) :])
                 else:
                     logits = runner.prefill(token_ids)
@@ -325,7 +421,8 @@ def main():
                     rng=rng,
                     cancelled=cancel.cancelled.is_set,
                 )
-                chat_encoder.extend_raw(generated)
+                if processor is None:
+                    chat_encoder.extend_raw(generated)
                 print()
                 if cancel.cancelled.is_set():
                     messages.append(

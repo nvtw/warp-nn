@@ -1035,7 +1035,7 @@ class Qwen35Runner(AutoregressiveRunner):
     def _vision_encoder(self):
         encoder = getattr(self, "_vision_encoder_instance", None)
         if encoder is None:
-            from .media import QwenVisionEncoder
+            from .vision import QwenVisionEncoder
 
             encoder = self._vision_encoder_instance = QwenVisionEncoder(
                 self.model_path,
