@@ -434,6 +434,33 @@ def _clamp_kernel(
     output[index] = output.dtype(wp.clamp(wp.float32(x[index]), minimum, maximum))
 
 
+@wp.kernel(enable_backward=False, module="unique")
+def _overlap_tile_blend_kernel(
+    tile: wp.array4d[Any],
+    canvas: wp.array4d[Any],
+    origin_y: int,
+    origin_x: int,
+    overlap_y: int,
+    overlap_x: int,
+    target_height: int,
+    target_width: int,
+):
+    """Blend one NCHW tile into an in-place canvas with cropped bounds."""
+    batch, channel, row, column = wp.tid()
+    target_y = origin_y + row
+    target_x = origin_x + column
+    if target_y < target_height and target_x < target_width:
+        value = wp.float32(tile[batch, channel, row, column])
+        previous = wp.float32(canvas[batch, channel, target_y, target_x])
+        if origin_y > 0 and row < overlap_y:
+            alpha_y = wp.float32(row) / wp.float32(overlap_y)
+            value = previous * (wp.float32(1.0) - alpha_y) + value * alpha_y
+        if origin_x > 0 and column < overlap_x:
+            alpha_x = wp.float32(column) / wp.float32(overlap_x)
+            value = previous * (wp.float32(1.0) - alpha_x) + value * alpha_x
+        canvas[batch, channel, target_y, target_x] = canvas.dtype(value)
+
+
 @wp.kernel(enable_backward=False)
 def _transpose_021_kernel(x: wp.array3d[Any], output: wp.array3d[Any]):
     """Transpose a rank-3 tensor from axes 0-1-2 to 0-2-1."""

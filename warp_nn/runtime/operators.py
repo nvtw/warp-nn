@@ -49,6 +49,7 @@ from warp_nn.runtime.kernels import (
     _linear_kernel,
     _channels_last_1d_kernels,
     _clamp_kernel_for_dtype,
+    _overlap_tile_blend_kernel,
     _channels_last_2d_kernels,
     _conv1d_mma_kernels,
     _conv2d_mma_kernels,
@@ -2407,6 +2408,74 @@ class ClampPlan:
             device=self.input.device,
         )
         return self.output
+
+
+class OverlapTileBlendPlan:
+    """Graph-safe in-place linear overlap blend for cropped NCHW tile canvases."""
+
+    def __init__(
+        self,
+        tile,
+        canvas,
+        origin_y,
+        origin_x,
+        overlap_y,
+        overlap_x,
+        target_height,
+        target_width,
+    ):
+        if tile.ndim != 4 or canvas.ndim != 4:
+            raise ValueError("overlap tile and canvas must be rank-four NCHW arrays")
+        if (
+            tile.shape[:2] != canvas.shape[:2]
+            or tile.dtype != canvas.dtype
+            or tile.device != canvas.device
+        ):
+            raise ValueError("overlap tile and canvas batch/channels must match")
+        if tile.dtype not in (wp.float16, wp.bfloat16, wp.float32):
+            raise TypeError("overlap tile blend requires FP16, BF16, or FP32")
+        values = (origin_y, origin_x, overlap_y, overlap_x, target_height, target_width)
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) for value in values
+        ):
+            raise TypeError("overlap tile blend geometry must use integers")
+        if min(origin_y, origin_x, overlap_y, overlap_x) < 0:
+            raise ValueError("overlap tile origins and extents must be nonnegative")
+        if (
+            target_height <= 0
+            or target_width <= 0
+            or target_height > canvas.shape[2]
+            or target_width > canvas.shape[3]
+            or origin_y >= target_height
+            or origin_x >= target_width
+        ):
+            raise ValueError("overlap tile target geometry is outside the canvas")
+        self.tile, self.canvas = tile, canvas
+        self.origin_y, self.origin_x = origin_y, origin_x
+        self.overlap_y, self.overlap_x = overlap_y, overlap_x
+        self.target_height, self.target_width = target_height, target_width
+
+    @property
+    def output(self):
+        return self.canvas
+
+    def execute(self):
+        wp.launch(
+            _overlap_tile_blend_kernel,
+            dim=self.tile.shape,
+            inputs=[
+                self.tile,
+                self.canvas,
+                self.origin_y,
+                self.origin_x,
+                self.overlap_y,
+                self.overlap_x,
+                self.target_height,
+                self.target_width,
+            ],
+            device=self.tile.device,
+        )
+        return self.canvas
 
 
 class SpatialRMSNormPlan:
