@@ -109,11 +109,13 @@ class QwenBatchExecutor:
     def select_decode_bucket(self, active_count: int) -> int:
         if not 0 < active_count <= self.max_batch_size:
             raise ValueError("invalid Qwen decode batch size")
-        return self.max_batch_size
+        return 1 if active_count == 1 else self.max_batch_size
 
     def decode(self, slots: list[int], bucket_size: int):
-        if bucket_size != self.max_batch_size:
+        if bucket_size not in (1, self.max_batch_size):
             raise ValueError("Qwen decoder bucket does not match its fixed batch size")
+        if bucket_size == 1 and len(slots) != 1:
+            raise ValueError("Qwen single-slot bucket requires one active request")
         tokens = [0] * self.max_batch_size
         active = [False] * self.max_batch_size
         results = []
@@ -137,10 +139,14 @@ class QwenBatchExecutor:
             if not eos:
                 state.cached_ids.append(token)
         if any(active):
-            logits = self.decoder.decode(tokens, active)
-            for slot in slots:
-                if active[slot]:
-                    self._state(slot).logits = logits[slot : slot + 1]
+            if bucket_size == 1:
+                slot = slots[0]
+                self._state(slot).logits = self.decoder.decode_one(slot, tokens[slot])
+            else:
+                logits = self.decoder.decode(tokens, active)
+                for slot in slots:
+                    if active[slot]:
+                        self._state(slot).logits = logits[slot : slot + 1]
         return results
 
     def release(self, slot: int, retain_prefix: bool) -> None:

@@ -60,6 +60,7 @@ class _BatchDecoder:
         self.prefills = []
         self.prefill_buffers = {}
         self.decodes = []
+        self.decode_ones = []
         self.releases = []
         self.resumes = []
 
@@ -81,6 +82,10 @@ class _BatchDecoder:
     def decode(self, token_ids, active=None):
         self.decodes.append((tuple(token_ids), tuple(active)))
         return _logits(self.size, 0)
+
+    def decode_one(self, slot, token_id):
+        self.decode_ones.append((slot, token_id))
+        return _logits(1, 0)
 
     def release(self, slot):
         self.releases.append(slot)
@@ -186,6 +191,30 @@ def test_opt_in_chat_preserves_reasoning_formatting():
     message = response["choices"][0]["message"]
     assert message["content"] == "A"
     assert message["reasoning_content"] == "Reasoning"
+
+
+def test_single_request_uses_optimized_decode_one_bucket():
+    runner = _Runner()
+    backend = ChatCompletions(
+        "warp-qwen",
+        runner,
+        _Tokenizer(),
+        max_new_tokens=3,
+        max_batch_size=4,
+        batch_wait_ms=0,
+    )
+    try:
+        response = backend.complete(
+            {
+                "model": "warp-qwen",
+                "messages": [{"role": "user", "content": "x"}],
+            }
+        )
+    finally:
+        backend.close()
+    assert response["choices"][0]["message"]["content"] == "A"
+    assert runner.batch.decode_ones == [(0, 1)]
+    assert runner.batch.decodes == []
 
 
 def test_public_endpoint_maps_batch_queue_overload_to_429():
