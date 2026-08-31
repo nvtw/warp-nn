@@ -1307,6 +1307,15 @@ class Qwen35BatchDecoder:
         self._rope_delta_values[slot] = int(rope_delta)
         self._slot_prefill_open[slot] = True
 
+    def resume_prefill(self, slot: int) -> None:
+        """Reopen a populated slot to append an exact retained-prefix suffix."""
+        self._validate_slot(slot)
+        if self._slot_prefill_open[slot]:
+            raise RuntimeError("incremental prefill is already open")
+        if self._lengths[slot] == 0:
+            raise RuntimeError("cannot resume an empty Qwen batch slot")
+        self._slot_prefill_open[slot] = True
+
     def _incremental_plan_for_rows(self, rows: int):
         plan = self._incremental_plans.get(rows)
         if plan is None:
@@ -1360,9 +1369,10 @@ class Qwen35BatchDecoder:
                 inputs=[self._slot_view.sequence_end, end - 1],
                 device=self.device,
             )
-            if self.device.is_cuda and plan.graphs and slot not in plan.graphs:
-                # CUDA cannot begin a second pointer-specialized capture while a
-                # graph using the shared workspace is still pending on the stream.
+            if self.device.is_cuda and slot not in plan.graphs:
+                # Pointer-specialized capture must start after all prior uses of
+                # the shared workspace; this synchronization disappears after
+                # the per-slot graph has been created.
                 wp.synchronize_stream(self.device)
             logits = self.runner._run(plan, graph_key=slot)
             self._lengths[slot] = end

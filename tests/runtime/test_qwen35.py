@@ -364,12 +364,21 @@ def test_qwen35_incremental_prefill_interleaves_slots_without_state_copies(tmp_p
     assert set(plan.graphs) == {0, 1}
     assert plan.tensors["lm_head.weight"].ptr == runner.weights["lm_head.weight"].ptr
 
-    actual = batch.decode([9, 9]).numpy()
-    for slot, prompt in enumerate(prompts):
+    batch.resume_prefill(0)
+    continued = batch.append_prefill(0, [9])
+    batch.end_prefill(0)
+    expected_continued = runner.prefill([*prompts[0], 9]).numpy()
+    np.testing.assert_array_equal(continued.numpy(), expected_continued)
+
+    actual = batch.decode([10, 10]).numpy()
+    decode_prompts = ([*prompts[0], 9], prompts[1])
+    for slot, prompt in enumerate(decode_prompts):
         runner.prefill(prompt)
-        expected_decode = runner.decode(9).numpy()
+        expected_decode = runner.decode(10).numpy()
         np.testing.assert_array_equal(actual[slot], expected_decode[0])
 
     batch.release(0)
     with pytest.raises(RuntimeError, match="begin_prefill"):
         batch.append_prefill(0, [1])
+    with pytest.raises(RuntimeError, match="empty"):
+        batch.resume_prefill(0)
