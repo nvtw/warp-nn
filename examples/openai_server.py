@@ -33,6 +33,19 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--cache-capacity", type=int, default=4096)
     parser.add_argument("--prefill-chunk-size", type=int, default=256)
+    parser.add_argument(
+        "--max-batch-size",
+        type=int,
+        choices=(1, 2, 4),
+        default=1,
+        help="Opt-in Qwen continuous decode batching",
+    )
+    parser.add_argument(
+        "--batch-wait-ms",
+        type=float,
+        default=2.0,
+        help="Idle request coalescing window for continuous batching",
+    )
     parser.add_argument("--yarn", action="store_true")
     parser.add_argument("--yarn-factor", type=float)
     parser.add_argument(
@@ -95,6 +108,8 @@ def main():
         args.top_k,
         presence_penalty,
         args.reasoning_effort,
+        max_batch_size=args.max_batch_size,
+        batch_wait_ms=args.batch_wait_ms,
     )
     server = OpenAIHTTPServer((args.host, args.port), backend, args.api_key)
     print(f"Serving {model_id} at http://{args.host}:{args.port}/v1")

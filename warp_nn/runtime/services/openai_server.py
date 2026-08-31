@@ -24,6 +24,11 @@ from warp_nn.runtime.chat import (
     split_reasoning,
     split_tool_prefix,
 )
+from warp_nn.runtime.services.batching import (
+    BatchRequest,
+    ContinuousBatchScheduler,
+    SchedulerOverloadedError,
+)
 
 
 class APIError(Exception):
@@ -31,6 +36,53 @@ class APIError(Exception):
         super().__init__(message)
         self.status = status
         self.param = param
+
+
+class _ScheduledRunner:
+    """Present scheduler token events through the ordinary Runner interface."""
+
+    def __init__(self, scheduler, cache_capacity, payload_factory, max_new_tokens):
+        self.scheduler = scheduler
+        self.cache_capacity = cache_capacity
+        self.payload_factory = payload_factory
+        self.max_new_tokens = max_new_tokens
+        self.handle = None
+        self._events = None
+
+    def prefill(self, token_ids):
+        prompt_ids = tuple(int(token) for token in token_ids)
+        available = self.cache_capacity - len(prompt_ids)
+        try:
+            self.handle = self.scheduler.submit(
+                BatchRequest(
+                    self.payload_factory(prompt_ids),
+                    len(prompt_ids),
+                    min(self.max_new_tokens, available),
+                    retain_prefix=True,
+                )
+            )
+        except SchedulerOverloadedError as error:
+            raise APIError("Server is busy", status=429) from error
+        self._events = self.handle.iter_events()
+        return self
+
+    def append(self, token_ids):
+        return self.prefill(token_ids)
+
+    def decode(self, _token_id):
+        return self
+
+    def sample_greedy(self, _logits):
+        if self._events is None:
+            raise RuntimeError("scheduled runner has not been prefilled")
+        for event in self._events:
+            if event.token is not None:
+                return int(event.token)
+        raise RuntimeError("scheduled generation ended without a token")
+
+    def cancel(self):
+        if self.handle is not None and not self.handle.future.done():
+            self.handle.cancel()
 
 
 def _text_content(content: object, param: str) -> str | None:
@@ -103,6 +155,8 @@ class ChatCompletions:
         presence_penalty: float = 0.0,
         reasoning_effort: str | None = None,
         preserve_thinking: bool = True,
+        max_batch_size: int = 1,
+        batch_wait_ms: float = 2.0,
     ):
         self.model = model
         self.runner = runner
@@ -120,12 +174,31 @@ class ChatCompletions:
         self._cached_ids: list[int] = []
         self._cache_serial = 0
         self._continuation = None
+        if max_batch_size not in (1, 2, 4):
+            raise ValueError("max_batch_size must be 1, 2, or 4")
+        if batch_wait_ms < 0.0:
+            raise ValueError("batch_wait_ms must be non-negative")
+        self.max_batch_size = max_batch_size
+        self._batch_scheduler = None
+        if max_batch_size > 1:
+            if not callable(getattr(runner, "create_batch_decoder", None)):
+                raise ValueError("continuous batching requires a Qwen batch decoder")
+            from warp_nn.runtime.qwen.batching import QwenBatchExecutor
+
+            executor = QwenBatchExecutor(runner, tokenizer, max_batch_size)
+            self._batch_scheduler = ContinuousBatchScheduler(
+                executor,
+                max_active=max_batch_size,
+                idle_wait_ms=batch_wait_ms,
+            )
 
     def complete(
         self,
         request: Mapping[str, object],
         emit: Callable[[dict[str, object]], None] | None = None,
     ):
+        if self._batch_scheduler is not None:
+            return self._complete_batched(request, emit)
         if request.get("model") not in (None, self.model):
             raise APIError(
                 f"Model {request['model']!r} is not available",
@@ -427,6 +500,83 @@ class ChatCompletions:
             "usage": usage,
         }
 
+    def _complete_batched(self, request, emit):
+        """Reuse the established response path around a scheduled runner proxy."""
+
+        try:
+            temperature = float(request.get("temperature", self.temperature))
+            top_p = float(request.get("top_p", self.top_p))
+            top_k = int(request.get("top_k", self.top_k))
+            presence_penalty = float(
+                request.get("presence_penalty", self.presence_penalty)
+            )
+        except (TypeError, ValueError) as error:
+            raise APIError("invalid sampling parameter") from error
+        if (
+            temperature < 0.0
+            or not 0.0 < top_p <= 1.0
+            or top_k < 0
+            or not -2.0 <= presence_penalty <= 2.0
+        ):
+            raise APIError("sampling parameters are outside their supported ranges")
+        max_tokens = request.get(
+            "max_completion_tokens", request.get("max_tokens", self.max_new_tokens)
+        )
+        if (
+            isinstance(max_tokens, bool)
+            or not isinstance(max_tokens, int)
+            or max_tokens <= 0
+        ):
+            raise APIError(
+                "max tokens must be a positive integer", param="max_completion_tokens"
+            )
+        max_tokens = min(max_tokens, self.max_new_tokens)
+        seed = request.get("seed")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise APIError("seed must be an integer", param="seed")
+
+        from warp_nn.runtime.qwen.batching import QwenBatchPayload
+
+        proxy = _ScheduledRunner(
+            self._batch_scheduler,
+            self.runner.cache_capacity,
+            lambda prompt_ids: QwenBatchPayload(
+                prompt_ids,
+                temperature,
+                top_k,
+                top_p,
+                presence_penalty,
+                seed,
+            ),
+            max_tokens,
+        )
+        local = ChatCompletions(
+            self.model,
+            proxy,
+            self.tokenizer,
+            self.max_new_tokens,
+            self.enable_thinking,
+            0.0,
+            1.0,
+            0,
+            0.0,
+            self.reasoning_effort,
+            self.preserve_thinking,
+        )
+        scheduled_request = dict(request)
+        scheduled_request.update(
+            temperature=0.0, top_p=1.0, top_k=0, presence_penalty=0.0
+        )
+        scheduled_request.pop("seed", None)
+        try:
+            return local.complete(scheduled_request, emit)
+        finally:
+            proxy.cancel()
+
+    def close(self):
+        if self._batch_scheduler is not None:
+            self._batch_scheduler.close()
+
     def _chunk(
         self,
         completion_id: str,
@@ -450,6 +600,10 @@ class OpenAIHTTPServer(ThreadingHTTPServer):
         self.backend = backend
         self.api_key = api_key
         super().__init__(address, OpenAIRequestHandler)
+
+    def server_close(self):
+        self.backend.close()
+        super().server_close()
 
 
 class OpenAIRequestHandler(BaseHTTPRequestHandler):
