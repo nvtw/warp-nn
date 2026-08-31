@@ -21,6 +21,7 @@ from warp_nn.runtime.kernels import (
     _GEMM_TRANSB_TILED_KERNEL,
     _gather_block_quantized_int8_kernel,
     _get_grouped_decode_linear_kernel,
+    _get_bidirectional_gqa_attention_kernel,
     _get_linear_tiled_kernel,
     _get_prefill_mma_linear_kernel,
     _get_partitioned_gqa_attention_kernels,
@@ -1499,6 +1500,109 @@ class EncoderStackPlan:
         for layer in self.layers:
             layer.execute()
         return self.output
+
+
+class BidirectionalGQAPlan:
+    """Fixed-buffer full or symmetric-sliding grouped-query attention.
+
+    Q/K/V projections stay separate so callers retain the optimized Linear path.
+    Inputs use [batch, heads, sequence, head_size] and may have different
+    query and key sequence lengths for cross-attention.
+    """
+
+    def __init__(
+        self,
+        query,
+        key,
+        value,
+        *,
+        query_valid=None,
+        key_valid=None,
+        window=None,
+        scale=None,
+    ):
+        if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+            raise ValueError("attention Q/K/V must be rank-four arrays")
+        if key.shape != value.shape:
+            raise ValueError("attention K/V shapes must match")
+        if any(item.dtype != query.dtype for item in (key, value)) or any(
+            item.device != query.device for item in (key, value)
+        ):
+            raise ValueError("attention Q/K/V must share dtype and device")
+        if query.dtype not in (wp.float16, wp.bfloat16, wp.float32):
+            raise TypeError("attention requires FP16, BF16, or FP32 tensors")
+        batch, query_heads, query_length, head_size = query.shape
+        if (
+            key.shape[0] != batch
+            or key.shape[3] != head_size
+            or key.shape[1] <= 0
+            or query_heads % key.shape[1]
+        ):
+            raise ValueError("attention head geometry is incompatible")
+        if window is not None and int(window) <= 0:
+            raise ValueError("attention window must be positive")
+        if window is not None and query_length != key.shape[2]:
+            raise ValueError("sliding attention requires equal Q/K sequence lengths")
+        self.query = query
+        self.key = key
+        self.value = value
+        self.output = wp.empty_like(query)
+        self.query_valid = self._mask(query_valid, batch, query_length, query)
+        self.key_valid = self._mask(key_valid, batch, key.shape[2], query)
+        self.window = int(window or 0)
+        self.scale = float(head_size**-0.5 if scale is None else scale)
+        if not math.isfinite(self.scale) or self.scale <= 0.0:
+            raise ValueError("attention scale must be finite and positive")
+        self._block_dim, self._kernel = _get_bidirectional_gqa_attention_kernel(
+            head_size, query.dtype
+        )
+
+    @staticmethod
+    def _mask(mask, batch, sequence, like):
+        if mask is None:
+            return wp.ones((batch, sequence), dtype=wp.bool, device=like.device)
+        if (
+            mask.shape != (batch, sequence)
+            or mask.dtype != wp.bool
+            or mask.device != like.device
+        ):
+            raise ValueError("attention masks must be matching boolean arrays")
+        return mask
+
+    def execute(self):
+        wp.launch_tiled(
+            self._kernel,
+            dim=(self.query.shape[0], self.query.shape[1], self.query.shape[2]),
+            inputs=[
+                self.query,
+                self.key,
+                self.value,
+                self.query_valid,
+                self.key_valid,
+                self.output,
+                wp.float32(self.scale),
+                self.window,
+            ],
+            block_dim=self._block_dim,
+            device=self.query.device,
+        )
+        return self.output
+
+
+class FixedKVAttentionPlan(BidirectionalGQAPlan):
+    """Graph-safe cross-attention whose projected condition K/V stay fixed."""
+
+    def __init__(
+        self, query, key, value, *, query_valid=None, key_valid=None, scale=None
+    ):
+        super().__init__(
+            query,
+            key,
+            value,
+            query_valid=query_valid,
+            key_valid=key_valid,
+            scale=scale,
+        )
 
 
 def resolve_rope_parameters(

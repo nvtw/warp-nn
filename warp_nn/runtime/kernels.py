@@ -2219,6 +2219,73 @@ def _create_gqa_attention_kernel(head_size: int, dtype: type):
     return kernel
 
 
+def _create_bidirectional_gqa_attention_kernel(head_size: int, dtype: type):
+    """Build stable full/sliding GQA for fixed query and key sequences."""
+    DTYPE = dtype
+
+    @wp.func
+    def dot(left: DTYPE, right: DTYPE):
+        return wp.float32(DTYPE(left)) * wp.float32(DTYPE(right))
+
+    @wp.func
+    def accumulate(
+        total: wp.float32, value: DTYPE, old_scale: wp.float32, weight: wp.float32
+    ):
+        return total * old_scale + wp.float32(DTYPE(value)) * weight
+
+    @wp.func
+    def normalize(total: wp.float32, denominator: wp.float32):
+        return DTYPE(total / denominator)
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def kernel(
+        query: wp.array4d(dtype=DTYPE),
+        key: wp.array4d(dtype=DTYPE),
+        value: wp.array4d(dtype=DTYPE),
+        query_valid: wp.array2d[wp.bool],
+        key_valid: wp.array2d[wp.bool],
+        output: wp.array4d(dtype=DTYPE),
+        scale: wp.float32,
+        window: int,
+    ):
+        batch, head, query_token = wp.tid()
+        kv_head = head / (query.shape[1] / key.shape[1])
+        accumulator = wp.tile_zeros(shape=(head_size,), dtype=wp.float32)
+        maximum = wp.float32(-3.402823466e38) + wp.float32(DTYPE(0.0))
+        denominator = wp.float32(0.0)
+        if query_valid[batch, query_token]:
+            query_values = wp.tile_load(
+                query[batch, head, query_token], shape=(head_size,)
+            )
+            for key_token in range(key.shape[2]):
+                in_window = window <= 0 or wp.abs(query_token - key_token) <= window
+                if key_valid[batch, key_token] and in_window:
+                    key_values = wp.tile_load(
+                        key[batch, kv_head, key_token], shape=(head_size,)
+                    )
+                    score = wp.tile_extract(
+                        wp.tile_sum(wp.tile_map(dot, query_values, key_values)), 0
+                    )
+                    score *= scale
+                    new_maximum = wp.max(maximum, score)
+                    old_scale = wp.exp(maximum - new_maximum)
+                    weight = wp.exp(score - new_maximum)
+                    denominator = denominator * old_scale + weight
+                    value_values = wp.tile_load(
+                        value[batch, kv_head, key_token], shape=(head_size,)
+                    )
+                    accumulator = wp.tile_map(
+                        accumulate, accumulator, value_values, old_scale, weight
+                    )
+                    maximum = new_maximum
+        safe_denominator = wp.max(denominator, wp.float32(1.0e-20))
+        normalized = wp.tile_map(normalize, accumulator, safe_denominator)
+        wp.tile_store(output[batch, head, query_token], normalized)
+
+    kernel.module.options["enable_backward"] = False
+    return kernel
+
+
 def _create_partitioned_gqa_attention_kernels(
     head_size: int,
     dtype: type,
@@ -2565,6 +2632,7 @@ def _create_partitioned_gqa_attention_kernels(
 
 
 _gqa_attention_kernel_cache = {}
+_bidirectional_gqa_attention_kernel_cache = {}
 _partitioned_gqa_attention_kernel_cache = {}
 
 
@@ -2575,6 +2643,17 @@ def _get_gqa_attention_kernel(head_size: int, dtype: type = wp.float16):
         _gqa_attention_kernel_cache[key] = _create_gqa_attention_kernel(*key)
     block_dim = min(1024, max(32, 1 << (head_size - 1).bit_length()))
     return block_dim, _gqa_attention_kernel_cache[key]
+
+
+def _get_bidirectional_gqa_attention_kernel(head_size: int, dtype: type = wp.float16):
+    """Return fixed-sequence bidirectional GQA and its tile block dimension."""
+    key = (head_size, dtype)
+    if key not in _bidirectional_gqa_attention_kernel_cache:
+        _bidirectional_gqa_attention_kernel_cache[key] = (
+            _create_bidirectional_gqa_attention_kernel(*key)
+        )
+    block_dim = min(1024, max(32, 1 << (head_size - 1).bit_length()))
+    return block_dim, _bidirectional_gqa_attention_kernel_cache[key]
 
 
 def _get_partitioned_gqa_attention_kernels(
