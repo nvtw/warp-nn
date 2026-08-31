@@ -8,6 +8,12 @@ from .checkpoint import (
     QwenImageTransformerManifest,
     TensorMetadataArchive,
 )
+from .prompt import (
+    QWEN_IMAGE_PREFIX_TOKENS,
+    QWEN_IMAGE_SYSTEM_PROMPT,
+    format_qwen_image_prompt,
+    tokenize_qwen_image_prompt,
+)
 from .runner import (
     QWEN_IMAGE_2512_RESOLUTIONS,
     FlowMatchEulerConfig,
@@ -24,6 +30,10 @@ from .vae import (
 )
 
 __all__ = [
+    "QWEN_IMAGE_PREFIX_TOKENS",
+    "QWEN_IMAGE_SYSTEM_PROMPT",
+    "format_qwen_image_prompt",
+    "tokenize_qwen_image_prompt",
     "FlowMatchEulerConfig",
     "QWEN_IMAGE_2512_RESOLUTIONS",
     "QwenImage2512Bundle",
