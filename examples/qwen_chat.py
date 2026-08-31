@@ -380,7 +380,10 @@ def main():
         )
         print("Use /images to list queued images or /clear-images to remove them.")
     print("Press Esc to stop a response and return to user input.")
-    print("Press Ctrl-D at an empty prompt to save and close the chat.")
+    if os.name == "nt":
+        print("Press Ctrl-Z then Enter at an empty prompt to save and close the chat.")
+    else:
+        print("Press Ctrl-D at an empty prompt to save and close the chat.")
     print(
         "The first response may spend a few minutes compiling Warp kernels with no GPU activity."
     )

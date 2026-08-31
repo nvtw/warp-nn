@@ -8,13 +8,14 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping, Sequence
 from datetime import datetime, timezone
 import json
-import os
 from pathlib import Path
 import re
 import secrets
 from typing import Any, Protocol
 
 import numpy as np
+
+from warp_nn.utils.paths import application_state_dir
 
 
 _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -26,8 +27,7 @@ class ChatSessionStore:
     def __init__(self, model: str | Path, directory: str | Path | None = None):
         self.model = str(Path(model).expanduser().resolve())
         if directory is None:
-            state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
-            directory = state / "warp-nn" / "chats"
+            directory = application_state_dir() / "chats"
         self.directory = Path(directory).expanduser().resolve()
 
     @staticmethod
