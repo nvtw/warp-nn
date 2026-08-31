@@ -14,6 +14,7 @@ from .bridges import (
     split_heads,
 )
 from .checkpoint import LoRACheckpoint, load_lora_safetensors, save_lora_safetensors
+from .data import SFTBatch, SFTExample, prepare_sft_batch
 from .gated_delta import GatedDeltaInputPlan
 from .gated_delta_rule import GatedDeltaRulePlan
 from .gated_norm import GatedRMSNormPlan
@@ -54,6 +55,8 @@ __all__ = [
     "build_muse_lora_training_plan",
     "QKTransformPlan",
     "QwenLoRATransformerBlockPlan",
+    "SFTBatch",
+    "SFTExample",
     "build_qwen_lora_training_plan",
     "TransformerPrimitivePlan",
     "accumulate_fp32_gradient",
@@ -69,6 +72,7 @@ __all__ = [
     "lora_backward",
     "lora_forward",
     "merge_heads",
+    "prepare_sft_batch",
     "save_lora_safetensors",
     "split_heads",
 ]
