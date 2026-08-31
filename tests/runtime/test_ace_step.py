@@ -293,3 +293,35 @@ def test_ace_cli_check_validates_without_loading_weights(tmp_path, capsys):
     assert report["variant"] == "acestep-v15-turbo"
     assert report["sample_rate"] == 48000
     assert report["samples_per_latent"] == 1920
+
+
+def test_ace_cli_writes_stereo_pcm16_only_after_ready_generation(tmp_path, monkeypatch):
+    import examples.ace_step as cli
+    from warp_nn.runtime.formats.wav import read_wav_pcm16
+
+    _write_bundle(tmp_path)
+    generated = np.array([[[-1.0, 1.0], [0.25, -0.5]]], dtype=np.float32)
+
+    class Pipeline:
+        ready = True
+        missing_components = ()
+
+        def __init__(self, bundle):
+            self.bundle = bundle
+
+        def load_text_encoder(self, **kwargs):
+            return None
+
+        def prepare_conditioning(self, *args, **kwargs):
+            return "conditioning"
+
+        def generate(self, *, conditioning):
+            assert conditioning == "conditioning"
+            return generated
+
+    monkeypatch.setattr(cli, "AceStep15Pipeline", Pipeline)
+    output = tmp_path / "result.wav"
+    assert cli.main([str(tmp_path), "--prompt", "music", "--output", str(output)]) == 0
+    audio = read_wav_pcm16(output)
+    assert audio.sample_rate == 48_000
+    np.testing.assert_allclose(audio.samples, generated[0], atol=1.0 / 32767.0)

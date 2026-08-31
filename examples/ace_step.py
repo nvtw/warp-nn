@@ -13,7 +13,10 @@ from __future__ import annotations
 import argparse
 import json
 
+import numpy as np
+
 from warp_nn.runtime.ace_step.runner import AceStep15Bundle, AceStep15Pipeline
+from warp_nn.runtime.formats.wav import write_wav_pcm16
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -30,6 +33,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", default="ace-step.wav")
     parser.add_argument("--no-cublas", action="store_true")
+    parser.add_argument(
+        "--normalize-output",
+        action="store_true",
+        help="peak-normalize before PCM16 conversion (off by default)",
+    )
     parser.add_argument(
         "--check",
         action="store_true",
@@ -76,7 +84,19 @@ def main(argv=None) -> int:
         raise RuntimeError(
             f"ACE-Step bundle and Qwen conditioning are ready; generation still needs {missing}"
         )
-    pipeline.generate(conditioning=conditioning, output=args.output)
+    audio = pipeline.generate(conditioning=conditioning)
+    if hasattr(audio, "numpy"):
+        audio = audio.numpy()
+    audio = np.asarray(audio)
+    if audio.ndim == 3 and audio.shape[0] == 1:
+        audio = audio[0]
+    write_wav_pcm16(
+        args.output,
+        audio,
+        bundle.vae.sampling_rate,
+        normalize=args.normalize_output,
+    )
+    print(f"Wrote {args.output}")
     return 0
 
 
