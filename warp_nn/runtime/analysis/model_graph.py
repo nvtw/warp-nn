@@ -321,6 +321,8 @@ def analyze_model(path: str | Path) -> dict:
         node_id = _component_id(layer, kind)
         parameters = sum(item.parameters for item in items)
         nbytes = sum(item.nbytes for item in items)
+        formats = Counter(item.format for item in items)
+        format_label = " + ".join(formats)
         layer_type = (
             str(layer_types[layer])
             if layer is not None and layer < len(layer_types)
@@ -332,9 +334,10 @@ def analyze_model(path: str | Path) -> dict:
             "type": "component",
             "kind": kind,
             "label": _display_name(kind, layer, layer_type),
-            "subtitle": f"{_compact_number(parameters)} params · {len(items)} tensors",
+            "subtitle": f"{format_label} · {_compact_number(parameters)} params · {len(items)} tensors",
             "parameters": parameters,
             "bytes": nbytes,
+            "formats": dict(formats),
             "explanation": explanation,
             "detailTitle": detail_title,
             "layer": layer,

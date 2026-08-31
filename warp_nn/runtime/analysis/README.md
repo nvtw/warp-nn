@@ -17,5 +17,5 @@ generate it without a browser, with:
 
 The overview follows the model's computation from embeddings through its layers
 to the output. Click a component for an explanation and exact storage statistics.
-Enable **Weights** to reveal every tensor, use search (`/`) to jump to a layer or
-weight name, and use **Untangle** for a lightly force-adjusted layout.
+Use search (`/`) to jump to a layer or exact weight name. Learned tensors remain
+available from each component's sidebar without crowding the architecture map.

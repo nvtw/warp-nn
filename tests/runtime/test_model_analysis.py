@@ -79,6 +79,8 @@ def test_analyze_model_builds_architecture_and_tensor_levels(tmp_path):
         if node.get("layer") == 0 and node["kind"] == "attention"
     )
     assert attention["label"] == "Layer 0 · Linear Attention"
+    assert attention["formats"] == {"F16": 1}
+    assert attention["subtitle"].startswith("F16 · ")
     assert attention["parameters"] == 128
     assert any(
         edge["source"] == attention["id"] and edge["kind"] == "contains"

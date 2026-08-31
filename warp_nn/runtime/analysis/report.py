@@ -54,7 +54,7 @@ _DOCUMENT = r"""<!doctype html>
       <canvas id="canvas" aria-label="Interactive model architecture graph"></canvas>
       <div class="toolbar">
         <div class="search"><input id="search" placeholder="Find a layer or tensor…" aria-label="Search nodes"><kbd>/</kbd></div><div class="divider"></div>
-        <button class="tool" id="fit">Fit</button><button class="tool" id="tensors">Weights</button><button class="tool" id="physics">Untangle</button>
+        <button class="tool" id="fit">Fit</button>
       </div>
       <div class="hint">Drag to pan · scroll to zoom · click a node to understand it</div>
     </section>
@@ -91,8 +91,8 @@ _DOCUMENT = r"""<!doctype html>
     const children=tensorNodes.filter(n=>n.parent===p.id);
     children.forEach((n,i)=>{const ring=Math.floor(i/12),a=(i%12)/Math.min(12,children.length-ring*12)*Math.PI*2;n.x=p.x+Math.cos(a)*(42+ring*20);n.y=p.y+Math.sin(a)*(42+ring*20);n.homeX=n.x;n.homeY=n.y});
   }
-  let dpr=1,width=0,height=0,scale=1,ox=0,oy=0,showWeights=false,selected=null,hovered=null,drag=null,physics=false,animation=0,query='';
-  const visible=()=>showWeights?nodes:componentNodes;
+  let dpr=1,width=0,height=0,scale=1,ox=0,oy=0,selected=null,hovered=null,drag=null,query='';
+  const visible=()=>componentNodes;
   function resize(){const r=stage.getBoundingClientRect();dpr=Math.min(devicePixelRatio||1,2);width=r.width;height=r.height;canvas.width=Math.round(width*dpr);canvas.height=Math.round(height*dpr);canvas.style.width=width+'px';canvas.style.height=height+'px';ctx.setTransform(dpr,0,0,dpr,0,0);draw()}
   const screen=n=>({x:n.x*scale+ox,y:n.y*scale+oy});
   const world=(x,y)=>({x:(x-ox)/scale,y:(y-oy)/scale});
@@ -116,22 +116,19 @@ _DOCUMENT = r"""<!doctype html>
     const children=tensorNodes.filter(x=>x.parent===n.id);let facts='';
     if(n.kind==='model'){facts=fact('Architecture',S.architecture)+fact('Checkpoint',S.format)+fact('Parameters',fmt(S.parameters))+fact('Stored size',bytes(S.bytes))+fact('Transformer layers',S.layers)+fact('Tensor formats',Object.entries(S.formats).map(x=>x.join(' × ')).join(', '))}
     else if(n.type==='tensor'){facts=fact('Shape',(n.shape||[]).join(' × ')||'scalar')+fact('Storage format',n.format)+fact('Values',fmt(n.parameters))+fact('Stored size',bytes(n.bytes))}
-    else{facts=fact('Parameters',fmt(n.parameters))+fact('Stored size',bytes(n.bytes))+fact('Tensors',n.tensorCount)+fact('Layer',n.layer==null?'Global':n.layer)+(n.layerType?fact('Layer variant',n.layerType.replaceAll('_',' ')):'')}
+    else{facts=fact('Parameters',fmt(n.parameters))+fact('Stored size',bytes(n.bytes))+fact('Data types',Object.entries(n.formats||{}).map(x=>x.join(' × ')).join(', '))+fact('Tensors',n.tensorCount)+fact('Layer',n.layer==null?'Global':n.layer)+(n.layerType?fact('Layer variant',n.layerType.replaceAll('_',' ')):'')}
     const weights=children.length?`<div class="section"><h3>Learned tensors</h3><div class="weight-list">${children.map(c=>`<div class="weight" data-node="${c.id}"><b>${esc(c.fullName)}</b><span>${esc(c.subtitle)} · ${esc(c.format)} · ${bytes(c.bytes)}</span></div>`).join('')}</div></div>`:'';
-    aside.innerHTML=`<div class="detail"><div class="eyebrow">${esc(names[n.kind]||'Component')}</div><h2>${esc(n.type==='tensor'?n.fullName:n.label)}</h2><div class="sub">${esc(n.subtitle)}</div><div class="explanation">${esc(n.explanation)}</div><div class="facts">${facts}</div>${weights}<div class="notice"><b>Reading the map.</b> Solid lines show the main flow of representations. Fine dotted lines connect a component to the weight tables it owns. Parameter sizes come from checkpoint headers; no model tensors were loaded.</div></div>`;
+    aside.innerHTML=`<div class="detail"><div class="eyebrow">${esc(names[n.kind]||'Component')}</div><h2>${esc(n.type==='tensor'?n.fullName:n.label)}</h2><div class="sub">${esc(n.subtitle)}</div><div class="explanation">${esc(n.explanation)}</div><div class="facts">${facts}</div>${weights}</div>`;
     aside.querySelectorAll('[data-node]').forEach(el=>el.onclick=()=>select(byId.get(el.dataset.node)));draw();
   }
   canvas.addEventListener('pointerdown',e=>{canvas.setPointerCapture(e.pointerId);const n=hitTest(e.offsetX,e.offsetY);drag={x:e.clientX,y:e.clientY,ox,oy,node:n&&e.altKey?n:null};canvas.classList.add('dragging')});
   canvas.addEventListener('pointermove',e=>{if(drag){if(drag.node){const w=world(e.offsetX,e.offsetY);drag.node.x=w.x;drag.node.y=w.y}else{ox=drag.ox+e.clientX-drag.x;oy=drag.oy+e.clientY-drag.y}draw();return}hovered=hitTest(e.offsetX,e.offsetY);canvas.style.cursor=hovered?'pointer':'grab';draw()});
   canvas.addEventListener('pointerup',e=>{const moved=drag&&Math.hypot(e.clientX-drag.x,e.clientY-drag.y)>4;if(!moved)select(hitTest(e.offsetX,e.offsetY));drag=null;canvas.classList.remove('dragging')});
   canvas.addEventListener('wheel',e=>{e.preventDefault();const before=world(e.offsetX,e.offsetY),factor=Math.exp(-e.deltaY*.001);scale=Math.max(.025,Math.min(3.5,scale*factor));ox=e.offsetX-before.x*scale;oy=e.offsetY-before.y*scale;draw()},{passive:false});
-  function physicsStep(){if(!physics)return;const v=componentNodes;for(let i=0;i<v.length;i++){const a=v[i];a.vx+=(a.homeX-a.x)*.002;a.vy+=(a.homeY-a.y)*.002;for(let j=i+1;j<v.length;j++){const b=v[j],dx=a.x-b.x,dy=a.y-b.y,d2=dx*dx+dy*dy+1;if(d2<18000){const f=85/d2;a.vx+=dx*f;a.vy+=dy*f;b.vx-=dx*f;b.vy-=dy*f}}}for(const n of v){n.vx*=.88;n.vy*=.88;n.x+=n.vx;n.y+=n.vy}draw();animation=requestAnimationFrame(physicsStep)}
   document.getElementById('fit').onclick=fit;
-  document.getElementById('tensors').onclick=e=>{showWeights=!showWeights;e.currentTarget.classList.toggle('active',showWeights);fit()};
-  document.getElementById('physics').onclick=e=>{physics=!physics;e.currentTarget.classList.toggle('active',physics);if(physics){cancelAnimationFrame(animation);physicsStep()}};
-  search.addEventListener('input',()=>{query=search.value.trim().toLowerCase();if(query){const found=nodes.find(n=>((n.fullName||n.label)+' '+(n.subtitle||'')).toLowerCase().includes(query));if(found){if(found.type==='tensor'&&!showWeights){showWeights=true;document.getElementById('tensors').classList.add('active')}const p=screen(found);ox+=width/2-p.x;oy+=height/2-p.y;select(found)}}draw()});
+  search.addEventListener('input',()=>{query=search.value.trim().toLowerCase();if(query){const found=nodes.find(n=>((n.fullName||n.label)+' '+(n.subtitle||'')).toLowerCase().includes(query));if(found){const target=found.type==='tensor'?byId.get(found.parent):found,p=screen(target);ox+=width/2-p.x;oy+=height/2-p.y;select(found)}}draw()});
   document.addEventListener('keydown',e=>{if(e.key==='/'&&document.activeElement!==search){e.preventDefault();search.focus()}if(e.key==='Escape'){search.value='';query='';search.blur();draw()}});
-  const legendKinds=['embedding','attention','mlp','normalization','output','tensor'];
+  const legendKinds=['embedding','attention','mlp','normalization','output'];
   const legend=document.createElement('div');legend.className='section';legend.innerHTML='<h3>Visual vocabulary</h3><div class="legend">'+legendKinds.map(k=>`<span class="legend-item"><i class="swatch" style="background:${palette[k]}"></i>${names[k]}</span>`).join('')+'</div>';aside.appendChild(legend);
   new ResizeObserver(resize).observe(stage);resize();requestAnimationFrame(()=>{readableOpening();select(byId.get('model'))});
 })();
