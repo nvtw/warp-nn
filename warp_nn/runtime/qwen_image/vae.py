@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Iterable
+import warp as wp
+
 
 from ..weights import extract_temporal_conv2d_weight
 from .runner import QwenImageVAEConfig
@@ -85,21 +87,10 @@ def _mid_block(specs, prefix, channels):
     _residual(specs, f"{prefix}.resnets.1", channels, channels)
 
 
-def qwen_image_2512_vae_decoder_weight_specs(
+def _qwen_image_vae_decoder_weight_specs(
     config: QwenImageVAEConfig,
 ) -> tuple[QwenImageVAEWeightSpec, ...]:
-    """Return the exact selected Diffusers state-dict contract for decoding."""
-
-    expected = (96, (1, 2, 4, 4), 2, 16, (False, True, True))
-    actual = (
-        config.base_dim,
-        config.dimension_multipliers,
-        config.residual_blocks,
-        config.latent_channels,
-        config.temporal_downsample,
-    )
-    if actual != expected:
-        raise ValueError("unsupported Qwen-Image-2512 VAE decoder geometry")
+    """Build a still-image contract for private synthetic test geometry."""
 
     specs: list[QwenImageVAEWeightSpec] = []
     base = config.base_dim
@@ -110,15 +101,12 @@ def qwen_image_2512_vae_decoder_weight_specs(
     _causal_conv(specs, "decoder.conv_in", latent, channels[-1])
     _mid_block(specs, "decoder.mid_block", channels[-1])
 
-    # Diffusers constructs [384, 384, 384, 192, 96], then halves the
-    # post-upsampler input channel count for every block after the first.
-    block_inputs = (
-        channels[-1],
-        channels[-1] // 2,
-        channels[-2] // 2,
-        channels[-3] // 2,
+    decoder_dims = (channels[-1], *channels[::-1])
+    block_inputs = tuple(
+        value if index == 0 else value // 2
+        for index, value in enumerate(decoder_dims[:-1])
     )
-    block_outputs = (channels[-1], *channels[-2::-1])
+    block_outputs = decoder_dims[1:]
     for block, (in_channels, out_channels) in enumerate(
         zip(block_inputs, block_outputs)
     ):
@@ -143,6 +131,24 @@ def qwen_image_2512_vae_decoder_weight_specs(
     _vector(specs, "decoder.norm_out.gamma", channels[0], source_rank=4)
     _causal_conv(specs, "decoder.conv_out", channels[0], 3)
     return tuple(specs)
+
+
+def qwen_image_2512_vae_decoder_weight_specs(
+    config: QwenImageVAEConfig,
+) -> tuple[QwenImageVAEWeightSpec, ...]:
+    """Return the exact selected Diffusers state-dict contract for decoding."""
+
+    expected = (96, (1, 2, 4, 4), 2, 16, (False, True, True))
+    actual = (
+        config.base_dim,
+        config.dimension_multipliers,
+        config.residual_blocks,
+        config.latent_channels,
+        config.temporal_downsample,
+    )
+    if actual != expected:
+        raise ValueError("unsupported Qwen-Image-2512 VAE decoder geometry")
+    return _qwen_image_vae_decoder_weight_specs(config)
 
 
 def prepare_qwen_image_vae_decoder_weights(
@@ -175,6 +181,8 @@ def prepare_qwen_image_vae_decoder_weights(
             prepared = extract_temporal_conv2d_weight(
                 source, spec.source_shape, spec.temporal_index
             )
+            if source.device.is_cuda:
+                wp.synchronize_stream(wp.get_stream(source.device))
         else:
             prepared = source.reshape(spec.prepared_shape)
         output[spec.name] = prepared
