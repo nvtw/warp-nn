@@ -15,6 +15,7 @@ from warp_nn.runtime.operators import (
     SpatialPatchUnpackPlan,
     TrueCFGPlan,
     flow_match_euler_schedule,
+    seeded_normal,
 )
 
 
@@ -174,3 +175,11 @@ def test_true_cfg_matches_reference_and_captures():
         / np.linalg.norm(combined, axis=-1, keepdims=True)
     )
     np.testing.assert_allclose(plan.output.numpy(), expected, rtol=0.035, atol=0.018)
+
+
+def test_seeded_normal_is_device_deterministic():
+    first = seeded_normal((2, 7), seed=41, dtype=wp.float32, device="cpu")
+    second = seeded_normal((2, 7), seed=41, dtype=wp.float32, device="cpu")
+    third = seeded_normal((2, 7), seed=42, dtype=wp.float32, device="cpu")
+    np.testing.assert_array_equal(first.numpy(), second.numpy())
+    assert not np.array_equal(first.numpy(), third.numpy())

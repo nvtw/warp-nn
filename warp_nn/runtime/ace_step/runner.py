@@ -16,13 +16,13 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
-from functools import lru_cache
 
 import numpy as np
 import warp as wp
 
 from ..formats.pytorch import load_pytorch_zip
 from ..kernels import _cast_kernel_for_dtypes
+from ..operators import seeded_normal
 from ..qwen.encoder import Qwen3Encoder
 from ..tokenizers import Qwen3Tokenizer
 from .._cublas import try_create_cublas
@@ -493,33 +493,6 @@ class AceStepTextToMusicInputs:
     chunk_mask: np.ndarray
     context_latents: np.ndarray
     timbre_latents: np.ndarray
-
-
-@lru_cache(maxsize=None)
-def _normal_fill_kernel(dtype):
-    DTYPE = dtype
-
-    @wp.kernel(enable_backward=False, module="unique")
-    def fill(output: wp.array1d(dtype=DTYPE), seed: int):
-        index = wp.tid()
-        state = wp.rand_init(seed, index)
-        output[index] = DTYPE(wp.randn(state))
-
-    return fill
-
-
-def seeded_normal(shape, *, seed=0, dtype=wp.bfloat16, device=None):
-    """Fill a GPU tensor with deterministic independent standard-normal noise."""
-    if not shape or any(int(value) <= 0 for value in shape):
-        raise ValueError("ACE-Step noise shape must be positive")
-    output = wp.empty(tuple(map(int, shape)), dtype=dtype, device=device)
-    wp.launch(
-        _normal_fill_kernel(dtype),
-        dim=output.size,
-        inputs=[output.flatten(), int(seed)],
-        device=output.device,
-    )
-    return output
 
 
 def text_to_music_inputs(

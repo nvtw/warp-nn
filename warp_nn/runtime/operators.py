@@ -26,6 +26,7 @@ from warp_nn.runtime.kernels import (
     _merge_attention_heads_kernel,
     _rotary_cache_kernel,
     _sequence_slice_kernel,
+    _seeded_normal_kernel,
     _sinusoidal_embedding_kernel,
     _split_attention_heads_kernel,
     _split_attention_streams_kernel,
@@ -1863,6 +1864,23 @@ class ChannelAffinePlan:
         return self.output
 
 
+def seeded_normal(shape, *, seed=0, dtype=wp.bfloat16, device=None):
+    """Create device-resident deterministic independent standard-normal noise."""
+    shape = tuple(int(value) for value in shape)
+    if not shape or any(value <= 0 for value in shape):
+        raise ValueError("normal noise shape must be positive")
+    if dtype not in (wp.float16, wp.bfloat16, wp.float32):
+        raise TypeError("normal noise requires FP16, BF16, or FP32 output")
+    output = wp.empty(shape, dtype=dtype, device=device)
+    wp.launch(
+        _seeded_normal_kernel(dtype),
+        dim=output.size,
+        inputs=[output.flatten(), int(seed)],
+        device=output.device,
+    )
+    return output
+
+
 class TrueCFGPlan:
     """Fused graph-safe true CFG with per-token positive-norm rescaling."""
 
@@ -3351,6 +3369,7 @@ class SequenceSlicePlan:
     def execute(self):
         wp.launch(
             _sequence_slice_kernel,
+            _seeded_normal_kernel,
             dim=self.output.shape,
             inputs=[self.input, self.output, self.start],
             device=self.input.device,

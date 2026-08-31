@@ -3360,6 +3360,20 @@ def _cast_kernel_for_dtypes(source_dtype: type, target_dtype: type):
 
 
 @lru_cache(maxsize=None)
+def _seeded_normal_kernel(dtype: type):
+    """Return deterministic independent standard-normal filling for one dtype."""
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def fill(output: wp.array1d(dtype=DTYPE), seed: int):
+        index = wp.tid()
+        state = wp.rand_init(seed, index)
+        output[index] = DTYPE(wp.randn(state))
+
+    return fill
+
+
+@lru_cache(maxsize=None)
 def _temporal_conv2d_slice_kernel(dtype: type):
     """Extract one OITHW temporal plane into a contiguous OIHW weight."""
     DTYPE = dtype
