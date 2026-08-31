@@ -49,6 +49,68 @@ class SafeTensorMetadata:
     format: str
 
 
+@dataclass(frozen=True)
+class SafeTensorIndex:
+    """A sharded checkpoint manifest inspectable without tensor files."""
+
+    path: Path
+    weights: tuple[tuple[str, str], ...]
+    metadata: tuple[tuple[str, object], ...]
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(name for name, _ in self.weights)
+
+    @property
+    def shards(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(shard for _, shard in self.weights))
+
+    @property
+    def total_size(self) -> int | None:
+        value = dict(self.metadata).get("total_size")
+        return int(value) if value is not None else None
+
+    def missing_shards(self) -> tuple[Path, ...]:
+        return tuple(
+            self.path.parent / shard
+            for shard in self.shards
+            if not (self.path.parent / shard).is_file()
+        )
+
+
+def read_safetensors_index(path: str | Path) -> SafeTensorIndex:
+    """Read and validate a Hugging Face safetensors shard index only."""
+    path = Path(path)
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        weight_map = document["weight_map"]
+        metadata = document.get("metadata", {})
+    except FileNotFoundError:
+        raise
+    except (OSError, KeyError, json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(f"Invalid safetensors index '{path}'") from exc
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"Safetensors index '{path}' has no weight map")
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Safetensors index '{path}' has invalid metadata")
+    weights = []
+    for name, shard in weight_map.items():
+        if not isinstance(name, str) or not name or not isinstance(shard, str):
+            raise ValueError(f"Safetensors index '{path}' has an invalid entry")
+        shard_path = Path(shard)
+        if shard_path.name != shard or shard_path.is_absolute():
+            raise ValueError(f"Safetensors shard '{shard}' must be a local filename")
+        weights.append((name, shard))
+    total_size = metadata.get("total_size")
+    if total_size is not None and (
+        isinstance(total_size, bool)
+        or not isinstance(total_size, int)
+        or total_size < 0
+    ):
+        raise ValueError(f"Safetensors index '{path}' has invalid total_size")
+    return SafeTensorIndex(path, tuple(weights), tuple(metadata.items()))
+
+
 def _read_header(path: Path) -> tuple[int, dict]:
     with path.open("rb") as stream:
         length_bytes = stream.read(8)
@@ -60,7 +122,9 @@ def _read_header(path: Path) -> tuple[int, dict]:
         try:
             header = json.loads(stream.read(header_length))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"Safetensors file '{path}' has an invalid JSON header") from exc
+            raise ValueError(
+                f"Safetensors file '{path}' has an invalid JSON header"
+            ) from exc
     if not isinstance(header, dict):
         raise ValueError(f"Safetensors file '{path}' has a non-object header")
     return 8 + header_length, header
@@ -87,14 +151,12 @@ class SafeTensorArchive:
             index_path = path / "model.safetensors.index.json"
             single_path = path / "model.safetensors"
             if index_path.is_file():
-                try:
-                    index = json.loads(index_path.read_text(encoding="utf-8"))
-                    weight_map = index["weight_map"]
-                except (OSError, KeyError, json.JSONDecodeError, TypeError) as exc:
-                    raise ValueError(f"Invalid safetensors index '{index_path}'") from exc
+                weight_map = dict(read_safetensors_index(index_path).weights)
             elif single_path.is_file():
                 _, header = _read_header(single_path)
-                weight_map = {name: single_path.name for name in header if name != "__metadata__"}
+                weight_map = {
+                    name: single_path.name for name in header if name != "__metadata__"
+                }
             else:
                 raise FileNotFoundError(f"No safetensors checkpoint found in '{path}'")
             base_dir = path
@@ -109,7 +171,9 @@ class SafeTensorArchive:
         for name, filename in weight_map.items():
             shard = (base_dir / filename).resolve()
             if shard.parent != base_dir:
-                raise ValueError(f"Safetensors shard '{filename}' is outside '{base_dir}'")
+                raise ValueError(
+                    f"Safetensors shard '{filename}' is outside '{base_dir}'"
+                )
             by_shard[shard].append(name)
 
         for shard, names in by_shard.items():
@@ -123,10 +187,19 @@ class SafeTensorArchive:
                     shape = tuple(int(dim) for dim in entry["shape"])
                     begin, end = (int(offset) for offset in entry["data_offsets"])
                 except (KeyError, TypeError, ValueError) as exc:
-                    raise ValueError(f"Invalid metadata for safetensor '{name}' in '{shard}'") from exc
+                    raise ValueError(
+                        f"Invalid metadata for safetensor '{name}' in '{shard}'"
+                    ) from exc
                 elements = int(np.prod(shape, dtype=np.int64))
-                if begin < 0 or end < begin or end > data_size or end - begin != elements * itemsize:
-                    raise ValueError(f"Invalid data range for safetensor '{name}' in '{shard}'")
+                if (
+                    begin < 0
+                    or end < begin
+                    or end > data_size
+                    or end - begin != elements * itemsize
+                ):
+                    raise ValueError(
+                        f"Invalid data range for safetensor '{name}' in '{shard}'"
+                    )
                 self._metadata[name] = SafeTensorMetadata(
                     shard=shard,
                     dtype=dtype,
@@ -143,7 +216,9 @@ class SafeTensorArchive:
     def metadata(self, name: str) -> SafeTensorMetadata:
         return self._metadata[name]
 
-    def load(self, device=None, names: Iterable[str] | None = None) -> dict[str, wp.array]:
+    def load(
+        self, device=None, names: Iterable[str] | None = None
+    ) -> dict[str, wp.array]:
         """Upload selected weights and release file mappings after the copies finish."""
         device = wp.get_device(device)
         selected = self.names if names is None else tuple(names)
@@ -167,7 +242,9 @@ class SafeTensorArchive:
             mappings.append(mapping)
             for name in shard_names:
                 info = self._metadata[name]
-                raw = np.ndarray((info.nbytes,), dtype=np.uint8, buffer=mapping, offset=info.offset)
+                raw = np.ndarray(
+                    (info.nbytes,), dtype=np.uint8, buffer=mapping, offset=info.offset
+                )
                 host = wp.array(
                     ptr=raw.ctypes.data,
                     dtype=info.dtype,
@@ -184,5 +261,7 @@ class SafeTensorArchive:
         if event is None:
             _release_mappings(resources, None)
         else:
-            Thread(target=_release_mappings, args=(resources, event), daemon=True).start()
+            Thread(
+                target=_release_mappings, args=(resources, event), daemon=True
+            ).start()
         return output
