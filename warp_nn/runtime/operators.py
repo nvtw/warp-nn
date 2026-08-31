@@ -17,6 +17,18 @@ import warp as wp
 from warp_nn.runtime.formats.gguf import BlockQuantizedTensor
 
 from warp_nn.runtime.kernels import (
+    _adaptive_layer_norm_kernel,
+    _bias_activation_kernel,
+    _broadcast_gated_residual_kernel,
+    _concatenate_attention_streams_kernel,
+    _concatenate_validity_kernel,
+    _get_layer_norm_kernel,
+    _merge_attention_heads_kernel,
+    _rotary_cache_kernel,
+    _sequence_slice_kernel,
+    _sinusoidal_embedding_kernel,
+    _split_attention_heads_kernel,
+    _split_attention_streams_kernel,
     _GEMM_CONFIG,
     _GEMM_TRANSB_TILED_KERNEL,
     _gather_block_quantized_int8_kernel,
@@ -2876,6 +2888,452 @@ class Snake1dPlan:
                 self.beta,
                 self.output,
                 self.logscale,
+            ],
+            device=self.input.device,
+        )
+        return self.output
+
+
+class BiasedLinearPlan:
+    """Fixed-buffer dense projection with fused bias and optional activation."""
+
+    def __init__(self, x, weight, bias, *, activation=None, cublas=None):
+        if x.ndim < 2 or weight.ndim != 2 or bias.shape != (weight.shape[0],):
+            raise ValueError("biased linear geometry is incompatible")
+        if x.shape[-1] != weight.shape[1]:
+            raise ValueError("biased linear input width does not match its weight")
+        if any(
+            value.dtype != x.dtype or value.device != x.device
+            for value in (weight, bias)
+        ):
+            raise ValueError("biased linear tensors must share dtype and device")
+        activations = {None: 0, "silu": 1, "gelu_tanh": 2}
+        if activation not in activations:
+            raise ValueError("activation must be None, 'silu', or 'gelu_tanh'")
+        self.input = x
+        self.bias = bias
+        self.activation = activations[activation]
+        rows = int(np.prod(x.shape[:-1]))
+        self._tensors = {"x": x.reshape((rows, x.shape[-1])), "weight": weight}
+        self._shapes = {name: value.shape for name, value in self._tensors.items()}
+        self._operation = Operation("Linear", ["x", "weight"], ["projected"])
+        plan_linear(
+            self._operation, self._tensors, self._shapes, x.device, cublas=cublas
+        )
+        self.output = self._tensors["projected"].reshape(
+            (*x.shape[:-1], weight.shape[0])
+        )
+
+    def execute(self):
+        execute_operations(
+            (self._operation,), self._tensors, self._shapes, self.input.device
+        )
+        projected = self._tensors["projected"]
+        wp.launch(
+            _bias_activation_kernel,
+            dim=projected.shape,
+            inputs=[projected, self.bias, projected, self.activation],
+            device=self.input.device,
+        )
+        return self.output
+
+
+class LayerNormPlan:
+    """Efficient affine-free last-axis LayerNorm with fixed buffers."""
+
+    def __init__(self, x, *, epsilon=1.0e-6):
+        if x.ndim < 2 or x.dtype not in (wp.float16, wp.bfloat16, wp.float32):
+            raise TypeError("LayerNorm requires a rank-two-or-higher floating tensor")
+        if not math.isfinite(epsilon) or epsilon <= 0.0:
+            raise ValueError("LayerNorm epsilon must be finite and positive")
+        self.input = x
+        self.epsilon = float(epsilon)
+        self.output = wp.empty_like(x)
+        self.rows = int(np.prod(x.shape[:-1]))
+        self.width = x.shape[-1]
+        self.tile_width, self.kernel = _get_layer_norm_kernel(self.width, x.dtype)
+
+    def execute(self):
+        wp.launch_tiled(
+            self.kernel,
+            dim=self.rows,
+            inputs=[
+                self.input.reshape((self.rows, self.width)),
+                self.output.reshape((self.rows, self.width)),
+                wp.float32(self.epsilon),
+            ],
+            block_dim=self.tile_width,
+            device=self.input.device,
+        )
+        return self.output
+
+
+class RMSNormPlan:
+    """Fixed-buffer last-axis RMSNorm for arbitrary leading dimensions."""
+
+    def __init__(self, x, weight, *, epsilon=1.0e-6):
+        self.input = x
+        self._tensors = {"x": x, "weight": weight}
+        self._shapes = {name: value.shape for name, value in self._tensors.items()}
+        self._operation = Operation(
+            "SimplifiedLayerNormalization",
+            ["x", "weight"],
+            ["normalized"],
+            {"epsilon": float(epsilon)},
+        )
+        plan_rms_norm(self._operation, self._tensors, self._shapes, x.device)
+        self.output = self._tensors["normalized"]
+
+    def execute(self):
+        execute_operations(
+            (self._operation,), self._tensors, self._shapes, self.input.device
+        )
+        return self.output
+
+
+class AdaptiveLayerNormPlan:
+    """Affine-free LayerNorm followed by batch-broadcast shift and scale."""
+
+    def __init__(self, x, modulation, *, shift_index, scale_index, epsilon=1.0e-6):
+        if x.ndim != 3 or modulation.ndim != 3:
+            raise ValueError("adaptive LayerNorm requires rank-three tensors")
+        if modulation.shape[0] != x.shape[0] or modulation.shape[2] != x.shape[2]:
+            raise ValueError("adaptive LayerNorm modulation geometry is incompatible")
+        if (
+            not 0 <= shift_index < modulation.shape[1]
+            or not 0 <= scale_index < modulation.shape[1]
+        ):
+            raise IndexError("adaptive LayerNorm modulation index is out of range")
+        if modulation.dtype != x.dtype or modulation.device != x.device:
+            raise ValueError("adaptive LayerNorm tensors must share dtype and device")
+        self.norm = LayerNormPlan(x, epsilon=epsilon)
+        self.modulation = modulation
+        self.shift_index = int(shift_index)
+        self.scale_index = int(scale_index)
+        self.output = wp.empty_like(x)
+
+    def execute(self):
+        self.norm.execute()
+        wp.launch(
+            _adaptive_layer_norm_kernel,
+            dim=self.output.shape,
+            inputs=[
+                self.norm.output,
+                self.modulation,
+                self.output,
+                self.shift_index,
+                self.scale_index,
+            ],
+            device=self.output.device,
+        )
+        return self.output
+
+
+class BroadcastGatedResidualPlan:
+    """Residual addition gated by one batch-broadcast modulation vector."""
+
+    def __init__(self, residual, branch, modulation, *, gate_index):
+        if residual.shape != branch.shape or residual.ndim != 3:
+            raise ValueError(
+                "gated residual branches must be matching rank-three tensors"
+            )
+        if (
+            modulation.shape[0] != residual.shape[0]
+            or modulation.shape[2] != residual.shape[2]
+        ):
+            raise ValueError("gated residual modulation geometry is incompatible")
+        if not 0 <= gate_index < modulation.shape[1]:
+            raise IndexError("gated residual modulation index is out of range")
+        if any(
+            value.dtype != residual.dtype or value.device != residual.device
+            for value in (branch, modulation)
+        ):
+            raise ValueError("gated residual tensors must share dtype and device")
+        self.residual, self.branch, self.modulation = residual, branch, modulation
+        self.gate_index = int(gate_index)
+        self.output = wp.empty_like(residual)
+
+    def execute(self):
+        wp.launch(
+            _broadcast_gated_residual_kernel,
+            dim=self.output.shape,
+            inputs=[
+                self.residual,
+                self.branch,
+                self.modulation,
+                self.output,
+                self.gate_index,
+            ],
+            device=self.residual.device,
+        )
+        return self.output
+
+
+class SinusoidalEmbeddingPlan:
+    """Graph-safe diffusion sinusoidal embedding from device-side FP32 values."""
+
+    def __init__(
+        self,
+        values,
+        width,
+        *,
+        dtype=wp.bfloat16,
+        maximum_period=10000.0,
+        scale=1.0,
+        frequency_shift=1.0,
+        flip_sin_cos=False,
+    ):
+        if values.ndim != 1 or values.dtype != wp.float32:
+            raise TypeError("sinusoidal embedding values must be a rank-one FP32 array")
+        if width <= 0 or maximum_period <= 0.0 or width // 2 <= frequency_shift:
+            raise ValueError("sinusoidal embedding geometry is invalid")
+        self.values = values
+        self.maximum_period = float(maximum_period)
+        self.scale = float(scale)
+        self.frequency_shift = float(frequency_shift)
+        self.flip_sin_cos = bool(flip_sin_cos)
+        self.output = wp.empty(
+            (values.shape[0], int(width)), dtype=dtype, device=values.device
+        )
+
+    def execute(self):
+        wp.launch(
+            _sinusoidal_embedding_kernel,
+            dim=self.output.shape,
+            inputs=[
+                self.values,
+                self.output,
+                wp.float32(self.maximum_period),
+                wp.float32(self.scale),
+                wp.float32(self.frequency_shift),
+                self.flip_sin_cos,
+            ],
+            device=self.values.device,
+        )
+        return self.output
+
+
+class AttentionHeadsPlan:
+    """Convert packed [B,S,H*D] activations into [B,H,S,D]."""
+
+    def __init__(self, x, heads):
+        if x.ndim != 3 or heads <= 0 or x.shape[2] % heads:
+            raise ValueError("packed attention head geometry is incompatible")
+        self.input = x
+        self.output = wp.empty(
+            (x.shape[0], int(heads), x.shape[1], x.shape[2] // int(heads)),
+            dtype=x.dtype,
+            device=x.device,
+        )
+
+    def execute(self):
+        wp.launch(
+            _split_attention_heads_kernel,
+            dim=self.output.shape,
+            inputs=[self.input, self.output],
+            device=self.input.device,
+        )
+        return self.output
+
+
+class AttentionMergePlan:
+    """Convert [B,H,S,D] attention heads into packed [B,S,H*D]."""
+
+    def __init__(self, x):
+        if x.ndim != 4:
+            raise ValueError("attention merge input must be rank four")
+        self.input = x
+        self.output = wp.empty(
+            (x.shape[0], x.shape[2], x.shape[1] * x.shape[3]),
+            dtype=x.dtype,
+            device=x.device,
+        )
+
+    def execute(self):
+        wp.launch(
+            _merge_attention_heads_kernel,
+            dim=self.input.shape,
+            inputs=[self.input, self.output],
+            device=self.input.device,
+        )
+        return self.output
+
+
+class RotaryCachePlan:
+    """Apply adjacent-pair RoPE using one cos/sin row per sequence token."""
+
+    def __init__(self, x, cosine, sine):
+        if x.ndim != 4 or x.shape[3] % 2:
+            raise ValueError("rotary input must have an even head width")
+        if cosine.shape != (x.shape[2], x.shape[3] // 2) or sine.shape != cosine.shape:
+            raise ValueError("rotary cache geometry is incompatible")
+        if any(
+            value.dtype != x.dtype or value.device != x.device
+            for value in (cosine, sine)
+        ):
+            raise ValueError("rotary tensors must share dtype and device")
+        self.input, self.cosine, self.sine = x, cosine, sine
+        self.output = wp.empty_like(x)
+
+    def execute(self):
+        wp.launch(
+            _rotary_cache_kernel,
+            dim=self.output.shape,
+            inputs=[self.input, self.cosine, self.sine, self.output],
+            device=self.input.device,
+        )
+        return self.output
+
+
+class JointBidirectionalAttentionPlan:
+    """Joint non-causal attention over two fixed [B,H,S,D] streams."""
+
+    def __init__(
+        self, first_qkv, second_qkv, *, first_valid=None, second_valid=None, scale=None
+    ):
+        first_q, first_k, first_v = first_qkv
+        second_q, second_k, second_v = second_qkv
+        if first_q.shape != first_k.shape or first_q.shape != first_v.shape:
+            raise ValueError("first joint-attention Q/K/V shapes must match")
+        if second_q.shape != second_k.shape or second_q.shape != second_v.shape:
+            raise ValueError("second joint-attention Q/K/V shapes must match")
+        if (
+            first_q.shape[:2] != second_q.shape[:2]
+            or first_q.shape[3] != second_q.shape[3]
+        ):
+            raise ValueError("joint-attention stream geometry is incompatible")
+        if any(
+            value.dtype != first_q.dtype or value.device != first_q.device
+            for value in (first_k, first_v, second_q, second_k, second_v)
+        ):
+            raise ValueError("joint-attention tensors must share dtype and device")
+        batch, heads, first_length, width = first_q.shape
+        second_length = second_q.shape[2]
+        shape = (batch, heads, first_length + second_length, width)
+        self.first_qkv, self.second_qkv = first_qkv, second_qkv
+        self.joint_q = wp.empty(shape, dtype=first_q.dtype, device=first_q.device)
+        self.joint_k = wp.empty_like(self.joint_q)
+        self.joint_v = wp.empty_like(self.joint_q)
+        self.first_valid = self._valid(first_valid, batch, first_length, first_q)
+        self.second_valid = self._valid(second_valid, batch, second_length, first_q)
+        self.joint_valid = wp.empty(
+            (batch, first_length + second_length), dtype=wp.bool, device=first_q.device
+        )
+        self.attention = BidirectionalGQAPlan(
+            self.joint_q,
+            self.joint_k,
+            self.joint_v,
+            key_valid=self.joint_valid,
+            scale=scale,
+        )
+        self.first_output = wp.empty_like(first_q)
+        self.second_output = wp.empty_like(second_q)
+
+    @staticmethod
+    def _valid(value, batch, sequence, like):
+        if value is None:
+            return wp.ones((batch, sequence), dtype=wp.bool, device=like.device)
+        if (
+            value.shape != (batch, sequence)
+            or value.dtype != wp.bool
+            or value.device != like.device
+        ):
+            raise ValueError("joint-attention validity mask is incompatible")
+        return value
+
+    def execute(self):
+        for first, second, joint in zip(
+            self.first_qkv, self.second_qkv, (self.joint_q, self.joint_k, self.joint_v)
+        ):
+            wp.launch(
+                _concatenate_attention_streams_kernel,
+                dim=joint.shape,
+                inputs=[first, second, joint],
+                device=joint.device,
+            )
+        wp.launch(
+            _concatenate_validity_kernel,
+            dim=self.joint_valid.shape,
+            inputs=[self.first_valid, self.second_valid, self.joint_valid],
+            device=self.joint_valid.device,
+        )
+        self.attention.execute()
+        wp.launch(
+            _split_attention_streams_kernel,
+            dim=self.attention.output.shape,
+            inputs=[self.attention.output, self.first_output, self.second_output],
+            device=self.attention.output.device,
+        )
+        return self.first_output, self.second_output
+
+
+class SequenceSlicePlan:
+    """Graph-safe contiguous rank-three sequence slice."""
+
+    def __init__(self, x, start, length):
+        if x.ndim != 3 or start < 0 or length <= 0 or start + length > x.shape[1]:
+            raise ValueError("sequence slice geometry is invalid")
+        self.input = x
+        self.start = int(start)
+        self.output = wp.empty(
+            (x.shape[0], int(length), x.shape[2]), dtype=x.dtype, device=x.device
+        )
+
+    def execute(self):
+        wp.launch(
+            _sequence_slice_kernel,
+            dim=self.output.shape,
+            inputs=[self.input, self.output, self.start],
+            device=self.input.device,
+        )
+        return self.output
+
+
+def multi_axis_rotary_cache_values(coordinates, axes, theta=10000.0):
+    """Build adjacent-pair RoPE caches for explicit multi-axis coordinates."""
+    coordinates = np.asarray(coordinates, dtype=np.float32)
+    axes = tuple(int(value) for value in axes)
+    if coordinates.ndim != 2 or coordinates.shape[1] != len(axes):
+        raise ValueError("rotary coordinates must have one column per axis")
+    if not axes or any(value <= 0 or value % 2 for value in axes):
+        raise ValueError("rotary axis widths must be positive and even")
+    if not math.isfinite(theta) or theta <= 0.0:
+        raise ValueError("rotary theta must be finite and positive")
+    angles = []
+    for index, width in enumerate(axes):
+        inverse = 1.0 / np.power(
+            theta, np.arange(0, width, 2, dtype=np.float32) / width
+        )
+        angles.append(coordinates[:, index : index + 1] * inverse[None])
+    values = np.concatenate(angles, axis=1)
+    return np.cos(values).astype(np.float32), np.sin(values).astype(np.float32)
+
+
+class ElementwiseActivationPlan:
+    """Fixed-buffer SiLU or tanh-approximate GELU activation."""
+
+    def __init__(self, x, activation):
+        activations = {"silu": 1, "gelu_tanh": 2}
+        if x.ndim < 2 or activation not in activations:
+            raise ValueError(
+                "activation requires a rank-two-or-higher tensor and known kind"
+            )
+        self.input = x
+        self.activation = activations[activation]
+        self.output = wp.empty_like(x)
+        self.bias = wp.zeros(x.shape[-1], dtype=x.dtype, device=x.device)
+        self.rows = int(np.prod(x.shape[:-1]))
+        self.width = x.shape[-1]
+
+    def execute(self):
+        wp.launch(
+            _bias_activation_kernel,
+            dim=(self.rows, self.width),
+            inputs=[
+                self.input.reshape((self.rows, self.width)),
+                self.bias,
+                self.output.reshape((self.rows, self.width)),
+                self.activation,
             ],
             device=self.input.device,
         )

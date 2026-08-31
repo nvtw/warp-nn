@@ -786,6 +786,164 @@ def _modulated_residual_kernel(
 
 
 @wp.kernel(enable_backward=False, module="unique")
+def _bias_activation_kernel(
+    x: wp.array2d[Any], bias: wp.array1d[Any], output: wp.array2d[Any], activation: int
+):
+    """Add a vector bias and optionally apply SiLU or tanh-approximate GELU."""
+    row, column = wp.tid()
+    value = wp.float32(x[row, column]) + wp.float32(bias[column])
+    if activation == 1:
+        value = value / (wp.float32(1.0) + wp.exp(-value))
+    elif activation == 2:
+        cubic = value * value * value
+        value = (
+            wp.float32(0.5)
+            * value
+            * (
+                wp.float32(1.0)
+                + wp.tanh(
+                    wp.float32(0.7978845608028654)
+                    * (value + wp.float32(0.044715) * cubic)
+                )
+            )
+        )
+    output[row, column] = x.dtype(value)
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _adaptive_layer_norm_kernel(
+    normalized: wp.array3d[Any],
+    modulation: wp.array3d[Any],
+    output: wp.array3d[Any],
+    shift_index: int,
+    scale_index: int,
+):
+    """Apply broadcast adaptive shift/scale after affine-free LayerNorm."""
+    batch, sequence, column = wp.tid()
+    shift = wp.float32(modulation[batch, shift_index, column])
+    scale = wp.float32(modulation[batch, scale_index, column])
+    output[batch, sequence, column] = normalized.dtype(
+        wp.float32(normalized[batch, sequence, column]) * (wp.float32(1.0) + scale)
+        + shift
+    )
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _broadcast_gated_residual_kernel(
+    residual: wp.array3d[Any],
+    branch: wp.array3d[Any],
+    modulation: wp.array3d[Any],
+    output: wp.array3d[Any],
+    gate_index: int,
+):
+    """Add a branch multiplied by one batch-broadcast modulation vector."""
+    batch, sequence, column = wp.tid()
+    output[batch, sequence, column] = residual.dtype(
+        wp.float32(residual[batch, sequence, column])
+        + wp.float32(branch[batch, sequence, column])
+        * wp.float32(modulation[batch, gate_index, column])
+    )
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _sinusoidal_embedding_kernel(
+    values: wp.array1d[wp.float32],
+    output: wp.array2d[Any],
+    maximum_period: wp.float32,
+    scale: wp.float32,
+    frequency_shift: wp.float32,
+    flip_sin_cos: bool,
+):
+    """Create a graph-safe diffusion-style sinusoidal embedding."""
+    batch, column = wp.tid()
+    half = output.shape[1] / 2
+    if column >= half * 2:
+        output[batch, column] = output.dtype(0.0)
+    else:
+        frequency_column = column % half
+        frequency = wp.exp(
+            -wp.log(maximum_period)
+            * wp.float32(frequency_column)
+            / (wp.float32(half) - frequency_shift)
+        )
+        angle = values[batch] * scale * frequency
+        use_cos = (column >= half) != flip_sin_cos
+        output[batch, column] = output.dtype(
+            wp.cos(angle) if use_cos else wp.sin(angle)
+        )
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _rotary_cache_kernel(
+    x: wp.array4d[Any],
+    cosine: wp.array2d[Any],
+    sine: wp.array2d[Any],
+    output: wp.array4d[Any],
+):
+    """Apply adjacent-pair RoPE from one precomputed cache row per token."""
+    batch, head, sequence, column = wp.tid()
+    pair = column / 2
+    partner = column + 1 if column % 2 == 0 else column - 1
+    sign = wp.float32(-1.0) if column % 2 == 0 else wp.float32(1.0)
+    output[batch, head, sequence, column] = x.dtype(
+        wp.float32(x[batch, head, sequence, column])
+        * wp.float32(cosine[sequence, pair])
+        + sign
+        * wp.float32(x[batch, head, sequence, partner])
+        * wp.float32(sine[sequence, pair])
+    )
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _concatenate_attention_streams_kernel(
+    first: wp.array4d[Any], second: wp.array4d[Any], output: wp.array4d[Any]
+):
+    """Concatenate two [B,H,S,D] streams along their sequence axis."""
+    batch, head, sequence, column = wp.tid()
+    if sequence < first.shape[2]:
+        output[batch, head, sequence, column] = first[batch, head, sequence, column]
+    else:
+        output[batch, head, sequence, column] = second[
+            batch, head, sequence - first.shape[2], column
+        ]
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _concatenate_validity_kernel(
+    first: wp.array2d[wp.bool], second: wp.array2d[wp.bool], output: wp.array2d[wp.bool]
+):
+    """Concatenate two batch/sequence validity masks."""
+    batch, sequence = wp.tid()
+    if sequence < first.shape[1]:
+        output[batch, sequence] = first[batch, sequence]
+    else:
+        output[batch, sequence] = second[batch, sequence - first.shape[1]]
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _split_attention_streams_kernel(
+    joint: wp.array4d[Any], first: wp.array4d[Any], second: wp.array4d[Any]
+):
+    """Split a joint [B,H,S,D] result into two fixed sequence streams."""
+    batch, head, sequence, column = wp.tid()
+    if sequence < first.shape[2]:
+        first[batch, head, sequence, column] = joint[batch, head, sequence, column]
+    else:
+        second[batch, head, sequence - first.shape[2], column] = joint[
+            batch, head, sequence, column
+        ]
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _sequence_slice_kernel(
+    x: wp.array3d[Any], output: wp.array3d[Any], source_offset: int
+):
+    """Copy one contiguous fixed-length slice along a rank-three sequence axis."""
+    batch, sequence, column = wp.tid()
+    output[batch, sequence, column] = x[batch, sequence + source_offset, column]
+
+
+@wp.kernel(enable_backward=False, module="unique")
 def _reorder_interleaved_heads_kernel(
     x: wp.array2d[Any], output: wp.array2d[Any], head_size: int
 ):
@@ -1497,6 +1655,72 @@ def _get_rms_norm_kernels(width: int, dtype: type, scale_dtype: type | None = No
     if key not in _rms_norm_kernel_cache:
         _rms_norm_kernel_cache[key] = _create_rms_norm_kernels(*key)
     return tile_width, _rms_norm_kernel_cache[key]
+
+
+def _create_layer_norm_kernel(tile_width: int, dtype: type):
+    """Build an affine-free row-wise LayerNorm kernel."""
+    TILE_WIDTH = tile_width
+    DTYPE = dtype
+
+    @wp.func
+    def to_float(value: dtype):
+        return wp.float32(dtype(value))
+
+    @wp.func
+    def square(value: dtype):
+        value_fp32 = wp.float32(dtype(value))
+        return value_fp32 * value_fp32
+
+    @wp.func
+    def normalize(value: dtype, mean: float, inverse_std: float):
+        return dtype((wp.float32(dtype(value)) - mean) * inverse_std)
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def layer_norm(
+        x: wp.array2d(dtype=DTYPE),
+        output: wp.array2d(dtype=DTYPE),
+        epsilon: wp.float32,
+    ):
+        row = wp.tid()
+        typed_zero = DTYPE(0.0)
+        sums = wp.tile_zeros(shape=(TILE_WIDTH,), dtype=wp.float32)
+        squares = wp.tile_zeros(shape=(TILE_WIDTH,), dtype=wp.float32)
+        for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
+            values = wp.tile_load(
+                x[row], shape=(TILE_WIDTH,), offset=(tile_index * TILE_WIDTH,)
+            )
+            sums += wp.tile_map(to_float, values)
+            squares += wp.tile_map(square, values)
+        mean = wp.tile_extract(wp.tile_sum(sums), 0) / wp.float32(x.shape[1])
+        variance = (
+            wp.tile_extract(wp.tile_sum(squares), 0) / wp.float32(x.shape[1])
+            - mean * mean
+        )
+        inverse_std = wp.float32(1.0) / wp.sqrt(
+            wp.max(variance, wp.float32(0.0)) + epsilon + wp.float32(typed_zero)
+        )
+        for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
+            offset = tile_index * TILE_WIDTH
+            values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
+            wp.tile_store(
+                output[row],
+                wp.tile_map(normalize, values, mean, inverse_std),
+                offset=(offset,),
+            )
+
+    return layer_norm
+
+
+_layer_norm_kernel_cache = {}
+
+
+def _get_layer_norm_kernel(width: int, dtype: type):
+    """Return a cached affine-free LayerNorm kernel and padded tile width."""
+    tile_width = min(512, max(32, 1 << (width - 1).bit_length()))
+    key = (tile_width, dtype)
+    if key not in _layer_norm_kernel_cache:
+        _layer_norm_kernel_cache[key] = _create_layer_norm_kernel(*key)
+    return tile_width, _layer_norm_kernel_cache[key]
 
 
 def _create_gated_rms_norm_kernel(
