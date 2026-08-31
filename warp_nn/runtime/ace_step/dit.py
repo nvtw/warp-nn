@@ -90,6 +90,11 @@ class AceStepDiTConfig:
     attention_bias: bool
     model_version: str
     is_turbo: bool
+    text_hidden_dim: int
+    timbre_hidden_dim: int
+    num_lyric_encoder_hidden_layers: int
+    num_timbre_encoder_hidden_layers: int
+    timbre_fix_frame: int
 
     @classmethod
     def from_dict(cls, source: Mapping[str, object]) -> "AceStepDiTConfig":
@@ -128,7 +133,24 @@ class AceStepDiTConfig:
         patch_size = int(source["patch_size"])
         in_channels = int(source["in_channels"])
         audio_channels = int(source["audio_acoustic_hidden_dim"])
-        if min(patch_size, in_channels, audio_channels) <= 0:
+        text_width = int(source.get("text_hidden_dim", 1024))
+        timbre_width = int(source.get("timbre_hidden_dim", 64))
+        lyric_layers = int(source.get("num_lyric_encoder_hidden_layers", 8))
+        timbre_layers = int(source.get("num_timbre_encoder_hidden_layers", 4))
+        timbre_frames = int(source.get("timbre_fix_frame", 750))
+        if (
+            min(
+                patch_size,
+                in_channels,
+                audio_channels,
+                text_width,
+                timbre_width,
+                lyric_layers,
+                timbre_layers,
+                timbre_frames,
+            )
+            <= 0
+        ):
             raise ValueError("ACE-Step patch and channel dimensions must be positive")
         if in_channels != 3 * audio_channels:
             raise ValueError(
@@ -158,6 +180,11 @@ class AceStepDiTConfig:
             attention_bias=bool(source.get("attention_bias", False)),
             model_version=str(source.get("model_version", "turbo")),
             is_turbo=bool(source.get("is_turbo", False)),
+            text_hidden_dim=text_width,
+            timbre_hidden_dim=timbre_width,
+            num_lyric_encoder_hidden_layers=lyric_layers,
+            num_timbre_encoder_hidden_layers=timbre_layers,
+            timbre_fix_frame=timbre_frames,
         )
 
 
