@@ -32,6 +32,22 @@ def require_weights(
     return result
 
 
+def storage_weight(value: wp.array, dtype: type) -> wp.array:
+    """Return a low-precision frozen view/copy suitable for training kernels.
+
+    GGUF intentionally stores small normalization/state tensors as FP32. Their
+    one-time FP16/BF16 mirrors are tiny compared with model projections and
+    avoid multiplying every hot kernel by mixed-storage specializations.
+    """
+    if value.dtype == dtype:
+        return value
+    if value.dtype != wp.float32 or dtype not in (wp.float16, wp.bfloat16):
+        raise TypeError("frozen training weights must use FP32, FP16, or BF16")
+    output = wp.empty(value.shape, dtype=dtype, device=value.device)
+    cast_from_float32(value, output)
+    return output
+
+
 class CausalLMTrainingPlan:
     """Compose frozen embeddings, a LoRA stack, and causal output loss.
 

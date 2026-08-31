@@ -230,6 +230,16 @@ def _model_fixture(device):
         )
         for name, shape in shapes.items()
     }
+    for name in tuple(weights):
+        if (
+            "layernorm.weight" in name
+            or name.endswith(("q_norm.weight", "k_norm.weight", "conv1d.weight"))
+            or name.endswith(("A_log", "dt_bias", "linear_attn.norm.weight"))
+            or name == "model.language_model.norm.weight"
+        ):
+            weights[name] = wp.array(
+                weights[name].numpy(), dtype=wp.float32, device=device
+            )
     model = build_qwen_lora_training_plan(
         config,
         weights,

@@ -11,7 +11,7 @@ from .adapters import LoRAAdapterCollection, LoRAAdapterConfig
 from .bridges import add_fp32_gradients, cast_from_float32, cast_to_float32
 from .gqa import GQALoRAAttentionPlan
 from .mlp import LoRASwiGLUPlan
-from .model import CausalLMTrainingPlan, require_weights
+from .model import CausalLMTrainingPlan, require_weights, storage_weight
 from .output import CausalLMOutputPlan
 from .primitives import residual_forward
 from .qk import QKTransformPlan
@@ -278,6 +278,15 @@ def build_muse_lora_training_plan(
     )
     dtype = adapters.targets[next(iter(adapters.targets))].weight.dtype
     device = adapters.device
+    frozen = {
+        name: storage_weight(value, dtype)
+        for name, value in loaded.items()
+        if value.dtype != dtype
+    }
+
+    def weight(name):
+        return frozen.get(name, loaded[name])
+
     unit_head = wp.ones(head_size, dtype=dtype, device=device)
     blocks = []
     for index, layer_type in enumerate(layer_types):
@@ -332,16 +341,16 @@ def build_muse_lora_training_plan(
             MuseLoRATransformerBlockPlan(
                 attention,
                 mlp,
-                input_norm_weight=loaded[prefix + "input_layernorm.weight"],
-                post_attention_norm_weight=loaded[
+                input_norm_weight=weight(prefix + "input_layernorm.weight"),
+                post_attention_norm_weight=weight(
                     prefix + "post_attention_layernorm.weight"
-                ],
-                feedforward_norm_weight=loaded[
+                ),
+                feedforward_norm_weight=weight(
                     prefix + "pre_feedforward_layernorm.weight"
-                ],
-                post_feedforward_norm_weight=loaded[
+                ),
+                post_feedforward_norm_weight=weight(
                     prefix + "post_feedforward_layernorm.weight"
-                ],
+                ),
                 rms_epsilon=float(config["rms_norm_eps"]),
                 post_epsilon=float(config["post_norm_eps"]),
                 centered_norm_scales=centered_norm_scales,
@@ -350,7 +359,7 @@ def build_muse_lora_training_plan(
     stack = LoRATransformerStackPlan(blocks)
     output = CausalLMOutputPlan(
         rows,
-        loaded["model.language_model.norm.weight"],
+        weight("model.language_model.norm.weight"),
         loaded["lm_head.weight"],
         epsilon=float(config["rms_norm_eps"]),
         norm_weight_offset=1.0 if centered_norm_scales else 0.0,

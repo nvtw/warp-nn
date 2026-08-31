@@ -20,15 +20,32 @@ def _inverse_rms(
 
 
 @lru_cache(maxsize=None)
-def _qk_kernels(dtype: type, rotary_dim: int):
+def _qk_kernels(dtype: type, rotary_dim: int, head_size: int):
     DTYPE = dtype
     ROTARY_DIM = rotary_dim
+    HEAD_SIZE = head_size
 
-    @wp.kernel(enable_backward=False, module="unique")
+    @wp.func
+    def square(value: DTYPE):
+        value_fp32 = wp.float32(value)
+        return value_fp32 * value_fp32
+
+    @wp.func
+    def weighted_dot(
+        value: DTYPE,
+        weight: DTYPE,
+        gradient: wp.float32,
+        weight_offset: wp.float32,
+    ):
+        return gradient * (wp.float32(weight) + weight_offset) * wp.float32(value)
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
     def mean_square(x: wp.array2d(dtype=DTYPE), output: wp.array1d(dtype=wp.float32)):
-        row, column = wp.tid()
-        value = wp.float32(x[row, column])
-        wp.atomic_add(output, row, value * value / wp.float32(x.shape[1]))
+        row = wp.tid()
+        values = wp.tile_load(x[row], shape=(HEAD_SIZE,))
+        output[row] = wp.tile_extract(
+            wp.tile_sum(wp.tile_map(square, values)), 0
+        ) / wp.float32(HEAD_SIZE)
 
     @wp.kernel(enable_backward=False, module="unique")
     def forward(
@@ -68,20 +85,16 @@ def _qk_kernels(dtype: type, rotary_dim: int):
         output[batch, head, token, column] = DTYPE(normalized)
 
     @wp.kernel(enable_backward=False, module="unique")
-    def reverse_and_dot(
+    def reverse_rotation(
         x: wp.array4d(dtype=DTYPE),
-        weight: wp.array1d(dtype=DTYPE),
         positions: wp.array2d(dtype=wp.int64),
         cosine: wp.array2d(dtype=DTYPE),
         sine: wp.array2d(dtype=DTYPE),
         output_grad: wp.array4d(dtype=wp.float32),
         scale: wp.float32,
-        weight_offset: wp.float32,
         normalized_grad: wp.array4d(dtype=wp.float32),
-        dot: wp.array1d(dtype=wp.float32),
     ):
         batch, head, token, column = wp.tid()
-        row = (batch * x.shape[1] + head) * x.shape[2] + token
         gradient = output_grad[batch, head, token, column]
         if column < ROTARY_DIM:
             half = ROTARY_DIM // 2
@@ -96,12 +109,24 @@ def _qk_kernels(dtype: type, rotary_dim: int):
             )
         gradient *= scale
         normalized_grad[batch, head, token, column] = gradient
-        wp.atomic_add(
-            dot,
-            row,
-            gradient
-            * (wp.float32(weight[column]) + weight_offset)
-            * wp.float32(x[batch, head, token, column]),
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def reduce_dot(
+        x: wp.array2d(dtype=DTYPE),
+        weight: wp.array1d(dtype=DTYPE),
+        normalized_grad: wp.array2d(dtype=wp.float32),
+        weight_offset: wp.float32,
+        dot: wp.array1d(dtype=wp.float32),
+    ):
+        row = wp.tid()
+        values = wp.tile_load(x[row], shape=(HEAD_SIZE,))
+        weights = wp.tile_load(weight, shape=(HEAD_SIZE,))
+        gradients = wp.tile_load(normalized_grad[row], shape=(HEAD_SIZE,))
+        dot[row] = wp.tile_extract(
+            wp.tile_sum(
+                wp.tile_map(weighted_dot, values, weights, gradients, weight_offset)
+            ),
+            0,
         )
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -125,9 +150,9 @@ def _qk_kernels(dtype: type, rotary_dim: int):
             x.shape[3]
         )
 
-    for kernel in (mean_square, forward, reverse_and_dot, input_gradient):
+    for kernel in (mean_square, forward, reverse_rotation, reduce_dot, input_gradient):
         kernel.module.options["enable_backward"] = False
-    return mean_square, forward, reverse_and_dot, input_gradient
+    return mean_square, forward, reverse_rotation, reduce_dot, input_gradient
 
 
 class QKTransformPlan:
@@ -172,7 +197,8 @@ class QKTransformPlan:
         self.epsilon = float(epsilon)
         self.scale = float(scale)
         self.weight_offset = float(weight_offset)
-        self._kernels = _qk_kernels(dtype, rotary_dim)
+        self._kernels = _qk_kernels(dtype, rotary_dim, head_size)
+        self.block_dim = min(512, max(32, 1 << (head_size - 1).bit_length()))
         rows = self.row_shape[0]
         self.mean_square = wp.empty(rows, dtype=wp.float32, device=self.device)
         self.inverse_rms = wp.empty(rows, dtype=wp.float32, device=self.device)
@@ -222,12 +248,11 @@ class QKTransformPlan:
         self._check(x, self.shape, self.dtype, "x")
         self._check(weight, (self.shape[3],), self.dtype, "weight")
         positions, cosine, sine = self._rope_inputs(positions, cosine, sine)
-        self.mean_square.zero_()
-        wp.launch(
+        wp.launch_tiled(
             self._kernels[0],
-            dim=self.row_shape,
-            inputs=[x.reshape(self.row_shape)],
-            outputs=[self.mean_square],
+            dim=self.row_shape[0],
+            inputs=[x.reshape(self.row_shape), self.mean_square],
+            block_dim=self.block_dim,
             device=self.device,
         )
         wp.launch(
@@ -261,25 +286,35 @@ class QKTransformPlan:
         self._check(weight, (self.shape[3],), self.dtype, "weight")
         self._check(output_grad, self.shape, wp.float32, "output gradient")
         positions, cosine, sine = self._rope_inputs(positions, cosine, sine)
-        self.dot.zero_()
         wp.launch(
             self._kernels[2],
             dim=self.shape,
             inputs=[
                 x,
-                weight,
                 positions,
                 cosine,
                 sine,
                 output_grad,
                 self.scale,
-                self.weight_offset,
             ],
-            outputs=[self.normalized_grad, self.dot],
+            outputs=[self.normalized_grad],
+            device=self.device,
+        )
+        wp.launch_tiled(
+            self._kernels[3],
+            dim=self.row_shape[0],
+            inputs=[
+                x.reshape(self.row_shape),
+                weight,
+                self.normalized_grad.reshape(self.row_shape),
+                self.weight_offset,
+                self.dot,
+            ],
+            block_dim=self.block_dim,
             device=self.device,
         )
         wp.launch(
-            self._kernels[3],
+            self._kernels[4],
             dim=self.shape,
             inputs=[
                 x,

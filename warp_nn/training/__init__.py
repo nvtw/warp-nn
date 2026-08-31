@@ -26,6 +26,11 @@ from .gated_delta_rule import GatedDeltaRulePlan
 from .gated_norm import GatedRMSNormPlan
 from .gqa import GQALoRAAttentionPlan
 from .linear_attention import QwenGatedDeltaLoRAAttentionPlan
+from .loaders import (
+    LoadedLoRATrainingModel,
+    load_muse_gguf_lora_training_plan,
+    load_qwen_gguf_lora_training_plan,
+)
 from .loss import LowPrecisionCrossEntropyPlan
 from .linear import linear_backward, linear_forward, lora_backward, lora_forward
 from .mlp import LoRASwiGLUPlan
@@ -58,6 +63,7 @@ __all__ = [
     "LoRASwiGLUPlan",
     "LoRATransformerStackPlan",
     "LoRATrainer",
+    "LoadedLoRATrainingModel",
     "LowPrecisionCrossEntropyPlan",
     "MuseLoRATransformerBlockPlan",
     "build_muse_lora_training_plan",
@@ -77,6 +83,8 @@ __all__ = [
     "linear_backward",
     "linear_forward",
     "load_lora_safetensors",
+    "load_muse_gguf_lora_training_plan",
+    "load_qwen_gguf_lora_training_plan",
     "restore_lora_collection",
     "lora_backward",
     "lora_forward",

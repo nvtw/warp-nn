@@ -15,7 +15,7 @@ from .gated_norm import GatedRMSNormPlan
 from .gqa import GQALoRAAttentionPlan
 from .linear_attention import QwenGatedDeltaLoRAAttentionPlan
 from .mlp import LoRASwiGLUPlan
-from .model import CausalLMTrainingPlan, require_weights
+from .model import CausalLMTrainingPlan, require_weights, storage_weight
 from .output import CausalLMOutputPlan
 from .primitives import residual_forward
 from .qk import QKTransformPlan
@@ -299,6 +299,23 @@ def build_qwen_lora_training_plan(
     )
     dtype = adapters.targets[next(iter(adapters.targets))].weight.dtype
     device = adapters.device
+    frozen = {
+        name: storage_weight(value, dtype)
+        for name, value in loaded.items()
+        if value.dtype != dtype
+    }
+
+    def weight(name):
+        return frozen.get(name, loaded[name])
+
+    state_workspace = wp.empty(
+        (
+            batch * linear_value_heads * sequence * linear_key_size,
+            linear_value_size,
+        ),
+        dtype=wp.float32,
+        device=device,
+    )
     blocks = []
     for index, layer_type in enumerate(layer_types):
         prefix = f"model.language_model.layers.{index}."
@@ -333,8 +350,8 @@ def build_qwen_lora_training_plan(
                     rotary_dim=rotary_dim,
                     device=device,
                 ),
-                query_norm_weight=loaded[prefix + "self_attn.q_norm.weight"],
-                key_norm_weight=loaded[prefix + "self_attn.k_norm.weight"],
+                query_norm_weight=weight(prefix + "self_attn.q_norm.weight"),
+                key_norm_weight=weight(prefix + "self_attn.k_norm.weight"),
                 interleaved_rope_weights=gguf_layout,
             )
         else:
@@ -359,10 +376,11 @@ def build_qwen_lora_training_plan(
                 linear_key_size,
                 linear_value_size,
                 dtype,
+                state_workspace=state_workspace,
                 device=device,
             )
             conv_width = inputs.conv_width
-            conv_weight = loaded[prefix + "linear_attn.conv1d.weight"]
+            conv_weight = weight(prefix + "linear_attn.conv1d.weight")
             if conv_weight.shape == (conv_width, 1, kernel_size):
                 conv_weight = conv_weight.reshape((conv_width, kernel_size))
             attention = QwenGatedDeltaLoRAAttentionPlan(
@@ -387,8 +405,8 @@ def build_qwen_lora_training_plan(
                     dtype=dtype,
                     device=device,
                 ),
-                a_log=loaded[prefix + "linear_attn.A_log"],
-                dt_bias=loaded[prefix + "linear_attn.dt_bias"],
+                a_log=weight(prefix + "linear_attn.A_log"),
+                dt_bias=weight(prefix + "linear_attn.dt_bias"),
                 recurrent_state=wp.zeros(
                     (
                         batch,
@@ -399,7 +417,7 @@ def build_qwen_lora_training_plan(
                     dtype=wp.float32,
                     device=device,
                 ),
-                norm_weight=loaded[prefix + "linear_attn.norm.weight"],
+                norm_weight=weight(prefix + "linear_attn.norm.weight"),
             )
         mlp = LoRASwiGLUPlan(
             adapters,
@@ -411,10 +429,10 @@ def build_qwen_lora_training_plan(
             QwenLoRATransformerBlockPlan(
                 attention,
                 mlp,
-                input_norm_weight=loaded[prefix + "input_layernorm.weight"],
-                post_attention_norm_weight=loaded[
+                input_norm_weight=weight(prefix + "input_layernorm.weight"),
+                post_attention_norm_weight=weight(
                     prefix + "post_attention_layernorm.weight"
-                ],
+                ),
                 epsilon=float(config["rms_norm_eps"]),
                 centered_norm_scales=centered_norm_scales,
             )
@@ -422,7 +440,7 @@ def build_qwen_lora_training_plan(
     stack = LoRATransformerStackPlan(blocks)
     output = CausalLMOutputPlan(
         rows,
-        loaded["model.language_model.norm.weight"],
+        weight("model.language_model.norm.weight"),
         loaded["lm_head.weight"],
         epsilon=float(config["rms_norm_eps"]),
         norm_weight_offset=1.0 if centered_norm_scales else 0.0,

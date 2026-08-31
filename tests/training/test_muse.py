@@ -258,6 +258,11 @@ def _model_fixture(device):
         )
         for name, shape in shapes.items()
     }
+    for name in tuple(weights):
+        if "layernorm.weight" in name or name == "model.language_model.norm.weight":
+            weights[name] = wp.array(
+                weights[name].numpy(), dtype=wp.float32, device=device
+            )
     model = build_muse_lora_training_plan(
         config,
         weights,

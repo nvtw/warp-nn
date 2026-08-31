@@ -20,6 +20,7 @@ class _RuleKernels:
     log_decay: object
     scalar: object
     chunkwise: object
+    materialize_states: object
     reverse: object
 
 
@@ -30,6 +31,7 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
     VALUE_SIZE = value_size
     VALUE_TILE = value_tile
     REVERSE_TILE = min(16, VALUE_TILE)
+    MATERIALIZE_TILE = min(8, VALUE_TILE)
 
     @wp.func
     def to_fp32(value: DTYPE):
@@ -77,6 +79,7 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
         output: wp.array4d(dtype=DTYPE),
         transformed: wp.array4d(dtype=DTYPE),
         present: wp.array4d(dtype=wp.float32),
+        checkpoints: wp.array4d(dtype=wp.float32),
         scale: wp.float32,
     ):
         batch, value_head, value_column = wp.tid()
@@ -87,6 +90,13 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
                 decay_value = decay[batch, token, value_head]
                 retrieved = wp.float32(0.0)
                 for column in range(KEY_SIZE):
+                    if token % _CHUNK == 0:
+                        checkpoints[
+                            batch * value.shape[1] + value_head,
+                            token // _CHUNK,
+                            column,
+                            value_column,
+                        ] = past[batch, value_head, column, value_column]
                     retrieved += (
                         wp.float32(key[batch, key_head, token, column])
                         * past[batch, value_head, column, value_column]
@@ -128,6 +138,7 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
         output: wp.array2d(dtype=DTYPE),
         transformed: wp.array2d(dtype=DTYPE),
         present: wp.array2d(dtype=wp.float32),
+        checkpoints: wp.array2d(dtype=wp.float32),
         key_heads: wp.int32,
         value_heads: wp.int32,
         sequence: wp.int32,
@@ -151,6 +162,14 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
 
         for chunk in range(chunks):
             token_start = chunk * _CHUNK
+            checkpoint_base = (
+                (batch * value_heads + value_head) * chunks + chunk
+            ) * KEY_SIZE
+            wp.tile_store(
+                checkpoints,
+                state,
+                offset=(checkpoint_base, value_offset),
+            )
             key_base = (batch * key_heads + key_head) * sequence + token_start
             value_base = (batch * value_heads + value_head) * sequence + token_start
             queries = wp.tile_load(
@@ -271,6 +290,55 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
         wp.tile_store(present, state, offset=(state_base, value_offset))
 
     @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def materialize_states(
+        key: wp.array2d(dtype=DTYPE),
+        decay: wp.array3d(dtype=wp.float32),
+        lengths: wp.array1d(dtype=wp.int32),
+        transformed: wp.array2d(dtype=DTYPE),
+        checkpoints: wp.array2d(dtype=wp.float32),
+        states: wp.array2d(dtype=wp.float32),
+        key_heads: wp.int32,
+        value_heads: wp.int32,
+        sequence: wp.int32,
+        chunks: wp.int32,
+    ):
+        item = wp.tid()
+        value_tiles = VALUE_SIZE // MATERIALIZE_TILE
+        value_tile_index = item % value_tiles
+        state_item = item // value_tiles
+        value_head = state_item % value_heads
+        batch = state_item // value_heads
+        key_head = value_head * key_heads // value_heads
+        value_offset = value_tile_index * MATERIALIZE_TILE
+        length = wp.clamp(lengths[batch], 0, sequence)
+        for chunk in range(chunks):
+            checkpoint_base = (
+                (batch * value_heads + value_head) * chunks + chunk
+            ) * KEY_SIZE
+            state = wp.tile_load(
+                checkpoints,
+                shape=(KEY_SIZE, MATERIALIZE_TILE),
+                offset=(checkpoint_base, value_offset),
+            )
+            for row in range(_CHUNK):
+                token = chunk * _CHUNK + row
+                if token < length:
+                    state_base = (
+                        (batch * value_heads + value_head) * sequence + token
+                    ) * KEY_SIZE
+                    wp.tile_store(states, state, offset=(state_base, value_offset))
+                    key_row = (batch * key_heads + key_head) * sequence + token
+                    value_row = (batch * value_heads + value_head) * sequence + token
+                    keys = wp.tile_load(key, shape=(1, KEY_SIZE), offset=(key_row, 0))
+                    deltas = wp.tile_load(
+                        transformed,
+                        shape=(1, MATERIALIZE_TILE),
+                        offset=(value_row, value_offset),
+                    )
+                    state *= decay[batch, token, value_head]
+                    wp.tile_matmul(wp.tile_transpose(keys), deltas, state)
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
     def reverse(
         query: wp.array2d(dtype=DTYPE),
         key: wp.array2d(dtype=DTYPE),
@@ -280,6 +348,7 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
         lengths: wp.array1d(dtype=wp.int32),
         transformed: wp.array2d(dtype=DTYPE),
         present: wp.array2d(dtype=wp.float32),
+        states: wp.array2d(dtype=wp.float32),
         output_grad: wp.array2d(dtype=wp.float32),
         present_grad: wp.array2d(dtype=wp.float32),
         query_grad: wp.array2d(dtype=wp.float32),
@@ -360,12 +429,13 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
                 decay_value = wp.max(
                     decay[batch, token, value_head], wp.float32(1.0e-30)
                 )
-                state /= decay_value
-                wp.tile_matmul(
-                    wp.tile_transpose(keys),
-                    deltas,
-                    state,
-                    alpha=-wp.float32(1.0) / decay_value,
+                token_state_base = (
+                    (batch * value_heads + value_head) * sequence + token
+                ) * KEY_SIZE
+                state = wp.tile_load(
+                    states,
+                    shape=(KEY_SIZE, REVERSE_TILE),
+                    offset=(token_state_base, value_offset),
                 )
                 decay_contribution = wp.tile_extract(
                     wp.tile_sum(state_gradient * state), 0
@@ -443,7 +513,7 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
             )
         wp.tile_store(past_grad, state_gradient, offset=(state_base, value_offset))
 
-    result = _RuleKernels(log_decay, scalar, chunkwise, reverse)
+    result = _RuleKernels(log_decay, scalar, chunkwise, materialize_states, reverse)
     for kernel in result.__dict__.values():
         kernel.module.options["enable_backward"] = False
     return result
@@ -463,6 +533,7 @@ class GatedDeltaRulePlan:
         dtype: type,
         *,
         scale: float | None = None,
+        state_workspace: wp.array | None = None,
         device=None,
     ):
         if min(batch, sequence, key_heads, value_heads, key_size, value_size) <= 0:
@@ -489,6 +560,31 @@ class GatedDeltaRulePlan:
         self.output = wp.empty(shape, dtype=dtype, device=self.device)
         self.transformed = wp.empty(shape, dtype=dtype, device=self.device)
         self.present = wp.empty(state_shape, dtype=wp.float32, device=self.device)
+        self.checkpoints = wp.empty(
+            (batch * value_heads, self.chunks, key_size, value_size),
+            dtype=wp.float32,
+            device=self.device,
+        )
+        workspace_shape = (
+            batch * value_heads * sequence * key_size,
+            value_size,
+        )
+        if state_workspace is None:
+            state_workspace = wp.empty(
+                workspace_shape, dtype=wp.float32, device=self.device
+            )
+        elif (
+            not isinstance(state_workspace, wp.array)
+            or state_workspace.shape != workspace_shape
+            or state_workspace.dtype != wp.float32
+            or state_workspace.device != self.device
+            or not state_workspace.is_contiguous
+        ):
+            raise ValueError(
+                "Gated Delta state workspace must be contiguous FP32 "
+                f"{workspace_shape} on {self.device}"
+            )
+        self.state_workspace = state_workspace
         query_shape = (batch, key_heads, sequence, key_size)
         self.query_grad = wp.empty(query_shape, dtype=wp.float32, device=self.device)
         self.key_grad = wp.empty(query_shape, dtype=wp.float32, device=self.device)
@@ -556,6 +652,12 @@ class GatedDeltaRulePlan:
                     self.present.reshape(
                         (self.batch * self.value_heads * self.key_size, self.value_size)
                     ),
+                    self.checkpoints.reshape(
+                        (
+                            self.batch * self.value_heads * self.chunks * self.key_size,
+                            self.value_size,
+                        )
+                    ),
                     self.key_heads,
                     self.value_heads,
                     self.sequence,
@@ -581,6 +683,7 @@ class GatedDeltaRulePlan:
                     self.output,
                     self.transformed,
                     self.present,
+                    self.checkpoints,
                     self.scale,
                 ],
                 device=self.device,
@@ -623,6 +726,30 @@ class GatedDeltaRulePlan:
         value_rows = self.batch * self.value_heads * self.sequence
         state_rows = self.batch * self.value_heads * self.key_size
         value_tiles = self.value_size // min(16, self.value_tile)
+        materialize_tiles = self.value_size // min(8, self.value_tile)
+        wp.launch_tiled(
+            self._kernels.materialize_states,
+            dim=self.batch * self.value_heads * materialize_tiles,
+            inputs=[
+                key.reshape((query_rows, self.key_size)),
+                decay,
+                lengths,
+                self.transformed.reshape((value_rows, self.value_size)),
+                self.checkpoints.reshape(
+                    (
+                        self.batch * self.value_heads * self.chunks * self.key_size,
+                        self.value_size,
+                    )
+                ),
+                self.state_workspace,
+                self.key_heads,
+                self.value_heads,
+                self.sequence,
+                self.chunks,
+            ],
+            block_dim=128,
+            device=self.device,
+        )
         wp.launch_tiled(
             self._kernels.reverse,
             dim=self.batch * self.value_heads * value_tiles,
@@ -635,6 +762,7 @@ class GatedDeltaRulePlan:
                 lengths,
                 self.transformed.reshape((value_rows, self.value_size)),
                 self.present.reshape((state_rows, self.value_size)),
+                self.state_workspace,
                 output_grad.reshape((value_rows, self.value_size)),
                 present_grad.reshape((state_rows, self.value_size)),
                 self.query_grad.reshape((query_rows, self.key_size)),
