@@ -3369,7 +3369,6 @@ class SequenceSlicePlan:
     def execute(self):
         wp.launch(
             _sequence_slice_kernel,
-            _seeded_normal_kernel,
             dim=self.output.shape,
             inputs=[self.input, self.output, self.start],
             device=self.input.device,
