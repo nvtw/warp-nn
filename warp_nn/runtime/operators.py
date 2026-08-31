@@ -36,7 +36,9 @@ from warp_nn.runtime.kernels import (
     _gqa_prepare_fp16_kernel,
     _linear_kernel,
     _audio_kernels,
+    _adaptive_rms_modulation_kernel,
     _encoder_kernels,
+    _modulated_residual_kernel,
     _quantize_activation_int8_kernel,
 )
 from warp_nn.utils.ops import resolve_dim
@@ -1603,6 +1605,144 @@ class FixedKVAttentionPlan(BidirectionalGQAPlan):
             key_valid=key_valid,
             scale=scale,
         )
+
+
+class AdaptiveRMSNormPlan:
+    """Graph-safe RMSNorm followed by broadcast timestep shift and scale."""
+
+    def __init__(
+        self,
+        x,
+        weight,
+        scale_shift_table,
+        timestep_modulation,
+        *,
+        shift_index,
+        scale_index,
+        epsilon=1.0e-6,
+    ):
+        if x.ndim != 3 or scale_shift_table.shape != (
+            1,
+            timestep_modulation.shape[1],
+            x.shape[2],
+        ):
+            raise ValueError("adaptive RMSNorm modulation geometry is incompatible")
+        if timestep_modulation.shape[0] != x.shape[0] or (
+            timestep_modulation.shape[2] != x.shape[2]
+        ):
+            raise ValueError("adaptive RMSNorm timestep shape is incompatible")
+        if not 0 <= shift_index < timestep_modulation.shape[1] or not (
+            0 <= scale_index < timestep_modulation.shape[1]
+        ):
+            raise IndexError("adaptive RMSNorm modulation index is out of range")
+        if any(
+            value.dtype != x.dtype or value.device != x.device
+            for value in (weight, scale_shift_table, timestep_modulation)
+        ):
+            raise ValueError("adaptive RMSNorm tensors must share dtype and device")
+        self.input = x
+        self.scale_shift_table = scale_shift_table
+        self.timestep_modulation = timestep_modulation
+        self.shift_index = int(shift_index)
+        self.scale_index = int(scale_index)
+        self._tensors = {"x": x, "weight": weight}
+        self._shapes = {"x": x.shape, "weight": weight.shape}
+        self._norm = Operation(
+            "SimplifiedLayerNormalization",
+            ["x", "weight"],
+            ["normalized"],
+            {"epsilon": float(epsilon)},
+        )
+        plan_rms_norm(self._norm, self._tensors, self._shapes, x.device)
+        self.output = wp.empty_like(x)
+
+    def execute(self):
+        execute_operations(
+            (self._norm,), self._tensors, self._shapes, self.input.device
+        )
+        wp.launch(
+            _adaptive_rms_modulation_kernel,
+            dim=self.output.shape,
+            inputs=[
+                self._tensors["normalized"],
+                self.scale_shift_table,
+                self.timestep_modulation,
+                self.output,
+                self.shift_index,
+                self.scale_index,
+            ],
+            device=self.input.device,
+        )
+        return self.output
+
+
+class ModulatedResidualPlan:
+    """Graph-safe residual addition with an optional AdaLN gate."""
+
+    def __init__(
+        self,
+        residual,
+        branch,
+        *,
+        scale_shift_table=None,
+        timestep_modulation=None,
+        gate_index=0,
+    ):
+        if (
+            residual.shape != branch.shape
+            or residual.dtype != branch.dtype
+            or (residual.device != branch.device)
+        ):
+            raise ValueError("residual and branch tensors must match")
+        self.residual = residual
+        self.branch = branch
+        self.use_gate = scale_shift_table is not None
+        if self.use_gate:
+            if timestep_modulation is None or scale_shift_table.shape != (
+                1,
+                timestep_modulation.shape[1],
+                residual.shape[2],
+            ):
+                raise ValueError("residual modulation geometry is incompatible")
+            if (
+                timestep_modulation.shape[0] != residual.shape[0]
+                or timestep_modulation.shape[2] != residual.shape[2]
+                or not 0 <= gate_index < timestep_modulation.shape[1]
+            ):
+                raise ValueError("residual timestep modulation is incompatible")
+            if any(
+                value.dtype != residual.dtype or value.device != residual.device
+                for value in (scale_shift_table, timestep_modulation)
+            ):
+                raise ValueError("residual modulation tensors must match the branch")
+        else:
+            scale_shift_table = wp.empty(
+                (1, 1, residual.shape[2]),
+                dtype=residual.dtype,
+                device=residual.device,
+            )
+            timestep_modulation = wp.empty_like(scale_shift_table)
+        self.scale_shift_table = scale_shift_table
+        self.timestep_modulation = timestep_modulation
+        self.gate_index = int(gate_index)
+        self.output = wp.empty_like(residual)
+
+    def execute(self):
+        wp.launch(
+            _modulated_residual_kernel,
+            dim=self.output.shape,
+            inputs=[
+                self.residual,
+                self.branch,
+                self.scale_shift_table,
+                self.timestep_modulation,
+                self.output,
+                self.gate_index,
+                self.use_gate,
+            ],
+            device=self.residual.device,
+        )
+        return self.output
 
 
 def resolve_rope_parameters(

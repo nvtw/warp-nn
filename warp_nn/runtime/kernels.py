@@ -728,6 +728,52 @@ def _merge_attention_heads_kernel(x: wp.array4d[Any], output: wp.array3d[Any]):
 
 
 @wp.kernel(enable_backward=False, module="unique")
+def _adaptive_rms_modulation_kernel(
+    normalized: wp.array3d[Any],
+    scale_shift_table: wp.array3d[Any],
+    timestep_modulation: wp.array3d[Any],
+    output: wp.array3d[Any],
+    shift_index: int,
+    scale_index: int,
+):
+    """Apply broadcast AdaLN shift/scale after a precomputed RMSNorm."""
+    batch, sequence, column = wp.tid()
+    shift = wp.float32(scale_shift_table[0, shift_index, column]) + wp.float32(
+        timestep_modulation[batch, shift_index, column]
+    )
+    scale = wp.float32(scale_shift_table[0, scale_index, column]) + wp.float32(
+        timestep_modulation[batch, scale_index, column]
+    )
+    output[batch, sequence, column] = normalized.dtype(
+        wp.float32(normalized[batch, sequence, column]) * (wp.float32(1.0) + scale)
+        + shift
+    )
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _modulated_residual_kernel(
+    residual: wp.array3d[Any],
+    branch: wp.array3d[Any],
+    scale_shift_table: wp.array3d[Any],
+    timestep_modulation: wp.array3d[Any],
+    output: wp.array3d[Any],
+    gate_index: int,
+    use_gate: bool,
+):
+    """Add a branch with an optional broadcast timestep/table gate."""
+    batch, sequence, column = wp.tid()
+    gate = wp.float32(1.0)
+    if use_gate:
+        gate = wp.float32(scale_shift_table[0, gate_index, column]) + wp.float32(
+            timestep_modulation[batch, gate_index, column]
+        )
+    output[batch, sequence, column] = residual.dtype(
+        wp.float32(residual[batch, sequence, column])
+        + wp.float32(branch[batch, sequence, column]) * gate
+    )
+
+
+@wp.kernel(enable_backward=False, module="unique")
 def _reorder_interleaved_heads_kernel(
     x: wp.array2d[Any], output: wp.array2d[Any], head_size: int
 ):
