@@ -159,6 +159,9 @@ class SafeTensorArchive:
             else:
                 raise FileNotFoundError(f"No safetensors checkpoint found in '{path}'")
             base_dir = path
+        elif path.name.endswith(".safetensors.index.json"):
+            base_dir = path.parent
+            weight_map = dict(read_safetensors_index(path).weights)
         else:
             base_dir = path.parent
             _, header = _read_header(path)

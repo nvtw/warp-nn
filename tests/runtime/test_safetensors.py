@@ -87,3 +87,25 @@ def test_safetensor_archive_flattens_rank_five_tensor(tmp_path):
 
     assert loaded.shape == (values.size,)
     np.testing.assert_array_equal(loaded.numpy(), values.reshape(-1))
+
+
+def test_safetensor_archive_accepts_explicit_custom_index_name(tmp_path):
+    values = np.array([1.0, 2.0], dtype=np.float32)
+    write_safetensors(
+        tmp_path / "diffusion_pytorch_model-00001-of-00001.safetensors",
+        {"weight": ("F32", values.shape, values.tobytes())},
+    )
+    index = tmp_path / "diffusion_pytorch_model.safetensors.index.json"
+    index.write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "weight": "diffusion_pytorch_model-00001-of-00001.safetensors"
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = SafeTensorArchive(index).load("cpu")["weight"]
+    np.testing.assert_array_equal(loaded.numpy(), values)
