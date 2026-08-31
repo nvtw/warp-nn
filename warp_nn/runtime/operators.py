@@ -34,6 +34,7 @@ from warp_nn.runtime.kernels import (
     _gqa_copy_past_fp16_kernel,
     _gqa_prepare_fp16_kernel,
     _linear_kernel,
+    _audio_kernels,
     _encoder_kernels,
     _quantize_activation_int8_kernel,
 )
@@ -1660,3 +1661,148 @@ _OP_DISPATCH: dict[str, Any] = {
     "Unsqueeze": _exec_squeeze,
     "Where": _exec_where,
 }
+
+
+def conv1d_output_length(
+    length: int,
+    kernel_size: int,
+    *,
+    stride: int = 1,
+    padding: int = 0,
+    dilation: int = 1,
+    transposed: bool = False,
+    output_padding: int = 0,
+) -> int:
+    """Return the PyTorch-compatible Conv1D output length."""
+    if min(length, kernel_size, stride, dilation) <= 0 or padding < 0:
+        raise ValueError("invalid Conv1D geometry")
+    if output_padding < 0 or output_padding >= stride:
+        raise ValueError("output_padding must be smaller than stride")
+    if transposed:
+        return (
+            (length - 1) * stride
+            - 2 * padding
+            + dilation * (kernel_size - 1)
+            + output_padding
+            + 1
+        )
+    if output_padding:
+        raise ValueError("output_padding is valid only for transposed convolution")
+    return (length + 2 * padding - dilation * (kernel_size - 1) - 1) // stride + 1
+
+
+class Conv1dPlan:
+    """Fixed-shape, graph-safe channels-last Conv1D or ConvTranspose1D."""
+
+    def __init__(
+        self,
+        x,
+        weight,
+        bias=None,
+        *,
+        stride=1,
+        padding=0,
+        dilation=1,
+        transposed=False,
+        output_padding=0,
+    ):
+        if x.ndim != 3 or weight.ndim != 3:
+            raise ValueError("Conv1D input and weight must be rank three")
+        if x.dtype != weight.dtype or x.device != weight.device:
+            raise ValueError("Conv1D input and weight must share dtype and device")
+        if x.dtype not in (wp.float16, wp.bfloat16, wp.float32):
+            raise TypeError("Conv1D requires FP16, BF16, or FP32 tensors")
+        in_channels = weight.shape[0] if transposed else weight.shape[1]
+        out_channels = weight.shape[1] if transposed else weight.shape[0]
+        if x.shape[2] != in_channels:
+            raise ValueError("Conv1D weight channels do not match the input")
+        if bias is not None and (
+            bias.shape != (out_channels,)
+            or bias.dtype != x.dtype
+            or bias.device != x.device
+        ):
+            raise ValueError(
+                "Conv1D bias must match output channels, dtype, and device"
+            )
+        self.input = x
+        self.weight = weight
+        self.stride = int(stride)
+        self.padding = int(padding)
+        self.dilation = int(dilation)
+        self.transposed = bool(transposed)
+        output_length = conv1d_output_length(
+            x.shape[1],
+            weight.shape[2],
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            transposed=self.transposed,
+            output_padding=int(output_padding),
+        )
+        if output_length <= 0:
+            raise ValueError("Conv1D geometry produces an empty output")
+        self.output = wp.empty(
+            (x.shape[0], output_length, out_channels),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        self.bias = (
+            bias
+            if bias is not None
+            else wp.zeros(out_channels, dtype=x.dtype, device=x.device)
+        )
+        self._use_bias = bias is not None
+        kernels = _audio_kernels(x.dtype)
+        self._kernel = kernels[1 if self.transposed else 0]
+
+    def execute(self):
+        wp.launch(
+            self._kernel,
+            dim=self.output.shape,
+            inputs=[
+                self.input,
+                self.weight,
+                self.bias,
+                self.output,
+                self.stride,
+                self.padding,
+                self.dilation,
+                self._use_bias,
+            ],
+            device=self.input.device,
+        )
+        return self.output
+
+
+class Snake1dPlan:
+    """Fixed-shape Oobleck Snake activation with channel parameters."""
+
+    def __init__(self, x, alpha, beta, *, logscale=True):
+        if x.ndim != 3 or alpha.shape != (x.shape[2],) or beta.shape != alpha.shape:
+            raise ValueError("Snake parameters must match the channels-last input")
+        if any(
+            value.dtype != x.dtype or value.device != x.device
+            for value in (alpha, beta)
+        ):
+            raise ValueError("Snake input and parameters must share dtype and device")
+        self.input = x
+        self.alpha = alpha
+        self.beta = beta
+        self.output = wp.empty_like(x)
+        self.logscale = bool(logscale)
+        self._kernel = _audio_kernels(x.dtype)[2]
+
+    def execute(self):
+        wp.launch(
+            self._kernel,
+            dim=self.output.shape,
+            inputs=[
+                self.input,
+                self.alpha,
+                self.beta,
+                self.output,
+                self.logscale,
+            ],
+            device=self.input.device,
+        )
+        return self.output

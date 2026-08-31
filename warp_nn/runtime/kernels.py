@@ -3215,3 +3215,81 @@ def _encoder_kernels(dtype: type, head_size: int):
         merge_heads,
         full_attention,
     )
+
+
+@lru_cache(maxsize=None)
+def _audio_kernels(dtype: type):
+    """Return reusable channels-last audio kernels for one compute dtype."""
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def conv1d_nlc(
+        x: wp.array3d(dtype=DTYPE),
+        weight: wp.array3d(dtype=DTYPE),
+        bias: wp.array1d(dtype=DTYPE),
+        output: wp.array3d(dtype=DTYPE),
+        stride: int,
+        padding: int,
+        dilation: int,
+        use_bias: bool,
+    ):
+        batch, position, out_channel = wp.tid()
+        total = wp.float32(0.0)
+        if use_bias:
+            total = wp.float32(bias[out_channel])
+        for kernel_index in range(weight.shape[2]):
+            source = position * stride - padding + kernel_index * dilation
+            if source >= 0 and source < x.shape[1]:
+                for in_channel in range(x.shape[2]):
+                    total += wp.float32(x[batch, source, in_channel]) * wp.float32(
+                        weight[out_channel, in_channel, kernel_index]
+                    )
+        output[batch, position, out_channel] = DTYPE(total)
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def conv_transpose1d_nlc(
+        x: wp.array3d(dtype=DTYPE),
+        weight: wp.array3d(dtype=DTYPE),
+        bias: wp.array1d(dtype=DTYPE),
+        output: wp.array3d(dtype=DTYPE),
+        stride: int,
+        padding: int,
+        dilation: int,
+        use_bias: bool,
+    ):
+        batch, position, out_channel = wp.tid()
+        total = wp.float32(0.0)
+        if use_bias:
+            total = wp.float32(bias[out_channel])
+        for kernel_index in range(weight.shape[2]):
+            numerator = position + padding - kernel_index * dilation
+            if numerator >= 0 and numerator % stride == 0:
+                source = numerator / stride
+                if source < x.shape[1]:
+                    for in_channel in range(x.shape[2]):
+                        total += wp.float32(x[batch, source, in_channel]) * wp.float32(
+                            weight[in_channel, out_channel, kernel_index]
+                        )
+        output[batch, position, out_channel] = DTYPE(total)
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def snake1d(
+        x: wp.array3d(dtype=DTYPE),
+        alpha: wp.array1d(dtype=DTYPE),
+        beta: wp.array1d(dtype=DTYPE),
+        output: wp.array3d(dtype=DTYPE),
+        logscale: bool,
+    ):
+        batch, position, channel = wp.tid()
+        value = wp.float32(x[batch, position, channel])
+        alpha_value = wp.float32(alpha[channel])
+        beta_value = wp.float32(beta[channel])
+        if logscale:
+            alpha_value = wp.exp(alpha_value)
+            beta_value = wp.exp(beta_value)
+        periodic = wp.sin(alpha_value * value)
+        output[batch, position, channel] = DTYPE(
+            value + periodic * periodic / (beta_value + wp.float32(1.0e-9))
+        )
+
+    return conv1d_nlc, conv_transpose1d_nlc, snake1d
