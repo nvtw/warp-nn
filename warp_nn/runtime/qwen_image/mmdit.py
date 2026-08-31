@@ -48,6 +48,32 @@ def qwen_image_rotary_coordinates(text_tokens, image_height, image_width):
     return text, image
 
 
+def qwen_image_mmdit_workspace_bytes(
+    config, image_tokens, text_tokens, *, batch=1, element_bytes=2
+):
+    """Return fixed activation/mask storage, excluding inputs and model weights."""
+    if min(image_tokens, text_tokens, batch, element_bytes) <= 0:
+        raise ValueError("Qwen-Image workspace geometry must be positive")
+    width = config.hidden_size
+    joint = image_tokens + text_tokens
+    output_width = config.patch_size**2 * config.output_channels
+    persistent = (
+        batch * image_tokens * width
+        + batch * text_tokens * config.text_width
+        + batch * text_tokens * width
+        + batch * 256
+        + 3 * batch * width
+        + width
+        + joint * config.head_dim
+        + 2 * batch * width
+        + 2 * batch * image_tokens * width
+        + batch * image_tokens * output_width
+    )
+    layer_scratch = 27 * batch * joint * width + 12 * batch * width
+    boolean_masks = batch * (3 * image_tokens + 2 * text_tokens)
+    return element_bytes * (persistent + layer_scratch) + boolean_masks
+
+
 def _validate_plan_weights(weights, config, dtype, device):
     expected = QwenImageTransformerManifest.from_config(config).shapes()
     missing = sorted(set(expected) - weights.keys())
@@ -65,6 +91,72 @@ def _validate_plan_weights(weights, config, dtype, device):
             )
 
 
+def _array_nbytes(value):
+    return int(np.prod(value.shape)) * wp.types.type_size_in_bytes(value.dtype)
+
+
+class _LayerScratch:
+    """Model-specific fixed buffers reused at identical points in every block."""
+
+    def __init__(self):
+        self.buffers = {}
+
+    def bind(self, name, allocated):
+        output = self.buffers.setdefault(name, allocated)
+        if (
+            output.shape != allocated.shape
+            or output.dtype != allocated.dtype
+            or output.device != allocated.device
+        ):
+            raise ValueError(f"Qwen-Image scratch buffer '{name}' is incompatible")
+        return output
+
+    @property
+    def nbytes(self):
+        return sum(_array_nbytes(value) for value in self.buffers.values())
+
+
+def _bind_output(plan, scratch, name):
+    plan.output = scratch.bind(name, plan.output)
+    return plan.output
+
+
+def _bind_linear_output(plan, scratch, name):
+    output = scratch.bind(name, plan.output)
+    plan._tensors["projected"] = output.reshape(plan._tensors["projected"].shape)
+    plan.output = output
+    return output
+
+
+def _bind_rms_output(plan, scratch, name):
+    plan.output = scratch.bind(name, plan.output)
+    plan._tensors["normalized"] = plan.output
+    return plan.output
+
+
+def _bind_adaptive_output(plan, scratch, name):
+    _bind_output(plan.norm, scratch, name + ".norm")
+    return _bind_output(plan, scratch, name)
+
+
+def _bind_joint_attention(plan, scratch):
+    plan.joint_q = scratch.bind("joint.q", plan.joint_q)
+    plan.joint_k = scratch.bind("joint.k", plan.joint_k)
+    plan.joint_v = scratch.bind("joint.v", plan.joint_v)
+    plan.second_valid = scratch.bind("joint.second_valid", plan.second_valid)
+    plan.joint_valid = scratch.bind("joint.valid", plan.joint_valid)
+    plan.attention.query = plan.joint_q
+    plan.attention.key = plan.joint_k
+    plan.attention.value = plan.joint_v
+    plan.attention.key_valid = plan.joint_valid
+    plan.attention.query_valid = scratch.bind(
+        "joint.query_valid", plan.attention.query_valid
+    )
+    plan.attention.output = scratch.bind("joint.output", plan.attention.output)
+    plan.first_output = scratch.bind("joint.first_output", plan.first_output)
+    plan.second_output = scratch.bind("joint.second_output", plan.second_output)
+
+
 class _QwenQKVPlan:
     def __init__(
         self,
@@ -76,6 +168,8 @@ class _QwenQKVPlan:
         sine,
         *,
         added=False,
+        scratch,
+        scratch_prefix,
         cublas=None,
     ):
         stem = "add_{}_proj" if added else "to_{}"
@@ -85,21 +179,27 @@ class _QwenQKVPlan:
             weights[f"{prefix}.{stem.format('q')}.bias"],
             cublas=cublas,
         )
+        _bind_linear_output(self.q, scratch, scratch_prefix + ".q")
         self.k = BiasedLinearPlan(
             x,
             weights[f"{prefix}.{stem.format('k')}.weight"],
             weights[f"{prefix}.{stem.format('k')}.bias"],
             cublas=cublas,
         )
+        _bind_linear_output(self.k, scratch, scratch_prefix + ".k")
         self.v = BiasedLinearPlan(
             x,
             weights[f"{prefix}.{stem.format('v')}.weight"],
             weights[f"{prefix}.{stem.format('v')}.bias"],
             cublas=cublas,
         )
+        _bind_linear_output(self.v, scratch, scratch_prefix + ".v")
         self.q_heads = AttentionHeadsPlan(self.q.output, heads)
         self.k_heads = AttentionHeadsPlan(self.k.output, heads)
         self.v_heads = AttentionHeadsPlan(self.v.output, heads)
+        _bind_output(self.q_heads, scratch, scratch_prefix + ".q_heads")
+        _bind_output(self.k_heads, scratch, scratch_prefix + ".k_heads")
+        _bind_output(self.v_heads, scratch, scratch_prefix + ".v_heads")
         norm_q = "norm_added_q" if added else "norm_q"
         norm_k = "norm_added_k" if added else "norm_k"
         self.q_norm = RMSNormPlan(
@@ -108,8 +208,12 @@ class _QwenQKVPlan:
         self.k_norm = RMSNormPlan(
             self.k_heads.output, weights[f"{prefix}.{norm_k}.weight"], epsilon=1.0e-6
         )
+        _bind_rms_output(self.q_norm, scratch, scratch_prefix + ".q_norm")
+        _bind_rms_output(self.k_norm, scratch, scratch_prefix + ".k_norm")
         self.q_rope = RotaryCachePlan(self.q_norm.output, cosine, sine)
         self.k_rope = RotaryCachePlan(self.k_norm.output, cosine, sine)
+        _bind_output(self.q_rope, scratch, scratch_prefix + ".q_rope")
+        _bind_output(self.k_rope, scratch, scratch_prefix + ".k_rope")
 
     @property
     def output(self):
@@ -143,24 +247,24 @@ class QwenImageMMDiTLayerPlan:
         image_rope,
         text_rope,
         *,
+        scratch,
         cublas=None,
     ):
         prefix = f"transformer_blocks.{layer}"
-        self.modulation_activation = ElementwiseActivationPlan(
-            timestep_embedding, "silu"
-        )
         self.image_modulation = BiasedLinearPlan(
-            self.modulation_activation.output,
+            timestep_embedding,
             weights[f"{prefix}.img_mod.1.weight"],
             weights[f"{prefix}.img_mod.1.bias"],
             cublas=cublas,
         )
+        _bind_linear_output(self.image_modulation, scratch, "image.modulation")
         self.text_modulation = BiasedLinearPlan(
-            self.modulation_activation.output,
+            timestep_embedding,
             weights[f"{prefix}.txt_mod.1.weight"],
             weights[f"{prefix}.txt_mod.1.bias"],
             cublas=cublas,
         )
+        _bind_linear_output(self.text_modulation, scratch, "text.modulation")
         batch, _, width = image.shape
         self.image_mod = self.image_modulation.output.reshape((batch, 6, width))
         self.text_mod = self.text_modulation.output.reshape((batch, 6, width))
@@ -170,6 +274,8 @@ class QwenImageMMDiTLayerPlan:
         self.text_norm1 = AdaptiveLayerNormPlan(
             text, self.text_mod, shift_index=0, scale_index=1
         )
+        _bind_adaptive_output(self.image_norm1, scratch, "image.norm1")
+        _bind_adaptive_output(self.text_norm1, scratch, "text.norm1")
         attention = f"{prefix}.attn"
         self.image_qkv = _QwenQKVPlan(
             self.image_norm1.output,
@@ -177,6 +283,8 @@ class QwenImageMMDiTLayerPlan:
             attention,
             config.heads,
             *image_rope,
+            scratch=scratch,
+            scratch_prefix="image.qkv",
             cublas=cublas,
         )
         self.text_qkv = _QwenQKVPlan(
@@ -185,6 +293,8 @@ class QwenImageMMDiTLayerPlan:
             attention,
             config.heads,
             *text_rope,
+            scratch=scratch,
+            scratch_prefix="text.qkv",
             added=True,
             cublas=cublas,
         )
@@ -193,20 +303,25 @@ class QwenImageMMDiTLayerPlan:
             self.image_qkv.output,
             first_valid=text_valid,
         )
+        _bind_joint_attention(self.joint_attention, scratch)
         self.image_merge = AttentionMergePlan(self.joint_attention.second_output)
         self.text_merge = AttentionMergePlan(self.joint_attention.first_output)
+        _bind_output(self.image_merge, scratch, "image.merge")
+        _bind_output(self.text_merge, scratch, "text.merge")
         self.image_attention_output = BiasedLinearPlan(
             self.image_merge.output,
             weights[f"{attention}.to_out.0.weight"],
             weights[f"{attention}.to_out.0.bias"],
             cublas=cublas,
         )
+        _bind_linear_output(self.image_attention_output, scratch, "image.attention")
         self.text_attention_output = BiasedLinearPlan(
             self.text_merge.output,
             weights[f"{attention}.to_add_out.weight"],
             weights[f"{attention}.to_add_out.bias"],
             cublas=cublas,
         )
+        _bind_linear_output(self.text_attention_output, scratch, "text.attention")
         self.image_attention_residual = BroadcastGatedResidualPlan(
             image,
             self.image_attention_output.output,
@@ -219,6 +334,8 @@ class QwenImageMMDiTLayerPlan:
             self.text_mod,
             gate_index=2,
         )
+        _bind_output(self.image_attention_residual, scratch, "image.attention_residual")
+        _bind_output(self.text_attention_residual, scratch, "text.attention_residual")
         self.image_norm2 = AdaptiveLayerNormPlan(
             self.image_attention_residual.output,
             self.image_mod,
@@ -231,6 +348,8 @@ class QwenImageMMDiTLayerPlan:
             shift_index=3,
             scale_index=4,
         )
+        _bind_adaptive_output(self.image_norm2, scratch, "image.norm2")
+        _bind_adaptive_output(self.text_norm2, scratch, "text.norm2")
         self.image_mlp_up = BiasedLinearPlan(
             self.image_norm2.output,
             weights[f"{prefix}.img_mlp.net.0.proj.weight"],
@@ -238,6 +357,7 @@ class QwenImageMMDiTLayerPlan:
             activation="gelu_tanh",
             cublas=cublas,
         )
+        _bind_linear_output(self.image_mlp_up, scratch, "image.mlp_up")
         self.text_mlp_up = BiasedLinearPlan(
             self.text_norm2.output,
             weights[f"{prefix}.txt_mlp.net.0.proj.weight"],
@@ -245,18 +365,21 @@ class QwenImageMMDiTLayerPlan:
             activation="gelu_tanh",
             cublas=cublas,
         )
+        _bind_linear_output(self.text_mlp_up, scratch, "text.mlp_up")
         self.image_mlp_down = BiasedLinearPlan(
             self.image_mlp_up.output,
             weights[f"{prefix}.img_mlp.net.2.weight"],
             weights[f"{prefix}.img_mlp.net.2.bias"],
             cublas=cublas,
         )
+        _bind_linear_output(self.image_mlp_down, scratch, "image.mlp_down")
         self.text_mlp_down = BiasedLinearPlan(
             self.text_mlp_up.output,
             weights[f"{prefix}.txt_mlp.net.2.weight"],
             weights[f"{prefix}.txt_mlp.net.2.bias"],
             cublas=cublas,
         )
+        _bind_linear_output(self.text_mlp_down, scratch, "text.mlp_down")
         self.image_residual = BroadcastGatedResidualPlan(
             self.image_attention_residual.output,
             self.image_mlp_down.output,
@@ -269,11 +392,12 @@ class QwenImageMMDiTLayerPlan:
             self.text_mod,
             gate_index=5,
         )
+        self.image_residual.output = image
+        self.text_residual.output = text
         self.image_output = self.image_residual.output
         self.text_output = self.text_residual.output
 
     def execute(self):
-        self.modulation_activation.execute()
         self.image_modulation.execute()
         self.text_modulation.execute()
         self.image_norm1.execute()
@@ -384,6 +508,9 @@ class QwenImageMMDiTPlan:
             weights["time_text_embed.timestep_embedder.linear_2.bias"],
             cublas=cublas,
         )
+        self.time_activation = ElementwiseActivationPlan(
+            self.time_linear2.output, "silu"
+        )
         text_coordinates, image_coordinates = qwen_image_rotary_coordinates(
             text.shape[1], int(image_height), int(image_width)
         )
@@ -402,13 +529,14 @@ class QwenImageMMDiTPlan:
             wp.array(image_sin, dtype=image_tokens.dtype, device=self.device),
         )
         self.layers = []
+        self.layer_scratch = _LayerScratch()
         image = self.image_input.output
         encoded_text = self.text_input.output
         for index in range(config.layers):
             layer = QwenImageMMDiTLayerPlan(
                 image,
                 encoded_text,
-                self.time_linear2.output,
+                self.time_activation.output,
                 text_valid,
                 weights,
                 config,
@@ -416,14 +544,12 @@ class QwenImageMMDiTPlan:
                 image_rope,
                 text_rope,
                 cublas=cublas,
+                scratch=self.layer_scratch,
             )
             self.layers.append(layer)
             image, encoded_text = layer.image_output, layer.text_output
-        self.final_activation = ElementwiseActivationPlan(
-            self.time_linear2.output, "silu"
-        )
         self.final_modulation = BiasedLinearPlan(
-            self.final_activation.output,
+            self.time_activation.output,
             weights["norm_out.linear.weight"],
             weights["norm_out.linear.bias"],
             cublas=cublas,
@@ -441,6 +567,14 @@ class QwenImageMMDiTPlan:
             cublas=cublas,
         )
         self.output = self.projection.output
+        self.layer_scratch_nbytes = self.layer_scratch.nbytes
+        self.activation_workspace_nbytes = qwen_image_mmdit_workspace_bytes(
+            config,
+            image_tokens.shape[1],
+            text.shape[1],
+            batch=image_tokens.shape[0],
+            element_bytes=wp.types.type_size_in_bytes(image_tokens.dtype),
+        )
 
     def execute(self):
         self.image_input.execute()
@@ -449,9 +583,9 @@ class QwenImageMMDiTPlan:
         self.time_frequency.execute()
         self.time_linear1.execute()
         self.time_linear2.execute()
+        self.time_activation.execute()
         for layer in self.layers:
             layer.execute()
-        self.final_activation.execute()
         self.final_modulation.execute()
         self.final_norm.execute()
         self.projection.execute()

@@ -12,15 +12,18 @@ from warp_nn.runtime.qwen_image import (
     QwenImageTransformerManifest,
 )
 from warp_nn.runtime.operators import multi_axis_rotary_cache_values
-from warp_nn.runtime.qwen_image.mmdit import qwen_image_rotary_coordinates
+from warp_nn.runtime.qwen_image.mmdit import (
+    qwen_image_mmdit_workspace_bytes,
+    qwen_image_rotary_coordinates,
+)
 
 
-def _config():
+def _config(layers=1):
     return QwenImageTransformerConfig(
         patch_size=2,
         input_channels=4,
         output_channels=1,
-        layers=1,
+        layers=layers,
         heads=2,
         head_dim=6,
         text_width=8,
@@ -225,3 +228,57 @@ def test_tiny_mmdit_matches_numpy_and_replays_captured_graph():
         image.numpy(), text.numpy(), valid_values, next_timestep, arrays, config, 2, 2
     )
     np.testing.assert_allclose(plan.output.numpy(), expected, rtol=0.08, atol=0.04)
+
+
+def test_official_workspace_is_bounded_independent_of_layer_count():
+    official = QwenImageTransformerConfig(
+        patch_size=2,
+        input_channels=64,
+        output_channels=16,
+        layers=60,
+        heads=24,
+        head_dim=128,
+        text_width=3584,
+        rope_axes=(16, 56, 56),
+        guidance_embeds=False,
+    )
+    expected = 1_450_221_047
+    assert qwen_image_mmdit_workspace_bytes(official, 83 * 83, 990) == expected
+    assert (
+        qwen_image_mmdit_workspace_bytes(
+            QwenImageTransformerConfig(**{**official.__dict__, "layers": 1}),
+            83 * 83,
+            990,
+        )
+        == expected
+    )
+
+
+@pytest.mark.skipif(not is_device_available("cuda:0"), reason="CUDA is unavailable")
+def test_two_layers_alias_scratch_and_replay():
+    config = _config(layers=2)
+    rng = np.random.default_rng(402)
+    weights = _weights(config, rng)
+    image = wp.array(
+        rng.normal(0.0, 0.2, (1, 4, 4)), dtype=wp.bfloat16, device="cuda:0"
+    )
+    text = wp.array(rng.normal(0.0, 0.2, (1, 3, 8)), dtype=wp.bfloat16, device="cuda:0")
+    valid = wp.array([[True, True, False]], dtype=wp.bool, device="cuda:0")
+    timestep = wp.array([0.4], dtype=wp.float32, device="cuda:0")
+    plan = QwenImageMMDiTPlan(image, text, valid, timestep, weights, config, 2, 2)
+
+    first, second = plan.layers
+    assert first.image_qkv.q.output.ptr == second.image_qkv.q.output.ptr
+    assert first.image_mlp_up.output.ptr == second.image_mlp_up.output.ptr
+    assert first.image_output.ptr == plan.image_input.output.ptr
+    assert second.image_output.ptr == plan.image_input.output.ptr
+    assert plan.activation_workspace_nbytes == qwen_image_mmdit_workspace_bytes(
+        config, 4, 3
+    )
+
+    expected = plan.execute().numpy()
+    plan.capture()
+    np.testing.assert_array_equal(plan.output.numpy(), expected)
+    plan.replay()
+    np.testing.assert_array_equal(plan.output.numpy(), expected)
+    assert plan.layer_scratch_nbytes == 4_842
