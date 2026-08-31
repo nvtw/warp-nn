@@ -7,8 +7,8 @@ import numpy as np
 import pytest
 import warp as wp
 
-from warp_nn.runtime.llama_encoder import _LlamaEncoderPlan
-from warp_nn.runtime.rope import rotary_cache_values
+from warp_nn.runtime.llama.encoder import _LlamaEncoderPlan
+from warp_nn.runtime.operators import rotary_cache_values
 
 
 def _runner(device="cpu", dtype=wp.float16):

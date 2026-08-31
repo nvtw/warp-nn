@@ -130,7 +130,7 @@ def split_tool_prefix(text: str, marker: str) -> tuple[str, str, bool]:
 
 
 def split_reasoning(text: str, enable_thinking: bool) -> tuple[str, str | None]:
-    """Separate a Qwen thinking response into answer and reasoning text."""
+    """Separate a tagged thinking response into answer and reasoning text."""
     if not enable_thinking:
         return text, None
     reasoning, marker, answer = text.partition("</think>")

@@ -6,7 +6,7 @@ import math
 import numpy as np
 import pytest
 
-from warp_nn.runtime.rope import resolve_rope_parameters, rotary_cache_values
+from warp_nn.runtime.operators import resolve_rope_parameters, rotary_cache_values
 
 
 def test_default_and_factor_one_yarn_match():

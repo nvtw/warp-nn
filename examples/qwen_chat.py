@@ -20,7 +20,7 @@ from warp_nn.runtime.chat import (
     sample_runner_token,
     split_tool_prefix,
 )
-from warp_nn.runtime.coding_tools import CodingTools
+from warp_nn.runtime.services.coding_tools import CodingTools
 
 
 class _EscapeMonitor:

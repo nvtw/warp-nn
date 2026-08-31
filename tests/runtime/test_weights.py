@@ -7,7 +7,7 @@ import numpy as np
 import warp as wp
 
 from tests.utilities import write_safetensors
-from warp_nn.runtime.llama_encoder import merge_lora_adapter
+from warp_nn.runtime.llama.encoder import merge_lora_adapter
 from warp_nn.runtime.weights import merge_lora_weight
 
 

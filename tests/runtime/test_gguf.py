@@ -8,7 +8,7 @@ import pytest
 import warp as wp
 
 from tests.utilities import is_device_available
-from warp_nn.runtime.gguf import GGUFArchive
+from warp_nn.runtime.formats.gguf import GGUFArchive
 
 
 def _string(value):

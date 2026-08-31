@@ -6,7 +6,7 @@ import math
 import numpy as np
 import warp as wp
 
-from warp_nn.runtime.encoder import EncoderLayerPlan
+from warp_nn.runtime.operators import EncoderLayerPlan
 
 
 def _layer_norm(x, weight, bias):

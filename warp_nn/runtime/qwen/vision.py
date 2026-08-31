@@ -13,10 +13,11 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 
-from .gguf import GGUFArchive, MappedGGUFArchive
-from .operators import Operation, execute_operations, plan_linear
-from .safetensors import SafeTensorArchive
-from .vision import VisionInput, preprocess_qwen_media, qwen_vision_positions
+from ..formats.gguf import GGUFArchive
+from ..operators import Operation, execute_operations, plan_linear
+from ..weights import MappedWeightArchive
+from ..formats.safetensors import SafeTensorArchive
+from .media import VisionInput, preprocess_qwen_media, qwen_vision_positions
 
 
 def _vision_weight_names(depth: int) -> list[str]:
@@ -763,20 +764,7 @@ class QwenVisionEncoder:
             raw_archive = SafeTensorArchive(source)
             mapping = _safetensor_map(self.depth)
 
-            class _MappedSafe:
-                names = tuple(mapping)
-
-                def metadata(self, name):
-                    return raw_archive.metadata(mapping[name])
-
-                def load(self, device=None, names=None):
-                    selected = self.names if names is None else tuple(names)
-                    loaded = raw_archive.load(
-                        device, [mapping[name] for name in selected]
-                    )
-                    return {name: loaded[mapping[name]] for name in selected}
-
-            archive = _MappedSafe()
+            archive = MappedWeightArchive(raw_archive, mapping)
             self.dtype = archive.metadata("patch_embed.weight").dtype
             selected = _vision_weight_names(self.depth)
         else:
@@ -787,7 +775,7 @@ class QwenVisionEncoder:
                 raise ValueError(
                     "GGUF vision checkpoint is not a Qwen3-VL merger mmproj"
                 )
-            archive = MappedGGUFArchive(gguf, _gguf_map(self.depth))
+            archive = MappedWeightArchive(gguf, _gguf_map(self.depth), gguf.tensor)
             self.dtype = archive.metadata("patch_embed.weight.0").dtype
             selected = [
                 name
@@ -920,7 +908,7 @@ class QwenMultimodalProcessor:
                     if isinstance(source, Mapping):
                         source = source.get("url")
                     if isinstance(source, (str, Path)):
-                        from .vision import load_rgb_image
+                        from .media import load_rgb_image
 
                         source = load_rgb_image(source)
                     vision = preprocess_qwen_media(source)

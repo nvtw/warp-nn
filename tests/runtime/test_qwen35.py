@@ -8,10 +8,9 @@ import json
 import numpy as np
 
 from tests.utilities import is_device_available, write_safetensors
-from warp_nn.runtime.qwen35 import (
+from warp_nn.runtime.autoregressive import _PlanMemoryError, _union_storage_bytes
+from warp_nn.runtime.qwen.qwen35 import (
     Qwen35Runner,
-    _PlanMemoryError,
-    _union_storage_bytes,
     _validate_config,
     _weight_names,
 )

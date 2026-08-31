@@ -8,14 +8,11 @@ import warp as wp
 
 from tests.utilities import is_device_available
 from warp_nn.runtime._cublas import try_create_cublas
-from warp_nn.runtime.gguf import BlockQuantizedTensor
+from warp_nn.runtime.formats.gguf import BlockQuantizedTensor
 from warp_nn.runtime.kernels import (
     _append_head_cache_kernel,
     _append_circular_head_cache_kernel,
-    _attention_group_geometry,
     _causal_conv_rows_kernel,
-    _decode_attention_head_group,
-    _decode_attention_partitions,
     _get_gated_rms_norm_kernel,
     _get_gqa_attention_kernel,
     _get_greedy_argmax_kernels,
@@ -24,8 +21,6 @@ from warp_nn.runtime.kernels import (
     _get_top_k_kernels,
     _get_matmul_int8_q8_kernel,
     _get_linear_attention_kernel,
-    _allocate_partitioned_gqa,
-    _launch_partitioned_gqa,
     _prepare_gated_delta_kernel,
     _relu2_kernel,
     _reorder_heads_kernel,
@@ -37,6 +32,11 @@ from warp_nn.runtime.kernels import (
 )
 from warp_nn.runtime.operators import (
     Operation,
+    _allocate_partitioned_gqa,
+    _attention_group_geometry,
+    _decode_attention_head_group,
+    _decode_attention_partitions,
+    _launch_partitioned_gqa,
     execute_operations,
     plan_linear,
     plan_rms_norm,

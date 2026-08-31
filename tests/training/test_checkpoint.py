@@ -9,7 +9,7 @@ import pytest
 
 import warp as wp
 
-from warp_nn.runtime.safetensors import SafeTensorArchive
+from warp_nn.runtime.formats.safetensors import SafeTensorArchive
 from warp_nn.training.adapters import LoRAAdapterConfig
 from warp_nn.training.checkpoint import load_lora_safetensors, save_lora_safetensors
 

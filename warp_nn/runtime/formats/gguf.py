@@ -449,23 +449,3 @@ class GGUFArchive:
                 target=_release_mapping, args=(resources, event), daemon=True
             ).start()
         return output
-
-
-class MappedGGUFArchive:
-    """Expose GGUF tensors under runtime-native checkpoint names."""
-
-    def __init__(self, archive: GGUFArchive, names: Mapping[str, str]):
-        self.archive = archive
-        self._names = dict(names)
-
-    @property
-    def names(self) -> tuple[str, ...]:
-        return tuple(self._names)
-
-    def metadata(self, name: str):
-        return self.archive.tensor(self._names[name])
-
-    def load(self, device=None, names=None) -> dict[str, wp.array]:
-        selected = self.names if names is None else tuple(names)
-        loaded = self.archive.load(device, [self._names[name] for name in selected])
-        return {name: loaded[self._names[name]] for name in selected}

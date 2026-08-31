@@ -10,15 +10,15 @@ import warp as wp
 
 from tests.runtime.test_qwen35 import _write_tiny_qwen35
 from tests.utilities import is_device_available
-from warp_nn.runtime.gguf import GGUFArchive
-from warp_nn.runtime.qwen35 import Qwen35Runner
-from warp_nn.runtime.qwen_vision import (
+from warp_nn.runtime.formats.gguf import GGUFArchive
+from warp_nn.runtime.qwen.qwen35 import Qwen35Runner
+from warp_nn.runtime.qwen.vision import (
     QwenMultimodalProcessor,
     QwenMultimodalPrompt,
     _gguf_map,
     _vision_weight_names,
 )
-from warp_nn.runtime.vision import (
+from warp_nn.runtime.qwen.media import (
     preprocess_qwen_media,
     qwen_vision_positions,
     resize_bicubic,

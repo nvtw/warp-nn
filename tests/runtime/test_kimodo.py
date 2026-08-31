@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import warp as wp
 
-from warp_nn.runtime.kimodo import (
+from warp_nn.runtime.kimodo.runner import (
     KimodoConfig,
     KimodoDenoiserPlan,
     KimodoDiffusionPlan,

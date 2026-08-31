@@ -34,8 +34,8 @@ from warp_nn.runtime.operators import (
     plan_residual_rms_norm,
     plan_rms_norm,
 )
-from warp_nn.runtime.qwen35 import Qwen35Runner
-from warp_nn.runtime.safetensors import SafeTensorArchive
+from warp_nn.runtime.autoregressive import AutoregressiveRunner
+from warp_nn.runtime.formats.safetensors import SafeTensorArchive
 from warp_nn.utils.device import parse_device
 
 
@@ -428,7 +428,7 @@ class _NemotronPlan:
         return self.logits
 
 
-class NemotronHRunner(Qwen35Runner):
+class NemotronHRunner(AutoregressiveRunner):
     """Run a text-only Nemotron-H FP8 or BF16 safetensors checkpoint."""
 
     def __init__(

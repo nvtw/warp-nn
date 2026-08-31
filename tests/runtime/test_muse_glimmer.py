@@ -9,7 +9,7 @@ import pytest
 from tests.utilities import is_device_available, write_safetensors
 from warp_nn.runtime import create_text_runner, create_tokenizer
 from warp_nn.runtime.chat import ChatEncodingCache
-from warp_nn.runtime.muse_glimmer import (
+from warp_nn.runtime.muse.glimmer import (
     MuseGlimmerRunner,
     MuseGlimmerTokenizer,
     _MuseStreamFilter,
@@ -17,7 +17,7 @@ from warp_nn.runtime.muse_glimmer import (
     _weight_names,
     parse_atem_tool_calls,
 )
-from warp_nn.runtime.qwen3 import _BYTE_ENCODER
+from warp_nn.runtime.tokenizers import _BYTE_ENCODER
 
 
 def _bfloat16_bytes(values: np.ndarray) -> bytes:

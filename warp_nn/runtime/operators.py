@@ -6,13 +6,15 @@
 from __future__ import annotations
 
 from typing import Any, Iterable
+from collections.abc import Mapping
 
 from dataclasses import dataclass, field
+import math
 
 import numpy as np
 import warp as wp
 
-from warp_nn.runtime.gguf import BlockQuantizedTensor
+from warp_nn.runtime.formats.gguf import BlockQuantizedTensor
 
 from warp_nn.runtime.kernels import (
     _GEMM_CONFIG,
@@ -21,6 +23,7 @@ from warp_nn.runtime.kernels import (
     _get_grouped_decode_linear_kernel,
     _get_linear_tiled_kernel,
     _get_prefill_mma_linear_kernel,
+    _get_partitioned_gqa_attention_kernels,
     _get_linear_vector_kernel,
     _get_q8_grouped_decode_linear_kernel,
     _get_q8_prefill_mma_linear_kernel,
@@ -31,9 +34,146 @@ from warp_nn.runtime.kernels import (
     _gqa_copy_past_fp16_kernel,
     _gqa_prepare_fp16_kernel,
     _linear_kernel,
+    _encoder_kernels,
     _quantize_activation_int8_kernel,
 )
 from warp_nn.utils.ops import resolve_dim
+
+
+def _decode_attention_partitions(head_size: int) -> int:
+    """Choose bounded decode parallelism from attention-head geometry."""
+    return max(64, min(256, int(head_size)))
+
+
+def _decode_attention_head_group(
+    query_heads: int, kv_heads: int, head_size: int
+) -> int:
+    """Choose bounded K/V reuse from the grouped-query ratio."""
+    if kv_heads <= 0 or query_heads < kv_heads or query_heads % kv_heads:
+        raise ValueError("query_heads must be a positive multiple of kv_heads")
+    if head_size > 128:
+        return 4
+    queries_per_kv = query_heads // kv_heads
+    return max(4, min(16, 1 << (queries_per_kv.bit_length() - 1)))
+
+
+def _attention_group_geometry(
+    query_heads: int, kv_heads: int | None, head_size: int, rows: int
+) -> tuple[int, int]:
+    """Choose a bounded query tile without introducing partial head groups."""
+    heads_per_group = 4
+    if kv_heads and (rows == 1 or rows >= 16):
+        candidate = _decode_attention_head_group(query_heads, kv_heads, head_size)
+        queries_per_kv = query_heads // kv_heads
+        if rows == 1 or queries_per_kv % candidate == 0:
+            heads_per_group = candidate
+    rows_per_group = (
+        1 if rows < 16 else max(1, min(4, 2048 // head_size // heads_per_group))
+    )
+    return rows_per_group, heads_per_group
+
+
+def _allocate_partitioned_gqa(
+    heads: int,
+    head_size: int,
+    dtype: type,
+    device,
+    partitions: int = 256,
+    rows: int = 1,
+    rows_per_group: int | None = None,
+    heads_per_group: int | None = None,
+    kv_heads: int | None = None,
+):
+    """Allocate one reusable workspace for partitioned decode attention."""
+    default_rows, default_heads = _attention_group_geometry(
+        heads, kv_heads, head_size, rows
+    )
+    if rows_per_group is None:
+        rows_per_group = default_rows
+    if heads_per_group is None:
+        heads_per_group = default_heads
+    block_dim, partitions, kernels = _get_partitioned_gqa_attention_kernels(
+        head_size, dtype, partitions, rows_per_group, heads_per_group
+    )
+    items = rows * heads * partitions
+    return (
+        block_dim,
+        partitions,
+        rows_per_group,
+        heads_per_group,
+        kernels,
+        wp.empty(items, dtype=wp.float32, device=device),
+        wp.empty(items, dtype=wp.float32, device=device),
+        wp.empty((items, head_size), dtype=wp.float32, device=device),
+    )
+
+
+def _launch_partitioned_gqa(
+    workspace,
+    query,
+    key,
+    value,
+    sequence_end,
+    output,
+    query_heads: int,
+    kv_heads: int,
+    total_length: int,
+    scale: float,
+    window: int,
+    device,
+):
+    """Launch partitioned decode attention using a reusable workspace."""
+    (
+        block_dim,
+        partitions,
+        rows_per_group,
+        heads_per_group,
+        kernels,
+        partial_maximum,
+        partial_denominator,
+        partial_output,
+    ) = workspace
+    queries_per_kv = query_heads // kv_heads
+    groups_per_batch = kv_heads * (
+        (queries_per_kv + heads_per_group - 1) // heads_per_group
+    )
+    sequence_length = output.shape[0]
+    row_groups = (sequence_length + rows_per_group - 1) // rows_per_group
+    batches = query.shape[0] // (query_heads * sequence_length)
+    wp.launch_tiled(
+        kernels[0],
+        dim=batches * row_groups * groups_per_batch * partitions,
+        inputs=[
+            query,
+            key,
+            value,
+            sequence_end,
+            partial_maximum,
+            partial_denominator,
+            partial_output,
+            query_heads,
+            kv_heads,
+            sequence_length,
+            total_length,
+            scale,
+            window,
+        ],
+        block_dim=block_dim,
+        device=device,
+    )
+    wp.launch_tiled(
+        kernels[1],
+        dim=batches * sequence_length * query_heads,
+        inputs=[
+            partial_maximum,
+            partial_denominator,
+            partial_output,
+            output,
+            query_heads,
+        ],
+        block_dim=block_dim,
+        device=device,
+    )
 
 
 @dataclass
@@ -192,7 +332,10 @@ def _exec_linear(op, tensors, shapes, device):
             )
     else:
         wp.launch(
-            _linear_kernel, dim=output.shape, inputs=[x, weight, output], device=device
+            _linear_kernel,
+            dim=output.shape,
+            inputs=[x, weight, output],
+            device=device,
         )
 
 
@@ -1128,6 +1271,348 @@ def _exec_lstm(op, tensors, shapes, device):
         dim=(batch, hidden_size),
         inputs=[gates, c_prev, cache["Bx"], cache["Bh"], h_out, c_out, hidden_size],
         device=device,
+    )
+
+
+def reuse_operation_outputs(
+    layer: dict, tensors: dict, pool: dict, op_type: str | None = None
+) -> None:
+    """Alias same-role operation outputs across sequential model layers."""
+    for role, value in layer.items():
+        if isinstance(value, Operation) and (
+            op_type is None or value.op_type == op_type
+        ):
+            for output_index, name in enumerate(value.outputs):
+                if name and name in tensors:
+                    output = tensors[name]
+                    key = (
+                        "operation",
+                        role,
+                        output_index,
+                        tuple(output.shape),
+                        output.dtype,
+                    )
+                    shared = pool.setdefault(key, output)
+                    tensors[name] = shared
+                    if output_index == 0 and "_output_2d" in value.attrs:
+                        value.attrs["_output_2d"] = shared.reshape(
+                            value.attrs["_output_2d"].shape
+                        )
+                    if output_index == 3 and "_residual_2d" in value.attrs:
+                        value.attrs["_residual_2d"] = shared.reshape(
+                            value.attrs["_residual_2d"].shape
+                        )
+
+
+def reuse_linear_outputs(layer: dict, tensors: dict, pool: dict) -> None:
+    """Alias same-role Linear outputs across sequential model layers."""
+    reuse_operation_outputs(layer, tensors, pool, "Linear")
+
+
+_ENCODER_DTYPES = (wp.float16, wp.bfloat16, wp.float32)
+
+
+class EncoderLayerPlan:
+    """One fixed-shape PyTorch-compatible post-norm TransformerEncoderLayer."""
+
+    def __init__(
+        self,
+        x: wp.array,
+        valid: wp.array,
+        weights: dict[str, wp.array],
+        prefix: str,
+        heads: int,
+        *,
+        epsilon: float = 1.0e-5,
+        cublas=None,
+    ):
+        if x.ndim != 3 or valid.shape != x.shape[:2]:
+            raise ValueError(
+                "encoder input must be [batch, sequence, hidden] with a matching mask"
+            )
+        if x.dtype not in _ENCODER_DTYPES or valid.dtype != wp.bool:
+            raise TypeError("encoder requires FP16/BF16/FP32 input and a boolean mask")
+        batch, sequence, hidden = x.shape
+        if heads <= 0 or hidden % heads:
+            raise ValueError("hidden size must be divisible by the positive head count")
+        self.device = x.device
+        self.dtype = x.dtype
+        self.batch, self.sequence, self.hidden = batch, sequence, hidden
+        self.heads, self.head_size = heads, hidden // heads
+        self.valid = valid
+        self.input = x
+        self.output = wp.empty_like(x)
+        self._attention_heads = wp.empty(
+            (batch, heads, sequence, self.head_size), dtype=x.dtype, device=x.device
+        )
+        self._query = wp.empty_like(self._attention_heads)
+        self._key = wp.empty_like(self._attention_heads)
+        self._value = wp.empty_like(self._attention_heads)
+        self._attention_flat = wp.empty(
+            (batch * sequence, hidden), dtype=x.dtype, device=x.device
+        )
+        self._norm1 = wp.empty(
+            (batch * sequence, hidden), dtype=x.dtype, device=x.device
+        )
+        self._norm2 = self.output.reshape((batch * sequence, hidden))
+        self._epsilon = float(epsilon)
+        self._weights = weights
+        self._prefix = prefix
+        self._tensors = {"x": x.reshape((batch * sequence, hidden))}
+        self._shapes = {"x": (batch * sequence, hidden)}
+        self._tensors["attention_flat"] = self._attention_flat
+        self._shapes["attention_flat"] = self._attention_flat.shape
+        self._tensors["norm1"] = self._norm1
+        self._shapes["norm1"] = self._norm1.shape
+        self._ops = []
+
+        def linear(name, source, weight):
+            op = Operation("Linear", [source, weight], [name])
+            self._tensors[weight] = weights[weight]
+            self._shapes[weight] = weights[weight].shape
+            plan_linear(op, self._tensors, self._shapes, self.device, cublas)
+            self._ops.append(op)
+            return op
+
+        p = prefix
+        self._qkv = linear("qkv", "x", f"{p}.self_attn.in_proj_weight")
+        self._out = linear(
+            "attention_projection", "attention_flat", f"{p}.self_attn.out_proj.weight"
+        )
+        self._ff1 = linear("ff1", "norm1", f"{p}.linear1.weight")
+        self._ff2 = linear("ff2", "ff1", f"{p}.linear2.weight")
+        kernels = _encoder_kernels(x.dtype, self.head_size)
+        (
+            self._add_bias,
+            self._bias_gelu,
+            self._residual_norm,
+            self._split,
+            self._merge,
+            self._attention,
+        ) = kernels
+
+    def _execute(self, op):
+        execute_operations([op], self._tensors, self._shapes, self.device)
+
+    def execute(self):
+        p = self._prefix
+        self._execute(self._qkv)
+        qkv = self._tensors["qkv"]
+        wp.launch(
+            self._add_bias,
+            dim=qkv.shape,
+            inputs=[qkv, self._weights[f"{p}.self_attn.in_proj_bias"]],
+            device=self.device,
+        )
+        wp.launch(
+            self._split,
+            dim=self._query.shape,
+            inputs=[qkv, self._query, self._key, self._value],
+            device=self.device,
+        )
+        wp.launch_tiled(
+            self._attention,
+            dim=self.batch * self.heads * self.sequence,
+            inputs=[
+                self._query,
+                self._key,
+                self._value,
+                self.valid,
+                self._attention_heads,
+                wp.float32(1.0 / math.sqrt(self.head_size)),
+            ],
+            block_dim=128,
+            device=self.device,
+        )
+        wp.launch(
+            self._merge,
+            dim=self._attention_heads.shape,
+            inputs=[self._attention_heads, self._attention_flat],
+            device=self.device,
+        )
+        self._execute(self._out)
+        wp.launch(
+            self._residual_norm,
+            dim=self.batch * self.sequence,
+            inputs=[
+                self._tensors["attention_projection"],
+                self._tensors["x"],
+                self._weights[f"{p}.self_attn.out_proj.bias"],
+                self._weights[f"{p}.norm1.weight"],
+                self._weights[f"{p}.norm1.bias"],
+                self._norm1,
+                wp.float32(self._epsilon),
+            ],
+            device=self.device,
+        )
+        self._execute(self._ff1)
+        wp.launch(
+            self._bias_gelu,
+            dim=self._tensors["ff1"].shape,
+            inputs=[self._tensors["ff1"], self._weights[f"{p}.linear1.bias"]],
+            device=self.device,
+        )
+        self._execute(self._ff2)
+        wp.launch(
+            self._residual_norm,
+            dim=self.batch * self.sequence,
+            inputs=[
+                self._tensors["ff2"],
+                self._norm1,
+                self._weights[f"{p}.linear2.bias"],
+                self._weights[f"{p}.norm2.weight"],
+                self._weights[f"{p}.norm2.bias"],
+                self._norm2,
+                wp.float32(self._epsilon),
+            ],
+            device=self.device,
+        )
+        return self.output
+
+
+class EncoderStackPlan:
+    """A fixed-buffer stack of post-norm encoder layers."""
+
+    def __init__(
+        self, x, valid, weights, prefix, layers, heads, *, epsilon=1.0e-5, cublas=None
+    ):
+        if layers <= 0:
+            raise ValueError("encoder stack requires at least one layer")
+        self.layers = []
+        current = x
+        for index in range(layers):
+            layer = EncoderLayerPlan(
+                current,
+                valid,
+                weights,
+                f"{prefix}.layers.{index}",
+                heads,
+                epsilon=epsilon,
+                cublas=cublas,
+            )
+            self.layers.append(layer)
+            current = layer.output
+        self.output = current
+
+    def execute(self):
+        for layer in self.layers:
+            layer.execute()
+        return self.output
+
+
+def resolve_rope_parameters(
+    base_parameters: Mapping[str, object],
+    scaling: Mapping[str, object] | None,
+    native_context: int,
+    target_context: int,
+) -> dict[str, object]:
+    """Resolve an explicit RoPE override and validate its supported context."""
+    parameters = dict(base_parameters)
+    if scaling is None:
+        if target_context > native_context:
+            raise ValueError(
+                "cache_capacity exceeds the model's native context; enable YaRN explicitly"
+            )
+        return parameters
+
+    parameters.update(scaling)
+    rope_type = str(scaling.get("rope_type", scaling.get("type", "yarn")))
+    if rope_type != "yarn":
+        raise ValueError("rope_scaling currently supports only YaRN")
+    parameters["rope_type"] = rope_type
+    original = int(parameters.get("original_max_position_embeddings", native_context))
+    if original <= 0:
+        raise ValueError("YaRN original_max_position_embeddings must be positive")
+    factor = float(parameters.get("factor", max(1.0, target_context / original)))
+    if not math.isfinite(factor) or factor < 1.0:
+        raise ValueError("YaRN factor must be at least 1")
+    if target_context > original * factor + 1.0e-6 * original:
+        raise ValueError(
+            "cache_capacity exceeds the context covered by the YaRN factor"
+        )
+    beta_fast = float(parameters.get("beta_fast", 32.0))
+    beta_slow = float(parameters.get("beta_slow", 1.0))
+    if (
+        not math.isfinite(beta_fast)
+        or not math.isfinite(beta_slow)
+        or beta_fast <= beta_slow
+        or beta_slow <= 0.0
+    ):
+        raise ValueError("YaRN requires finite beta_fast > beta_slow > 0")
+    parameters.update(
+        {
+            "factor": factor,
+            "original_max_position_embeddings": original,
+            "beta_fast": beta_fast,
+            "beta_slow": beta_slow,
+        }
+    )
+    return parameters
+
+
+def rotary_cache_values(
+    length: int, rotary_dim: int, parameters: Mapping[str, object]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build FP32 cosine/sine tables for default RoPE or static YaRN."""
+    if length <= 0 or rotary_dim <= 0 or rotary_dim % 2:
+        raise ValueError(
+            "rotary cache length and even rotary dimension must be positive"
+        )
+    theta = float(parameters.get("rope_theta", 10000.0))
+    if theta <= 1.0:
+        raise ValueError("rope_theta must be greater than 1")
+    dimensions = np.arange(0, rotary_dim, 2, dtype=np.float32)
+    position_frequencies = theta ** (dimensions / rotary_dim)
+    attention_factor = 1.0
+    rope_type = str(parameters.get("rope_type", "default"))
+    if rope_type == "default":
+        inverse_frequencies = 1.0 / position_frequencies
+    elif rope_type == "yarn":
+        factor = float(parameters["factor"])
+        original = int(parameters["original_max_position_embeddings"])
+        beta_fast = float(parameters.get("beta_fast", 32.0))
+        beta_slow = float(parameters.get("beta_slow", 1.0))
+
+        def correction_dimension(rotations: float) -> float:
+            return (
+                rotary_dim
+                * math.log(original / (rotations * 2.0 * math.pi))
+                / (2.0 * math.log(theta))
+            )
+
+        low = correction_dimension(beta_fast)
+        high = correction_dimension(beta_slow)
+        if bool(parameters.get("truncate", True)):
+            low, high = math.floor(low), math.ceil(high)
+        low = max(low, 0.0)
+        high = min(high, rotary_dim - 1.0)
+        if low == high:
+            high += 0.001
+        ramp = np.clip(
+            (np.arange(rotary_dim // 2, dtype=np.float32) - low) / (high - low),
+            0.0,
+            1.0,
+        )
+        extrapolation = 1.0 - ramp
+        inverse_frequencies = (1.0 / (factor * position_frequencies)) * (
+            1.0 - extrapolation
+        ) + (1.0 / position_frequencies) * extrapolation
+        attention_factor = float(
+            parameters.get(
+                "attention_factor",
+                1.0 if factor <= 1.0 else 0.1 * math.log(factor) + 1.0,
+            )
+        )
+        if not math.isfinite(attention_factor) or attention_factor <= 0.0:
+            raise ValueError("YaRN attention_factor must be positive")
+    else:
+        raise ValueError(f"Unsupported rope_type '{rope_type}'")
+
+    positions = np.arange(length, dtype=np.float32)[:, None]
+    angles = positions * inverse_frequencies[None, :]
+    return (
+        attention_factor * np.cos(angles),
+        attention_factor * np.sin(angles),
     )
 
 

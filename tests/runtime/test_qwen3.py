@@ -10,7 +10,7 @@ import numpy as np
 from examples.qwen_chat import _generate
 from warp_nn.runtime import Qwen3Tokenizer, parse_qwen_tool_calls, sample_token
 from warp_nn.runtime.chat import ChatEncodingCache
-from warp_nn.runtime.qwen3 import _BYTE_ENCODER
+from warp_nn.runtime.tokenizers import _BYTE_ENCODER
 
 
 def _write_tokenizer(path: Path):

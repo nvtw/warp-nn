@@ -41,39 +41,6 @@ from warp_nn.utils.config import get_kernel_config
 # ---------------------------------------------------------------------------
 
 
-def _decode_attention_partitions(head_size: int) -> int:
-    """Choose bounded decode parallelism from attention-head geometry."""
-    return max(64, min(256, int(head_size)))
-
-
-def _decode_attention_head_group(
-    query_heads: int, kv_heads: int, head_size: int
-) -> int:
-    """Choose bounded K/V reuse from the grouped-query ratio."""
-    if kv_heads <= 0 or query_heads < kv_heads or query_heads % kv_heads:
-        raise ValueError("query_heads must be a positive multiple of kv_heads")
-    if head_size > 128:
-        return 4
-    queries_per_kv = query_heads // kv_heads
-    return max(4, min(16, 1 << (queries_per_kv.bit_length() - 1)))
-
-
-def _attention_group_geometry(
-    query_heads: int, kv_heads: int | None, head_size: int, rows: int
-) -> tuple[int, int]:
-    """Choose a bounded query tile without introducing partial head groups."""
-    heads_per_group = 4
-    if kv_heads and (rows == 1 or rows >= 16):
-        candidate = _decode_attention_head_group(query_heads, kv_heads, head_size)
-        queries_per_kv = query_heads // kv_heads
-        if rows == 1 or queries_per_kv % candidate == 0:
-            heads_per_group = candidate
-    rows_per_group = (
-        1 if rows < 16 else max(1, min(4, 2048 // head_size // heads_per_group))
-    )
-    return rows_per_group, heads_per_group
-
-
 @wp.kernel
 def _gemm_transb_kernel(
     A: wp.array2d[Any],  # (M, K)
@@ -2627,109 +2594,6 @@ def _get_partitioned_gqa_attention_kernels(
     return block_dim, partitions, _partitioned_gqa_attention_kernel_cache[key]
 
 
-def _allocate_partitioned_gqa(
-    heads: int,
-    head_size: int,
-    dtype: type,
-    device,
-    partitions: int = 256,
-    rows: int = 1,
-    rows_per_group: int | None = None,
-    heads_per_group: int | None = None,
-    kv_heads: int | None = None,
-):
-    """Allocate one reusable workspace for partitioned decode attention."""
-    default_rows, default_heads = _attention_group_geometry(
-        heads, kv_heads, head_size, rows
-    )
-    if rows_per_group is None:
-        rows_per_group = default_rows
-    if heads_per_group is None:
-        heads_per_group = default_heads
-    block_dim, partitions, kernels = _get_partitioned_gqa_attention_kernels(
-        head_size, dtype, partitions, rows_per_group, heads_per_group
-    )
-    items = rows * heads * partitions
-    return (
-        block_dim,
-        partitions,
-        rows_per_group,
-        heads_per_group,
-        kernels,
-        wp.empty(items, dtype=wp.float32, device=device),
-        wp.empty(items, dtype=wp.float32, device=device),
-        wp.empty((items, head_size), dtype=wp.float32, device=device),
-    )
-
-
-def _launch_partitioned_gqa(
-    workspace,
-    query,
-    key,
-    value,
-    sequence_end,
-    output,
-    query_heads: int,
-    kv_heads: int,
-    total_length: int,
-    scale: float,
-    window: int,
-    device,
-):
-    """Launch partitioned decode attention using a reusable workspace."""
-    (
-        block_dim,
-        partitions,
-        rows_per_group,
-        heads_per_group,
-        kernels,
-        partial_maximum,
-        partial_denominator,
-        partial_output,
-    ) = workspace
-    queries_per_kv = query_heads // kv_heads
-    groups_per_batch = kv_heads * (
-        (queries_per_kv + heads_per_group - 1) // heads_per_group
-    )
-    sequence_length = output.shape[0]
-    row_groups = (sequence_length + rows_per_group - 1) // rows_per_group
-    batches = query.shape[0] // (query_heads * sequence_length)
-    wp.launch_tiled(
-        kernels[0],
-        dim=batches * row_groups * groups_per_batch * partitions,
-        inputs=[
-            query,
-            key,
-            value,
-            sequence_end,
-            partial_maximum,
-            partial_denominator,
-            partial_output,
-            query_heads,
-            kv_heads,
-            sequence_length,
-            total_length,
-            scale,
-            window,
-        ],
-        block_dim=block_dim,
-        device=device,
-    )
-    wp.launch_tiled(
-        kernels[1],
-        dim=batches * sequence_length * query_heads,
-        inputs=[
-            partial_maximum,
-            partial_denominator,
-            partial_output,
-            output,
-            query_heads,
-        ],
-        block_dim=block_dim,
-        device=device,
-    )
-
-
 @wp.kernel
 def _initialize_attention_mask(mask: wp.array2d[wp.int64], length: int):
     """Set the first ``length`` mask entries and clear the remainder."""
@@ -3085,6 +2949,27 @@ def _cast_kernel_for_dtypes(source_dtype: type, target_dtype: type):
     return _KERNEL_OVERLOADS[key]
 
 
+@lru_cache(maxsize=None)
+def _merge_lora_kernel(dtype: type):
+    """Return an in-place LoRA merge kernel specialized for one weight dtype."""
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def merge_lora(
+        weight: wp.array2d(dtype=DTYPE),
+        a: wp.array2d(dtype=DTYPE),
+        b: wp.array2d(dtype=DTYPE),
+        scale: wp.float32,
+    ):
+        row, column = wp.tid()
+        delta = wp.float32(0.0)
+        for rank in range(a.shape[0]):
+            delta += wp.float32(b[row, rank]) * wp.float32(a[rank, column])
+        weight[row, column] = DTYPE(wp.float32(weight[row, column]) + scale * delta)
+
+    return merge_lora
+
+
 def _where_kernel_for_dtype(dtype: type):
     key = (_where_broadcast_kernel, dtype)
     if key not in _KERNEL_OVERLOADS:
@@ -3183,3 +3068,150 @@ def _stage_mrope_token_position(
     rope_positions[1, 0] = wp.int64(rope_position)
     rope_positions[2, 0] = wp.int64(rope_position)
     sequence_end[0] = cache_position
+
+
+@lru_cache(maxsize=None)
+def _encoder_kernels(dtype: type, head_size: int):
+    DTYPE = dtype
+    HEAD_SIZE = head_size
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def add_bias(x: wp.array2d(dtype=DTYPE), bias: wp.array1d(dtype=DTYPE)):
+        row, column = wp.tid()
+        x[row, column] = DTYPE(wp.float32(x[row, column]) + wp.float32(bias[column]))
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def bias_gelu(x: wp.array2d(dtype=DTYPE), bias: wp.array1d(dtype=DTYPE)):
+        row, column = wp.tid()
+        value = wp.float32(x[row, column]) + wp.float32(bias[column])
+        # Exact PyTorch GELU default (erf), rather than the tanh approximation.
+        value *= wp.float32(0.5) * (
+            wp.float32(1.0) + wp.erf(value * wp.float32(0.7071067811865476))
+        )
+        x[row, column] = DTYPE(value)
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def residual_layer_norm(
+        branch: wp.array2d(dtype=DTYPE),
+        residual: wp.array2d(dtype=DTYPE),
+        bias: wp.array1d(dtype=DTYPE),
+        scale: wp.array1d(dtype=DTYPE),
+        shift: wp.array1d(dtype=DTYPE),
+        output: wp.array2d(dtype=DTYPE),
+        epsilon: wp.float32,
+    ):
+        row = wp.tid()
+        width = branch.shape[1]
+        mean = wp.float32(0.0)
+        for column in range(width):
+            mean += (
+                wp.float32(branch[row, column])
+                + wp.float32(bias[column])
+                + wp.float32(residual[row, column])
+            )
+        mean /= wp.float32(width)
+        variance = wp.float32(0.0)
+        for column in range(width):
+            value = (
+                wp.float32(branch[row, column])
+                + wp.float32(bias[column])
+                + wp.float32(residual[row, column])
+                - mean
+            )
+            variance += value * value
+        inverse = wp.float32(1.0) / wp.sqrt(variance / wp.float32(width) + epsilon)
+        for column in range(width):
+            value = (
+                wp.float32(branch[row, column])
+                + wp.float32(bias[column])
+                + wp.float32(residual[row, column])
+            )
+            output[row, column] = DTYPE(
+                (value - mean) * inverse * wp.float32(scale[column])
+                + wp.float32(shift[column])
+            )
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def split_qkv(
+        packed: wp.array2d(dtype=DTYPE),
+        query: wp.array4d(dtype=DTYPE),
+        key: wp.array4d(dtype=DTYPE),
+        value: wp.array4d(dtype=DTYPE),
+    ):
+        batch, head, token, column = wp.tid()
+        hidden = query.shape[1] * query.shape[3]
+        row = batch * query.shape[2] + token
+        offset = head * query.shape[3] + column
+        query[batch, head, token, column] = DTYPE(packed[row, offset])
+        key[batch, head, token, column] = DTYPE(packed[row, hidden + offset])
+        value[batch, head, token, column] = DTYPE(packed[row, hidden * 2 + offset])
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def merge_heads(x: wp.array4d(dtype=DTYPE), output: wp.array2d(dtype=DTYPE)):
+        batch, head, token, column = wp.tid()
+        output[batch * x.shape[2] + token, head * x.shape[3] + column] = DTYPE(
+            x[batch, head, token, column]
+        )
+
+    @wp.func
+    def dot(left: DTYPE, right: DTYPE):
+        return wp.float32(DTYPE(left)) * wp.float32(DTYPE(right))
+
+    @wp.func
+    def update(
+        total: wp.float32,
+        current: DTYPE,
+        old_scale: wp.float32,
+        probability: wp.float32,
+    ):
+        return total * old_scale + wp.float32(DTYPE(current)) * probability
+
+    @wp.func
+    def normalize(total: wp.float32, denominator: wp.float32):
+        return total / denominator
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def full_attention(
+        query: wp.array4d(dtype=DTYPE),
+        key: wp.array4d(dtype=DTYPE),
+        value: wp.array4d(dtype=DTYPE),
+        valid: wp.array2d(dtype=wp.bool),
+        output: wp.array4d(dtype=DTYPE),
+        scale: wp.float32,
+    ):
+        item = wp.tid()
+        sequence = query.shape[2]
+        token = item % sequence
+        head = (item / sequence) % query.shape[1]
+        batch = item / (query.shape[1] * sequence)
+        kv_head = head / (query.shape[1] / key.shape[1])
+        accumulator = wp.tile_zeros(shape=(HEAD_SIZE,), dtype=wp.float32)
+        q = wp.tile_load(query[batch, head, token], shape=(HEAD_SIZE,))
+        maximum = wp.float32(-3.402823466e38)
+        denominator = wp.float32(0.0)
+        for source in range(sequence):
+            if valid[batch, source]:
+                k = wp.tile_load(key[batch, kv_head, source], shape=(HEAD_SIZE,))
+                score = wp.tile_extract(wp.tile_sum(wp.tile_map(dot, q, k)), 0) * scale
+                new_maximum = wp.max(maximum, score)
+                old_scale = wp.exp(maximum - new_maximum)
+                probability = wp.exp(score - new_maximum)
+                denominator = denominator * old_scale + probability
+                v = wp.tile_load(value[batch, kv_head, source], shape=(HEAD_SIZE,))
+                accumulator = wp.tile_map(
+                    update, accumulator, v, old_scale, probability
+                )
+                maximum = new_maximum
+        accumulator = wp.tile_map(normalize, accumulator, denominator)
+        wp.tile_store(
+            output[batch, head, token], wp.tile_astype(accumulator, dtype=DTYPE)
+        )
+
+    return (
+        add_bias,
+        bias_gelu,
+        residual_layer_norm,
+        split_qkv,
+        merge_heads,
+        full_attention,
+    )

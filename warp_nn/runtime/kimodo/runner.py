@@ -5,7 +5,7 @@
 
 This module owns only Kimodo-specific orchestration and motion representation.
 The encoder blocks delegate their dense and attention work to
-``warp_nn.runtime.encoder``.
+``warp_nn.runtime.operators``.
 """
 
 from dataclasses import dataclass
@@ -19,10 +19,11 @@ from typing import Mapping
 import numpy as np
 import warp as wp
 
-from .encoder import EncoderStackPlan, _encoder_kernels
-from .operators import Operation, execute_operations, plan_linear
-from .safetensors import SafeTensorArchive
-from .weights import load_cast_weights
+from ..kernels import _encoder_kernels
+from ..operators import EncoderStackPlan
+from ..operators import Operation, execute_operations, plan_linear
+from ..formats.safetensors import SafeTensorArchive
+from ..weights import load_cast_weights
 
 
 @dataclass(frozen=True)
@@ -1202,7 +1203,7 @@ class KimodoRunner:
         self._plans = {}
         self.text_encoder = None
         if text_model_path is not None:
-            from .llama_encoder import LLM2VecRunner
+            from ..llama.encoder import LLM2VecRunner
 
             self.text_encoder = LLM2VecRunner(
                 text_model_path,
@@ -1217,7 +1218,7 @@ class KimodoRunner:
         if key not in self._plans:
             cublas = None
             if self.use_cublas:
-                from ._cublas import Cublas
+                from .._cublas import Cublas
 
                 cublas = Cublas(self.device)
             self._plans[key] = KimodoGenerationPlan(

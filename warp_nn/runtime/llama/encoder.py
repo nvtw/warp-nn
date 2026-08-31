@@ -10,25 +10,25 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 
-from .encoder import _encoder_kernels
-from .kernels import (
+from ..kernels import _encoder_kernels
+from ..kernels import (
     _binary_broadcast_kernel,
     _get_masked_mean_pool_kernel,
     _gather_rows_kernel,
     _reorder_heads_kernel,
     _rotary_embedding_kernel_for_dtype,
 )
-from .operators import (
+from ..operators import (
     Operation,
     execute_operations,
     plan_linear,
     plan_rms_norm,
     plan_swiglu,
 )
-from .qwen3 import Qwen3Tokenizer
-from .rope import rotary_cache_values
-from .safetensors import SafeTensorArchive
-from .weights import load_cast_weights, merge_lora_weight
+from ..tokenizers import Qwen3Tokenizer
+from ..operators import rotary_cache_values
+from ..formats.safetensors import SafeTensorArchive
+from ..weights import load_cast_weights, merge_lora_weight
 
 
 class Llama3Tokenizer(Qwen3Tokenizer):
@@ -417,7 +417,7 @@ class LLM2VecRunner:
         self.tokenizer = Llama3Tokenizer(model_path)
         self.cublas = None
         if use_cublas:
-            from ._cublas import Cublas
+            from .._cublas import Cublas
 
             self.cublas = Cublas(self.device)
         parameters = {

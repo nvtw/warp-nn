@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from tests.utilities import is_device_available, write_safetensors
-from warp_nn.runtime.nemotron_h import NemotronHRunner, _validate_config, _weight_names
+from warp_nn.runtime.nemotron.runner import NemotronHRunner, _validate_config, _weight_names
 
 
 def _bfloat16_bytes(values: np.ndarray) -> bytes:

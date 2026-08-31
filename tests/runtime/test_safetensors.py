@@ -10,7 +10,7 @@ import warp as wp
 
 from tests.utilities import write_safetensors
 from warp_nn.runtime.kernels import _dequantize_e4m3_kernel
-from warp_nn.runtime.safetensors import SafeTensorArchive
+from warp_nn.runtime.formats.safetensors import SafeTensorArchive
 
 
 def test_safetensor_archive_loads_single_file(tmp_path):

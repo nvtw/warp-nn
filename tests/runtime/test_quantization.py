@@ -8,7 +8,7 @@ import pytest
 import warp as wp
 
 from tests.utilities import is_device_available
-from warp_nn.runtime.gguf import BlockQuantizedTensor
+from warp_nn.runtime.formats.gguf import BlockQuantizedTensor
 from warp_nn.runtime.quantization import (
     estimate_loaded_weight_bytes,
     is_q8_linear_weight,

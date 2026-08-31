@@ -10,7 +10,7 @@ from collections.abc import Iterable
 
 import warp as wp
 
-from warp_nn.runtime.gguf import BlockQuantizedTensor
+from warp_nn.runtime.formats.gguf import BlockQuantizedTensor
 from warp_nn.runtime.kernels import _get_quantize_int8_kernel
 
 _PROJECTION_SUFFIXES = (

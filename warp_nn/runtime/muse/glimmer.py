@@ -15,18 +15,19 @@ from pathlib import Path
 import warp as wp
 
 from warp_nn.runtime._cublas import try_create_cublas
-from warp_nn.runtime.gguf import BlockQuantizedTensor, GGUFArchive
+from warp_nn.runtime.formats.gguf import (
+    BlockQuantizedTensor,
+    GGUFArchive,
+    find_gguf_files,
+)
 from warp_nn.runtime.kernels import (
-    _allocate_partitioned_gqa,
     _append_circular_head_cache_kernel,
     _append_head_cache_kernel,
     _binary_broadcast_kernel,
-    _decode_attention_partitions,
     _gather_rows_kernel,
     _get_gather_q8_0_rows_kernel,
     _get_gqa_attention_kernel,
     _get_greedy_argmax_kernels,
-    _launch_partitioned_gqa,
     _logit_softcap_kernel,
     _reorder_heads_kernel,
     _reorder_interleaved_heads_kernel,
@@ -36,47 +37,26 @@ from warp_nn.runtime.kernels import (
 )
 from warp_nn.runtime.operators import (
     Operation,
+    _allocate_partitioned_gqa,
+    _decode_attention_partitions,
+    _launch_partitioned_gqa,
     execute_operations,
     plan_linear,
     plan_rms_norm,
     plan_swiglu,
+    reuse_operation_outputs,
 )
 from warp_nn.runtime.quantization import (
     estimate_loaded_weight_bytes,
     load_native_weights,
     normalize_weight_quantization,
 )
-from warp_nn.runtime.qwen3 import Qwen3Tokenizer, _pretokenize_o200k
-from warp_nn.runtime.qwen35 import Qwen35Runner, _reuse_layer_operation_outputs
-from warp_nn.runtime.rope import resolve_rope_parameters, rotary_cache_values
-from warp_nn.runtime.safetensors import SafeTensorArchive
+from warp_nn.runtime.weights import MappedWeightArchive
+from warp_nn.runtime.tokenizers import Qwen3Tokenizer, _pretokenize_o200k
+from warp_nn.runtime.autoregressive import AutoregressiveRunner
+from warp_nn.runtime.operators import resolve_rope_parameters, rotary_cache_values
+from warp_nn.runtime.formats.safetensors import SafeTensorArchive
 from warp_nn.utils.device import parse_device
-
-
-def _gguf_paths(path: str | Path) -> tuple[Path, ...]:
-    path = Path(path)
-    directory = path if path.is_dir() else path.parent
-    if path.is_dir():
-        first_files = sorted(directory.glob("*-00001-of-*.gguf"))
-        if not first_files:
-            first_files = [
-                item
-                for item in sorted(directory.glob("*.gguf"))
-                if "mmproj" not in item.name.lower()
-            ]
-        if len(first_files) != 1:
-            raise FileNotFoundError(
-                f"Expected one GGUF model in '{directory}', found {len(first_files)}"
-            )
-        path = first_files[0]
-    match = re.fullmatch(r"(.+)-(\d{5})-of-(\d{5})\.gguf", path.name)
-    if match is None:
-        return (path,)
-    count = int(match.group(3))
-    return tuple(
-        directory / f"{match.group(1)}-{index:05d}-of-{count:05d}.gguf"
-        for index in range(1, count + 1)
-    )
 
 
 def _gguf_config(metadata: Mapping[str, object]) -> dict:
@@ -145,24 +125,6 @@ def _gguf_weight_map(config: Mapping[str, object]) -> dict[str, str]:
             }
         )
     return names
-
-
-class _MappedGGUFArchive:
-    def __init__(self, archive: GGUFArchive, names: Mapping[str, str]):
-        self.archive = archive
-        self._names = dict(names)
-
-    @property
-    def names(self) -> tuple[str, ...]:
-        return tuple(self._names)
-
-    def metadata(self, name: str):
-        return self.archive.tensor(self._names[name])
-
-    def load(self, device=None, names=None) -> dict[str, wp.array]:
-        selected = self.names if names is None else tuple(names)
-        loaded = self.archive.load(device, [self._names[name] for name in selected])
-        return {name: loaded[self._names[name]] for name in selected}
 
 
 def _validate_config(config: dict) -> None:
@@ -353,7 +315,7 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
         if (path / "tokenizer.json").is_file():
             super().__init__(path)
         else:
-            archive = GGUFArchive(_gguf_paths(path))
+            archive = GGUFArchive(find_gguf_files(path))
             metadata = archive.metadata
             if metadata.get("tokenizer.ggml.model") != "gpt2":
                 raise ValueError("Muse GGUF requires an embedded GPT-2 BPE tokenizer")
@@ -636,7 +598,7 @@ class _MusePlan:
 
     def _reuse_layer_buffers(self, layer: dict, index: int) -> None:
         """Alias non-overlapping per-layer temporaries by their execution role."""
-        _reuse_layer_operation_outputs(layer, self.tensors, self._layer_buffer_pool)
+        reuse_operation_outputs(layer, self.tensors, self._layer_buffer_pool)
 
         def reuse(role: str, value: wp.array, name: str | None = None, slot: int = 0):
             key = ("buffer", role, slot, tuple(value.shape), value.dtype)
@@ -1039,7 +1001,7 @@ class _MusePlan:
         return self.logits
 
 
-class MuseGlimmerRunner(Qwen35Runner):
+class MuseGlimmerRunner(AutoregressiveRunner):
     """Run text-only Muse Glimmer BF16 safetensors or GGUF checkpoints."""
 
     def __init__(
@@ -1062,9 +1024,11 @@ class MuseGlimmerRunner(Qwen35Runner):
             self.gguf_layout = False
             self.centered_norm_scales = True
         else:
-            gguf = GGUFArchive(_gguf_paths(path))
+            gguf = GGUFArchive(find_gguf_files(path))
             self.config = _gguf_config(gguf.metadata)
-            archive = _MappedGGUFArchive(gguf, _gguf_weight_map(self.config))
+            archive = MappedWeightArchive(
+                gguf, _gguf_weight_map(self.config), gguf.tensor
+            )
             self.gguf_layout = True
             self.centered_norm_scales = False
         _validate_config(self.config)

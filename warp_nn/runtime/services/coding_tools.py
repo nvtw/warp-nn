@@ -14,7 +14,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 
-from warp_nn.runtime.sandbox import is_sandbox_available, run_sandboxed
+from warp_nn.runtime.services.sandbox import is_sandbox_available, run_sandboxed
 
 
 _SKIP_DIRECTORIES = {".git", ".hg", ".svn", ".venv", "__pycache__", "node_modules"}

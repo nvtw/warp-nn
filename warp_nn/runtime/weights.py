@@ -3,43 +3,33 @@
 
 """Small format-neutral helpers for streaming inference-weight conversion."""
 
-from functools import lru_cache
 import math
 
 import warp as wp
 
-
-@lru_cache(maxsize=None)
-def _cast_kernel(source_dtype, target_dtype):
-    SOURCE = source_dtype
-    TARGET = target_dtype
-
-    @wp.kernel(enable_backward=False, module="unique")
-    def cast(source: wp.array(dtype=SOURCE), output: wp.array(dtype=TARGET)):
-        index = wp.tid()
-        output[index] = TARGET(source[index])
-
-    return cast
+from warp_nn.runtime.kernels import _cast_kernel_for_dtypes, _merge_lora_kernel
 
 
-@lru_cache(maxsize=None)
-def _merge_lora_kernel(dtype):
-    DTYPE = dtype
+class MappedWeightArchive:
+    """Expose an archive through canonical runtime weight names."""
 
-    @wp.kernel(enable_backward=False, module="unique")
-    def merge_lora(
-        weight: wp.array2d(dtype=DTYPE),
-        a: wp.array2d(dtype=DTYPE),
-        b: wp.array2d(dtype=DTYPE),
-        scale: wp.float32,
-    ):
-        row, column = wp.tid()
-        delta = wp.float32(0.0)
-        for rank in range(a.shape[0]):
-            delta += wp.float32(b[row, rank]) * wp.float32(a[rank, column])
-        weight[row, column] = DTYPE(wp.float32(weight[row, column]) + scale * delta)
+    def __init__(self, archive, names, metadata=None):
+        self.archive = archive
+        self._names = dict(names)
+        self._metadata = metadata or archive.metadata
 
-    return merge_lora
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(self._names)
+
+    def metadata(self, name: str):
+        return self._metadata(self._names[name])
+
+    def load(self, device=None, names=None) -> dict[str, wp.array]:
+        selected = self.names if names is None else tuple(names)
+        sources = [self._names[name] for name in selected]
+        loaded = self.archive.load(device, sources)
+        return {name: loaded[self._names[name]] for name in selected}
 
 
 def merge_lora_weight(weight, a, b, scale):
@@ -91,7 +81,7 @@ def load_cast_weights(archive, names, device, dtype=None):
             raise TypeError(f"cannot cast non-floating weight '{name}'")
         converted = wp.empty(source.shape, dtype=dtype, device=device)
         wp.launch(
-            _cast_kernel(source.dtype, dtype),
+            _cast_kernel_for_dtypes(source.dtype, dtype),
             dim=source.size,
             inputs=[source.flatten(), converted.flatten()],
             device=device,
