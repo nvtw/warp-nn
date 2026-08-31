@@ -4,8 +4,8 @@
 """Validate or run the dependency-free ACE-Step 1.5 pipeline.
 
 The ``--check`` path is useful while downloading: it validates the official
-multi-component bundle without loading tensors. Generation remains deliberately
-gated by ``AceStep15Pipeline.ready`` until the native DiT sampler is complete.
+multi-component bundle without loading tensors. Generation runs the native
+dependency-free turbo pipeline when the complete official bundle is present.
 """
 
 from __future__ import annotations
