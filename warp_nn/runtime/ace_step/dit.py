@@ -23,12 +23,15 @@ from warp_nn.runtime.kernels import (
     _split_attention_heads_kernel,
 )
 from warp_nn.runtime.operators import (
+    AdaptiveRMSNormPlan,
     BidirectionalGQAPlan,
     FixedKVAttentionPlan,
+    ModulatedResidualPlan,
     Operation,
     execute_operations,
     plan_linear,
     plan_rms_norm,
+    plan_swiglu,
 )
 
 
@@ -462,6 +465,168 @@ class AceStepAttentionPlan:
             device=self.device,
         )
         self._execute(self.output_projection)
+        return self.output
+
+
+class AceStepDiTLayerPlan:
+    """One exact ACE-Step AdaLN/self/cross/SwiGLU transformer layer."""
+
+    def __init__(
+        self,
+        hidden,
+        timestep_modulation,
+        context,
+        weights,
+        config,
+        layer_index,
+        *,
+        query_valid=None,
+        context_valid=None,
+        position_ids=None,
+        cos_cache=None,
+        sin_cache=None,
+        cublas=None,
+    ):
+        if timestep_modulation.shape != (
+            hidden.shape[0],
+            6,
+            config.hidden_size,
+        ):
+            raise ValueError("ACE layer timestep modulation must be [batch, 6, hidden]")
+        prefix = f"decoder.layers.{layer_index}"
+        table = weights[prefix + ".scale_shift_table"]
+        self.device = hidden.device
+        self.weights = weights
+        self.self_norm = AdaptiveRMSNormPlan(
+            hidden,
+            weights[prefix + ".self_attn_norm.weight"],
+            table,
+            timestep_modulation,
+            shift_index=0,
+            scale_index=1,
+            epsilon=config.rms_norm_eps,
+        )
+        self.self_attention = AceStepAttentionPlan(
+            self.self_norm.output,
+            weights,
+            prefix + ".self_attn",
+            config,
+            query_valid=query_valid,
+            key_valid=query_valid,
+            position_ids=position_ids,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            layer_index=layer_index,
+            cublas=cublas,
+        )
+        self.self_residual = ModulatedResidualPlan(
+            hidden,
+            self.self_attention.output,
+            scale_shift_table=table,
+            timestep_modulation=timestep_modulation,
+            gate_index=2,
+        )
+        self._cross_tensors = {
+            "x": self.self_residual.output,
+            "weight": weights[prefix + ".cross_attn_norm.weight"],
+        }
+        self._cross_shapes = {
+            name: value.shape for name, value in self._cross_tensors.items()
+        }
+        self._cross_norm = Operation(
+            "SimplifiedLayerNormalization",
+            ["x", "weight"],
+            ["normalized"],
+            {"epsilon": config.rms_norm_eps},
+        )
+        plan_rms_norm(
+            self._cross_norm,
+            self._cross_tensors,
+            self._cross_shapes,
+            self.device,
+        )
+        self.cross_attention = AceStepAttentionPlan(
+            self._cross_tensors["normalized"],
+            weights,
+            prefix + ".cross_attn",
+            config,
+            context=context,
+            query_valid=query_valid,
+            key_valid=context_valid,
+            layer_index=layer_index,
+            cublas=cublas,
+        )
+        self.cross_residual = ModulatedResidualPlan(
+            self.self_residual.output, self.cross_attention.output
+        )
+        self.mlp_norm = AdaptiveRMSNormPlan(
+            self.cross_residual.output,
+            weights[prefix + ".mlp_norm.weight"],
+            table,
+            timestep_modulation,
+            shift_index=3,
+            scale_index=4,
+            epsilon=config.rms_norm_eps,
+        )
+        rows = hidden.shape[0] * hidden.shape[1]
+        self._mlp_tensors = dict(weights)
+        self._mlp_tensors["x"] = self.mlp_norm.output.reshape(
+            (rows, config.hidden_size)
+        )
+        self._mlp_shapes = {
+            name: tuple(value.shape) for name, value in self._mlp_tensors.items()
+        }
+
+        def linear(name, source, weight):
+            operation = Operation("Linear", [source, weight], [name])
+            plan_linear(
+                operation,
+                self._mlp_tensors,
+                self._mlp_shapes,
+                self.device,
+                cublas=cublas,
+            )
+            return operation
+
+        self.gate = linear("gate", "x", prefix + ".mlp.gate_proj.weight")
+        self.up = linear("up", "x", prefix + ".mlp.up_proj.weight")
+        self.swiglu = Operation("_SwiGLU", ["gate", "up"], ["activated"])
+        plan_swiglu(self.swiglu, self._mlp_tensors, self._mlp_shapes, self.device)
+        self.down = linear("down", "activated", prefix + ".mlp.down_proj.weight")
+        down = self._mlp_tensors["down"].reshape(hidden.shape)
+        self.mlp_residual = ModulatedResidualPlan(
+            self.cross_residual.output,
+            down,
+            scale_shift_table=table,
+            timestep_modulation=timestep_modulation,
+            gate_index=5,
+        )
+        self.output = self.mlp_residual.output
+
+    def prepare_fixed_condition(self, force=False):
+        """Project the condition K/V once for repeated diffusion steps."""
+        self.cross_attention.prepare_fixed_kv(force=force)
+
+    def execute(self):
+        self.self_norm.execute()
+        self.self_attention.execute()
+        self.self_residual.execute()
+        execute_operations(
+            (self._cross_norm,),
+            self._cross_tensors,
+            self._cross_shapes,
+            self.device,
+        )
+        self.cross_attention.execute()
+        self.cross_residual.execute()
+        self.mlp_norm.execute()
+        execute_operations(
+            (self.gate, self.up, self.swiglu, self.down),
+            self._mlp_tensors,
+            self._mlp_shapes,
+            self.device,
+        )
+        self.mlp_residual.execute()
         return self.output
 
 

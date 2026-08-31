@@ -11,6 +11,7 @@ from warp_nn.runtime.ace_step.dit import (
     AceStepDiTConfig,
     AceStepDiTLayout,
     AceStepAttentionPlan,
+    AceStepDiTLayerPlan,
     TURBO_TIMESTEPS,
     bidirectional_attention_mask,
     dit_weight_names,
@@ -270,3 +271,148 @@ def test_executable_self_attention_matches_sliding_reference():
     merged = np.transpose(attended, (0, 2, 1, 3)).reshape(1, 5, 16)
     expected = merged @ arrays[prefix + ".o_proj.weight"].T
     np.testing.assert_allclose(actual, expected, rtol=0.04, atol=0.02)
+
+
+def _attention_reference(x, source, arrays, prefix, heads, kv_heads, window=None):
+    batch, sequence, hidden = x.shape
+    width = hidden // heads
+    key_length = source.shape[1]
+    query = (x @ arrays[prefix + ".q_proj.weight"].T).reshape(
+        batch, sequence, heads, width
+    )
+    query = _rms_norm(
+        np.transpose(query, (0, 2, 1, 3)),
+        arrays[prefix + ".q_norm.weight"],
+        1.0e-6,
+    )
+    key = (source @ arrays[prefix + ".k_proj.weight"].T).reshape(
+        batch, key_length, kv_heads, width
+    )
+    key = _rms_norm(
+        np.transpose(key, (0, 2, 1, 3)),
+        arrays[prefix + ".k_norm.weight"],
+        1.0e-6,
+    )
+    value = (source @ arrays[prefix + ".v_proj.weight"].T).reshape(
+        batch, key_length, kv_heads, width
+    )
+    value = np.transpose(value, (0, 2, 1, 3))
+    attended = np.zeros_like(query)
+    for b in range(batch):
+        for head in range(heads):
+            kv_head = head // (heads // kv_heads)
+            for token in range(sequence):
+                first = 0 if window is None else max(0, token - window)
+                end = (
+                    key_length
+                    if window is None
+                    else min(key_length, token + window + 1)
+                )
+                scores = query[b, head, token] @ key[b, kv_head, first:end].T
+                scores /= np.sqrt(width)
+                probability = np.exp(scores - scores.max())
+                probability /= probability.sum()
+                attended[b, head, token] = probability @ value[b, kv_head, first:end]
+    merged = np.transpose(attended, (0, 2, 1, 3)).reshape(batch, sequence, hidden)
+    return merged @ arrays[prefix + ".o_proj.weight"].T
+
+
+def test_full_dit_layer_matches_numpy_reference_and_graph():
+    from tests.utilities import is_device_available
+
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is unavailable")
+    config = _config(sliding_window=1)
+    rng = np.random.default_rng(131)
+    hidden = rng.normal(0.0, 0.15, size=(1, 4, 16)).astype(np.float32)
+    context = rng.normal(0.0, 0.15, size=(1, 6, 16)).astype(np.float32)
+    timestep = rng.normal(0.0, 0.05, size=(1, 6, 16)).astype(np.float32)
+    layer = "decoder.layers.0"
+    arrays = {
+        layer + ".scale_shift_table": rng.normal(0.0, 0.05, size=(1, 6, 16)).astype(
+            np.float32
+        ),
+        layer + ".self_attn_norm.weight": rng.normal(1.0, 0.05, size=16).astype(
+            np.float32
+        ),
+        layer + ".cross_attn_norm.weight": rng.normal(1.0, 0.05, size=16).astype(
+            np.float32
+        ),
+        layer + ".mlp_norm.weight": rng.normal(1.0, 0.05, size=16).astype(np.float32),
+        layer + ".mlp.gate_proj.weight": rng.normal(0.0, 0.15, size=(48, 16)).astype(
+            np.float32
+        ),
+        layer + ".mlp.up_proj.weight": rng.normal(0.0, 0.15, size=(48, 16)).astype(
+            np.float32
+        ),
+        layer + ".mlp.down_proj.weight": rng.normal(0.0, 0.15, size=(16, 48)).astype(
+            np.float32
+        ),
+    }
+    for module in ("self_attn", "cross_attn"):
+        prefix = layer + "." + module
+        arrays.update(
+            {
+                prefix + ".q_proj.weight": rng.normal(0.0, 0.15, size=(16, 16)).astype(
+                    np.float32
+                ),
+                prefix + ".k_proj.weight": rng.normal(0.0, 0.15, size=(8, 16)).astype(
+                    np.float32
+                ),
+                prefix + ".v_proj.weight": rng.normal(0.0, 0.15, size=(8, 16)).astype(
+                    np.float32
+                ),
+                prefix + ".o_proj.weight": rng.normal(0.0, 0.15, size=(16, 16)).astype(
+                    np.float32
+                ),
+                prefix + ".q_norm.weight": rng.normal(1.0, 0.05, size=4).astype(
+                    np.float32
+                ),
+                prefix + ".k_norm.weight": rng.normal(1.0, 0.05, size=4).astype(
+                    np.float32
+                ),
+            }
+        )
+    weights = {
+        name: wp.array(value, dtype=wp.bfloat16, device="cuda:0")
+        for name, value in arrays.items()
+    }
+    plan = AceStepDiTLayerPlan(
+        wp.array(hidden, dtype=wp.bfloat16, device="cuda:0"),
+        wp.array(timestep, dtype=wp.bfloat16, device="cuda:0"),
+        wp.array(context, dtype=wp.bfloat16, device="cuda:0"),
+        weights,
+        config,
+        0,
+        position_ids=wp.array(np.arange(4, dtype=np.int64)[None], device="cuda:0"),
+        cos_cache=wp.ones((4, 2), dtype=wp.bfloat16, device="cuda:0"),
+        sin_cache=wp.zeros((4, 2), dtype=wp.bfloat16, device="cuda:0"),
+    )
+    plan.prepare_fixed_condition()
+    wp.capture_begin(device="cuda:0")
+    plan.execute()
+    graph = wp.capture_end(device="cuda:0")
+    wp.capture_launch(graph)
+
+    table = arrays[layer + ".scale_shift_table"] + timestep
+    self_input = _rms_norm(hidden, arrays[layer + ".self_attn_norm.weight"], 1.0e-6)
+    self_input = self_input * (1.0 + table[:, 1, None]) + table[:, 0, None]
+    self_output = _attention_reference(
+        self_input, self_input, arrays, layer + ".self_attn", 4, 2, 1
+    )
+    after_self = hidden + self_output * table[:, 2, None]
+    cross_input = _rms_norm(
+        after_self, arrays[layer + ".cross_attn_norm.weight"], 1.0e-6
+    )
+    cross_output = _attention_reference(
+        cross_input, context, arrays, layer + ".cross_attn", 4, 2
+    )
+    after_cross = after_self + cross_output
+    mlp_input = _rms_norm(after_cross, arrays[layer + ".mlp_norm.weight"], 1.0e-6)
+    mlp_input = mlp_input * (1.0 + table[:, 4, None]) + table[:, 3, None]
+    gate = mlp_input @ arrays[layer + ".mlp.gate_proj.weight"].T
+    up = mlp_input @ arrays[layer + ".mlp.up_proj.weight"].T
+    activated = gate / (1.0 + np.exp(-gate)) * up
+    down = activated @ arrays[layer + ".mlp.down_proj.weight"].T
+    expected = after_cross + down * table[:, 5, None]
+    np.testing.assert_allclose(plan.output.numpy(), expected, rtol=0.08, atol=0.04)
