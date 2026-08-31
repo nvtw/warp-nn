@@ -382,3 +382,61 @@ def test_qwen35_incremental_prefill_interleaves_slots_without_state_copies(tmp_p
         batch.append_prefill(0, [1])
     with pytest.raises(RuntimeError, match="empty"):
         batch.resume_prefill(0)
+
+
+
+def test_qwen35_single_slot_decode_uses_batch_one_plan_and_isolates_state(tmp_path):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    model_path = tmp_path / "tiny-qwen35-single-slot"
+    _write_tiny_qwen35(model_path)
+    runner = Qwen35Runner(
+        model_path,
+        device="cuda:0",
+        cache_capacity=8,
+        prefill_chunk_size=4,
+        use_cublas=False,
+    )
+    batch = runner.create_batch_decoder(4)
+    prompts = ([1, 2], [3, 4], [5, 6], [7, 8])
+    for slot, prompt in enumerate(prompts):
+        batch.prefill(slot, prompt)
+
+    retained = list(prompts[1])
+    for token in (12, 13, 14):
+        batch.resume_prefill(1)
+        tail_logits = batch.append_prefill(1, [token])
+        batch.end_prefill(1)
+        retained.append(token)
+        wp.synchronize_stream(runner.device)
+        expected_tail = runner.prefill(retained).numpy()
+        np.testing.assert_array_equal(tail_logits.numpy(), expected_tail)
+
+    recurrent_before = batch.recurrent_states[0].numpy().copy()
+    conv_before = batch.conv_states[0].numpy().copy()
+    key_before = batch.kv_caches[1][0].numpy().copy()
+    wp.synchronize_stream(runner.device)
+    runner.prefill(prompts[2])
+    for token in (9, 10, 11):
+        expected = runner.decode(token).numpy()
+        actual = batch.decode_one(2, token).numpy()
+        np.testing.assert_array_equal(actual, expected)
+
+    plan = batch._incremental_plans[1]
+    assert set(plan.graphs) == {1, 2}
+    assert plan.tensors["lm_head.weight"].ptr == runner.weights["lm_head.weight"].ptr
+    recurrent_after = batch.recurrent_states[0].numpy()
+    conv_after = batch.conv_states[0].numpy()
+    key_after = batch.kv_caches[1][0].numpy()
+    recurrent_rows = recurrent_before.shape[0] // 4
+    cache_rows = key_before.shape[0] // 4
+    for slot in (0, 1, 3):
+        np.testing.assert_array_equal(
+            recurrent_after[slot * recurrent_rows : (slot + 1) * recurrent_rows],
+            recurrent_before[slot * recurrent_rows : (slot + 1) * recurrent_rows],
+        )
+        np.testing.assert_array_equal(conv_after[slot], conv_before[slot])
+        np.testing.assert_array_equal(
+            key_after[slot * cache_rows : (slot + 1) * cache_rows],
+            key_before[slot * cache_rows : (slot + 1) * cache_rows],
+        )

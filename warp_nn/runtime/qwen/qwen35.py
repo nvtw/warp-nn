@@ -43,6 +43,7 @@ from warp_nn.runtime.kernels import (
     _overlay_embedding_rows_kernel,
     _set_sequence_end,
     _stage_decode_batch_kernel,
+    _stage_mrope_token_position,
     _sigmoid_gate_kernel,
     _split_last_axis_kernel,
     _unpack_gated_heads_kernel,
@@ -1355,6 +1356,42 @@ class Qwen35BatchDecoder:
         if not self._slot_prefill_open[slot] or self._lengths[slot] == 0:
             raise RuntimeError("incremental prefill has no prompt tokens")
         self._slot_prefill_open[slot] = False
+        return self.prefill_outputs[slot : slot + 1]
+
+    def decode_one(self, slot: int, token_id: int) -> wp.array:
+        """Decode one selected slot with the optimized batch-one projection path."""
+        self._validate_slot(slot)
+        position = self._lengths[slot]
+        if position == 0:
+            raise RuntimeError(f"Qwen batch slot {slot} has not been prefilled")
+        if position >= self.runner.cache_capacity:
+            raise ValueError(f"Qwen batch slot {slot} cache is full")
+        plan = self._incremental_plan_for_rows(1)
+        self._slot_view.select(slot)
+        wp.launch(
+            _stage_mrope_token_position,
+            dim=1,
+            inputs=[
+                plan.input_ids,
+                plan.position_ids,
+                plan.rope_position_ids,
+                self._slot_view.sequence_end,
+                int(token_id),
+                position,
+                position + self._rope_delta_values[slot],
+            ],
+            device=self.device,
+        )
+        if self.device.is_cuda and slot not in plan.graphs:
+            wp.synchronize_stream(self.device)
+        logits = self.runner._run(plan, graph_key=slot)
+        self._lengths[slot] += 1
+        wp.copy(
+            self.prefill_outputs.flatten(),
+            logits.flatten(),
+            dest_offset=slot * logits.size,
+            count=logits.size,
+        )
         return self.prefill_outputs[slot : slot + 1]
 
     def decode(self, token_ids, active=None) -> wp.array:
