@@ -508,6 +508,8 @@ def _native_linear_geometry(
         return None
     if rows >= 64 and rows % 64 == 0 and columns % 32 == 0:
         return 64, 32
+    if rows >= 64 and rows % 64 == 0 and columns % 16 == 0:
+        return 64, 16
     if rows >= 16 and rows % 16 == 0 and columns % 64 == 0:
         return 16, 64
     return None

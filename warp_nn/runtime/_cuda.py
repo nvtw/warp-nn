@@ -475,7 +475,13 @@ def get_prefill_mma_projection(
     dtype: type, tile_m: int, tile_n: int, *, transposed_right: bool = True
 ):
     """Return an SM80+ GEMM primitive for either right-operand storage layout."""
-    if (tile_m, tile_n) not in ((16, 64), (64, 64), (64, 32), (128, 32)):
+    if (tile_m, tile_n) not in (
+        (16, 64),
+        (64, 64),
+        (64, 32),
+        (64, 16),
+        (128, 32),
+    ):
         raise ValueError("Unsupported prefill MMA tile geometry")
     block_dim = tile_m * tile_n // 8
     if dtype == wp.float16:
