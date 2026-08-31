@@ -12,6 +12,7 @@ from warp_nn.runtime.ace_step.dit import (
     AceStepDiTLayout,
     AceStepAttentionPlan,
     AceStepDiTLayerPlan,
+    AceStepDiTPlan,
     TURBO_TIMESTEPS,
     bidirectional_attention_mask,
     dit_weight_names,
@@ -416,3 +417,118 @@ def test_full_dit_layer_matches_numpy_reference_and_graph():
     down = activated @ arrays[layer + ".mlp.down_proj.weight"].T
     expected = after_cross + down * table[:, 5, None]
     np.testing.assert_allclose(plan.output.numpy(), expected, rtol=0.08, atol=0.04)
+
+
+def test_top_level_dit_graph_and_sampler_smoke():
+    from tests.utilities import is_device_available
+
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is unavailable")
+    config = _config(
+        num_hidden_layers=1,
+        layer_types=["full_attention"],
+        use_sliding_window=False,
+    )
+    rng = np.random.default_rng(137)
+    arrays = {
+        "decoder.proj_in.1.weight": rng.normal(0, 0.1, (16, 12, 2)).astype(np.float32),
+        "decoder.proj_in.1.bias": np.zeros(16, dtype=np.float32),
+        "decoder.condition_embedder.weight": rng.normal(0, 0.1, (16, 16)).astype(
+            np.float32
+        ),
+        "decoder.condition_embedder.bias": np.zeros(16, dtype=np.float32),
+        "decoder.norm_out.weight": np.ones(16, dtype=np.float32),
+        "decoder.scale_shift_table": rng.normal(0, 0.02, (1, 2, 16)).astype(np.float32),
+        "decoder.proj_out.1.weight": rng.normal(0, 0.1, (16, 4, 2)).astype(np.float32),
+        "decoder.proj_out.1.bias": np.zeros(4, dtype=np.float32),
+    }
+    for time in ("time_embed", "time_embed_r"):
+        arrays.update(
+            {
+                f"decoder.{time}.linear_1.weight": rng.normal(
+                    0, 0.05, (16, 256)
+                ).astype(np.float32),
+                f"decoder.{time}.linear_1.bias": np.zeros(16, dtype=np.float32),
+                f"decoder.{time}.linear_2.weight": rng.normal(0, 0.05, (16, 16)).astype(
+                    np.float32
+                ),
+                f"decoder.{time}.linear_2.bias": np.zeros(16, dtype=np.float32),
+                f"decoder.{time}.time_proj.weight": rng.normal(
+                    0, 0.05, (96, 16)
+                ).astype(np.float32),
+                f"decoder.{time}.time_proj.bias": np.zeros(96, dtype=np.float32),
+            }
+        )
+    layer = "decoder.layers.0"
+    arrays.update(
+        {
+            layer + ".scale_shift_table": rng.normal(0, 0.02, (1, 6, 16)).astype(
+                np.float32
+            ),
+            layer + ".self_attn_norm.weight": np.ones(16, dtype=np.float32),
+            layer + ".cross_attn_norm.weight": np.ones(16, dtype=np.float32),
+            layer + ".mlp_norm.weight": np.ones(16, dtype=np.float32),
+            layer + ".mlp.gate_proj.weight": rng.normal(0, 0.08, (48, 16)).astype(
+                np.float32
+            ),
+            layer + ".mlp.up_proj.weight": rng.normal(0, 0.08, (48, 16)).astype(
+                np.float32
+            ),
+            layer + ".mlp.down_proj.weight": rng.normal(0, 0.08, (16, 48)).astype(
+                np.float32
+            ),
+        }
+    )
+    for module in ("self_attn", "cross_attn"):
+        prefix = layer + "." + module
+        arrays.update(
+            {
+                prefix + ".q_proj.weight": rng.normal(0, 0.08, (16, 16)).astype(
+                    np.float32
+                ),
+                prefix + ".k_proj.weight": rng.normal(0, 0.08, (8, 16)).astype(
+                    np.float32
+                ),
+                prefix + ".v_proj.weight": rng.normal(0, 0.08, (8, 16)).astype(
+                    np.float32
+                ),
+                prefix + ".o_proj.weight": rng.normal(0, 0.08, (16, 16)).astype(
+                    np.float32
+                ),
+                prefix + ".q_norm.weight": np.ones(4, dtype=np.float32),
+                prefix + ".k_norm.weight": np.ones(4, dtype=np.float32),
+            }
+        )
+    weights = {
+        name: wp.array(value, dtype=wp.bfloat16, device="cuda:0")
+        for name, value in arrays.items()
+    }
+    hidden = wp.array(
+        rng.normal(0, 0.2, (1, 5, 4)).astype(np.float32),
+        dtype=wp.bfloat16,
+        device="cuda:0",
+    )
+    plan = AceStepDiTPlan(
+        hidden,
+        wp.array(
+            rng.normal(0, 0.2, (1, 5, 8)).astype(np.float32),
+            dtype=wp.bfloat16,
+            device="cuda:0",
+        ),
+        wp.array(
+            rng.normal(0, 0.2, (1, 3, 16)).astype(np.float32),
+            dtype=wp.bfloat16,
+            device="cuda:0",
+        ),
+        weights,
+        config,
+    )
+    before = hidden.numpy().copy()
+    graph = plan.capture()
+    assert graph is not None
+    output = plan.run_schedule((0.8, 0.5)).numpy()
+    assert output.shape == (1, 5, 4)
+    assert np.isfinite(output).all()
+    assert not np.array_equal(output, before)
+    with pytest.raises(ValueError, match="strictly descending"):
+        plan.run_schedule((0.5, 0.8))

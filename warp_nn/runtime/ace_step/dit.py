@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 import math
 
 import numpy as np
@@ -22,17 +23,21 @@ from warp_nn.runtime.kernels import (
     _rotary_embedding_kernel_for_dtype,
     _split_attention_heads_kernel,
 )
+from warp_nn.runtime.formats.safetensors import SafeTensorArchive
 from warp_nn.runtime.operators import (
     AdaptiveRMSNormPlan,
     BidirectionalGQAPlan,
     FixedKVAttentionPlan,
     ModulatedResidualPlan,
     Operation,
+    Conv1dPlan,
     execute_operations,
     plan_linear,
     plan_rms_norm,
     plan_swiglu,
+    rotary_cache_values,
 )
+from warp_nn.runtime.weights import load_cast_weights
 
 
 _LAYER_TYPES = frozenset(("full_attention", "sliding_attention"))
@@ -628,6 +633,474 @@ class AceStepDiTLayerPlan:
         )
         self.mlp_residual.execute()
         return self.output
+
+
+@lru_cache(maxsize=None)
+def _ace_dit_kernels(dtype):
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def pack_latents(
+        hidden: wp.array3d(dtype=DTYPE),
+        context: wp.array3d(dtype=DTYPE),
+        output: wp.array3d(dtype=DTYPE),
+    ):
+        batch, frame, channel = wp.tid()
+        if frame >= hidden.shape[1]:
+            output[batch, frame, channel] = DTYPE(0.0)
+        elif channel < context.shape[2]:
+            output[batch, frame, channel] = context[batch, frame, channel]
+        else:
+            output[batch, frame, channel] = hidden[
+                batch, frame, channel - context.shape[2]
+            ]
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def bias(x: wp.array2d(dtype=DTYPE), b: wp.array1d(dtype=DTYPE)):
+        row, column = wp.tid()
+        x[row, column] = DTYPE(wp.float32(x[row, column]) + wp.float32(b[column]))
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def silu(x: wp.array2d(dtype=DTYPE), output: wp.array2d(dtype=DTYPE)):
+        row, column = wp.tid()
+        value = wp.float32(x[row, column])
+        output[row, column] = DTYPE(value / (wp.float32(1.0) + wp.exp(-value)))
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def timestep_frequency(
+        timestep: wp.array1d(dtype=DTYPE),
+        timestep_r: wp.array1d(dtype=DTYPE),
+        output: wp.array2d(dtype=DTYPE),
+        difference: bool,
+    ):
+        batch, column = wp.tid()
+        half = output.shape[1] / 2
+        if column >= half * 2:
+            output[batch, column] = DTYPE(0.0)
+        else:
+            frequency_column = column % half
+            frequency = wp.exp(
+                -wp.log(wp.float32(10000.0))
+                * wp.float32(frequency_column)
+                / wp.float32(half)
+            )
+            value = wp.float32(timestep[batch])
+            if difference:
+                value -= wp.float32(timestep_r[batch])
+            angle = value * wp.float32(1000.0) * frequency
+            output[batch, column] = DTYPE(
+                wp.cos(angle) if column < half else wp.sin(angle)
+            )
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def combine(
+        left: wp.array2d(dtype=DTYPE),
+        right: wp.array2d(dtype=DTYPE),
+        output: wp.array2d(dtype=DTYPE),
+    ):
+        row, column = wp.tid()
+        output[row, column] = DTYPE(
+            wp.float32(left[row, column]) + wp.float32(right[row, column])
+        )
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def repeat_rows(x: wp.array2d(dtype=DTYPE), output: wp.array3d(dtype=DTYPE)):
+        typed_zero = DTYPE(0.0)
+        batch, row, column = wp.tid()
+        output[batch, row, column] = DTYPE(
+            wp.float32(x[batch, column]) + wp.float32(typed_zero)
+        )
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def crop(x: wp.array3d(dtype=DTYPE), output: wp.array3d(dtype=DTYPE)):
+        typed_zero = DTYPE(0.0)
+        batch, frame, channel = wp.tid()
+        output[batch, frame, channel] = DTYPE(
+            wp.float32(x[batch, frame, channel]) + wp.float32(typed_zero)
+        )
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def flow_step(
+        latent: wp.array3d(dtype=DTYPE),
+        velocity: wp.array3d(dtype=DTYPE),
+        timestep: wp.array1d(dtype=DTYPE),
+        next_timestep: wp.array1d(dtype=DTYPE),
+    ):
+        batch, frame, channel = wp.tid()
+        dt = wp.float32(timestep[batch]) - wp.float32(next_timestep[batch])
+        latent[batch, frame, channel] = DTYPE(
+            wp.float32(latent[batch, frame, channel])
+            - wp.float32(velocity[batch, frame, channel]) * dt
+        )
+
+    return (
+        pack_latents,
+        bias,
+        silu,
+        timestep_frequency,
+        combine,
+        repeat_rows,
+        crop,
+        flow_step,
+    )
+
+
+class _TimeEmbeddingPlan:
+    def __init__(
+        self, timestep, timestep_r, weights, prefix, hidden, difference, cublas
+    ):
+        self.device = timestep.device
+        self.timestep = timestep
+        self.timestep_r = timestep_r
+        self.difference = difference
+        self.weights = weights
+        self.tensors = dict(weights)
+        batch = timestep.shape[0]
+        self.frequency = wp.empty(
+            (batch, 256), dtype=timestep.dtype, device=self.device
+        )
+        self.tensors["frequency"] = self.frequency
+        self.shapes = {name: tuple(value.shape) for name, value in self.tensors.items()}
+
+        def linear(name, source, suffix):
+            operation = Operation(
+                "Linear", [source, prefix + suffix + ".weight"], [name]
+            )
+            plan_linear(
+                operation, self.tensors, self.shapes, self.device, cublas=cublas
+            )
+            return operation
+
+        self.linear1 = linear("linear1", "frequency", ".linear_1")
+        self.linear2 = linear("temb", "linear1", ".linear_2")
+        self.activated = wp.empty(
+            (batch, hidden), dtype=timestep.dtype, device=self.device
+        )
+        self.tensors["activated"] = self.activated
+        self.shapes["activated"] = self.activated.shape
+        self.projection = linear("projection", "activated", ".time_proj")
+        self.temb = self.tensors["temb"]
+        self.modulation = self.tensors["projection"].reshape((batch, 6, hidden))
+        self._kernels = _ace_dit_kernels(timestep.dtype)
+        self.prefix = prefix
+
+    def execute(self):
+        wp.launch(
+            self._kernels[3],
+            dim=self.frequency.shape,
+            inputs=[self.timestep, self.timestep_r, self.frequency, self.difference],
+            device=self.device,
+        )
+        execute_operations((self.linear1,), self.tensors, self.shapes, self.device)
+        wp.launch(
+            self._kernels[1],
+            dim=self.tensors["linear1"].shape,
+            inputs=[
+                self.tensors["linear1"],
+                self.weights[self.prefix + ".linear_1.bias"],
+            ],
+            device=self.device,
+        )
+        wp.launch(
+            self._kernels[2],
+            dim=self.activated.shape,
+            inputs=[self.tensors["linear1"], self.activated],
+            device=self.device,
+        )
+        execute_operations((self.linear2,), self.tensors, self.shapes, self.device)
+        wp.launch(
+            self._kernels[1],
+            dim=self.temb.shape,
+            inputs=[self.temb, self.weights[self.prefix + ".linear_2.bias"]],
+            device=self.device,
+        )
+        wp.launch(
+            self._kernels[2],
+            dim=self.activated.shape,
+            inputs=[self.temb, self.activated],
+            device=self.device,
+        )
+        execute_operations((self.projection,), self.tensors, self.shapes, self.device)
+        wp.launch(
+            self._kernels[1],
+            dim=self.tensors["projection"].shape,
+            inputs=[
+                self.tensors["projection"],
+                self.weights[self.prefix + ".time_proj.bias"],
+            ],
+            device=self.device,
+        )
+
+
+class AceStepDiTPlan:
+    """Fixed-shape, graph-capturable ACE-Step 1.5 diffusion transformer."""
+
+    def __init__(
+        self,
+        hidden,
+        context_latents,
+        condition,
+        weights,
+        config,
+        *,
+        condition_valid=None,
+        cublas=None,
+    ):
+        if hidden.shape[:2] != context_latents.shape[:2] or (
+            hidden.shape[2] != config.audio_acoustic_hidden_dim
+            or context_latents.shape[2] + hidden.shape[2] != config.in_channels
+        ):
+            raise ValueError("ACE DiT latent and context shapes are incompatible")
+        if condition.shape[0] != hidden.shape[0] or (
+            condition.shape[2] != config.encoder_hidden_size
+        ):
+            raise ValueError("ACE DiT condition shape is incompatible")
+        self.device = hidden.device
+        self.dtype = hidden.dtype
+        self.config = config
+        self.hidden = hidden
+        self.context_latents = context_latents
+        self.weights = weights
+        batch, frames, _ = hidden.shape
+        padded = (
+            (frames + config.patch_size - 1) // config.patch_size
+        ) * config.patch_size
+        self.packed = wp.empty(
+            (batch, padded, config.in_channels), dtype=self.dtype, device=self.device
+        )
+        self.timestep = wp.ones(batch, dtype=self.dtype, device=self.device)
+        self.timestep_r = wp.ones(batch, dtype=self.dtype, device=self.device)
+        self.next_timestep = wp.zeros(batch, dtype=self.dtype, device=self.device)
+        self._kernels = _ace_dit_kernels(self.dtype)
+        self.proj_in = Conv1dPlan(
+            self.packed,
+            weights["decoder.proj_in.1.weight"],
+            weights["decoder.proj_in.1.bias"],
+            stride=config.patch_size,
+        )
+        condition_tensors = dict(weights)
+        condition_tensors["condition"] = condition.reshape(
+            (-1, config.encoder_hidden_size)
+        )
+        condition_shapes = {
+            name: tuple(value.shape) for name, value in condition_tensors.items()
+        }
+        self._condition_tensors = condition_tensors
+        self._condition_shapes = condition_shapes
+        self.condition_projection = Operation(
+            "Linear", ["condition", "decoder.condition_embedder.weight"], ["projected"]
+        )
+        plan_linear(
+            self.condition_projection,
+            condition_tensors,
+            condition_shapes,
+            self.device,
+            cublas=cublas,
+        )
+        self.condition = condition_tensors["projected"].reshape(
+            (batch, condition.shape[1], config.hidden_size)
+        )
+        self.time_t = _TimeEmbeddingPlan(
+            self.timestep,
+            self.timestep_r,
+            weights,
+            "decoder.time_embed",
+            config.hidden_size,
+            False,
+            cublas,
+        )
+        self.time_r = _TimeEmbeddingPlan(
+            self.timestep,
+            self.timestep_r,
+            weights,
+            "decoder.time_embed_r",
+            config.hidden_size,
+            True,
+            cublas,
+        )
+        self.temb = wp.empty(
+            (batch, config.hidden_size), dtype=self.dtype, device=self.device
+        )
+        self.modulation = wp.empty(
+            (batch, 6, config.hidden_size), dtype=self.dtype, device=self.device
+        )
+        positions = wp.array(
+            np.broadcast_to(
+                np.arange(self.proj_in.output.shape[1], dtype=np.int64),
+                (batch, self.proj_in.output.shape[1]),
+            ).copy(),
+            device=self.device,
+        )
+        cos, sin = rotary_cache_values(
+            self.proj_in.output.shape[1],
+            config.head_dim,
+            {"rope_theta": config.rope_theta},
+        )
+        cos_cache = wp.array(cos, dtype=self.dtype, device=self.device)
+        sin_cache = wp.array(sin, dtype=self.dtype, device=self.device)
+        self.layers = []
+        current = self.proj_in.output
+        for index in range(config.num_hidden_layers):
+            layer = AceStepDiTLayerPlan(
+                current,
+                self.modulation,
+                self.condition,
+                weights,
+                config,
+                index,
+                context_valid=condition_valid,
+                position_ids=positions,
+                cos_cache=cos_cache,
+                sin_cache=sin_cache,
+                cublas=cublas,
+            )
+            self.layers.append(layer)
+            current = layer.output
+        self.output_modulation = wp.empty(
+            (batch, 2, config.hidden_size), dtype=self.dtype, device=self.device
+        )
+        self.output_norm = AdaptiveRMSNormPlan(
+            current,
+            weights["decoder.norm_out.weight"],
+            weights["decoder.scale_shift_table"],
+            self.output_modulation,
+            shift_index=0,
+            scale_index=1,
+            epsilon=config.rms_norm_eps,
+        )
+        self.proj_out = Conv1dPlan(
+            self.output_norm.output,
+            weights["decoder.proj_out.1.weight"],
+            weights["decoder.proj_out.1.bias"],
+            stride=config.patch_size,
+            transposed=True,
+        )
+        self.output = wp.empty(hidden.shape, dtype=self.dtype, device=self.device)
+        self.graph = None
+
+    def prepare_fixed_condition(self):
+        execute_operations(
+            (self.condition_projection,),
+            self._condition_tensors,
+            self._condition_shapes,
+            self.device,
+        )
+        wp.launch(
+            self._kernels[1],
+            dim=self._condition_tensors["projected"].shape,
+            inputs=[
+                self._condition_tensors["projected"],
+                self.weights["decoder.condition_embedder.bias"],
+            ],
+            device=self.device,
+        )
+        for layer in self.layers:
+            layer.prepare_fixed_condition(force=True)
+
+    def execute(self):
+        wp.launch(
+            self._kernels[0],
+            dim=self.packed.shape,
+            inputs=[self.hidden, self.context_latents, self.packed],
+            device=self.device,
+        )
+        self.proj_in.execute()
+        self.time_t.execute()
+        self.time_r.execute()
+        wp.launch(
+            self._kernels[4],
+            dim=self.temb.shape,
+            inputs=[self.time_t.temb, self.time_r.temb, self.temb],
+            device=self.device,
+        )
+        wp.launch(
+            self._kernels[4],
+            dim=self.modulation.reshape((self.modulation.shape[0], -1)).shape,
+            inputs=[
+                self.time_t.modulation.reshape((self.modulation.shape[0], -1)),
+                self.time_r.modulation.reshape((self.modulation.shape[0], -1)),
+                self.modulation.reshape((self.modulation.shape[0], -1)),
+            ],
+            device=self.device,
+        )
+        for layer in self.layers:
+            layer.execute()
+        wp.launch(
+            self._kernels[5],
+            dim=self.output_modulation.shape,
+            inputs=[self.temb, self.output_modulation],
+            device=self.device,
+        )
+        self.output_norm.execute()
+        self.proj_out.execute()
+        wp.launch(
+            self._kernels[6],
+            dim=self.output.shape,
+            inputs=[self.proj_out.output, self.output],
+            device=self.device,
+        )
+        return self.output
+
+    def capture(self):
+        self.prepare_fixed_condition()
+        self.execute()
+        wp.launch(
+            self._kernels[7],
+            dim=self.hidden.shape,
+            inputs=[self.hidden, self.output, self.timestep, self.timestep],
+            device=self.device,
+        )
+        wp.synchronize_stream(wp.get_stream(self.device))
+        wp.capture_begin(device=self.device)
+        self.execute()
+        wp.launch(
+            self._kernels[7],
+            dim=self.hidden.shape,
+            inputs=[
+                self.hidden,
+                self.output,
+                self.timestep,
+                self.next_timestep,
+            ],
+            device=self.device,
+        )
+        self.graph = wp.capture_end(device=self.device)
+        return self.graph
+
+    def diffusion_step(self, timestep, next_timestep):
+        self.timestep.assign(np.full(self.timestep.shape, timestep, dtype=np.float32))
+        self.timestep_r.assign(
+            np.full(self.timestep_r.shape, timestep, dtype=np.float32)
+        )
+        self.next_timestep.assign(
+            np.full(self.next_timestep.shape, next_timestep, dtype=np.float32)
+        )
+        if self.graph is None:
+            self.capture()
+        wp.capture_launch(self.graph)
+        return self.hidden
+
+    def run_schedule(self, schedule):
+        """Run a descending turbo/base flow schedule through one captured graph."""
+        values = tuple(float(value) for value in schedule)
+        if (
+            not values
+            or any(not 0.0 < value <= 1.0 for value in values)
+            or any(left <= right for left, right in zip(values, values[1:]))
+        ):
+            raise ValueError(
+                "ACE diffusion schedule must be strictly descending in (0, 1]"
+            )
+        for index, value in enumerate(values):
+            next_value = values[index + 1] if index + 1 < len(values) else 0.0
+            self.diffusion_step(value, next_value)
+        return self.hidden
+
+
+def load_ace_dit_weights(path, config, device, dtype=wp.bfloat16):
+    """Load exactly the official ACE DiT tensors from sharded safetensors."""
+    archive = SafeTensorArchive(path)
+    return load_cast_weights(archive, dit_weight_names(config), device, dtype)
 
 
 def dit_weight_names(config: AceStepDiTConfig, prefix: str = "decoder") -> list[str]:
