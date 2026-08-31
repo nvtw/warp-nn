@@ -275,7 +275,12 @@ class _EncoderStackPlan:
 
 
 class AceStepConditionPlan:
-    """Fixed-shape official caption, lyric, silence-timbre condition plan."""
+    """Fixed-shape ACE 1.5 turbo condition plan.
+
+    The current timbre boundary accepts one reference per sample, or one silence
+    reference broadcast over the batch; packed multi-reference input is not yet
+    supported. Masks are read once while the fixed packing plan is constructed.
+    """
 
     def __init__(
         self,
@@ -323,6 +328,11 @@ class AceStepConditionPlan:
             raise ValueError("ACE condition inputs must share dtype and device")
         if text_valid.dtype != wp.bool or lyric_valid.dtype != wp.bool:
             raise TypeError("ACE condition masks must be boolean")
+        if (
+            text_valid.device != text_hidden.device
+            or lyric_valid.device != text_hidden.device
+        ):
+            raise ValueError("ACE condition masks must share the input device")
         self.device = text_hidden.device
         self.dtype = text_hidden.dtype
         self.config = config
@@ -449,6 +459,7 @@ class AceStepConditionPlan:
             dtype=self.dtype,
             device=self.device,
         )
+        self._null_output = wp.empty_like(self.output)
 
     def execute(self):
         execute_operations(
@@ -516,18 +527,17 @@ class AceStepConditionPlan:
 
     def null_condition(self):
         """Return the learned unconditional embedding expanded to this shape."""
-        output = wp.empty_like(self.output)
         wp.launch(
             self._kernels[2],
-            dim=output.shape,
-            inputs=[self.weights["null_condition_emb"], output],
+            dim=self._null_output.shape,
+            inputs=[self.weights["null_condition_emb"], self._null_output],
             device=self.device,
         )
-        return output
+        return self._null_output
 
 
 class AceStepConditionEncoder:
-    """Load official ACE condition weights and build fixed-shape plans."""
+    """Load exact ACE 1.5 turbo condition weights and build fixed-shape plans."""
 
     def __init__(
         self,
@@ -541,6 +551,14 @@ class AceStepConditionEncoder:
         self.device = parse_device(device)
         self.dtype = dtype
         self.config = config
+        if config.model_version != "turbo" or not config.is_turbo:
+            raise ValueError(
+                "ACE condition execution currently supports only ACE-Step 1.5 turbo"
+            )
+        if config.encoder_hidden_size != config.hidden_size:
+            raise ValueError(
+                "ACE turbo condition execution requires encoder and decoder hidden widths to match"
+            )
         archive = SafeTensorArchive(Path(path))
         names = condition_weight_names(config)
         missing = set(names) - set(archive.names)

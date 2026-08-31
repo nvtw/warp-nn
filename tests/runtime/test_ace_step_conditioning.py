@@ -156,13 +156,15 @@ def test_condition_encoder_exact_timbre_pool_and_stable_pack(tmp_path):
     np.testing.assert_array_equal(
         valid.numpy(), [[True, True, True, True, True, False]]
     )
-    null = plan.null_condition().numpy()
+    null_buffer = plan.null_condition()
+    null = null_buffer.numpy()
     np.testing.assert_allclose(
         null,
         np.broadcast_to(weights["null_condition_emb"], null.shape),
         rtol=5e-4,
         atol=5e-4,
     )
+    assert plan.null_condition().ptr == null_buffer.ptr
 
 
 @pytest.mark.skipif(not is_device_available("cuda:0"), reason="CUDA unavailable")
@@ -209,3 +211,51 @@ def test_official_condition_encoder_bf16_finite_cuda():
     assert np.isfinite(values).all()
     assert valid.numpy().tolist() == [[True, True, True, True, True, False]]
     assert np.isfinite(plan.null_condition().numpy()).all()
+
+
+def test_condition_encoder_executes_live_attention_and_mlp(tmp_path):
+    rng = np.random.default_rng(227)
+    config = _config()
+    weights = _weights(config, rng)
+    prefix = "encoder.lyric_encoder.layers.0."
+    for suffix in (
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.o_proj.weight",
+        "mlp.gate_proj.weight",
+        "mlp.up_proj.weight",
+        "mlp.down_proj.weight",
+    ):
+        weights[prefix + suffix] = rng.normal(
+            0, 0.03, weights[prefix + suffix].shape
+        ).astype(np.float32)
+    path = tmp_path / "dit"
+    path.mkdir()
+    _write_safetensors(path / "model.safetensors", weights)
+    encoder = AceStepConditionEncoder(
+        path, config, dtype=wp.float16, device="cpu", use_cublas=False
+    )
+    plan = encoder.plan(
+        wp.array(rng.normal(size=(1, 1, 1024)), dtype=wp.float16, device="cpu"),
+        wp.ones((1, 1), dtype=wp.bool, device="cpu"),
+        wp.array(rng.normal(size=(1, 2, 1024)), dtype=wp.float16, device="cpu"),
+        wp.ones((1, 2), dtype=wp.bool, device="cpu"),
+        wp.array(rng.normal(size=(1, 4, 4)), dtype=wp.float16, device="cpu"),
+    )
+    condition, _ = plan.execute()
+    layer = plan.lyric_stack.layers[0]
+    assert np.any(layer.attention.output.numpy() != 0.0)
+    assert np.any(layer._mlp_tensors["down"].numpy() != 0.0)
+    assert np.isfinite(condition.numpy()).all()
+
+
+def test_condition_encoder_rejects_non_turbo_before_loading(tmp_path):
+    raw = {
+        **_config().__dict__,
+        "layer_types": list(_config().layer_types),
+        "is_turbo": False,
+    }
+    config = AceStepDiTConfig.from_dict(raw)
+    with pytest.raises(ValueError, match="only ACE-Step 1.5 turbo"):
+        AceStepConditionEncoder(tmp_path, config, device="cpu")
