@@ -45,6 +45,7 @@ from warp_nn.runtime.kernels import (
     _modulated_residual_kernel,
     _quantize_activation_int8_kernel,
     _spatial_diffusion_kernels,
+    _true_cfg_kernel,
     _spatial_vae_kernels,
 )
 from warp_nn.utils.ops import resolve_dim
@@ -1844,6 +1845,42 @@ class ChannelAffinePlan:
             dim=self.output.shape,
             inputs=[self.input, self.scale, self.bias, self.output],
             device=self.input.device,
+        )
+        return self.output
+
+
+class TrueCFGPlan:
+    """Fused graph-safe true CFG with per-token positive-norm rescaling."""
+
+    def __init__(self, positive, negative, scale=4.0):
+        if (
+            positive.ndim != 3
+            or negative.shape != positive.shape
+            or negative.dtype != positive.dtype
+            or negative.device != positive.device
+        ):
+            raise ValueError("CFG predictions must be matching rank-three arrays")
+        if positive.dtype not in (wp.float16, wp.bfloat16, wp.float32):
+            raise TypeError("CFG predictions must use FP16, BF16, or FP32")
+        if not math.isfinite(scale):
+            raise ValueError("CFG scale must be finite")
+        self.positive, self.negative = positive, negative
+        self.scale = float(scale)
+        self.output = wp.empty_like(positive)
+        self._kernel = _true_cfg_kernel(positive.dtype, positive.shape[2])
+
+    def execute(self):
+        wp.launch_tiled(
+            self._kernel,
+            dim=self.positive.shape[0] * self.positive.shape[1],
+            inputs=[
+                self.positive,
+                self.negative,
+                self.output,
+                wp.float32(self.scale),
+            ],
+            block_dim=min(128, self.positive.shape[2]),
+            device=self.positive.device,
         )
         return self.output
 

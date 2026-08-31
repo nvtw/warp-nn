@@ -3,6 +3,7 @@
 
 import json
 
+import numpy as np
 import pytest
 
 from warp_nn.runtime.formats.safetensors import read_safetensors_index
@@ -140,3 +141,15 @@ def test_safetensors_index_rejects_escaping_shard(tmp_path):
     _write_json(path, {"weight_map": {"weight": "../outside.safetensors"}})
     with pytest.raises(ValueError, match="local filename"):
         read_safetensors_index(path)
+
+
+def test_qwen_image_uses_exact_official_flow_schedule(tmp_path):
+    _bundle(tmp_path)
+    bundle = QwenImage2512Bundle.inspect(tmp_path)
+    schedule = bundle.scheduler.schedule(50, 6889)
+
+    assert schedule.shape == (51,)
+    assert schedule[0] == 1.0
+    assert schedule[-2] == pytest.approx(0.02, abs=1.0e-7)
+    assert schedule[-1] == 0.0
+    assert np.all(np.diff(schedule) < 0.0)

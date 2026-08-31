@@ -13,6 +13,7 @@ from warp_nn.runtime.operators import (
     ModulatedResidualPlan,
     SpatialPatchPackPlan,
     SpatialPatchUnpackPlan,
+    TrueCFGPlan,
     flow_match_euler_schedule,
 )
 
@@ -148,3 +149,28 @@ def test_spatial_diffusion_plans_capture_on_cuda():
     wp.capture_launch(graph)
 
     np.testing.assert_allclose(unpack.output.numpy(), x.numpy(), atol=0.01)
+
+
+def test_true_cfg_matches_reference_and_captures():
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is unavailable")
+    rng = np.random.default_rng(82)
+    positive = rng.normal(size=(2, 5, 16)).astype(np.float32)
+    negative = rng.normal(size=(2, 5, 16)).astype(np.float32)
+    scale = 4.0
+    plan = TrueCFGPlan(
+        wp.array(positive, dtype=wp.bfloat16, device="cuda:0"),
+        wp.array(negative, dtype=wp.bfloat16, device="cuda:0"),
+        scale,
+    )
+    wp.capture_begin(device="cuda:0")
+    plan.execute()
+    graph = wp.capture_end(device="cuda:0")
+    wp.capture_launch(graph)
+
+    combined = negative + scale * (positive - negative)
+    expected = combined * (
+        np.linalg.norm(positive, axis=-1, keepdims=True)
+        / np.linalg.norm(combined, axis=-1, keepdims=True)
+    )
+    np.testing.assert_allclose(plan.output.numpy(), expected, rtol=0.035, atol=0.018)

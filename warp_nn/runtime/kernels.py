@@ -3122,6 +3122,52 @@ def _temporal_conv2d_slice_kernel(dtype: type):
 
 
 @lru_cache(maxsize=None)
+def _true_cfg_kernel(dtype: type, width: int):
+    """Fuse true-CFG combination and positive-prediction norm rescaling."""
+    DTYPE = dtype
+    WIDTH = int(width)
+
+    @wp.func
+    def square(value: dtype):
+        value_fp32 = wp.float32(dtype(value))
+        return value_fp32 * value_fp32
+
+    @wp.func
+    def combine(positive: dtype, negative: dtype, scale: wp.float32):
+        return wp.float32(dtype(negative)) + scale * (
+            wp.float32(dtype(positive)) - wp.float32(dtype(negative))
+        )
+
+    @wp.func
+    def rescale(value: wp.float32, ratio: wp.float32):
+        return dtype(value * ratio)
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def true_cfg(
+        positive: wp.array3d(dtype=DTYPE),
+        negative: wp.array3d(dtype=DTYPE),
+        output: wp.array3d(dtype=DTYPE),
+        scale: wp.float32,
+    ):
+        row = wp.tid()
+        batch = row / positive.shape[1]
+        token = row % positive.shape[1]
+        positive_values = wp.tile_load(positive[batch, token], shape=(WIDTH,))
+        negative_values = wp.tile_load(negative[batch, token], shape=(WIDTH,))
+        combined = wp.tile_map(combine, positive_values, negative_values, scale)
+        positive_norm = wp.sqrt(
+            wp.tile_extract(wp.tile_sum(wp.tile_map(square, positive_values)), 0)
+        )
+        combined_norm = wp.sqrt(wp.tile_extract(wp.tile_sum(combined * combined), 0))
+        ratio = positive_norm / wp.max(
+            combined_norm, wp.float32(1.0e-20) + wp.float32(DTYPE(0.0))
+        )
+        wp.tile_store(output[batch, token], wp.tile_map(rescale, combined, ratio))
+
+    return true_cfg
+
+
+@lru_cache(maxsize=None)
 def _spatial_diffusion_kernels(dtype: type):
     """Reusable spatial patch, channel-affine, and Euler update kernels."""
     DTYPE = dtype

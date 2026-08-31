@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Sequence
 
 from ..formats.safetensors import SafeTensorIndex, read_safetensors_index
+from ..operators import flow_match_euler_schedule
 
 
 QWEN_IMAGE_2512_RESOLUTIONS = {
@@ -195,6 +196,21 @@ class FlowMatchEulerConfig:
     terminal_shift: float
     dynamic_shifting: bool
     time_shift_type: str
+
+    def schedule(self, steps: int, image_sequence_length: int):
+        """Build the exact official inference sigma schedule."""
+        if not self.dynamic_shifting:
+            raise ValueError("Qwen-Image requires dynamic flow shifting")
+        return flow_match_euler_schedule(
+            steps,
+            image_sequence_length,
+            base_sequence_length=self.base_sequence_length,
+            maximum_sequence_length=self.maximum_sequence_length,
+            base_shift=self.base_shift,
+            maximum_shift=self.maximum_shift,
+            terminal_shift=self.terminal_shift,
+            time_shift_type=self.time_shift_type,
+        )
 
     @classmethod
     def load(cls, path: str | Path) -> FlowMatchEulerConfig:
