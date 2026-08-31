@@ -36,6 +36,7 @@ from warp_nn.runtime.kernels import (
     _gqa_prepare_fp16_kernel,
     _linear_kernel,
     _channels_last_1d_kernels,
+    _clamp_kernel_for_dtype,
     _channels_last_2d_kernels,
     _conv1d_mma_kernels,
     _conv2d_mma_kernels,
@@ -2356,6 +2357,40 @@ class Conv2dPlan:
                 self.dilation[0],
                 self.dilation[1],
                 self._use_bias,
+            ],
+            device=self.input.device,
+        )
+        return self.output
+
+
+class ClampPlan:
+    """Graph-safe elementwise clamp for contiguous floating tensors."""
+
+    def __init__(self, x, minimum, maximum):
+        if x.dtype not in (wp.float16, wp.bfloat16, wp.float32):
+            raise TypeError("clamp input must use FP16, BF16, or FP32")
+        if not x.is_contiguous:
+            raise ValueError("clamp input must be contiguous")
+        self.minimum, self.maximum = float(minimum), float(maximum)
+        if (
+            not math.isfinite(self.minimum)
+            or not math.isfinite(self.maximum)
+            or self.minimum > self.maximum
+        ):
+            raise ValueError("clamp bounds must be finite and ordered")
+        self.input = x
+        self.output = wp.empty_like(x)
+        self._kernel = _clamp_kernel_for_dtype(x.dtype)
+
+    def execute(self):
+        wp.launch(
+            self._kernel,
+            dim=self.input.size,
+            inputs=[
+                self.input.flatten(),
+                self.output.flatten(),
+                wp.float32(self.minimum),
+                wp.float32(self.maximum),
             ],
             device=self.input.device,
         )

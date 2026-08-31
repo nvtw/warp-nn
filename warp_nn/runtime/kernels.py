@@ -423,6 +423,18 @@ def _cast_kernel(x: wp.array1d[Any], out: wp.array1d[Any]):
 
 
 @wp.kernel(enable_backward=False)
+def _clamp_kernel(
+    x: wp.array1d[Any],
+    output: wp.array1d[Any],
+    minimum: wp.float32,
+    maximum: wp.float32,
+):
+    """Clamp a contiguous floating array with FP32 bounds."""
+    index = wp.tid()
+    output[index] = output.dtype(wp.clamp(wp.float32(x[index]), minimum, maximum))
+
+
+@wp.kernel(enable_backward=False)
 def _transpose_021_kernel(x: wp.array3d[Any], output: wp.array3d[Any]):
     """Transpose a rank-3 tensor from axes 0-1-2 to 0-2-1."""
     i, j, k = wp.tid()
@@ -3080,6 +3092,10 @@ def _kernel_for_dtype(kernel, dtype: type, *parameter_types: type | tuple[int]):
         ]
         _KERNEL_OVERLOADS[key] = wp.overload(kernel, signature)
     return _KERNEL_OVERLOADS[key]
+
+
+def _clamp_kernel_for_dtype(dtype: type):
+    return _kernel_for_dtype(_clamp_kernel, dtype, (1,), (1,), wp.float32, wp.float32)
 
 
 def _cast_kernel_for_dtypes(source_dtype: type, target_dtype: type):

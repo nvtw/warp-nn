@@ -7,6 +7,7 @@ import warp as wp
 
 from tests.utilities import is_device_available
 from warp_nn.runtime.operators import (
+    ClampPlan,
     Conv2dPlan,
     NearestUpsample2dPlan,
     ResidualAddPlan,
@@ -185,3 +186,10 @@ def test_spatial_self_attention_matches_reference_and_captures():
     projected = attended @ projection_weight[:, :, 0, 0].T + projection_bias
     expected = values + projected.reshape(values.shape)
     np.testing.assert_allclose(plan.output.numpy(), expected, rtol=0.055, atol=0.025)
+
+
+def test_clamp_plan_preserves_shape_and_values():
+    values = np.array([[-2.0, -0.5, 0.25, 3.0]], dtype=np.float32).reshape(1, 2, 2, 1)
+    plan = ClampPlan(wp.array(values, device="cpu"), -1.0, 1.0)
+    assert plan.output.shape == values.shape
+    np.testing.assert_array_equal(plan.execute().numpy(), np.clip(values, -1.0, 1.0))
