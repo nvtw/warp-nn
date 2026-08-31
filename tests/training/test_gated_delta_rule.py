@@ -231,6 +231,15 @@ def test_gated_delta_rule_bfloat16_chunkwise_matches_recurrence_and_graph():
     for actual, expected in zip(gradients, expected_gradients):
         np.testing.assert_allclose(_numpy(actual), expected, rtol=1.0e-1, atol=1.5e-2)
 
+    gradient_snapshot = tuple(_numpy(gradient) for gradient in gradients)
+    repeated_gradients = plan.backward(
+        *inputs,
+        output_gradient,
+        present_grad=present_gradient,
+    )
+    for actual, expected in zip(repeated_gradients, gradient_snapshot):
+        np.testing.assert_array_equal(_numpy(actual), expected)
+
     def execute():
         plan.forward(*inputs)
         plan.backward(*inputs, output_gradient, present_grad=present_gradient)
