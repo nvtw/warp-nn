@@ -12,6 +12,7 @@ from .mmdit import (
     QwenImageMMDiTLayerPlan,
     QwenImageMMDiTPlan,
     load_qwen_image_transformer_weights,
+    qwen_image_mmdit_workspace_bytes,
     qwen_image_rotary_coordinates,
 )
 from .prompt import (
@@ -21,6 +22,7 @@ from .prompt import (
     format_qwen_image_prompt,
     tokenize_qwen_image_prompt,
 )
+from .pipeline import QwenImage2512Pipeline, qwen_image_to_rgb8
 from .runner import (
     QWEN_IMAGE_2512_RESOLUTIONS,
     FlowMatchEulerConfig,
@@ -48,6 +50,7 @@ __all__ = [
     "QWEN_IMAGE_2512_RESOLUTIONS",
     "QwenImage2512VAEDecoder",
     "QwenImage2512Bundle",
+    "QwenImage2512Pipeline",
     "QwenImageMMDiTLayerPlan",
     "QwenImage2512VAETiledDecoder",
     "QwenImageMMDiTPlan",
@@ -61,6 +64,8 @@ __all__ = [
     "QwenImageVAETilingConfig",
     "load_qwen_image_transformer_weights",
     "prepare_qwen_image_vae_decoder_weights",
+    "qwen_image_mmdit_workspace_bytes",
     "qwen_image_rotary_coordinates",
+    "qwen_image_to_rgb8",
     "qwen_image_2512_vae_decoder_weight_specs",
 ]
