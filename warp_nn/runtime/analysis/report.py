@@ -79,12 +79,12 @@ _DOCUMENT = r"""<!doctype html>
   const byId=new Map(nodes.map(n=>[n.id,n]));
   const componentNodes=nodes.filter(n=>n.type==='component'), tensorNodes=nodes.filter(n=>n.type==='tensor');
   const maxLayer=Math.max(0,...componentNodes.map(n=>n.layer==null?-1:n.layer));
-  const laneY=n=>n.kind==='model'?0:(n.layer==null?0:(n.lane-3.5)*76);
+  const laneY=n=>n.kind==='model'?0:(n.layer==null?0:(n.lane-3.5)*90);
   for(const n of componentNodes){
     if(n.kind==='model'){n.x=0;n.y=0}
-    else if(n.layer!=null){n.x=430+n.layer*245;n.y=laneY(n)}
+    else if(n.layer!=null){n.x=460+n.layer*285;n.y=laneY(n)}
     else if(['embedding','vision','vae','other'].includes(n.kind)){n.x=220;n.y=(['embedding','vision','vae','other'].indexOf(n.kind)-.8)*92}
-    else {n.x=430+(maxLayer+1)*245+(['final_norm','output'].indexOf(n.kind)+.2)*210;n.y=0}
+    else {n.x=460+(maxLayer+1)*285+(['final_norm','output'].indexOf(n.kind)+.2)*235;n.y=0}
     n.homeX=n.x;n.homeY=n.y;
   }
   for(const p of componentNodes){
@@ -96,18 +96,20 @@ _DOCUMENT = r"""<!doctype html>
   function resize(){const r=stage.getBoundingClientRect();dpr=Math.min(devicePixelRatio||1,2);width=r.width;height=r.height;canvas.width=Math.round(width*dpr);canvas.height=Math.round(height*dpr);canvas.style.width=width+'px';canvas.style.height=height+'px';ctx.setTransform(dpr,0,0,dpr,0,0);draw()}
   const screen=n=>({x:n.x*scale+ox,y:n.y*scale+oy});
   const world=(x,y)=>({x:(x-ox)/scale,y:(y-oy)/scale});
-  function fit(){const v=visible();if(!v.length)return;let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;for(const n of v){minX=Math.min(minX,n.x-70);maxX=Math.max(maxX,n.x+70);minY=Math.min(minY,n.y-50);maxY=Math.max(maxY,n.y+50)}scale=Math.min(1.15,(width-80)/(maxX-minX),(height-80)/(maxY-minY));ox=width/2-(minX+maxX)/2*scale;oy=height/2-(minY+maxY)/2*scale;draw()}
+  function frame(v,maximum=1.15){if(!v.length)return;let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;for(const n of v){minX=Math.min(minX,n.x-110);maxX=Math.max(maxX,n.x+110);minY=Math.min(minY,n.y-70);maxY=Math.max(maxY,n.y+70)}scale=Math.min(maximum,(width-80)/(maxX-minX),(height-80)/(maxY-minY));ox=width/2-(minX+maxX)/2*scale;oy=height/2-(minY+maxY)/2*scale;draw()}
+  function fit(){frame(visible())}
+  function readableOpening(){frame(componentNodes.filter(n=>n.kind==='model'||n.layer==null||n.layer<3),1.1)}
   function rounded(x,y,w,h,r){ctx.beginPath();ctx.roundRect(x,y,w,h,r)}
   function edge(a,b,contains){const A=screen(a),B=screen(b);ctx.beginPath();ctx.moveTo(A.x,A.y);const dx=(B.x-A.x)*.52;ctx.bezierCurveTo(A.x+dx,A.y,B.x-dx,B.y,B.x,B.y);ctx.strokeStyle=contains?'rgba(150,163,180,.20)':'rgba(92,112,141,.25)';ctx.lineWidth=contains?1:1.4;ctx.setLineDash(contains?[2,4]:[]);ctx.stroke();ctx.setLineDash([])}
   function drawNode(n){const p=screen(n), hit=n===selected||n===hovered, match=query&&((n.fullName||n.label)+' '+(n.subtitle||'')).toLowerCase().includes(query);if(n.type==='tensor'){ctx.beginPath();ctx.arc(p.x,p.y,Math.max(2.5,n.r*scale),0,Math.PI*2);ctx.fillStyle=match?'#e84f76':palette.tensor;ctx.fill();return}
-    const w=Math.max(82,Math.min(154,72+n.label.length*3.5))*Math.max(.55,Math.min(1,scale)),h=43*Math.max(.65,Math.min(1,scale));
+    const w=Math.max(120,Math.min(210,92+n.label.length*4.6))*Math.max(.62,Math.min(1,scale)),h=56*Math.max(.7,Math.min(1,scale));
     if(hit||match){ctx.shadowColor=match?'rgba(232,79,118,.35)':'rgba(39,71,118,.25)';ctx.shadowBlur=18}
     rounded(p.x-w/2,p.y-h/2,w,h,10);ctx.fillStyle='rgba(255,255,255,.97)';ctx.fill();ctx.shadowBlur=0;ctx.strokeStyle=match?'#e84f76':hit?palette[n.kind]:'#d4dce7';ctx.lineWidth=hit||match?2:1;ctx.stroke();
     ctx.beginPath();ctx.arc(p.x-w/2+12,p.y,4.2,0,Math.PI*2);ctx.fillStyle=palette[n.kind]||palette.other;ctx.fill();
-    if(scale>.31){ctx.fillStyle='#233044';ctx.font=`600 ${Math.max(8,11*Math.min(1,scale))}px ui-sans-serif,system-ui`;ctx.textAlign='left';ctx.textBaseline='middle';const label=n.label.length>25?n.label.slice(0,24)+'…':n.label;ctx.fillText(label,p.x-w/2+22,p.y-(scale>.6?5:0));if(scale>.6){ctx.fillStyle='#7a8494';ctx.font='9px ui-sans-serif,system-ui';ctx.fillText(n.subtitle,p.x-w/2+22,p.y+9)}}
+    if(scale>.22){ctx.fillStyle='#233044';ctx.font=`650 ${Math.max(9,13*Math.min(1,scale))}px ui-sans-serif,system-ui`;ctx.textAlign='left';ctx.textBaseline='middle';const label=n.label.length>30?n.label.slice(0,29)+'…':n.label;ctx.fillText(label,p.x-w/2+24,p.y-(scale>.48?7:0));if(scale>.48){ctx.fillStyle='#717d8f';ctx.font='10.5px ui-sans-serif,system-ui';ctx.fillText(n.subtitle,p.x-w/2+24,p.y+11)}}
   }
   function draw(){ctx.clearRect(0,0,width,height);const ids=new Set(visible().map(n=>n.id));for(const e of graph.edges){if(ids.has(e.source)&&ids.has(e.target))edge(byId.get(e.source),byId.get(e.target),e.kind==='contains')}for(const n of visible())drawNode(n)}
-  function hitTest(x,y){const v=visible();for(let i=v.length-1;i>=0;i--){const n=v[i],p=screen(n),radius=n.type==='tensor'?Math.max(8,n.r*scale):Math.max(22,55*scale);if((p.x-x)**2+(p.y-y)**2<radius**2)return n}return null}
+  function hitTest(x,y){const v=visible();for(let i=v.length-1;i>=0;i--){const n=v[i],p=screen(n),radius=n.type==='tensor'?Math.max(8,n.r*scale):Math.max(28,82*scale);if((p.x-x)**2+(p.y-y)**2<radius**2)return n}return null}
   function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
   function fact(label,value){return `<div class="fact"><span>${label}</span><b>${esc(value)}</b></div>`}
   function select(n){selected=n;if(!n){aside.innerHTML='<div class="empty"><div class="orb"></div><b>Choose a component</b><p>Click any node to see what it does and inspect the learned tensors inside it.</p></div>';draw();return}
@@ -131,7 +133,7 @@ _DOCUMENT = r"""<!doctype html>
   document.addEventListener('keydown',e=>{if(e.key==='/'&&document.activeElement!==search){e.preventDefault();search.focus()}if(e.key==='Escape'){search.value='';query='';search.blur();draw()}});
   const legendKinds=['embedding','attention','mlp','normalization','output','tensor'];
   const legend=document.createElement('div');legend.className='section';legend.innerHTML='<h3>Visual vocabulary</h3><div class="legend">'+legendKinds.map(k=>`<span class="legend-item"><i class="swatch" style="background:${palette[k]}"></i>${names[k]}</span>`).join('')+'</div>';aside.appendChild(legend);
-  new ResizeObserver(resize).observe(stage);resize();requestAnimationFrame(()=>{fit();select(byId.get('model'))});
+  new ResizeObserver(resize).observe(stage);resize();requestAnimationFrame(()=>{readableOpening();select(byId.get('model'))});
 })();
 </script>
 </body>
