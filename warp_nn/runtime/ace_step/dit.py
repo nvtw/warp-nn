@@ -15,6 +15,21 @@ from dataclasses import dataclass
 import math
 
 import numpy as np
+import warp as wp
+
+from warp_nn.runtime.kernels import (
+    _merge_attention_heads_kernel,
+    _rotary_embedding_kernel_for_dtype,
+    _split_attention_heads_kernel,
+)
+from warp_nn.runtime.operators import (
+    BidirectionalGQAPlan,
+    FixedKVAttentionPlan,
+    Operation,
+    execute_operations,
+    plan_linear,
+    plan_rms_norm,
+)
 
 
 _LAYER_TYPES = frozenset(("full_attention", "sliding_attention"))
@@ -195,6 +210,259 @@ class AceStepDiTLayout:
             if config.layer_types[layer_index] == "sliding_attention"
             else None
         )
+
+
+class AceStepAttentionPlan:
+    """Executable official ACE attention block with optimized projections.
+
+    Self-attention applies per-head Q/K RMSNorm and split-half RoPE before the
+    reusable bidirectional GQA core. Cross-attention projects and normalizes
+    condition K/V once; repeated diffusion steps only recompute Q and output.
+    """
+
+    def __init__(
+        self,
+        hidden,
+        weights,
+        prefix,
+        config,
+        *,
+        context=None,
+        query_valid=None,
+        key_valid=None,
+        position_ids=None,
+        cos_cache=None,
+        sin_cache=None,
+        layer_index=0,
+        cublas=None,
+    ):
+        if hidden.ndim != 3 or hidden.shape[2] != config.hidden_size:
+            raise ValueError("ACE attention hidden input has incompatible shape")
+        if hidden.dtype not in (wp.float16, wp.bfloat16):
+            raise TypeError("ACE attention requires FP16 or BF16 input")
+        self.hidden = hidden
+        self.context = context
+        self.cross_attention = context is not None
+        if self.cross_attention:
+            if (
+                context.ndim != 3
+                or context.shape[0] != hidden.shape[0]
+                or context.shape[2] != config.hidden_size
+                or context.dtype != hidden.dtype
+                or context.device != hidden.device
+            ):
+                raise ValueError("ACE cross-attention context is incompatible")
+        elif any(value is None for value in (position_ids, cos_cache, sin_cache)):
+            raise ValueError("ACE self-attention requires positions and RoPE caches")
+        if config.attention_bias:
+            raise ValueError("biased ACE attention projections are not yet supported")
+        if not 0 <= layer_index < config.num_hidden_layers:
+            raise IndexError("ACE attention layer index is out of range")
+        self.device = hidden.device
+        self.config = config
+        self.prefix = prefix
+        self.weights = weights
+        self.tensors = dict(weights)
+        self.shapes = {name: tuple(value.shape) for name, value in weights.items()}
+        batch, query_length, hidden_size = hidden.shape
+        key_source = context if self.cross_attention else hidden
+        key_length = key_source.shape[1]
+        self.tensors["hidden"] = hidden.reshape((batch * query_length, hidden_size))
+        self.shapes["hidden"] = self.tensors["hidden"].shape
+        self.tensors["key_source"] = key_source.reshape(
+            (batch * key_length, hidden_size)
+        )
+        self.shapes["key_source"] = self.tensors["key_source"].shape
+
+        def linear(name, source, weight):
+            operation = Operation("Linear", [source, weight], [name])
+            plan_linear(
+                operation,
+                self.tensors,
+                self.shapes,
+                self.device,
+                cublas=cublas,
+            )
+            return operation
+
+        self.q_projection = linear("q_projected", "hidden", prefix + ".q_proj.weight")
+        self.k_projection = linear(
+            "k_projected", "key_source", prefix + ".k_proj.weight"
+        )
+        self.v_projection = linear(
+            "v_projected", "key_source", prefix + ".v_proj.weight"
+        )
+        q_shape = (
+            batch,
+            config.num_attention_heads,
+            query_length,
+            config.head_dim,
+        )
+        kv_shape = (
+            batch,
+            config.num_key_value_heads,
+            key_length,
+            config.head_dim,
+        )
+        self.query = wp.empty(q_shape, dtype=hidden.dtype, device=self.device)
+        self.key = wp.empty(kv_shape, dtype=hidden.dtype, device=self.device)
+        self.value = wp.empty_like(self.key)
+        self.tensors["query"] = self.query
+        self.shapes["query"] = q_shape
+        self.tensors["key"] = self.key
+        self.shapes["key"] = kv_shape
+        self.q_norm = Operation(
+            "SimplifiedLayerNormalization",
+            ["query", prefix + ".q_norm.weight"],
+            ["query_norm"],
+            {"epsilon": config.rms_norm_eps},
+        )
+        self.k_norm = Operation(
+            "SimplifiedLayerNormalization",
+            ["key", prefix + ".k_norm.weight"],
+            ["key_norm"],
+            {"epsilon": config.rms_norm_eps},
+        )
+        plan_rms_norm(self.q_norm, self.tensors, self.shapes, self.device)
+        plan_rms_norm(self.k_norm, self.tensors, self.shapes, self.device)
+        self.position_ids = position_ids
+        self.cos_cache = cos_cache
+        self.sin_cache = sin_cache
+        if self.cross_attention:
+            attention_query = self.tensors["query_norm"]
+            attention_key = self.tensors["key_norm"]
+            self.attention = FixedKVAttentionPlan(
+                attention_query,
+                attention_key,
+                self.value,
+                query_valid=query_valid,
+                key_valid=key_valid,
+            )
+        else:
+            self.rotated_query = wp.empty_like(self.query)
+            self.rotated_key = wp.empty_like(self.key)
+            self._rotary = _rotary_embedding_kernel_for_dtype(hidden.dtype)
+            window = (
+                config.sliding_window
+                if config.layer_types[layer_index] == "sliding_attention"
+                else None
+            )
+            self.attention = BidirectionalGQAPlan(
+                self.rotated_query,
+                self.rotated_key,
+                self.value,
+                query_valid=query_valid,
+                key_valid=key_valid,
+                window=window,
+            )
+        self.merged = wp.empty(
+            (batch, query_length, hidden_size), dtype=hidden.dtype, device=self.device
+        )
+        self.tensors["merged"] = self.merged.reshape(
+            (batch * query_length, hidden_size)
+        )
+        self.shapes["merged"] = self.tensors["merged"].shape
+        self.output_projection = linear("output", "merged", prefix + ".o_proj.weight")
+        self.output = self.tensors["output"].reshape((batch, query_length, hidden_size))
+        self._fixed_kv_ready = False
+
+    def _execute(self, operation):
+        execute_operations((operation,), self.tensors, self.shapes, self.device)
+
+    def _prepare_kv(self):
+        self._execute(self.k_projection)
+        self._execute(self.v_projection)
+        for projected, output, heads in (
+            (self.tensors["k_projected"], self.key, self.config.num_key_value_heads),
+            (self.tensors["v_projected"], self.value, self.config.num_key_value_heads),
+        ):
+            wp.launch(
+                _split_attention_heads_kernel,
+                dim=output.shape,
+                inputs=[
+                    projected.reshape(
+                        (
+                            self.hidden.shape[0],
+                            output.shape[2],
+                            heads * self.config.head_dim,
+                        )
+                    ),
+                    output,
+                ],
+                device=self.device,
+            )
+        self._execute(self.k_norm)
+        if not self.cross_attention:
+            wp.launch(
+                self._rotary,
+                dim=self.rotated_key.shape,
+                inputs=[
+                    self.tensors["key_norm"],
+                    self.position_ids,
+                    self.cos_cache,
+                    self.sin_cache,
+                    self.rotated_key,
+                    self.config.head_dim,
+                    False,
+                    False,
+                ],
+                device=self.device,
+            )
+
+    def prepare_fixed_kv(self, force=False):
+        """Project condition K/V once before graph capture."""
+        if not self.cross_attention:
+            raise RuntimeError("fixed K/V preparation is only for cross-attention")
+        if force or not self._fixed_kv_ready:
+            self._prepare_kv()
+            self._fixed_kv_ready = True
+
+    def execute(self):
+        self._execute(self.q_projection)
+        wp.launch(
+            _split_attention_heads_kernel,
+            dim=self.query.shape,
+            inputs=[
+                self.tensors["q_projected"].reshape(
+                    (
+                        self.hidden.shape[0],
+                        self.hidden.shape[1],
+                        self.config.num_attention_heads * self.config.head_dim,
+                    )
+                ),
+                self.query,
+            ],
+            device=self.device,
+        )
+        self._execute(self.q_norm)
+        if self.cross_attention:
+            self.prepare_fixed_kv()
+        else:
+            self._prepare_kv()
+            wp.launch(
+                self._rotary,
+                dim=self.rotated_query.shape,
+                inputs=[
+                    self.tensors["query_norm"],
+                    self.position_ids,
+                    self.cos_cache,
+                    self.sin_cache,
+                    self.rotated_query,
+                    self.config.head_dim,
+                    False,
+                    False,
+                ],
+                device=self.device,
+            )
+        attention_output = self.attention.execute()
+        wp.launch(
+            _merge_attention_heads_kernel,
+            dim=attention_output.shape,
+            inputs=[attention_output, self.merged],
+            device=self.device,
+        )
+        self._execute(self.output_projection)
+        return self.output
 
 
 def dit_weight_names(config: AceStepDiTConfig, prefix: str = "decoder") -> list[str]:

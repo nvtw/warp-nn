@@ -5,10 +5,12 @@ import math
 
 import numpy as np
 import pytest
+import warp as wp
 
 from warp_nn.runtime.ace_step.dit import (
     AceStepDiTConfig,
     AceStepDiTLayout,
+    AceStepAttentionPlan,
     TURBO_TIMESTEPS,
     bidirectional_attention_mask,
     dit_weight_names,
@@ -133,3 +135,138 @@ def test_bidirectional_masks_adaln_split_and_euler_update():
     velocity = np.full_like(latent, 0.25)
     np.testing.assert_allclose(flow_euler_step(latent, velocity, 0.8, 0.3), 0.875)
     np.testing.assert_allclose(flow_euler_step(latent, velocity, 0.8), 0.8)
+
+
+def _rms_norm(x, scale, epsilon):
+    return x * scale / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + epsilon)
+
+
+def test_executable_cross_attention_matches_reference_and_reuses_fixed_kv():
+    from tests.utilities import is_device_available
+
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is unavailable")
+    config = _config()
+    rng = np.random.default_rng(109)
+    hidden = rng.normal(0.0, 0.2, size=(2, 3, 16)).astype(np.float32)
+    context = rng.normal(0.0, 0.2, size=(2, 5, 16)).astype(np.float32)
+    prefix = "decoder.layers.0.cross_attn"
+    arrays = {
+        prefix + ".q_proj.weight": rng.normal(0.0, 0.2, size=(16, 16)).astype(
+            np.float32
+        ),
+        prefix + ".k_proj.weight": rng.normal(0.0, 0.2, size=(8, 16)).astype(
+            np.float32
+        ),
+        prefix + ".v_proj.weight": rng.normal(0.0, 0.2, size=(8, 16)).astype(
+            np.float32
+        ),
+        prefix + ".o_proj.weight": rng.normal(0.0, 0.2, size=(16, 16)).astype(
+            np.float32
+        ),
+        prefix + ".q_norm.weight": rng.normal(1.0, 0.1, size=4).astype(np.float32),
+        prefix + ".k_norm.weight": rng.normal(1.0, 0.1, size=4).astype(np.float32),
+    }
+    weights = {
+        name: wp.array(value, dtype=wp.bfloat16, device="cuda:0")
+        for name, value in arrays.items()
+    }
+    hidden_wp = wp.array(hidden, dtype=wp.bfloat16, device="cuda:0")
+    context_wp = wp.array(context, dtype=wp.bfloat16, device="cuda:0")
+    plan = AceStepAttentionPlan(hidden_wp, weights, prefix, config, context=context_wp)
+    actual = plan.execute().numpy()
+
+    query = (hidden @ arrays[prefix + ".q_proj.weight"].T).reshape(2, 3, 4, 4)
+    query = np.transpose(query, (0, 2, 1, 3))
+    key = (context @ arrays[prefix + ".k_proj.weight"].T).reshape(2, 5, 2, 4)
+    key = np.transpose(key, (0, 2, 1, 3))
+    value = (context @ arrays[prefix + ".v_proj.weight"].T).reshape(2, 5, 2, 4)
+    value = np.transpose(value, (0, 2, 1, 3))
+    query = _rms_norm(query, arrays[prefix + ".q_norm.weight"], config.rms_norm_eps)
+    key = _rms_norm(key, arrays[prefix + ".k_norm.weight"], config.rms_norm_eps)
+    attended = np.zeros_like(query)
+    for batch in range(2):
+        for head in range(4):
+            kv_head = head // 2
+            scores = query[batch, head] @ key[batch, kv_head].T / 2.0
+            probabilities = np.exp(scores - scores.max(axis=-1, keepdims=True))
+            probabilities /= probabilities.sum(axis=-1, keepdims=True)
+            attended[batch, head] = probabilities @ value[batch, kv_head]
+    merged = np.transpose(attended, (0, 2, 1, 3)).reshape(2, 3, 16)
+    expected = merged @ arrays[prefix + ".o_proj.weight"].T
+    np.testing.assert_allclose(actual, expected, rtol=0.04, atol=0.02)
+
+    wp.capture_begin(device="cuda:0")
+    plan.execute()
+    graph = wp.capture_end(device="cuda:0")
+    context_wp.assign(np.zeros_like(context))
+    wp.capture_launch(graph)
+    np.testing.assert_allclose(plan.output.numpy(), expected, rtol=0.04, atol=0.02)
+
+
+def test_executable_self_attention_matches_sliding_reference():
+    from tests.utilities import is_device_available
+
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is unavailable")
+    config = _config(sliding_window=1)
+    rng = np.random.default_rng(113)
+    hidden = rng.normal(0.0, 0.2, size=(1, 5, 16)).astype(np.float32)
+    prefix = "decoder.layers.0.self_attn"
+    arrays = {
+        prefix + ".q_proj.weight": rng.normal(0.0, 0.2, size=(16, 16)).astype(
+            np.float32
+        ),
+        prefix + ".k_proj.weight": rng.normal(0.0, 0.2, size=(8, 16)).astype(
+            np.float32
+        ),
+        prefix + ".v_proj.weight": rng.normal(0.0, 0.2, size=(8, 16)).astype(
+            np.float32
+        ),
+        prefix + ".o_proj.weight": rng.normal(0.0, 0.2, size=(16, 16)).astype(
+            np.float32
+        ),
+        prefix + ".q_norm.weight": rng.normal(1.0, 0.1, size=4).astype(np.float32),
+        prefix + ".k_norm.weight": rng.normal(1.0, 0.1, size=4).astype(np.float32),
+    }
+    weights = {
+        name: wp.array(value, dtype=wp.bfloat16, device="cuda:0")
+        for name, value in arrays.items()
+    }
+    plan = AceStepAttentionPlan(
+        wp.array(hidden, dtype=wp.bfloat16, device="cuda:0"),
+        weights,
+        prefix,
+        config,
+        position_ids=wp.array(np.arange(5, dtype=np.int64)[None], device="cuda:0"),
+        cos_cache=wp.ones((5, 2), dtype=wp.bfloat16, device="cuda:0"),
+        sin_cache=wp.zeros((5, 2), dtype=wp.bfloat16, device="cuda:0"),
+        layer_index=0,
+    )
+    actual = plan.execute().numpy()
+    query = (hidden @ arrays[prefix + ".q_proj.weight"].T).reshape(1, 5, 4, 4)
+    query = _rms_norm(
+        np.transpose(query, (0, 2, 1, 3)),
+        arrays[prefix + ".q_norm.weight"],
+        config.rms_norm_eps,
+    )
+    key = (hidden @ arrays[prefix + ".k_proj.weight"].T).reshape(1, 5, 2, 4)
+    key = _rms_norm(
+        np.transpose(key, (0, 2, 1, 3)),
+        arrays[prefix + ".k_norm.weight"],
+        config.rms_norm_eps,
+    )
+    value = (hidden @ arrays[prefix + ".v_proj.weight"].T).reshape(1, 5, 2, 4)
+    value = np.transpose(value, (0, 2, 1, 3))
+    attended = np.zeros_like(query)
+    for head in range(4):
+        kv_head = head // 2
+        for token in range(5):
+            first, end = max(0, token - 1), min(5, token + 2)
+            scores = query[0, head, token] @ key[0, kv_head, first:end].T / 2.0
+            probabilities = np.exp(scores - scores.max())
+            probabilities /= probabilities.sum()
+            attended[0, head, token] = probabilities @ value[0, kv_head, first:end]
+    merged = np.transpose(attended, (0, 2, 1, 3)).reshape(1, 5, 16)
+    expected = merged @ arrays[prefix + ".o_proj.weight"].T
+    np.testing.assert_allclose(actual, expected, rtol=0.04, atol=0.02)

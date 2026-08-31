@@ -710,6 +710,24 @@ def _reorder_heads_kernel(x: wp.array2d[Any], output: wp.array2d[Any], head_size
 
 
 @wp.kernel(enable_backward=False, module="unique")
+def _split_attention_heads_kernel(x: wp.array3d[Any], output: wp.array4d[Any]):
+    """Convert packed [batch, sequence, heads * width] to explicit heads."""
+    batch, head, sequence, column = wp.tid()
+    output[batch, head, sequence, column] = x[
+        batch, sequence, head * output.shape[3] + column
+    ]
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _merge_attention_heads_kernel(x: wp.array4d[Any], output: wp.array3d[Any]):
+    """Convert explicit heads to packed [batch, sequence, heads * width]."""
+    batch, head, sequence, column = wp.tid()
+    output[batch, sequence, head * x.shape[3] + column] = x[
+        batch, head, sequence, column
+    ]
+
+
+@wp.kernel(enable_backward=False, module="unique")
 def _reorder_interleaved_heads_kernel(
     x: wp.array2d[Any], output: wp.array2d[Any], head_size: int
 ):
