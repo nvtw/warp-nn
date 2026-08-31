@@ -13,7 +13,6 @@ import struct
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Thread
 
 import numpy as np
 import warp as wp
@@ -276,10 +275,7 @@ class SafeTensorArchive:
 
         event = wp.record_event() if device.is_cuda and output else None
         resources = (host_views, byte_views, mappings, streams)
-        if event is None:
-            _release_mappings(resources, None)
-        else:
-            Thread(
-                target=_release_mappings, args=(resources, event), daemon=True
-            ).start()
+        # Finish uploads before returning so mmap cleanup can never race a
+        # caller that immediately begins CUDA graph capture.
+        _release_mappings(resources, event)
         return output

@@ -109,12 +109,20 @@ def load_qwen_encoder_config(path: str | Path) -> dict:
     if head_dim <= 0:
         raise ValueError("Qwen head geometry is inconsistent")
     config["head_dim"] = head_dim
+    if config.get("model_type") == "qwen2_5_vl":
+        # Qwen2.5-VL omits this field although its Q/K/V projections have bias.
+        config.setdefault("attention_bias", True)
+        config.setdefault("qk_norm", False)
     if config.get("hidden_act", "silu") != "silu":
         raise ValueError("Qwen encoder requires SiLU-gated MLPs")
     rope_scaling = config.get("rope_scaling")
     if rope_scaling not in (None, {}):
         rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
-        if config.get("model_type") != "qwen2_5_vl" or rope_type != "mrope":
+        if (
+            config.get("model_type") != "qwen2_5_vl"
+            or rope_type not in ("default", "mrope")
+            or "mrope_section" not in rope_scaling
+        ):
             raise ValueError("Qwen encoder requires default or text-only M-RoPE")
     return config
 
