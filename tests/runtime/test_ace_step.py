@@ -241,7 +241,77 @@ def test_pipeline_never_claims_incomplete_execution_is_ready(tmp_path):
         "Oobleck VAE decoder",
     )
     with pytest.raises(RuntimeError, match="not ready"):
-        pipeline.generate("prompt")
+        pipeline.generate(conditioning=None)
+
+
+def test_pipeline_orchestrates_minimal_turbo_path_on_device(monkeypatch):
+    from types import SimpleNamespace
+
+    dtype = wp.float32
+    conditioning = SimpleNamespace(
+        text_hidden_states=wp.zeros((1, 2, 1024), dtype=dtype, device="cpu"),
+        text_attention_mask=wp.ones((1, 2), dtype=wp.bool, device="cpu"),
+        lyric_hidden_states=wp.zeros((1, 3, 1024), dtype=dtype, device="cpu"),
+        lyric_attention_mask=wp.ones((1, 3), dtype=wp.bool, device="cpu"),
+    )
+    condition = wp.zeros((1, 6, 16), dtype=dtype, device="cpu")
+    valid = wp.ones((1, 6), dtype=wp.bool, device="cpu")
+
+    class Condition:
+        def plan(self, text, text_mask, lyric, lyric_mask, reference):
+            assert reference.shape == (1, 750, 64)
+            return SimpleNamespace(execute=lambda: (condition, valid))
+
+    class DiT:
+        def __init__(self, hidden):
+            self.hidden = hidden
+
+        def run_schedule(self, schedule):
+            assert len(schedule) == 4
+            return self.hidden
+
+    class Decoder:
+        def __init__(self, frames):
+            self.device = wp.get_device("cpu")
+            self.input = wp.empty((1, frames, 64), dtype=dtype, device="cpu")
+            self.output = wp.zeros((1, frames * 1920, 2), dtype=dtype, device="cpu")
+
+        def execute(self):
+            return self.output
+
+    bundle = SimpleNamespace(
+        text_encoder_path=Path("."),
+        dit_path=Path("."),
+    )
+    monkeypatch.setattr(
+        "warp_nn.runtime.ace_step.runner.Qwen3Tokenizer",
+        lambda _path: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        "warp_nn.runtime.ace_step.runner.load_silence_latent",
+        lambda *_args, **_kwargs: np.zeros((1, 4, 64), dtype=np.float32),
+    )
+
+    def dit_factory(hidden, context, packed, packed_valid):
+        assert hidden.shape == (1, 6, 64)
+        assert context.shape == (1, 6, 128)
+        assert packed is condition and packed_valid is valid
+        return DiT(hidden)
+
+    pipeline = AceStep15Pipeline(
+        bundle,
+        text_executor=object(),
+        condition_executor=Condition(),
+        dit_executor=dit_factory,
+        vae_decoder=lambda frames, batch: Decoder(frames),
+    )
+    audio = pipeline.generate(
+        conditioning=conditioning,
+        duration_seconds=0.21,
+        seed=7,
+        steps=4,
+    )
+    assert audio.shape == (1, 6 * 1920, 2)
 
 
 def test_load_silence_latent_transposes_official_layout(monkeypatch):
@@ -332,8 +402,8 @@ def test_ace_cli_writes_stereo_pcm16_only_after_ready_generation(tmp_path, monke
         def __init__(self, bundle):
             self.bundle = bundle
 
-        def load_text_encoder(self, **kwargs):
-            return None
+        def load_generation_stack(self, **kwargs):
+            return self
 
         def prepare_conditioning(self, *args, **kwargs):
             return "conditioning"

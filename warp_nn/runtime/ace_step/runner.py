@@ -24,6 +24,7 @@ import warp as wp
 from ..formats.pytorch import load_pytorch_zip
 from ..qwen.encoder import Qwen3Encoder
 from ..tokenizers import Qwen3Tokenizer
+from .._cublas import try_create_cublas
 
 
 DEFAULT_DIT_INSTRUCTION = "Fill the audio semantic mask based on the given conditions:"
@@ -598,6 +599,64 @@ class AceStep15Pipeline:
         self.text_executor = encoder
         return encoder
 
+    def load_generation_stack(
+        self,
+        *,
+        dtype=wp.bfloat16,
+        device=None,
+        use_cublas: bool = True,
+    ):
+        """Load all fixed weights needed by the minimal turbo generation path."""
+        from .conditioning import AceStepConditionEncoder
+        from .dit import (
+            AceStepDiTConfig as NativeDiTConfig,
+            AceStepDiTPlan,
+            load_ace_dit_weights,
+        )
+        from .vae import OobleckVAEDecoder
+
+        encoder = self.load_text_encoder(
+            dtype=dtype, device=device, use_cublas=use_cublas
+        )
+        raw_config = _read_json(self.bundle.dit_path / "config.json")
+        config = NativeDiTConfig.from_dict(raw_config)
+        condition = AceStepConditionEncoder(
+            self.bundle.dit_path,
+            config,
+            dtype=dtype,
+            device=encoder.device,
+            use_cublas=use_cublas,
+        )
+        weights = load_ace_dit_weights(
+            self.bundle.dit_path, config, encoder.device, dtype
+        )
+        cublas = try_create_cublas() if use_cublas and encoder.device.is_cuda else None
+
+        def dit_factory(hidden, context, packed_condition, valid):
+            return AceStepDiTPlan(
+                hidden,
+                context,
+                packed_condition,
+                weights,
+                config,
+                condition_valid=valid,
+                cublas=cublas,
+            )
+
+        def vae_factory(frames, batch):
+            return OobleckVAEDecoder.from_pretrained(
+                self.bundle.vae_path,
+                frames,
+                batch_size=batch,
+                device=encoder.device,
+                dtype=dtype,
+            )
+
+        self.condition_executor = condition
+        self.dit_executor = dit_factory
+        self.vae_decoder = vae_factory
+        return self
+
     def prepare_gpu_conditioning(
         self, tokens: AceStepTokenBatch
     ) -> AceStepConditioning:
@@ -680,10 +739,48 @@ class AceStep15Pipeline:
     def ready(self) -> bool:
         return not self.missing_components
 
-    def generate(self, *args, **kwargs):
+    def generate(
+        self,
+        *,
+        conditioning: AceStepConditioning,
+        duration_seconds: float = 30.0,
+        seed: int = 0,
+        steps: int = 8,
+    ):
+        """Generate stereo audio through condition encoder, DiT, and VAE."""
         if not self.ready:
             missing = ", ".join(self.missing_components)
             raise RuntimeError(f"ACE-Step 1.5 pipeline is not ready; missing {missing}")
-        raise NotImplementedError(
-            "ACE-Step sampling orchestration will be enabled with the DiT executor"
+        if not 1 <= steps <= 8:
+            raise ValueError("ACE-Step turbo steps must be between 1 and 8")
+        from .dit import turbo_schedule
+
+        batch = conditioning.text_hidden_states.shape[0]
+        silence = load_silence_latent(
+            self.bundle.dit_path / "silence_latent.pt", channels=64
         )
+        inputs = text_to_music_inputs(silence, duration_seconds, batch_size=batch)
+        device = conditioning.text_hidden_states.device
+        dtype = conditioning.text_hidden_states.dtype
+        reference = wp.array(inputs.timbre_latents, dtype=dtype, device=device)
+        condition_plan = self.condition_executor.plan(
+            conditioning.text_hidden_states,
+            conditioning.text_attention_mask,
+            conditioning.lyric_hidden_states,
+            conditioning.lyric_attention_mask,
+            reference,
+        )
+        packed_condition, condition_valid = condition_plan.execute()
+        hidden = seeded_normal(
+            inputs.source_latents.shape, seed=seed, dtype=dtype, device=device
+        )
+        context = wp.array(inputs.context_latents, dtype=dtype, device=device)
+        dit = self.dit_executor(hidden, context, packed_condition, condition_valid)
+        latent = dit.run_schedule(turbo_schedule(shift=3.0, steps=steps))
+        decoder = self.vae_decoder(latent.shape[1], batch)
+        decoder.input.assign(latent)
+        decoder.execute()
+        if decoder.device.is_cuda:
+            wp.synchronize_stream(wp.get_stream(decoder.device))
+            decoder.capture()
+        return decoder.execute()

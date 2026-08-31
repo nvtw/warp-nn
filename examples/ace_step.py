@@ -84,7 +84,7 @@ def main(argv=None) -> int:
     if not args.prompt:
         raise ValueError("--prompt is required for generation")
     pipeline = AceStep15Pipeline(bundle)
-    pipeline.load_text_encoder(device=args.device, use_cublas=not args.no_cublas)
+    pipeline.load_generation_stack(device=args.device, use_cublas=not args.no_cublas)
     token_options = {
         "languages": [args.language],
         "metadata": [args.metadata],
