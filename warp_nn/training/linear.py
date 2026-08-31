@@ -12,6 +12,8 @@ from functools import lru_cache
 
 import warp as wp
 
+from warp_nn.runtime._cuda import get_prefill_mma_projection
+
 
 _STORAGE_DTYPES = (wp.float16, wp.bfloat16)
 
@@ -198,6 +200,27 @@ _TILE_M = 32
 _TILE_N = 32
 _TILE_K = 32
 _TILE_BLOCK_DIM = 128
+
+
+@lru_cache(maxsize=None)
+def _get_native_linear_kernel(dtype: type, tile_m: int, tile_n: int):
+    # Wrap the shared SM80+ pipelined MMA projection primitive.
+    DTYPE = dtype
+    project = get_prefill_mma_projection(dtype, tile_m, tile_n)
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(
+        x: wp.array2d(dtype=DTYPE),
+        weight: wp.array2d(dtype=DTYPE),
+        output: wp.array2d(dtype=DTYPE),
+        columns: int,
+        inner: int,
+    ):
+        typed_zero = DTYPE(0.0)  # noqa: F841 - retain dtype in the Warp closure
+        wp.static(project)(x, weight, output, wp.tid(), columns, inner)
+
+    kernel.module.options["enable_backward"] = False
+    return kernel
 
 
 @lru_cache(maxsize=None)
@@ -462,6 +485,30 @@ def _linear_shapes(x: wp.array, weight: wp.array) -> tuple[int, int, int]:
     return rows, columns, inner
 
 
+def _native_forward_geometry(
+    rows: int,
+    columns: int,
+    reduction: int,
+    dtype: type,
+    device,
+    *arrays: wp.array,
+) -> tuple[int, int] | None:
+    # Select a shared pipelined SM80+ MMA geometry without padding.
+    if (
+        not device.is_cuda
+        or device.arch < 80
+        or dtype not in _STORAGE_DTYPES
+        or reduction % 32
+        or not all(array.is_contiguous and array.ptr % 16 == 0 for array in arrays)
+    ):
+        return None
+    if rows >= 64 and rows % 64 == 0 and columns % 32 == 0:
+        return 64, 32
+    if rows >= 16 and rows % 16 == 0 and columns % 64 == 0:
+        return 16, 64
+    return None
+
+
 def _use_tiled(
     rows: int,
     columns: int,
@@ -571,6 +618,9 @@ def linear_forward(
     """Launch ``output = x @ weight.T`` into a preallocated low-precision array."""
     rows, columns, inner = _linear_shapes(x, weight)
     _check_array("output", output, (rows, columns), x.dtype, x.device)
+    native_geometry = _native_forward_geometry(
+        rows, columns, inner, x.dtype, x.device, x, weight, output
+    )
     if cublas is not None and x.device.is_cuda:
         cublas.gemm(
             x.ptr,
@@ -581,6 +631,16 @@ def linear_forward(
             inner,
             wp.get_stream(x.device).cuda_stream,
             2 if x.dtype == wp.float16 else 14,
+        )
+    elif native_geometry is not None:
+        tile_m, tile_n = native_geometry
+        block_dim = tile_m * tile_n // 8
+        wp.launch(
+            _get_native_linear_kernel(x.dtype, tile_m, tile_n),
+            dim=(rows // tile_m) * (columns // tile_n) * block_dim,
+            inputs=[x, weight, output, columns, inner],
+            block_dim=block_dim,
+            device=x.device,
         )
     elif _use_tiled(rows, columns, inner, x.dtype, x.device, x, weight, output):
         _launch_tiled(
