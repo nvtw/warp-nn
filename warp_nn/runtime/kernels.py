@@ -1075,23 +1075,6 @@ def _append_head_cache_decode_batch_kernel(
 
 
 @wp.kernel(enable_backward=False, module="unique")
-def _copy_head_cache_prefix_slot_kernel(
-    source: wp.array2d[Any],
-    destination: wp.array2d[Any],
-    slot: int,
-    prefix_length: int,
-    heads: int,
-    capacity: int,
-):
-    """Copy initialized head-major prefix rows into one batched cache slot."""
-    head, position, column = wp.tid()
-    source_row = head * capacity + position
-    destination_row = (slot * heads + head) * capacity + position
-    if position < prefix_length:
-        destination[destination_row, column] = source[source_row, column]
-
-
-@wp.kernel(enable_backward=False, module="unique")
 def _append_head_cache_kernel(
     x: wp.array2d[Any],
     positions: wp.array2d[wp.int64],

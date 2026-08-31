@@ -26,7 +26,6 @@ from warp_nn.runtime.kernels import (
     _causal_conv_decode_batch_kernel,
     _gather_rows_kernel,
     _cast_kernel_for_dtypes,
-    _copy_head_cache_prefix_slot_kernel,
     _get_gated_rms_norm_kernel,
     _get_gated_delta_decode_batch_kernel,
     _get_gather_q8_0_rows_kernel,
@@ -1255,45 +1254,10 @@ class Qwen35BatchDecoder:
             )
 
     def prefill(self, slot: int, token_ids, *, rope_delta: int = 0) -> wp.array:
-        """Prefill one slot sequentially, then copy only mutable state."""
-        self._validate_slot(slot)
-        tokens = tuple(int(token) for token in token_ids)
-        logits = self.runner.prefill(tokens)
-        for index, source in self.runner.conv_states.items():
-            destination = self.conv_states[index]
-            wp.copy(destination.flatten(), source.flatten(), dest_offset=slot * source.size)
-        for index, source in self.runner.recurrent_states.items():
-            destination = self.recurrent_states[index]
-            wp.copy(destination.flatten(), source.flatten(), dest_offset=slot * source.size)
-        for index, (source_key, source_value) in self.runner.kv_caches.items():
-            destination_key, destination_value = self.kv_caches[index]
-            for source, destination in (
-                (source_key, destination_key),
-                (source_value, destination_value),
-            ):
-                wp.launch(
-                    _copy_head_cache_prefix_slot_kernel,
-                    dim=(self.runner.kv_heads, len(tokens), self.runner.head_size),
-                    inputs=[
-                        source,
-                        destination,
-                        slot,
-                        len(tokens),
-                        self.runner.kv_heads,
-                        self.runner.cache_capacity,
-                    ],
-                    device=self.device,
-                )
-        self._lengths[slot] = len(tokens)
-        self._rope_delta_values[slot] = int(rope_delta)
-        self._slot_prefill_open[slot] = False
-        wp.copy(
-            self.prefill_outputs.flatten(),
-            logits.flatten(),
-            dest_offset=slot * logits.size,
-            count=logits.size,
-        )
-        return self.prefill_outputs[slot : slot + 1]
+        """Prefill one slot directly through its persistent state views."""
+        self.begin_prefill(slot, rope_delta=rope_delta)
+        self.append_prefill(slot, token_ids)
+        return self.end_prefill(slot)
 
     def begin_prefill(self, slot: int, *, rope_delta: int = 0) -> None:
         """Reset one slot for state-aware incremental prompt ingestion."""
