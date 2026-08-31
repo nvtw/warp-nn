@@ -289,6 +289,7 @@ def main():
     messages = [] if system is None else [{"role": "system", "content": system}]
     pending_images = []
     cached_ids = []
+    cached_media_count = 0
     chat_encoder = ChatEncodingCache(tokenizer)
     if args.unsafe_shell and not args.coding_agent:
         parser.error("--unsafe-shell requires --tools")
@@ -332,6 +333,7 @@ def main():
             messages = [] if system is None else [{"role": "system", "content": system}]
             pending_images.clear()
             cached_ids.clear()
+            cached_media_count = 0
             chat_encoder.reset()
             print("History cleared.")
             continue
@@ -397,13 +399,20 @@ def main():
                     )
                     break
                 print("Assistant: ", end="", flush=True)
-                if multimodal_prompt is not None:
-                    logits = runner.prefill_multimodal(multimodal_prompt)
-                elif cached_ids and token_ids[: len(cached_ids)] == cached_ids:
+                prefix_is_cached = (
+                    bool(cached_ids) and token_ids[: len(cached_ids)] == cached_ids
+                )
+                media_count = (
+                    len(multimodal_prompt.media) if multimodal_prompt is not None else 0
+                )
+                if prefix_is_cached and media_count == cached_media_count:
                     logits = runner.append(token_ids[len(cached_ids) :])
+                elif multimodal_prompt is not None and multimodal_prompt.media:
+                    logits = runner.prefill_multimodal(multimodal_prompt)
                 else:
                     logits = runner.prefill(token_ids)
                 cached_ids = list(token_ids)
+                cached_media_count = media_count
                 generation_limit = min(
                     args.max_new_tokens, args.cache_capacity - len(token_ids)
                 )
@@ -483,6 +492,7 @@ def main():
                                 {"role": "assistant", "content": history_response}
                             )
                         cached_ids.clear()
+                        cached_media_count = 0
                         chat_encoder.reset()
                         print("[Cancelled.]")
                         break
