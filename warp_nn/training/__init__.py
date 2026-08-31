@@ -27,6 +27,7 @@ from .primitives import CrossEntropyPlan, EmbeddingPlan, TransformerPrimitivePla
 from .qk import QKTransformPlan
 from .qwen import QwenLoRATransformerBlockPlan
 from .step import LoRALinearTrainingPlan
+from .stack import LoRATransformerStackPlan
 
 
 __all__ = [
@@ -42,6 +43,7 @@ __all__ = [
     "LoRACheckpoint",
     "LoRALinearTrainingPlan",
     "LoRASwiGLUPlan",
+    "LoRATransformerStackPlan",
     "MuseLoRATransformerBlockPlan",
     "QKTransformPlan",
     "QwenLoRATransformerBlockPlan",
