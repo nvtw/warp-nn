@@ -16,6 +16,13 @@ from .runner import (
     QwenImageVAEConfig,
 )
 
+from .vae import (
+    QwenImageVAEWeightSpec,
+    load_qwen_image_2512_vae_decoder_weights,
+    prepare_qwen_image_vae_decoder_weights,
+    qwen_image_2512_vae_decoder_weight_specs,
+)
+
 __all__ = [
     "FlowMatchEulerConfig",
     "QWEN_IMAGE_2512_RESOLUTIONS",
@@ -25,4 +32,8 @@ __all__ = [
     "QwenImageTransformerManifest",
     "QwenImageVAEConfig",
     "TensorMetadataArchive",
+    "QwenImageVAEWeightSpec",
+    "load_qwen_image_2512_vae_decoder_weights",
+    "prepare_qwen_image_vae_decoder_weights",
+    "qwen_image_2512_vae_decoder_weight_specs",
 ]
