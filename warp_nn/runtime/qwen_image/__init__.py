@@ -8,9 +8,16 @@ from .checkpoint import (
     QwenImageTransformerManifest,
     TensorMetadataArchive,
 )
+from .mmdit import (
+    QwenImageMMDiTLayerPlan,
+    QwenImageMMDiTPlan,
+    load_qwen_image_transformer_weights,
+    qwen_image_rotary_coordinates,
+)
 from .prompt import (
     QWEN_IMAGE_PREFIX_TOKENS,
     QWEN_IMAGE_SYSTEM_PROMPT,
+    QwenImagePromptEncoder,
     format_qwen_image_prompt,
     tokenize_qwen_image_prompt,
 )
@@ -33,12 +40,15 @@ from .vae_decoder import QwenImage2512VAEDecoder
 __all__ = [
     "QWEN_IMAGE_PREFIX_TOKENS",
     "QWEN_IMAGE_SYSTEM_PROMPT",
+    "QwenImagePromptEncoder",
     "format_qwen_image_prompt",
     "tokenize_qwen_image_prompt",
     "FlowMatchEulerConfig",
     "QWEN_IMAGE_2512_RESOLUTIONS",
     "QwenImage2512VAEDecoder",
     "QwenImage2512Bundle",
+    "QwenImageMMDiTLayerPlan",
+    "QwenImageMMDiTPlan",
     "QwenImageTensorSpec",
     "QwenImageTransformerConfig",
     "QwenImageTransformerManifest",
@@ -46,6 +56,8 @@ __all__ = [
     "TensorMetadataArchive",
     "QwenImageVAEWeightSpec",
     "load_qwen_image_2512_vae_decoder_weights",
+    "load_qwen_image_transformer_weights",
     "prepare_qwen_image_vae_decoder_weights",
+    "qwen_image_rotary_coordinates",
     "qwen_image_2512_vae_decoder_weight_specs",
 ]
