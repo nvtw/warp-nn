@@ -416,10 +416,10 @@ class LLM2VecRunner:
             merge_lora_adapter(self.weights, adapter, dtype, self.device)
         self.tokenizer = Llama3Tokenizer(model_path)
         self.cublas = None
-        if use_cublas:
-            from .._cublas import Cublas
+        if use_cublas and self.device.is_cuda:
+            from .._cublas import try_create_cublas
 
-            self.cublas = Cublas(self.device)
+            self.cublas = try_create_cublas()
         parameters = {
             "rope_theta": float(self.config.get("rope_theta", 500000.0)),
             "partial_rotary_factor": 1.0,

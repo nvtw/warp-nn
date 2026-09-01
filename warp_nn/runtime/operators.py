@@ -622,9 +622,13 @@ def plan_linear(
             op.attrs["_q8_grouped_decode_kernel"] = (
                 _get_q8_grouped_decode_linear_kernel(dtype, outputs_per_group)
             )
-        op.attrs["_q8_kernel"] = _get_matmul_int8_q8_kernel(
-            8, dtype, True, outputs_per_group
-        )
+        if (
+            "_q8_mma_kernel" not in op.attrs
+            and "_q8_grouped_decode_kernel" not in op.attrs
+        ):
+            op.attrs["_q8_kernel"] = _get_matmul_int8_q8_kernel(
+                8, dtype, True, outputs_per_group
+            )
         return
     if weight.dtype != dtype or dtype not in (
         wp.float16,
@@ -1121,8 +1125,6 @@ def _exec_gather_block_quantized(op, tensors, shapes, device):
 def _exec_matmul_nbits(op, tensors, shapes, device):
     K = int(op.attrs["K"])
     N = int(op.attrs["N"])
-    bits = int(op.attrs["bits"])
-    block_size = op.attrs["_block_size"]
     dtype = op.attrs["_dtype"]
     zero_points = op.attrs["_zero_points"]
     has_zero_points = op.attrs["_has_zero_points"]

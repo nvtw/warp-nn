@@ -35,7 +35,6 @@ from warp_nn.runtime.kernels import (
     _get_mrope_embedding_kernel,
     _get_mrope_decode_batch_kernel,
     _get_gqa_attention_kernel,
-    _get_greedy_argmax_kernels,
     _get_linear_attention_kernel,
     _get_lp_normalization_kernel,
     _linear_attention_value_blocks,
@@ -1312,8 +1311,7 @@ class Qwen35Runner(AutoregressiveRunner):
         for index, layer_type in enumerate(self.config["layer_types"]):
             if layer_type == "linear_attention":
                 name = (
-                    f"model.language_model.layers.{index}."
-                    "linear_attn.in_proj_a.weight"
+                    f"model.language_model.layers.{index}.linear_attn.in_proj_a.weight"
                 )
                 self.weights[name] = cast_weight(self.weights[name], self.dtype)
         self.zero_bias = wp.zeros(1, dtype=self.dtype, device=self.device)
@@ -1358,16 +1356,7 @@ class Qwen35Runner(AutoregressiveRunner):
         self._chunk_plan._capture_ready = False
         self._record_plan_storage(self._decode_plan)
         self._record_plan_storage(self._chunk_plan)
-        self._sample_partial_values = wp.empty(
-            128, dtype=wp.float32, device=self.device
-        )
-        self._sample_partial_tokens = wp.empty(128, dtype=wp.int32, device=self.device)
-        self._sampled_token = wp.empty(1, dtype=wp.int32, device=self.device)
-        self._sampled_token_host = wp.empty(
-            1, dtype=wp.int32, device="cpu", pinned=self.device.is_cuda
-        )
-        self._sampled_token_host_view = self._sampled_token_host.numpy()
-        self._greedy_argmax_kernels = _get_greedy_argmax_kernels(1024, 128, self.dtype)
+        self._initialize_sampling()
         self.sequence_length = 0
 
     def create_batch_decoder(self, max_batch_size: int = 4) -> Qwen35BatchDecoder:

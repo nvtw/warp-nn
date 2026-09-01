@@ -362,7 +362,7 @@ def _create_linear_tiled_kernel(dtype: type, tile_m: int, tile_k: int):
     ):
         """Compute a tiled ``output = x @ weight.T`` projection."""
         tile_row, tile_column = wp.tid()
-        typed_zero = DTYPE(0.0)
+        typed_zero = DTYPE(0.0)  # noqa: F841 - retain dtype in the Warp closure
         accumulator = wp.tile_zeros(shape=(TILE_M, TILE_N), dtype=wp.float32)
         for inner_tile in range((x.shape[1] + TILE_K - 1) / TILE_K):
             inner_offset = inner_tile * TILE_K
@@ -546,8 +546,8 @@ def _transpose_021_kernel(x: wp.array3d[Any], output: wp.array3d[Any]):
 @wp.kernel(enable_backward=False)
 def _transpose_0213_kernel(x: wp.array4d[Any], output: wp.array4d[Any]):
     """Transpose a rank-4 tensor from axes 0-1-2-3 to 0-2-1-3."""
-    i, j, k, l = wp.tid()
-    output[i, j, k, l] = x[i, k, j, l]
+    i, j, k, column = wp.tid()
+    output[i, j, k, column] = x[i, k, j, column]
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -1484,16 +1484,6 @@ def _repack_gguf_nvfp4_kernel(
     output[row, block, output_byte] = wp.uint8(low | (high << 4))
 
 
-@wp.func
-def _expand_int4x4(value: wp.uint32) -> wp.int32:
-    return wp.int32(
-        (value & wp.uint32(0x000F))
-        | ((value & wp.uint32(0x00F0)) << wp.uint32(4))
-        | ((value & wp.uint32(0x0F00)) << wp.uint32(8))
-        | ((value & wp.uint32(0xF000)) << wp.uint32(12))
-    )
-
-
 @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
 def _matmul_int4_q8_kernel(
     activations: wp.array3d[wp.uint32],
@@ -2412,7 +2402,7 @@ def _create_linear_attention_kernel(
     ):
         """Update recurrent attention state and emit the current sequence."""
         item = wp.tid()
-        typed_zero = DTYPE(0.0)
+        typed_zero = DTYPE(0.0)  # noqa: F841 - retain dtype in the Warp closure
         value_block = item % VALUE_BLOCKS
         state_item = item / VALUE_BLOCKS
         batch = state_item / value_heads
@@ -3582,9 +3572,6 @@ def _get_stage_decode_batch_kernel(mrope: bool = False):
             rope_positions[batch, 0] = rope_position
 
     return kernel
-
-
-_stage_decode_batch_kernel = _get_stage_decode_batch_kernel(True)
 
 
 @wp.kernel(enable_backward=False, module="unique")

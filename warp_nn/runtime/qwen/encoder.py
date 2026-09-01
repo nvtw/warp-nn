@@ -74,7 +74,10 @@ def qwen3_encoder_weight_names(config: dict) -> tuple[str, ...]:
 
 def load_qwen_encoder_config(path: str | Path) -> dict:
     """Load a Qwen3 or language-only Qwen2.5-VL shape contract."""
-    config = json.loads((Path(path) / "config.json").read_text(encoding="utf-8"))
+    path = Path(path)
+    if path.is_dir():
+        path /= "config.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
     if "text_config" in config:
         config = dict(config["text_config"])
     required = (
@@ -130,41 +133,15 @@ def load_qwen_encoder_config(path: str | Path) -> dict:
 def load_qwen3_encoder_config(path: str | Path) -> dict:
     """Load and validate the standard full-attention Qwen3 shape contract."""
     path = Path(path)
-    raw_config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    config_path = path / "config.json" if path.is_dir() else path
+    raw_config = json.loads(config_path.read_text(encoding="utf-8"))
     if "head_dim" not in raw_config:
         raise ValueError("Qwen3 encoder config is missing ['head_dim']")
     config = load_qwen_encoder_config(path)
-    required = (
-        "hidden_size",
-        "intermediate_size",
-        "num_hidden_layers",
-        "num_attention_heads",
-        "num_key_value_heads",
-        "vocab_size",
-        "max_position_embeddings",
-    )
-    missing = [name for name in required if name not in config]
-    if missing:
-        raise ValueError(f"Qwen3 encoder config is missing {missing}")
     if config.get("model_type") != "qwen3":
         raise ValueError("Qwen3 encoder requires model_type 'qwen3'")
-    layers = int(config["num_hidden_layers"])
-    layer_types = config.get("layer_types", ["full_attention"] * layers)
-    if len(layer_types) != layers or set(layer_types) != {"full_attention"}:
-        raise ValueError("Qwen3 encoder supports full-attention layers only")
-    query_heads = int(config["num_attention_heads"])
-    kv_heads = int(config["num_key_value_heads"])
-    if query_heads <= 0 or kv_heads <= 0 or query_heads % kv_heads:
-        raise ValueError("Qwen3 query heads must be a positive multiple of KV heads")
-    if int(config["head_dim"]) <= 0:
-        raise ValueError("Qwen3 head_dim must be positive")
-    if (
-        config.get("attention_bias", False)
-        or config.get("hidden_act", "silu") != "silu"
-    ):
+    if config.get("attention_bias", False):
         raise ValueError("only bias-free SiLU Qwen3 encoders are supported")
-    if config.get("rope_scaling") not in (None, {}):
-        raise ValueError("Qwen3 encoder currently supports default RoPE only")
     return config
 
 

@@ -1217,10 +1217,10 @@ class KimodoRunner:
         key = (batch, frames, cfg_type)
         if key not in self._plans:
             cublas = None
-            if self.use_cublas:
-                from .._cublas import Cublas
+            if self.use_cublas and self.device.is_cuda:
+                from .._cublas import try_create_cublas
 
-                cublas = Cublas(self.device)
+                cublas = try_create_cublas()
             self._plans[key] = KimodoGenerationPlan(
                 batch,
                 frames,

@@ -11,7 +11,6 @@ constructing it never implies that an incomplete model can generate audio.
 
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,9 +22,11 @@ import warp as wp
 from ..formats.pytorch import load_pytorch_zip
 from ..kernels import _cast_kernel_for_dtypes
 from ..operators import seeded_normal
-from ..qwen.encoder import Qwen3Encoder
+from ..qwen.encoder import Qwen3Encoder, load_qwen3_encoder_config
 from ..tokenizers import Qwen3Tokenizer
 from .._cublas import try_create_cublas
+from .dit import AceStepDiTConfig
+from .vae import OobleckVAEConfig
 
 
 DEFAULT_DIT_INSTRUCTION = "Fill the audio semantic mask based on the given conditions:"
@@ -38,24 +39,6 @@ SFT_GENERATION_PROMPT = """# Instruction
 # Metas
 {}<|endoftext|>
 """
-
-
-def _read_json(path: Path) -> dict:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as error:
-        raise FileNotFoundError(f"ACE-Step file not found: {path}") from error
-    except json.JSONDecodeError as error:
-        raise ValueError(f"invalid JSON in ACE-Step file {path}: {error}") from error
-    if not isinstance(value, dict):
-        raise ValueError(f"ACE-Step JSON object expected in {path}")
-    return value
-
-
-def _require_fields(data: dict, names: Sequence[str], label: str) -> None:
-    missing = [name for name in names if name not in data]
-    if missing:
-        raise ValueError(f"{label} config is missing {missing}")
 
 
 @dataclass(frozen=True)
@@ -75,186 +58,23 @@ class Qwen3EmbeddingConfig:
 
     @classmethod
     def load(cls, path: str | Path) -> Qwen3EmbeddingConfig:
-        data = _read_json(Path(path))
-        _require_fields(
-            data,
-            (
-                "model_type",
-                "hidden_size",
-                "intermediate_size",
-                "num_hidden_layers",
-                "num_attention_heads",
-                "num_key_value_heads",
-                "head_dim",
-                "vocab_size",
-                "max_position_embeddings",
-            ),
-            "Qwen3 embedding",
-        )
-        if data["model_type"] != "qwen3":
-            raise ValueError("ACE-Step text encoder must use the Qwen3 architecture")
-        if data.get("hidden_act", "silu") != "silu" or data.get(
-            "attention_bias", False
-        ):
-            raise ValueError("only bias-free SiLU Qwen3 embedding models are supported")
-        query_heads = int(data["num_attention_heads"])
-        kv_heads = int(data["num_key_value_heads"])
-        hidden_size = int(data["hidden_size"])
-        head_dim = int(data["head_dim"])
-        # Qwen3 permits a head dimension independent of hidden_size; the official
-        # 0.6B encoder uses 16 * 128 Q channels with hidden size 1024.
-        if query_heads % kv_heads or head_dim <= 0:
-            raise ValueError("invalid Qwen3 embedding head geometry")
-        layers = int(data["num_hidden_layers"])
-        layer_types = data.get("layer_types")
-        if layer_types is not None and (
-            len(layer_types) != layers or set(layer_types) != {"full_attention"}
-        ):
-            raise ValueError(
-                "ACE-Step text encoder requires full-attention Qwen3 layers"
-            )
+        try:
+            data = load_qwen3_encoder_config(path)
+        except ValueError as error:
+            if "heads" in str(error):
+                raise ValueError("invalid Qwen3 embedding head geometry") from error
+            raise
         return cls(
-            hidden_size=hidden_size,
+            hidden_size=int(data["hidden_size"]),
             intermediate_size=int(data["intermediate_size"]),
-            layers=layers,
-            query_heads=query_heads,
-            kv_heads=kv_heads,
-            head_dim=head_dim,
+            layers=int(data["num_hidden_layers"]),
+            query_heads=int(data["num_attention_heads"]),
+            kv_heads=int(data["num_key_value_heads"]),
+            head_dim=int(data["head_dim"]),
             vocabulary_size=int(data["vocab_size"]),
             max_sequence_length=int(data["max_position_embeddings"]),
             rms_norm_epsilon=float(data.get("rms_norm_eps", 1.0e-6)),
             rope_theta=float(data.get("rope_theta", 1_000_000.0)),
-        )
-
-
-@dataclass(frozen=True)
-class AceStepDiTConfig:
-    """Validated shape contract for an ACE-Step 1.5 DiT checkpoint."""
-
-    model_version: str
-    hidden_size: int
-    intermediate_size: int
-    layers: int
-    query_heads: int
-    kv_heads: int
-    head_dim: int
-    input_channels: int
-    text_hidden_size: int
-    lyric_layers: int
-    timbre_layers: int
-    audio_decoder_layers: int
-    patch_size: int
-    sliding_window: int | None
-    is_turbo: bool
-
-    @classmethod
-    def load(cls, path: str | Path) -> AceStepDiTConfig:
-        data = _read_json(Path(path))
-        _require_fields(
-            data,
-            (
-                "model_type",
-                "model_version",
-                "hidden_size",
-                "intermediate_size",
-                "num_hidden_layers",
-                "num_attention_heads",
-                "num_key_value_heads",
-                "head_dim",
-                "in_channels",
-                "text_hidden_dim",
-                "num_lyric_encoder_hidden_layers",
-                "num_timbre_encoder_hidden_layers",
-                "num_audio_decoder_hidden_layers",
-                "patch_size",
-            ),
-            "ACE-Step DiT",
-        )
-        if data["model_type"] != "acestep":
-            raise ValueError("ACE-Step DiT config has an incompatible model_type")
-        query_heads = int(data["num_attention_heads"])
-        kv_heads = int(data["num_key_value_heads"])
-        hidden_size = int(data["hidden_size"])
-        head_dim = int(data["head_dim"])
-        if query_heads % kv_heads or query_heads * head_dim != hidden_size:
-            raise ValueError("invalid ACE-Step DiT head geometry")
-        layers = int(data["num_hidden_layers"])
-        layer_types = data.get("layer_types")
-        if layer_types is not None and len(layer_types) != layers:
-            raise ValueError(
-                "ACE-Step DiT layer_types does not match num_hidden_layers"
-            )
-        is_turbo = bool(data.get("is_turbo", data["model_version"] == "turbo"))
-        return cls(
-            model_version=str(data["model_version"]),
-            hidden_size=hidden_size,
-            intermediate_size=int(data["intermediate_size"]),
-            layers=layers,
-            query_heads=query_heads,
-            kv_heads=kv_heads,
-            head_dim=head_dim,
-            input_channels=int(data["in_channels"]),
-            text_hidden_size=int(data["text_hidden_dim"]),
-            lyric_layers=int(data["num_lyric_encoder_hidden_layers"]),
-            timbre_layers=int(data["num_timbre_encoder_hidden_layers"]),
-            audio_decoder_layers=int(data["num_audio_decoder_hidden_layers"]),
-            patch_size=int(data["patch_size"]),
-            sliding_window=(
-                int(data["sliding_window"])
-                if data.get("use_sliding_window", False)
-                else None
-            ),
-            is_turbo=is_turbo,
-        )
-
-
-@dataclass(frozen=True)
-class OobleckVAEConfig:
-    """Validated audio geometry for the official stereo Oobleck VAE."""
-
-    sampling_rate: int
-    audio_channels: int
-    encoder_hidden_size: int
-    decoder_input_channels: int
-    decoder_channels: int
-    channel_multiples: tuple[int, ...]
-    sampling_ratios: tuple[int, ...]
-
-    @property
-    def samples_per_latent(self) -> int:
-        return int(np.prod(self.sampling_ratios))
-
-    @classmethod
-    def load(cls, path: str | Path) -> OobleckVAEConfig:
-        data = _read_json(Path(path))
-        _require_fields(
-            data,
-            (
-                "_class_name",
-                "sampling_rate",
-                "audio_channels",
-                "encoder_hidden_size",
-                "decoder_input_channels",
-                "decoder_channels",
-                "channel_multiples",
-                "downsampling_ratios",
-            ),
-            "Oobleck VAE",
-        )
-        if data["_class_name"] != "AutoencoderOobleck":
-            raise ValueError("ACE-Step VAE must use AutoencoderOobleck")
-        multiples = tuple(map(int, data["channel_multiples"]))
-        ratios = tuple(map(int, data["downsampling_ratios"]))
-        if not multiples or len(multiples) != len(ratios) or min(ratios) <= 0:
-            raise ValueError("invalid Oobleck VAE channel or sampling stages")
-        return cls(
-            sampling_rate=int(data["sampling_rate"]),
-            audio_channels=int(data["audio_channels"]),
-            encoder_hidden_size=int(data["encoder_hidden_size"]),
-            decoder_input_channels=int(data["decoder_input_channels"]),
-            decoder_channels=int(data["decoder_channels"]),
-            channel_multiples=multiples,
-            sampling_ratios=ratios,
         )
 
 
@@ -582,18 +402,13 @@ class AceStep15Pipeline:
     ):
         """Load all fixed weights needed by the minimal turbo generation path."""
         from .conditioning import AceStepConditionEncoder
-        from .dit import (
-            AceStepDiTConfig as NativeDiTConfig,
-            AceStepDiTPlan,
-            load_ace_dit_weights,
-        )
+        from .dit import AceStepDiTPlan, load_ace_dit_weights
         from .vae import OobleckVAEDecoder
 
         encoder = self.load_text_encoder(
             dtype=dtype, device=device, use_cublas=use_cublas
         )
-        raw_config = _read_json(self.bundle.dit_path / "config.json")
-        config = NativeDiTConfig.from_dict(raw_config)
+        config = self.bundle.dit
         condition = AceStepConditionEncoder(
             self.bundle.dit_path,
             config,

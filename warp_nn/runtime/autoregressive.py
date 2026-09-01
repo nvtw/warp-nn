@@ -14,6 +14,7 @@ from warp_nn.runtime.formats.gguf import (
     BlockQuantizedTensor,
 )
 from warp_nn.runtime.kernels import (
+    _get_greedy_argmax_kernels,
     _get_top_k_kernels,
     _set_sequence_end,
     _stage_mrope_token_position,
@@ -80,6 +81,19 @@ def _storage_bytes(value, excluded=()) -> int:
 
 
 class AutoregressiveRunner:
+    def _initialize_sampling(self) -> None:
+        """Allocate the fixed device and bounded host buffers used by sampling."""
+        self._sample_partial_values = wp.empty(
+            128, dtype=wp.float32, device=self.device
+        )
+        self._sample_partial_tokens = wp.empty(128, dtype=wp.int32, device=self.device)
+        self._sampled_token = wp.empty(1, dtype=wp.int32, device=self.device)
+        self._sampled_token_host = wp.empty(
+            1, dtype=wp.int32, device="cpu", pinned=self.device.is_cuda
+        )
+        self._sampled_token_host_view = self._sampled_token_host.numpy()
+        self._greedy_argmax_kernels = _get_greedy_argmax_kernels(1024, 128, self.dtype)
+
     def _record_plan_storage(self, plan) -> None:
         if not self.device.is_cuda:
             plan._owned_storage_bytes = 0

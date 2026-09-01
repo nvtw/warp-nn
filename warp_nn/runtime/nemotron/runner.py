@@ -19,7 +19,6 @@ from warp_nn.runtime.kernels import (
     _gather_rows_kernel,
     _get_gated_rms_norm_kernel,
     _get_gqa_attention_kernel,
-    _get_greedy_argmax_kernels,
     _get_mamba2_decode_kernel,
     _get_mamba2_prefill_kernel,
     _relu2_kernel,
@@ -508,10 +507,5 @@ class NemotronHRunner(AutoregressiveRunner):
                 )
         self._decode_plan = _NemotronPlan(self, 1)
         self._chunk_plan = _NemotronPlan(self, self.prefill_chunk_size)
-        self._sample_partial_values = wp.empty(128, dtype=wp.float32, device=self.device)
-        self._sample_partial_tokens = wp.empty(128, dtype=wp.int32, device=self.device)
-        self._sampled_token = wp.empty(1, dtype=wp.int32, device=self.device)
-        self._sampled_token_host = wp.empty(1, dtype=wp.int32, device="cpu", pinned=self.device.is_cuda)
-        self._sampled_token_host_view = self._sampled_token_host.numpy()
-        self._greedy_argmax_kernels = _get_greedy_argmax_kernels(1024, 128, self.dtype)
+        self._initialize_sampling()
         self.sequence_length = 0

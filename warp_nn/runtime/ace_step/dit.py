@@ -13,7 +13,9 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
+import json
 import math
+from pathlib import Path
 
 import numpy as np
 import warp as wp
@@ -94,6 +96,7 @@ class AceStepDiTConfig:
     timbre_hidden_dim: int
     num_lyric_encoder_hidden_layers: int
     num_timbre_encoder_hidden_layers: int
+    num_audio_decoder_hidden_layers: int
     timbre_fix_frame: int
 
     @classmethod
@@ -106,7 +109,6 @@ class AceStepDiTConfig:
             "num_key_value_heads",
             "head_dim",
             "in_channels",
-            "audio_acoustic_hidden_dim",
             "patch_size",
             "layer_types",
         )
@@ -132,11 +134,14 @@ class AceStepDiTConfig:
             raise ValueError("ACE-Step DiT requires the SiLU-gated Qwen MLP")
         patch_size = int(source["patch_size"])
         in_channels = int(source["in_channels"])
-        audio_channels = int(source["audio_acoustic_hidden_dim"])
+        audio_channels = int(source.get("audio_acoustic_hidden_dim", in_channels // 3))
         text_width = int(source.get("text_hidden_dim", 1024))
         timbre_width = int(source.get("timbre_hidden_dim", 64))
         lyric_layers = int(source.get("num_lyric_encoder_hidden_layers", 8))
         timbre_layers = int(source.get("num_timbre_encoder_hidden_layers", 4))
+        audio_decoder_layers = int(
+            source.get("num_audio_decoder_hidden_layers", layers)
+        )
         timbre_frames = int(source.get("timbre_fix_frame", 750))
         if (
             min(
@@ -147,6 +152,7 @@ class AceStepDiTConfig:
                 timbre_width,
                 lyric_layers,
                 timbre_layers,
+                audio_decoder_layers,
                 timbre_frames,
             )
             <= 0
@@ -179,13 +185,85 @@ class AceStepDiTConfig:
             rms_norm_eps=float(source.get("rms_norm_eps", 1.0e-6)),
             attention_bias=bool(source.get("attention_bias", False)),
             model_version=str(source.get("model_version", "turbo")),
-            is_turbo=bool(source.get("is_turbo", False)),
+            is_turbo=bool(
+                source.get("is_turbo", source.get("model_version", "turbo") == "turbo")
+            ),
             text_hidden_dim=text_width,
             timbre_hidden_dim=timbre_width,
             num_lyric_encoder_hidden_layers=lyric_layers,
             num_timbre_encoder_hidden_layers=timbre_layers,
+            num_audio_decoder_hidden_layers=audio_decoder_layers,
             timbre_fix_frame=timbre_frames,
         )
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> "AceStepDiTConfig":
+        """Load one DiT config file (or component directory)."""
+        path = Path(path)
+        if path.is_dir():
+            path /= "config.json"
+        source = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(source, dict):
+            raise ValueError(f"ACE-Step JSON object expected in {path}")
+        required = (
+            "model_type",
+            "model_version",
+            "hidden_size",
+            "intermediate_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "head_dim",
+            "in_channels",
+            "text_hidden_dim",
+            "num_lyric_encoder_hidden_layers",
+            "num_timbre_encoder_hidden_layers",
+            "num_audio_decoder_hidden_layers",
+            "patch_size",
+            "layer_types",
+        )
+        missing = [name for name in required if name not in source]
+        if missing:
+            raise ValueError(f"ACE-Step DiT config is missing {missing}")
+        if source.get("model_type") != "acestep":
+            raise ValueError("ACE-Step DiT config has an incompatible model_type")
+        return cls.from_dict(source)
+
+    load = from_file
+
+    # Compatibility names used by bundle discovery and older callers. Keeping
+    # these as properties avoids maintaining a second config representation.
+    @property
+    def layers(self) -> int:
+        return self.num_hidden_layers
+
+    @property
+    def query_heads(self) -> int:
+        return self.num_attention_heads
+
+    @property
+    def kv_heads(self) -> int:
+        return self.num_key_value_heads
+
+    @property
+    def input_channels(self) -> int:
+        return self.in_channels
+
+    @property
+    def text_hidden_size(self) -> int:
+        return self.text_hidden_dim
+
+    @property
+    def lyric_layers(self) -> int:
+        return self.num_lyric_encoder_hidden_layers
+
+    @property
+    def timbre_layers(self) -> int:
+        return self.num_timbre_encoder_hidden_layers
+
+    @property
+    def audio_decoder_layers(self) -> int:
+        return self.num_audio_decoder_hidden_layers
 
 
 @dataclass(frozen=True)

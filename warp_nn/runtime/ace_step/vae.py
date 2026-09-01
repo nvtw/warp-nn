@@ -57,6 +57,8 @@ class OobleckVAEConfig:
 
     @classmethod
     def from_dict(cls, config: dict) -> "OobleckVAEConfig":
+        if config.get("_class_name", "AutoencoderOobleck") != "AutoencoderOobleck":
+            raise ValueError("ACE-Step VAE must use AutoencoderOobleck")
         return cls(
             encoder_hidden_size=int(config.get("encoder_hidden_size", 128)),
             downsampling_ratios=tuple(
@@ -74,7 +76,31 @@ class OobleckVAEConfig:
         path = Path(path)
         if path.is_dir():
             path /= "config.json"
-        return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        config = json.loads(path.read_text(encoding="utf-8"))
+        required = (
+            "_class_name",
+            "sampling_rate",
+            "audio_channels",
+            "encoder_hidden_size",
+            "decoder_input_channels",
+            "decoder_channels",
+            "channel_multiples",
+            "downsampling_ratios",
+        )
+        missing = [name for name in required if name not in config]
+        if missing:
+            raise ValueError(f"Oobleck VAE config is missing {missing}")
+        return cls.from_dict(config)
+
+    load = from_file
+
+    @property
+    def sampling_ratios(self) -> tuple[int, ...]:
+        return self.downsampling_ratios
+
+    @property
+    def samples_per_latent(self) -> int:
+        return self.hop_length
 
 
 @lru_cache(maxsize=None)
