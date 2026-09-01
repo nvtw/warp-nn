@@ -54,6 +54,7 @@ def test_named_lora_adapters_deterministic_shapes_and_masters_cpu():
     collection = _collection(weights)
     duplicate = _collection(duplicate_weights)
 
+    assert collection.optimizer.learning_rate == pytest.approx(0.05)
     assert tuple(collection.targets) == ("attention.q", "attention.v", "mlp.up")
     assert tuple(collection.configs) == tuple(collection.targets)
     assert all(
@@ -128,6 +129,10 @@ def test_named_lora_adapter_lifecycle_keeps_pointers_and_base_frozen_cpu():
 
 def test_named_lora_adapter_validation_cpu():
     weight = wp.zeros((3, 4), dtype=wp.float16, device="cpu")
+    default = LoRAAdapterCollection(
+        {"x": weight}, {"x": 2}, {"x": LoRAAdapterConfig(1)}
+    )
+    assert default.optimizer.learning_rate == pytest.approx(1.0e-4)
     with pytest.raises(ValueError, match="exact target mapping"):
         LoRAAdapterCollection({"x": weight}, {"x": 2}, {"wrong": LoRAAdapterConfig(1)})
     with pytest.raises(TypeError, match="FP16 or BF16"):

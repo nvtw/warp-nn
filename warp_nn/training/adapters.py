@@ -150,9 +150,9 @@ class LoRAAdapterCollection:
         self.cublas = shared_cublas
         self.configs = MappingProxyType(dict(target_configs))
         self.targets = MappingProxyType(targets)
-        self.optimizer = AdamWPlan(
-            parameters, gradients, **dict(optimizer_options or {})
-        )
+        options = {"learning_rate": 1.0e-4}
+        options.update(optimizer_options or {})
+        self.optimizer = AdamWPlan(parameters, gradients, **options)
         parameter_names = tuple(
             key
             for name in names

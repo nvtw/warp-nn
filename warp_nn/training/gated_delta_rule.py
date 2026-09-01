@@ -245,25 +245,25 @@ def _kernels(
                     base_factor = wp.float32(0.0)
                     if segment_start <= token_start:
                         base_factor = wp.exp(log_value)
+                    prior_start = wp.max(0, segment_start - token_start)
                     delta_row = beta_value * (
                         wp.tile_map(to_fp32, value_row) - base_factor * retrieved_row
                     )
-                    for prior in range(row):
-                        if token_start + prior >= segment_start:
-                            prior_log = local_log_decay[
-                                batch, value_head, token_start + prior
-                            ]
-                            coefficient = (
-                                beta_value
-                                * wp.tile_extract(key_products, row, prior)
-                                * wp.exp(log_value - prior_log)
-                            )
-                            prior_delta = wp.tile_view(
-                                deltas,
-                                offset=(prior, 0),
-                                shape=(1, VALUE_TILE),
-                            )
-                            delta_row -= coefficient * wp.tile_map(to_fp32, prior_delta)
+                    for prior in range(prior_start, row):
+                        prior_log = local_log_decay[
+                            batch, value_head, token_start + prior
+                        ]
+                        coefficient = (
+                            beta_value
+                            * wp.tile_extract(key_products, row, prior)
+                            * wp.exp(log_value - prior_log)
+                        )
+                        prior_delta = wp.tile_view(
+                            deltas,
+                            offset=(prior, 0),
+                            shape=(1, VALUE_TILE),
+                        )
+                        delta_row -= coefficient * wp.tile_map(to_fp32, prior_delta)
                     stored_delta = wp.tile_map(to_storage, delta_row)
                     wp.tile_assign(deltas, stored_delta, offset=(row, 0))
                     output_row = base_factor * wp.tile_view(
@@ -271,22 +271,19 @@ def _kernels(
                         offset=(row, 0),
                         shape=(1, VALUE_TILE),
                     )
-                    for prior in range(row + 1):
-                        if token_start + prior >= segment_start:
-                            prior_log = local_log_decay[
-                                batch, value_head, token_start + prior
-                            ]
-                            coefficient = wp.tile_extract(
-                                query_products, row, prior
-                            ) * wp.exp(log_value - prior_log)
-                            prior_delta = wp.tile_view(
-                                deltas,
-                                offset=(prior, 0),
-                                shape=(1, VALUE_TILE),
-                            )
-                            output_row += coefficient * wp.tile_map(
-                                to_fp32, prior_delta
-                            )
+                    for prior in range(prior_start, row + 1):
+                        prior_log = local_log_decay[
+                            batch, value_head, token_start + prior
+                        ]
+                        coefficient = wp.tile_extract(
+                            query_products, row, prior
+                        ) * wp.exp(log_value - prior_log)
+                        prior_delta = wp.tile_view(
+                            deltas,
+                            offset=(prior, 0),
+                            shape=(1, VALUE_TILE),
+                        )
+                        output_row += coefficient * wp.tile_map(to_fp32, prior_delta)
                     wp.tile_assign(outputs, output_row, offset=(row, 0))
 
             valid_end = wp.min(length, wp.min(sequence, token_start + _CHUNK))
@@ -296,9 +293,10 @@ def _kernels(
                 end_log = local_log_decay[batch, value_head, valid_end - 1]
                 if wp.static(SEGMENTED):
                     final_segment_start = segment_bounds[batch, valid_end - 1, 0]
-            for row in range(_CHUNK):
+            final_row_start = wp.max(0, final_segment_start - token_start)
+            for row in range(final_row_start, _CHUNK):
                 token = token_start + row
-                if token < sequence and token < length and token >= final_segment_start:
+                if token < sequence and token < length:
                     factor = wp.exp(end_log - local_log_decay[batch, value_head, token])
                     wp.tile_assign(
                         weighted,
@@ -733,9 +731,6 @@ class GatedDeltaRulePlan:
         self._segmented_kernels = _kernels(
             dtype, key_size, value_size, self.value_tile, True
         )
-        self._dummy_segment_bounds = wp.empty(
-            (1, 1, 1), dtype=wp.int32, device=self.device
-        )
         self.local_log_decay = wp.empty(
             (batch, value_heads, sequence), dtype=wp.float32, device=self.device
         )
@@ -810,7 +805,7 @@ class GatedDeltaRulePlan:
     ):
         """Return output and final state while retaining reversible token deltas."""
         self._validate(query, key, value, decay, beta, lengths, past)
-        bounds = self._validate_segment_bounds(segment_bounds)
+        bounds = self._validate_segment_bounds(segment_bounds, lengths)
         kernels = (
             self._segmented_kernels if segment_bounds is not None else self._kernels
         )
@@ -908,7 +903,7 @@ class GatedDeltaRulePlan:
     ):
         """Reverse the recurrence into FP32 Q/K/V, gate, and past-state gradients."""
         self._validate(query, key, value, decay, beta, lengths, past)
-        bounds = self._validate_segment_bounds(segment_bounds)
+        bounds = self._validate_segment_bounds(segment_bounds, lengths)
         kernels = (
             self._segmented_kernels if segment_bounds is not None else self._kernels
         )
@@ -1025,9 +1020,9 @@ class GatedDeltaRulePlan:
                 f"on {self.device}"
             )
 
-    def _validate_segment_bounds(self, segment_bounds):
+    def _validate_segment_bounds(self, segment_bounds, lengths):
         if segment_bounds is None:
-            return self._dummy_segment_bounds
+            return lengths.reshape((self.batch, 1, 1))
         shape = (self.batch, self.sequence, 2)
         if (
             not isinstance(segment_bounds, wp.array)
