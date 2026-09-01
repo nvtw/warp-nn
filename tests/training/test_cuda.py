@@ -216,6 +216,52 @@ def test_cuda_bfloat16_tiled_linear_tails_and_graph_replay():
     np.testing.assert_array_equal(_numpy(grad_weight), grad_weight_reference)
 
 
+def test_cuda_bfloat16_tiled_lora_tails():
+    device = CUDA_DEVICES[0]
+    if device.arch < 80:
+        pytest.skip("BF16 tiled LoRA requires SM80 or newer")
+
+    rows, columns, inner, rank = 33, 35, 37, 2
+    scale = 0.25
+    rng = np.random.default_rng(97)
+    x = _array(rng.normal(0.0, 0.1, (rows, inner)), wp.bfloat16, device)
+    weight = _array(rng.normal(0.0, 0.1, (columns, inner)), wp.bfloat16, device)
+    lora_a = _array(rng.normal(0.0, 0.1, (rank, inner)), wp.bfloat16, device)
+    lora_b = _array(rng.normal(0.0, 0.1, (columns, rank)), wp.bfloat16, device)
+    grad_output = _array(rng.normal(0.0, 0.1, (rows, columns)), wp.bfloat16, device)
+    plan = LoRALinearTrainingPlan(
+        rows, inner, columns, rank, wp.bfloat16, device=device
+    )
+    # Exercise the non-split boundary-masked fallback explicitly.
+    plan.forward_matmul_splits = 1
+    plan.backward_matmul_splits = 1
+
+    plan.forward(x, weight, lora_a, lora_b, scale=scale)
+    plan.backward(x, weight, lora_a, lora_b, grad_output, scale=scale)
+    x_np, weight_np = _numpy(x), _numpy(weight)
+    a_np, b_np, dy_np = _numpy(lora_a), _numpy(lora_b), _numpy(grad_output)
+    hidden_reference = x_np @ a_np.T
+    grad_hidden_reference = scale * dy_np @ b_np
+    np.testing.assert_allclose(
+        _numpy(plan.hidden), hidden_reference, atol=0.01, rtol=0.01
+    )
+    np.testing.assert_allclose(
+        _numpy(plan.output),
+        x_np @ weight_np.T + scale * hidden_reference @ b_np.T,
+        atol=0.08,
+        rtol=0.03,
+    )
+    np.testing.assert_allclose(
+        _numpy(plan.grad_hidden), grad_hidden_reference, atol=0.01, rtol=0.01
+    )
+    np.testing.assert_allclose(
+        _numpy(plan.grad_input),
+        dy_np @ weight_np + grad_hidden_reference @ a_np,
+        atol=0.08,
+        rtol=0.03,
+    )
+
+
 def test_cuda_bfloat16_base_linear_split_k_and_graph_replay():
     device = CUDA_DEVICES[0]
     if device.arch < 80:

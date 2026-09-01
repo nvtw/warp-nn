@@ -187,12 +187,6 @@ class _TiledLinearKernels:
 
 
 @dataclass(frozen=True)
-class _TiledLoRAKernels:
-    transposed_right: object
-    regular_right: object
-
-
-@dataclass(frozen=True)
 class _SplitKLoRAKernels:
     transposed_right: object
     regular_right: object
@@ -206,61 +200,120 @@ _TILE_BLOCK_DIM = 128
 
 
 @lru_cache(maxsize=None)
-def _get_native_linear_kernel(
-    dtype: type, tile_m: int, tile_n: int, *, transposed_right: bool = True
+def _get_tiled_gemm_kernel(
+    dtype: type,
+    output_dtype: type,
+    *,
+    transposed_right: bool,
+    scale_output: bool,
 ):
-    # Wrap the shared SM80+ pipelined MMA projection primitive.
+    """Create one boundary-masked tensor-core GEMM specialization."""
+    if dtype not in _STORAGE_DTYPES or output_dtype not in (
+        dtype,
+        wp.float32,
+    ):
+        raise TypeError("tiled GEMM requires FP16/BF16 input and matching/FP32 output")
     DTYPE = dtype
-    project = get_prefill_mma_projection(
-        dtype, tile_m, tile_n, transposed_right=transposed_right
-    )
+    OUTPUT_DTYPE = output_dtype
+    TRANSPOSE_RIGHT = transposed_right
+    SCALE_OUTPUT = scale_output
+    FP32_OUTPUT = output_dtype == wp.float32
+
+    @wp.func
+    def cast_output(value: wp.float32):
+        return OUTPUT_DTYPE(value)
 
     @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
     def kernel(
-        x: wp.array2d(dtype=DTYPE),
-        weight: wp.array2d(dtype=DTYPE),
-        output: wp.array2d(dtype=DTYPE),
-        columns: int,
-        inner: int,
+        left: wp.array2d(dtype=DTYPE),
+        right: wp.array2d(dtype=DTYPE),
+        output: wp.array2d(dtype=OUTPUT_DTYPE),
+        reduction: int,
+        scale: wp.float32,
     ):
-        typed_zero = DTYPE(0.0)  # noqa: F841 - retain dtype in the Warp closure
-        wp.static(project)(x, weight, output, wp.tid(), columns, inner)
+        tile_row, tile_column = wp.tid()
+        accumulator = wp.tile_zeros(shape=(_TILE_M, _TILE_N), dtype=wp.float32)
+        for inner_tile in range((reduction + _TILE_K - 1) / _TILE_K):
+            inner_offset = inner_tile * _TILE_K
+            left_tile = wp.tile_load(
+                left,
+                shape=(_TILE_M, _TILE_K),
+                offset=(tile_row * _TILE_M, inner_offset),
+            )
+            if wp.static(TRANSPOSE_RIGHT):
+                right_tile = wp.tile_transpose(
+                    wp.tile_load(
+                        right,
+                        shape=(_TILE_N, _TILE_K),
+                        offset=(tile_column * _TILE_N, inner_offset),
+                    )
+                )
+            else:
+                right_tile = wp.tile_load(
+                    right,
+                    shape=(_TILE_K, _TILE_N),
+                    offset=(inner_offset, tile_column * _TILE_N),
+                )
+            wp.tile_matmul(left_tile, right_tile, accumulator)
+        if wp.static(SCALE_OUTPUT):
+            accumulator *= scale
+        if wp.static(FP32_OUTPUT):
+            wp.tile_store(
+                output,
+                accumulator,
+                offset=(tile_row * _TILE_M, tile_column * _TILE_N),
+            )
+        else:
+            wp.tile_store(
+                output,
+                wp.tile_map(cast_output, accumulator),
+                offset=(tile_row * _TILE_M, tile_column * _TILE_N),
+            )
 
     kernel.module.options["enable_backward"] = False
     return kernel
 
 
 @lru_cache(maxsize=None)
-def _get_native_split_k_linear_kernel(
-    dtype: type, tile_m: int, tile_n: int, *, transposed_right: bool = True
+def _get_native_linear_kernel(
+    dtype: type,
+    tile_m: int,
+    tile_n: int,
+    *,
+    transposed_right: bool = True,
+    split_k: bool = False,
 ):
-    """Wrap the shared SM80+ MMA primitive with an FP32 split-K output."""
+    """Wrap the shared SM80+ MMA pipeline for direct or split-K output."""
     DTYPE = dtype
-    project = get_prefill_mma_split_k_projection(
-        dtype, tile_m, tile_n, transposed_right=transposed_right
+    SPLIT_K = split_k
+    OUTPUT_DTYPE = wp.float32 if split_k else dtype
+    project = (
+        get_prefill_mma_split_k_projection(
+            dtype, tile_m, tile_n, transposed_right=transposed_right
+        )
+        if split_k
+        else get_prefill_mma_projection(
+            dtype, tile_m, tile_n, transposed_right=transposed_right
+        )
     )
 
     @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
     def kernel(
         x: wp.array2d(dtype=DTYPE),
         weight: wp.array2d(dtype=DTYPE),
-        partial: wp.array2d(dtype=wp.float32),
+        output: wp.array2d(dtype=OUTPUT_DTYPE),
         rows: int,
         columns: int,
         inner: int,
         splits: int,
     ):
         typed_zero = DTYPE(0.0)  # noqa: F841 - retain dtype in the Warp closure
-        wp.static(project)(
-            x,
-            weight,
-            partial,
-            wp.tid(),
-            rows,
-            columns,
-            inner,
-            splits,
-        )
+        if wp.static(SPLIT_K):
+            wp.static(project)(
+                x, weight, output, wp.tid(), rows, columns, inner, splits
+            )
+        else:
+            wp.static(project)(x, weight, output, wp.tid(), columns, inner)
 
     kernel.module.options["enable_backward"] = False
     return kernel
@@ -292,53 +345,6 @@ def _get_tiled_linear_kernels(dtype: type) -> _TiledLinearKernels:
     if dtype not in _STORAGE_DTYPES:
         raise TypeError("tiled training Linear supports FP16 and BF16 storage")
     DTYPE = dtype
-
-    @wp.func
-    def cast_output(value: wp.float32):
-        return DTYPE(value)
-
-    def create_low_output_kernel(transpose_right: bool):
-        TRANSPOSE_RIGHT = transpose_right
-
-        @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
-        def kernel(
-            left: wp.array2d(dtype=DTYPE),
-            right: wp.array2d(dtype=DTYPE),
-            output: wp.array2d(dtype=DTYPE),
-            reduction: int,
-        ):
-            tile_row, tile_column = wp.tid()
-            accumulator = wp.tile_zeros(shape=(_TILE_M, _TILE_N), dtype=wp.float32)
-            for inner_tile in range((reduction + _TILE_K - 1) / _TILE_K):
-                inner_offset = inner_tile * _TILE_K
-                left_tile = wp.tile_load(
-                    left,
-                    shape=(_TILE_M, _TILE_K),
-                    offset=(tile_row * _TILE_M, inner_offset),
-                )
-                if wp.static(TRANSPOSE_RIGHT):
-                    right_tile = wp.tile_transpose(
-                        wp.tile_load(
-                            right,
-                            shape=(_TILE_N, _TILE_K),
-                            offset=(tile_column * _TILE_N, inner_offset),
-                        )
-                    )
-                else:
-                    right_tile = wp.tile_load(
-                        right,
-                        shape=(_TILE_K, _TILE_N),
-                        offset=(inner_offset, tile_column * _TILE_N),
-                    )
-                wp.tile_matmul(left_tile, right_tile, accumulator)
-            wp.tile_store(
-                output,
-                wp.tile_map(cast_output, accumulator),
-                offset=(tile_row * _TILE_M, tile_column * _TILE_N),
-            )
-
-        kernel.module.options["enable_backward"] = False
-        return kernel
 
     @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
     def grad_weight(
@@ -379,67 +385,13 @@ def _get_tiled_linear_kernels(dtype: type) -> _TiledLinearKernels:
 
     grad_weight.module.options["enable_backward"] = False
     return _TiledLinearKernels(
-        forward=create_low_output_kernel(True),
-        grad_input=create_low_output_kernel(False),
+        forward=_get_tiled_gemm_kernel(
+            dtype, dtype, transposed_right=True, scale_output=False
+        ),
+        grad_input=_get_tiled_gemm_kernel(
+            dtype, dtype, transposed_right=False, scale_output=False
+        ),
         grad_weight=grad_weight,
-    )
-
-
-@lru_cache(maxsize=None)
-def _get_tiled_lora_kernels(dtype: type) -> _TiledLoRAKernels:
-    """Create tensor-core low-precision GEMMs with FP32 LoRA outputs."""
-    if dtype not in _STORAGE_DTYPES:
-        raise TypeError("tiled LoRA supports FP16 and BF16 storage")
-    DTYPE = dtype
-
-    def create_kernel(transpose_right: bool):
-        TRANSPOSE_RIGHT = transpose_right
-
-        @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
-        def kernel(
-            left: wp.array2d(dtype=DTYPE),
-            right: wp.array2d(dtype=DTYPE),
-            output: wp.array2d(dtype=wp.float32),
-            reduction: int,
-            scale: wp.float32,
-        ):
-            tile_row, tile_column = wp.tid()
-            accumulator = wp.tile_zeros(shape=(_TILE_M, _TILE_N), dtype=wp.float32)
-            for inner_tile in range((reduction + _TILE_K - 1) / _TILE_K):
-                inner_offset = inner_tile * _TILE_K
-                left_tile = wp.tile_load(
-                    left,
-                    shape=(_TILE_M, _TILE_K),
-                    offset=(tile_row * _TILE_M, inner_offset),
-                )
-                if wp.static(TRANSPOSE_RIGHT):
-                    right_tile = wp.tile_transpose(
-                        wp.tile_load(
-                            right,
-                            shape=(_TILE_N, _TILE_K),
-                            offset=(tile_column * _TILE_N, inner_offset),
-                        )
-                    )
-                else:
-                    right_tile = wp.tile_load(
-                        right,
-                        shape=(_TILE_K, _TILE_N),
-                        offset=(inner_offset, tile_column * _TILE_N),
-                    )
-                wp.tile_matmul(left_tile, right_tile, accumulator)
-            accumulator *= scale
-            wp.tile_store(
-                output,
-                accumulator,
-                offset=(tile_row * _TILE_M, tile_column * _TILE_N),
-            )
-
-        kernel.module.options["enable_backward"] = False
-        return kernel
-
-    return _TiledLoRAKernels(
-        transposed_right=create_kernel(True),
-        regular_right=create_kernel(False),
     )
 
 
@@ -653,8 +605,12 @@ def _launch_native_split_k(
         return False
     block_dim = tile_m * tile_n // 8
     wp.launch(
-        _get_native_split_k_linear_kernel(
-            left.dtype, tile_m, tile_n, transposed_right=transposed_right
+        _get_native_linear_kernel(
+            left.dtype,
+            tile_m,
+            tile_n,
+            transposed_right=transposed_right,
+            split_k=True,
         ),
         dim=(rows // tile_m) * (columns // tile_n) * splits * block_dim,
         inputs=[left, right, workspace, rows, columns, reduction, splits],
@@ -815,7 +771,7 @@ def linear_forward(
         wp.launch(
             _get_native_linear_kernel(x.dtype, tile_m, tile_n),
             dim=(rows // tile_m) * (columns // tile_n) * block_dim,
-            inputs=[x, weight, output, columns, inner],
+            inputs=[x, weight, output, rows, columns, inner, 1],
             block_dim=block_dim,
             device=x.device,
         )
@@ -828,6 +784,7 @@ def linear_forward(
             rows,
             columns,
             inner,
+            1.0,
         )
     else:
         wp.launch(
@@ -896,7 +853,7 @@ def linear_backward(
         wp.launch(
             _get_native_linear_kernel(x.dtype, tile_m, tile_n, transposed_right=False),
             dim=(rows // tile_m) * (inner // tile_n) * block_dim,
-            inputs=[grad_output, weight, grad_input, inner, columns],
+            inputs=[grad_output, weight, grad_input, rows, inner, columns, 1],
             block_dim=block_dim,
             device=x.device,
         )
@@ -911,6 +868,7 @@ def linear_backward(
             rows,
             inner,
             columns,
+            1.0,
         )
     else:
         wp.launch(
@@ -1006,7 +964,12 @@ def lora_forward(
         )
     elif _use_skinny_tiled(rows, x.shape[1], x.dtype, x.device, x, lora_a, hidden):
         _launch_tiled(
-            _get_tiled_lora_kernels(x.dtype).transposed_right,
+            _get_tiled_gemm_kernel(
+                x.dtype,
+                wp.float32,
+                transposed_right=True,
+                scale_output=True,
+            ),
             x,
             lora_a,
             hidden,
@@ -1106,7 +1069,12 @@ def lora_backward(
         grad_hidden,
     ):
         _launch_tiled(
-            _get_tiled_lora_kernels(x.dtype).regular_right,
+            _get_tiled_gemm_kernel(
+                x.dtype,
+                wp.float32,
+                transposed_right=False,
+                scale_output=True,
+            ),
             grad_output,
             lora_b,
             grad_hidden,
