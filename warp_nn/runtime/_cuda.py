@@ -386,6 +386,12 @@ _PREFILL_MMA_PROJECTION = r"""
 
     const int row = warp_row * 16 + (lane >> 2);
     const int col = column + warp_column * 16 + (lane & 3) * 2;
+    OUTPUT_EPILOGUE
+#endif
+"""
+
+
+_PREFILL_MMA_LOW_PRECISION_EPILOGUE = r"""
     op[row * columns + col] = OUTPUT_TYPE(c0);
     op[row * columns + col + 1] = OUTPUT_TYPE(c1);
     op[(row + 8) * columns + col] = OUTPUT_TYPE(c2);
@@ -394,7 +400,14 @@ _PREFILL_MMA_PROJECTION = r"""
     op[row * columns + col + 9] = OUTPUT_TYPE(c5);
     op[(row + 8) * columns + col + 8] = OUTPUT_TYPE(c6);
     op[(row + 8) * columns + col + 9] = OUTPUT_TYPE(c7);
-#endif
+"""
+
+
+_PREFILL_MMA_FP32_EPILOGUE = r"""
+    *reinterpret_cast<float2*>(op + row * columns + col) = make_float2(c0, c1);
+    *reinterpret_cast<float2*>(op + (row + 8) * columns + col) = make_float2(c2, c3);
+    *reinterpret_cast<float2*>(op + row * columns + col + 8) = make_float2(c4, c5);
+    *reinterpret_cast<float2*>(op + (row + 8) * columns + col + 8) = make_float2(c6, c7);
 """
 
 
@@ -504,8 +517,14 @@ def _prefill_mma_projection_snippet(
     snippet = _PREFILL_MMA_PROJECTION
     for marker, replacement in layout.items():
         snippet = snippet.replace(marker, replacement)
+    epilogue = (
+        _PREFILL_MMA_FP32_EPILOGUE
+        if output_type == "static_cast<float>"
+        else _PREFILL_MMA_LOW_PRECISION_EPILOGUE
+    )
     return (
         snippet.replace("BLOCK_SETUP", block_setup)
+        .replace("OUTPUT_EPILOGUE", epilogue)
         .replace("OUTPUT_POINTER", output_pointer)
         .replace("OUTPUT_TYPE", output_type)
         .replace("NATIVE_TYPE", native_type)
