@@ -750,6 +750,8 @@ def test_cuda_adamw_master_and_bfloat16_mirror_graph_replay():
         beta1=0.0,
         beta2=0.0,
         epsilon=1.0e-8,
+        warmup_steps=2,
+        total_steps=4,
     )
     wp.synchronize_device(device)
     pointers = (
@@ -759,6 +761,7 @@ def test_cuda_adamw_master_and_bfloat16_mirror_graph_replay():
         plan.first_moments[0].ptr,
         plan.second_moments[0].ptr,
         plan.step_count.ptr,
+        plan.effective_learning_rate.ptr,
     )
 
     wp.capture_begin(device=device)
@@ -771,7 +774,7 @@ def test_cuda_adamw_master_and_bfloat16_mirror_graph_replay():
     wp.capture_launch(graph)
     wp.capture_launch(graph)
 
-    expected_master = initial - np.float32(0.25) * np.sign(gradient_values)
+    expected_master = initial - np.float32(0.1875) * np.sign(gradient_values)
     np.testing.assert_array_equal(plan.step_count.numpy(), [2])
     np.testing.assert_array_equal(
         plan.masters[0].numpy().reshape(initial.shape), expected_master
@@ -786,6 +789,7 @@ def test_cuda_adamw_master_and_bfloat16_mirror_graph_replay():
         plan.first_moments[0].ptr,
         plan.second_moments[0].ptr,
         plan.step_count.ptr,
+        plan.effective_learning_rate.ptr,
     )
 
 

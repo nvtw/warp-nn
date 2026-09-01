@@ -20,9 +20,15 @@ def _prepare_step(
     all_finite: wp.array1d[wp.int32],
     step_enabled: wp.array1d[wp.int32],
     multiplier: wp.array1d[wp.float32],
+    step: wp.array1d[wp.int32],
+    effective_learning_rate: wp.array1d[wp.float32],
     normalize_by_valid_tokens: bool,
     loss_scale: wp.float32,
     legacy_multiplier: wp.float32,
+    learning_rate: wp.float32,
+    warmup_steps: wp.int32,
+    total_steps: wp.int32,
+    min_learning_rate_ratio: wp.float32,
 ):
     all_finite[0] = 1
     step_enabled[0] = 1
@@ -33,6 +39,26 @@ def _prepare_step(
             multiplier[0] = wp.float32(1.0) / (loss_scale * wp.float32(count))
         else:
             step_enabled[0] = 0
+    factor = wp.float32(1.0)
+    candidate_step = step[0] + 1
+    if total_steps > 0:
+        if warmup_steps > 0 and candidate_step <= warmup_steps:
+            factor = wp.float32(candidate_step) / wp.float32(warmup_steps)
+        else:
+            progress = wp.clamp(
+                wp.float32(candidate_step - warmup_steps)
+                / wp.float32(total_steps - warmup_steps),
+                wp.float32(0.0),
+                wp.float32(1.0),
+            )
+            cosine = wp.float32(0.5) * (
+                wp.float32(1.0) + wp.cos(wp.float32(3.141592653589793) * progress)
+            )
+            factor = (
+                min_learning_rate_ratio
+                + (wp.float32(1.0) - min_learning_rate_ratio) * cosine
+            )
+    effective_learning_rate[0] = learning_rate * factor
 
 
 @wp.kernel(enable_backward=False)
@@ -104,7 +130,7 @@ def _get_adamw_kernels(dtype: type) -> _AdamWKernels:
         all_finite: wp.array1d[wp.int32],
         step_enabled: wp.array1d[wp.int32],
         gradient_multiplier: wp.array1d[wp.float32],
-        learning_rate: wp.float32,
+        learning_rate: wp.array1d[wp.float32],
         beta1: wp.float32,
         beta2: wp.float32,
         epsilon: wp.float32,
@@ -123,7 +149,7 @@ def _get_adamw_kernels(dtype: type) -> _AdamWKernels:
         corrected_second = second / (wp.float32(1.0) - wp.pow(beta2, step_value))
         value = master[index]
         update = corrected_first / (wp.sqrt(corrected_second) + epsilon)
-        updated = value - learning_rate * (update + weight_decay * value)
+        updated = value - learning_rate[0] * (update + weight_decay * value)
         master[index] = updated
         parameter[index] = DTYPE(updated)
 
@@ -163,6 +189,9 @@ class AdamWPlan:
         loss_scale: float = 1.0,
         accumulation_steps: int = 1,
         normalize_by_valid_tokens: bool = False,
+        warmup_steps: int = 0,
+        total_steps: int | None = None,
+        min_learning_rate_ratio: float = 0.0,
     ):
         if not parameters or len(parameters) != len(gradients):
             raise ValueError(
@@ -188,6 +217,21 @@ class AdamWPlan:
             raise ValueError(
                 "weight_decay must be non-negative and accumulation_steps positive"
             )
+        if not isinstance(warmup_steps, int) or warmup_steps < 0:
+            raise ValueError("warmup_steps must be a non-negative integer")
+        if total_steps is not None and (
+            not isinstance(total_steps, int) or total_steps <= 0
+        ):
+            raise ValueError("total_steps must be a positive integer or None")
+        if total_steps is None:
+            if warmup_steps != 0 or min_learning_rate_ratio != 0.0:
+                raise ValueError("warmup and minimum learning rate require total_steps")
+        elif warmup_steps >= total_steps:
+            raise ValueError("warmup_steps must be smaller than total_steps")
+        if not math.isfinite(min_learning_rate_ratio) or not (
+            0.0 <= min_learning_rate_ratio <= 1.0
+        ):
+            raise ValueError("min_learning_rate_ratio must be in [0, 1]")
 
         device = parameters[0].device
         slots = []
@@ -234,6 +278,7 @@ class AdamWPlan:
         self.all_finite = wp.ones(1, dtype=wp.int32, device=device)
         self.step_enabled = wp.ones(1, dtype=wp.int32, device=device)
         self.normalization_multiplier = wp.empty(1, dtype=wp.float32, device=device)
+        self.effective_learning_rate = wp.empty(1, dtype=wp.float32, device=device)
         self.learning_rate = float(learning_rate)
         self.beta1 = float(beta1)
         self.beta2 = float(beta2)
@@ -242,6 +287,9 @@ class AdamWPlan:
         self.loss_scale = float(loss_scale)
         self.gradient_multiplier = 1.0 / (self.loss_scale * accumulation_steps)
         self.normalize_by_valid_tokens = bool(normalize_by_valid_tokens)
+        self.warmup_steps = int(warmup_steps)
+        self.total_steps = 0 if total_steps is None else int(total_steps)
+        self.min_learning_rate_ratio = float(min_learning_rate_ratio)
 
     @property
     def first_moments(self) -> tuple[wp.array, ...]:
@@ -299,9 +347,15 @@ class AdamWPlan:
                 self.all_finite,
                 self.step_enabled,
                 self.normalization_multiplier,
+                self.step_count,
+                self.effective_learning_rate,
                 self.normalize_by_valid_tokens,
                 self.loss_scale,
                 self.gradient_multiplier,
+                self.learning_rate,
+                self.warmup_steps,
+                self.total_steps,
+                self.min_learning_rate_ratio,
             ],
             device=self.device,
         )
@@ -336,7 +390,7 @@ class AdamWPlan:
                     self.all_finite,
                     self.step_enabled,
                     self.normalization_multiplier,
-                    self.learning_rate,
+                    self.effective_learning_rate,
                     self.beta1,
                     self.beta2,
                     self.epsilon,
