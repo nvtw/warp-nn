@@ -8,7 +8,8 @@ import warp as wp
 
 from warp_nn.training.linear import (
     _get_linear_kernels,
-    _get_tiled_linear_kernels,
+    _get_tiled_gemm_kernel,
+    _get_tiled_weight_gradient_kernel,
     linear_backward,
     linear_forward,
     lora_backward,
@@ -167,12 +168,21 @@ def test_kernels_are_cached_by_storage_dtype():
 
 
 def test_linear_rejects_non_fp32_weight_gradient():
-    assert _get_tiled_linear_kernels(wp.float16) is _get_tiled_linear_kernels(
-        wp.float16
+    tiled = _get_tiled_gemm_kernel(
+        wp.float16,
+        wp.float16,
+        transposed_right=True,
+        scale_output=False,
     )
-    assert _get_tiled_linear_kernels(wp.float16) is not _get_tiled_linear_kernels(
-        wp.bfloat16
+    assert tiled is _get_tiled_gemm_kernel(
+        wp.float16,
+        wp.float16,
+        transposed_right=True,
+        scale_output=False,
     )
+    weight_gradient = _get_tiled_weight_gradient_kernel(wp.float16)
+    assert weight_gradient is _get_tiled_weight_gradient_kernel(wp.float16)
+    assert weight_gradient is not _get_tiled_weight_gradient_kernel(wp.bfloat16)
     x = wp.zeros((2, 3), dtype=wp.float16, device="cpu")
     weight = wp.zeros((4, 3), dtype=wp.float16, device="cpu")
     grad_output = wp.zeros((2, 4), dtype=wp.float16, device="cpu")

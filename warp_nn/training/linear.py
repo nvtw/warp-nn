@@ -180,13 +180,6 @@ def _get_linear_kernels(dtype: type) -> _LinearKernels:
 
 
 @dataclass(frozen=True)
-class _TiledLinearKernels:
-    forward: object
-    grad_input: object
-    grad_weight: object
-
-
-@dataclass(frozen=True)
 class _SplitKLoRAKernels:
     transposed_right: object
     regular_right: object
@@ -340,8 +333,8 @@ def _get_native_split_k_combine_kernel(dtype: type):
 
 
 @lru_cache(maxsize=None)
-def _get_tiled_linear_kernels(dtype: type) -> _TiledLinearKernels:
-    """Create one shared tensor-core GEMM family for Linear and its gradients."""
+def _get_tiled_weight_gradient_kernel(dtype: type):
+    """Create the distinct transposed-output FP32 weight-gradient GEMM."""
     if dtype not in _STORAGE_DTYPES:
         raise TypeError("tiled training Linear supports FP16 and BF16 storage")
     DTYPE = dtype
@@ -384,15 +377,7 @@ def _get_tiled_linear_kernels(dtype: type) -> _TiledLinearKernels:
         )
 
     grad_weight.module.options["enable_backward"] = False
-    return _TiledLinearKernels(
-        forward=_get_tiled_gemm_kernel(
-            dtype, dtype, transposed_right=True, scale_output=False
-        ),
-        grad_input=_get_tiled_gemm_kernel(
-            dtype, dtype, transposed_right=False, scale_output=False
-        ),
-        grad_weight=grad_weight,
-    )
+    return grad_weight
 
 
 @lru_cache(maxsize=None)
@@ -777,7 +762,12 @@ def linear_forward(
         )
     elif _use_tiled(rows, columns, inner, x.dtype, x.device, x, weight, output):
         _launch_tiled(
-            _get_tiled_linear_kernels(x.dtype).forward,
+            _get_tiled_gemm_kernel(
+                x.dtype,
+                x.dtype,
+                transposed_right=True,
+                scale_output=False,
+            ),
             x,
             weight,
             output,
@@ -861,7 +851,12 @@ def linear_backward(
         rows, inner, columns, x.dtype, x.device, grad_output, weight, grad_input
     ):
         _launch_tiled(
-            _get_tiled_linear_kernels(x.dtype).grad_input,
+            _get_tiled_gemm_kernel(
+                x.dtype,
+                x.dtype,
+                transposed_right=False,
+                scale_output=False,
+            ),
             grad_output,
             weight,
             grad_input,
@@ -883,7 +878,7 @@ def linear_backward(
         return
     if _use_tiled(columns, inner, rows, x.dtype, x.device, grad_output, x, grad_weight):
         _launch_tiled(
-            _get_tiled_linear_kernels(x.dtype).grad_weight,
+            _get_tiled_weight_gradient_kernel(x.dtype),
             grad_output,
             x,
             grad_weight,

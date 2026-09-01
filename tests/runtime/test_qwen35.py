@@ -487,7 +487,10 @@ def test_qwen35_single_slot_decode_uses_batch_one_plan_and_isolates_state(tmp_pa
             recurrent_before[slot * recurrent_rows : (slot + 1) * recurrent_rows],
         )
         np.testing.assert_array_equal(conv_after[slot], conv_before[slot])
-        np.testing.assert_array_equal(
+        # Unwritten cache rows may hold NaNs; isolation requires exact values
+        # and matching NaN positions, not initialized padding.
+        assert np.array_equal(
             key_after[slot * cache_rows : (slot + 1) * cache_rows],
             key_before[slot * cache_rows : (slot + 1) * cache_rows],
+            equal_nan=True,
         )
