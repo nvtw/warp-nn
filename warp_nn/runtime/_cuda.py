@@ -548,6 +548,7 @@ def get_prefill_mma_projection(
     tile_n: int,
     *,
     transposed_right: bool = True,
+    stage_k: int = 32,
 ):
     """Return an SM80+ GEMM primitive for either right-operand storage layout."""
     snippet = _prefill_mma_projection_snippet(
@@ -561,7 +562,7 @@ def get_prefill_mma_projection(
         ),
         output_pointer="NATIVE_TYPE* op = output.data + row_base * columns;",
         output_type="NATIVE_TYPE",
-        stage_k=32,
+        stage_k=stage_k,
     )
 
     @wp.func_native(snippet)

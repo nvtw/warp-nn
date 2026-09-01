@@ -275,6 +275,7 @@ def _get_native_linear_kernel(
     *,
     transposed_right: bool = True,
     split_k: bool = False,
+    stage_k: int = 32,
 ):
     """Wrap the shared SM80+ MMA pipeline for direct or split-K output."""
     DTYPE = dtype
@@ -286,7 +287,11 @@ def _get_native_linear_kernel(
         )
         if split_k
         else get_prefill_mma_projection(
-            dtype, tile_m, tile_n, transposed_right=transposed_right
+            dtype,
+            tile_m,
+            tile_n,
+            transposed_right=transposed_right,
+            stage_k=stage_k,
         )
     )
 
@@ -754,7 +759,12 @@ def linear_forward(
         tile_m, tile_n = native_geometry
         block_dim = tile_m * tile_n // 8
         wp.launch(
-            _get_native_linear_kernel(x.dtype, tile_m, tile_n),
+            _get_native_linear_kernel(
+                x.dtype,
+                tile_m,
+                tile_n,
+                stage_k=64 if rows >= 128 and inner % 64 == 0 else 32,
+            ),
             dim=(rows // tile_m) * (columns // tile_n) * block_dim,
             inputs=[x, weight, output, rows, columns, inner, 1],
             block_dim=block_dim,
@@ -841,7 +851,13 @@ def linear_backward(
         tile_m, tile_n = native_geometry
         block_dim = tile_m * tile_n // 8
         wp.launch(
-            _get_native_linear_kernel(x.dtype, tile_m, tile_n, transposed_right=False),
+            _get_native_linear_kernel(
+                x.dtype,
+                tile_m,
+                tile_n,
+                transposed_right=False,
+                stage_k=64 if rows >= 128 and columns % 64 == 0 else 32,
+            ),
             dim=(rows // tile_m) * (inner // tile_n) * block_dim,
             inputs=[grad_output, weight, grad_input, rows, inner, columns, 1],
             block_dim=block_dim,

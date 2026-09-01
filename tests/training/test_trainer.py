@@ -78,6 +78,38 @@ def test_trainer_direct_steps_and_adapter_restore_cpu(tmp_path):
     }
 
 
+def test_trainer_accumulation_matches_manual_valid_token_update_cpu():
+    trainer = _trainer("cpu")
+    reference = _trainer("cpu")
+    trainer.model.adapters.optimizer.normalize_by_valid_tokens = True
+    reference.model.adapters.optimizer.normalize_by_valid_tokens = True
+    batches = (
+        prepare_sft_batch([SFTExample(prompt=[1], response=[3, 5])], 2, pad_token_id=0),
+        prepare_sft_batch([SFTExample(prompt=[2], response=[4, 6])], 2, pad_token_id=0),
+    )
+
+    trainer.begin_accumulation()
+    for batch in batches:
+        trainer.load_batch(batch)
+        trainer.accumulate()
+    trainer.finish_accumulation()
+
+    model = reference.model
+    model.adapters.zero_grad()
+    for batch in batches:
+        inputs = (*batch.upload("cpu"), reference.cosine, reference.sine)
+        model.forward(*inputs, reduction="sum")
+        model.backward(*inputs, reduction="sum", accumulate=True)
+        model.adapters.optimizer.accumulate_valid_tokens(model.output.valid_count)
+    model.adapters.step()
+
+    assert int(trainer.model.adapters.optimizer.step_count.numpy()[0]) == 1
+    for name, master in trainer.model.adapters.named_masters.items():
+        np.testing.assert_array_equal(
+            master.numpy(), reference.model.adapters.named_masters[name].numpy()
+        )
+
+
 CUDA_DEVICES = [device for device in wp.get_devices() if device.is_cuda]
 
 
@@ -95,3 +127,21 @@ def test_trainer_captures_without_warmup_update_and_converges():
 
     assert int(optimizer.step_count.numpy()[0]) == 20
     assert final < initial
+
+
+@pytest.mark.skipif(not CUDA_DEVICES, reason="CUDA device required")
+def test_trainer_captures_valid_token_accumulation():
+    trainer = _trainer(CUDA_DEVICES[0])
+    optimizer = trainer.model.adapters.optimizer
+    optimizer.normalize_by_valid_tokens = True
+    trainer.capture_accumulation()
+    assert int(optimizer.step_count.numpy()[0]) == 0
+
+    trainer.begin_accumulation()
+    trainer.accumulate()
+    trainer.accumulate()
+    trainer.finish_accumulation()
+    wp.synchronize_device(trainer.device)
+
+    assert int(optimizer.step_count.numpy()[0]) == 1
+    assert int(optimizer.valid_token_count.numpy()[0]) == 4

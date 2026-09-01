@@ -49,7 +49,10 @@ class LoRATrainer:
         self.lengths = wp.empty(batch, dtype=wp.int32, device=self.device)
         self.positions = wp.empty((batch, sequence), dtype=wp.int64, device=self.device)
         self.graph = None
+        self.accumulation_graph = None
+        self.update_graph = None
         self._loaded = False
+        self._accumulating = False
 
     @property
     def _inputs(self):
@@ -78,8 +81,19 @@ class LoRATrainer:
             raise RuntimeError("load a batch before evaluation")
         return float(self.model.forward(*self._inputs).numpy()[0])
 
+    def _capture_graph(self, launch):
+        wp.capture_begin(device=self.device)
+        try:
+            launch()
+            return wp.capture_end(device=self.device)
+        except Exception:
+            wp.capture_end(device=self.device)
+            raise
+
     def capture(self) -> None:
         """Compile and capture the complete zero-grad through AdamW step."""
+        if self._accumulating:
+            raise RuntimeError("finish gradient accumulation before capture")
         if not self.device.is_cuda:
             raise RuntimeError("CUDA graph capture requires a CUDA model")
         if not self._loaded:
@@ -89,16 +103,74 @@ class LoRATrainer:
         self.model.backward(*self._inputs)
         self.model.adapters.zero_grad()
         wp.synchronize_device(self.device)
-        wp.capture_begin(device=self.device)
-        try:
-            self.model.train_step(*self._inputs)
-            self.graph = wp.capture_end(device=self.device)
-        except Exception:
-            wp.capture_end(device=self.device)
-            raise
+        self.graph = self._capture_graph(lambda: self.model.train_step(*self._inputs))
+
+    def _accumulate(self) -> wp.array:
+        loss = self.model.forward(*self._inputs, reduction="sum")
+        self.model.backward(*self._inputs, reduction="sum", accumulate=True)
+        self.model.adapters.optimizer.accumulate_valid_tokens(
+            self.model.output.valid_count
+        )
+        return loss
+
+    def capture_accumulation(self) -> None:
+        """Capture one summed-gradient microbatch and its separate AdamW update."""
+        if self._accumulating:
+            raise RuntimeError("finish gradient accumulation before capture")
+        if not self.device.is_cuda:
+            raise RuntimeError("CUDA graph capture requires a CUDA model")
+        if not self._loaded:
+            raise RuntimeError("load a batch before capture")
+        optimizer = self.model.adapters.optimizer
+        if not optimizer.normalize_by_valid_tokens:
+            raise RuntimeError(
+                "gradient accumulation requires normalize_by_valid_tokens=True"
+            )
+        self.model.adapters.zero_grad()
+        self._accumulate()
+        self.model.adapters.zero_grad()
+        wp.synchronize_device(self.device)
+        self.accumulation_graph = self._capture_graph(self._accumulate)
+        self.update_graph = self._capture_graph(self.model.adapters.step)
+        self.model.adapters.zero_grad()
+
+    def begin_accumulation(self) -> None:
+        """Begin an exact valid-token-normalized microbatch accumulation window."""
+        if self._accumulating:
+            raise RuntimeError("gradient accumulation is already active")
+        if not self.model.adapters.optimizer.normalize_by_valid_tokens:
+            raise RuntimeError(
+                "gradient accumulation requires normalize_by_valid_tokens=True"
+            )
+        self.model.adapters.zero_grad()
+        self._accumulating = True
+
+    def accumulate(self) -> wp.array:
+        """Add the loaded microbatch's summed gradients to the active window."""
+        if not self._loaded:
+            raise RuntimeError("load a batch before training")
+        if not self._accumulating:
+            raise RuntimeError("begin gradient accumulation first")
+        if self.accumulation_graph is None:
+            return self._accumulate()
+        wp.capture_launch(self.accumulation_graph)
+        return self.model.output.loss
+
+    def finish_accumulation(self) -> wp.array:
+        """Apply one AdamW update normalized by all accumulated valid tokens."""
+        if not self._accumulating:
+            raise RuntimeError("begin gradient accumulation first")
+        if self.update_graph is None:
+            self.model.adapters.step()
+        else:
+            wp.capture_launch(self.update_graph)
+        self._accumulating = False
+        return self.model.output.loss
 
     def step(self) -> wp.array:
         """Launch one direct or captured update and return the fixed loss scalar."""
+        if self._accumulating:
+            raise RuntimeError("use accumulate while gradient accumulation is active")
         if not self._loaded:
             raise RuntimeError("load a batch before training")
         if self.graph is None:
