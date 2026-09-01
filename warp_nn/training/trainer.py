@@ -48,6 +48,10 @@ class LoRATrainer:
         self.targets = wp.empty(model.rows, dtype=wp.int32, device=self.device)
         self.lengths = wp.empty(batch, dtype=wp.int32, device=self.device)
         self.positions = wp.empty((batch, sequence), dtype=wp.int64, device=self.device)
+        self.segment_bounds = wp.empty(
+            (batch, sequence, 2), dtype=wp.int32, device=self.device
+        )
+        self._segment_bounds_input = None
         self.graph = None
         self.accumulation_graph = None
         self.update_graph = None
@@ -73,13 +77,35 @@ class LoRATrainer:
         self.targets.assign(batch.targets.reshape(-1))
         self.lengths.assign(batch.lengths)
         self.positions.assign(batch.positions)
+        segment_bounds = batch.segment_bounds
+        was_segmented = self._segment_bounds_input is not None
+        if segment_bounds is not None and segment_bounds.shape != (
+            self.batch,
+            self.sequence,
+            2,
+        ):
+            raise ValueError(
+                f"batch segment bounds must have shape {(self.batch, self.sequence, 2)}"
+            )
+        if segment_bounds is not None:
+            self.segment_bounds.assign(segment_bounds)
+            self._segment_bounds_input = self.segment_bounds
+        else:
+            self._segment_bounds_input = None
+        if was_segmented != (self._segment_bounds_input is not None):
+            self.graph = None
+            self.accumulation_graph = None
         self._loaded = True
 
     def evaluate_loss(self) -> float:
         """Run forward only and return the synchronized mean loss."""
         if not self._loaded:
             raise RuntimeError("load a batch before evaluation")
-        return float(self.model.forward(*self._inputs).numpy()[0])
+        return float(
+            self.model.forward(
+                *self._inputs, segment_bounds=self._segment_bounds_input
+            ).numpy()[0]
+        )
 
     def _capture_graph(self, launch):
         wp.capture_begin(device=self.device)
@@ -99,15 +125,28 @@ class LoRATrainer:
         if not self._loaded:
             raise RuntimeError("load a batch before capture")
         self.model.adapters.zero_grad()
-        self.model.forward(*self._inputs)
-        self.model.backward(*self._inputs)
+        self.model.forward(*self._inputs, segment_bounds=self._segment_bounds_input)
+        self.model.backward(*self._inputs, segment_bounds=self._segment_bounds_input)
         self.model.adapters.zero_grad()
         wp.synchronize_device(self.device)
-        self.graph = self._capture_graph(lambda: self.model.train_step(*self._inputs))
+        self.graph = self._capture_graph(
+            lambda: self.model.train_step(
+                *self._inputs, segment_bounds=self._segment_bounds_input
+            )
+        )
 
     def _accumulate(self) -> wp.array:
-        loss = self.model.forward(*self._inputs, reduction="sum")
-        self.model.backward(*self._inputs, reduction="sum", accumulate=True)
+        loss = self.model.forward(
+            *self._inputs,
+            segment_bounds=self._segment_bounds_input,
+            reduction="sum",
+        )
+        self.model.backward(
+            *self._inputs,
+            segment_bounds=self._segment_bounds_input,
+            reduction="sum",
+            accumulate=True,
+        )
         self.model.adapters.optimizer.accumulate_valid_tokens(
             self.model.output.valid_count
         )
@@ -174,7 +213,9 @@ class LoRATrainer:
         if not self._loaded:
             raise RuntimeError("load a batch before training")
         if self.graph is None:
-            return self.model.train_step(*self._inputs)
+            return self.model.train_step(
+                *self._inputs, segment_bounds=self._segment_bounds_input
+            )
         wp.capture_launch(self.graph)
         return self.model.output.loss
 

@@ -106,14 +106,26 @@ class MuseLoRATransformerBlockPlan:
         self.input_grad = wp.empty(shape, dtype=wp.float32, device=self.device)
 
     def forward(
-        self, x: wp.array, lengths: wp.array, positions=None, cosine=None, sine=None
+        self,
+        x: wp.array,
+        lengths: wp.array,
+        positions=None,
+        cosine=None,
+        sine=None,
+        *,
+        segment_bounds=None,
     ) -> wp.array:
         """Execute the exact Muse layer into the fixed output buffer."""
         input_norm = self.input_norm.forward(
             x.reshape(self.shape4), self.weights[0]
         ).reshape(self.shape)
         attention_output = self.attention.forward(
-            input_norm, lengths, positions, cosine, sine
+            input_norm,
+            lengths,
+            positions,
+            cosine,
+            sine,
+            segment_bounds=segment_bounds,
         )
         post_attention = self.post_attention_norm.forward(
             attention_output.reshape(self.shape4), self.weights[1]
@@ -138,6 +150,7 @@ class MuseLoRATransformerBlockPlan:
         cosine=None,
         sine=None,
         *,
+        segment_bounds=None,
         accumulate: bool = False,
     ) -> wp.array:
         """Reverse the exact Muse layer and return fixed FP32 input gradients."""
@@ -178,6 +191,7 @@ class MuseLoRATransformerBlockPlan:
             positions,
             cosine,
             sine,
+            segment_bounds=segment_bounds,
             accumulate=accumulate,
         )
         attention_input_grad = self.input_norm.backward(

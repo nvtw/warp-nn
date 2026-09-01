@@ -40,7 +40,7 @@ def _numpy(array):
     return np.asarray(array.numpy(), dtype=np.float32)
 
 
-def _gqa_reference(query, key, value, lengths, scale, window):
+def _gqa_reference(query, key, value, lengths, scale, window, segment_bounds=None):
     output = np.zeros_like(query, dtype=np.float32)
     lse = np.full(query.shape[:3], -np.finfo(np.float32).max, dtype=np.float32)
     heads_per_kv = query.shape[1] // key.shape[1]
@@ -49,6 +49,8 @@ def _gqa_reference(query, key, value, lengths, scale, window):
             kv_head = head // heads_per_kv
             for token in range(int(length)):
                 first = max(0, token + 1 - window) if window else 0
+                if segment_bounds is not None:
+                    first = max(first, int(segment_bounds[batch, token, 0]))
                 keys = slice(first, token + 1)
                 scores = key[batch, kv_head, keys] @ query[batch, head, token] * scale
                 maximum = np.max(scores)
@@ -59,7 +61,9 @@ def _gqa_reference(query, key, value, lengths, scale, window):
     return output, lse
 
 
-def _gqa_backward_reference(query, key, value, output_grad, lengths, scale, window):
+def _gqa_backward_reference(
+    query, key, value, output_grad, lengths, scale, window, segment_bounds=None
+):
     query_grad = np.zeros_like(query, dtype=np.float32)
     key_grad = np.zeros_like(key, dtype=np.float32)
     value_grad = np.zeros_like(value, dtype=np.float32)
@@ -69,6 +73,8 @@ def _gqa_backward_reference(query, key, value, output_grad, lengths, scale, wind
             kv_head = head // heads_per_kv
             for token in range(int(length)):
                 first = max(0, token + 1 - window) if window else 0
+                if segment_bounds is not None:
+                    first = max(first, int(segment_bounds[batch, token, 0]))
                 keys = slice(first, token + 1)
                 scores = key[batch, kv_head, keys] @ query[batch, head, token] * scale
                 probabilities = np.exp(scores - np.max(scores))
@@ -532,6 +538,79 @@ def test_cuda_streaming_gqa_backward_reference_and_accumulate(dtype, head_size, 
         np.testing.assert_allclose(
             actual, 2.0 * expected, atol=2.0 * gradient_atol, rtol=2e-3
         )
+
+
+def test_cuda_segmented_flash_gqa_matches_isolated_examples():
+    device = CUDA_DEVICES[0]
+    rng = np.random.default_rng(313)
+    batch, query_heads, kv_heads, sequence, head_size = 1, 4, 2, 18, 128
+    query_shape = (batch, query_heads, sequence, head_size)
+    kv_shape = (batch, kv_heads, sequence, head_size)
+    query = _array(rng.normal(0.0, 0.2, query_shape), wp.bfloat16, device)
+    key = _array(rng.normal(0.0, 0.2, kv_shape), wp.bfloat16, device)
+    value = _array(rng.normal(0.0, 0.2, kv_shape), wp.bfloat16, device)
+    output_grad = _array(rng.normal(0.0, 0.2, query_shape), wp.bfloat16, device)
+    lengths_np = np.array([sequence], dtype=np.int32)
+    lengths = _array(lengths_np, wp.int32, device)
+    bounds_np = np.empty((batch, sequence, 2), dtype=np.int32)
+    bounds_np[:, :7] = (0, 7)
+    bounds_np[:, 7:] = (7, sequence)
+    bounds = _array(bounds_np, wp.int32, device)
+    output = wp.empty(query_shape, dtype=wp.bfloat16, device=device)
+    lse = wp.empty(query_shape[:3], dtype=wp.float32, device=device)
+    accumulator = wp.empty(query_shape, dtype=wp.float32, device=device)
+    query_grad = wp.empty(query_shape, dtype=wp.float32, device=device)
+    key_grad = wp.empty(kv_shape, dtype=wp.float32, device=device)
+    value_grad = wp.empty(kv_shape, dtype=wp.float32, device=device)
+    delta = wp.empty(query_shape[:3], dtype=wp.float32, device=device)
+    scale = head_size**-0.5
+
+    gqa_attention_forward(
+        query,
+        key,
+        value,
+        lengths,
+        output,
+        lse,
+        accumulator,
+        segment_bounds=bounds,
+        scale=scale,
+    )
+    gqa_attention_backward(
+        query,
+        key,
+        value,
+        output_grad,
+        lengths,
+        lse,
+        query_grad,
+        key_grad,
+        value_grad,
+        delta,
+        segment_bounds=bounds,
+        scale=scale,
+    )
+
+    query_np, key_np, value_np = _numpy(query), _numpy(key), _numpy(value)
+    forward = _gqa_reference(
+        query_np, key_np, value_np, lengths_np, scale, 0, bounds_np
+    )
+    backward = _gqa_backward_reference(
+        query_np,
+        key_np,
+        value_np,
+        _numpy(output_grad),
+        lengths_np,
+        scale,
+        0,
+        bounds_np,
+    )
+    np.testing.assert_allclose(_numpy(output), forward[0], atol=2e-2, rtol=8e-3)
+    np.testing.assert_allclose(_numpy(lse), forward[1], atol=5e-4, rtol=5e-4)
+    for actual, expected in zip(
+        (_numpy(query_grad), _numpy(key_grad), _numpy(value_grad)), backward
+    ):
+        np.testing.assert_allclose(actual, expected, atol=2e-3, rtol=2e-3)
 
 
 def test_cuda_rms_tape_and_stable_cross_entropy():

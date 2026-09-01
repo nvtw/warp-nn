@@ -106,14 +106,26 @@ class QwenLoRATransformerBlockPlan:
         self.input_grad = wp.empty(self.shape, dtype=wp.float32, device=self.device)
 
     def forward(
-        self, x: wp.array, lengths: wp.array, positions=None, cosine=None, sine=None
+        self,
+        x: wp.array,
+        lengths: wp.array,
+        positions=None,
+        cosine=None,
+        sine=None,
+        *,
+        segment_bounds=None,
     ) -> wp.array:
         """Execute the exact Qwen attention layer."""
         normalized = self.input_norm.forward(
             x.reshape(self.shape4), self.weights[0]
         ).reshape(self.shape)
         attention_output = self.attention.forward(
-            normalized, lengths, positions, cosine, sine
+            normalized,
+            lengths,
+            positions,
+            cosine,
+            sine,
+            segment_bounds=segment_bounds,
         )
         residual_forward(x, attention_output, self.attention_residual)
         mlp_input = self.post_attention_norm.forward(
@@ -133,6 +145,7 @@ class QwenLoRATransformerBlockPlan:
         cosine=None,
         sine=None,
         *,
+        segment_bounds=None,
         accumulate: bool = False,
     ) -> wp.array:
         """Reverse the Qwen layer and return its fixed FP32 input gradient."""
@@ -160,6 +173,7 @@ class QwenLoRATransformerBlockPlan:
             positions,
             cosine,
             sine,
+            segment_bounds=segment_bounds,
             accumulate=accumulate,
         )
         attention_input_grad = self.input_norm.backward(

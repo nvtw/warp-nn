@@ -32,7 +32,13 @@ class _RuleKernels:
 
 
 @lru_cache(maxsize=None)
-def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
+def _kernels(
+    dtype: type,
+    key_size: int,
+    value_size: int,
+    value_tile: int,
+    segmented: bool = False,
+):
     DTYPE = dtype
     KEY_SIZE = key_size
     VALUE_SIZE = value_size
@@ -40,7 +46,9 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
     REVERSE_TILE = min(16, VALUE_TILE)
     MATERIALIZE_TILE = min(8, VALUE_TILE)
     PARTIAL_ROWS = KEY_SIZE // REVERSE_TILE if KEY_SIZE % REVERSE_TILE == 0 else 0
+    ZERO_PARTIAL_ROWS = 2 * PARTIAL_ROWS + 1
     DETERMINISTIC_PARTIALS = _can_store_backward_partials(KEY_SIZE, VALUE_TILE)
+    SEGMENTED = segmented
 
     @wp.func
     def to_fp32(value: DTYPE):
@@ -62,6 +70,7 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
     def log_decay(
         decay: wp.array3d(dtype=wp.float32),
         lengths: wp.array1d(dtype=wp.int32),
+        segment_bounds: wp.array3d(dtype=wp.int32),
         output: wp.array3d(dtype=wp.float32),
     ):
         batch, head, chunk = wp.tid()
@@ -71,6 +80,9 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
         for row in range(_CHUNK):
             token = start + row
             if token < decay.shape[1] and token < length:
+                if wp.static(SEGMENTED):
+                    if token == segment_bounds[batch, token, 0]:
+                        total = wp.float32(0.0)
                 total += wp.log(wp.max(decay[batch, token, head], wp.float32(1.0e-30)))
                 output[batch, head, token] = total
             elif token < decay.shape[1]:
@@ -84,6 +96,7 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
         decay: wp.array3d(dtype=wp.float32),
         beta: wp.array3d(dtype=wp.float32),
         lengths: wp.array1d(dtype=wp.int32),
+        segment_bounds: wp.array3d(dtype=wp.int32),
         past: wp.array4d(dtype=wp.float32),
         output: wp.array4d(dtype=DTYPE),
         transformed: wp.array4d(dtype=DTYPE),
@@ -96,6 +109,10 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
         length = wp.clamp(lengths[batch], 0, query.shape[2])
         for token in range(query.shape[2]):
             if token < length:
+                if wp.static(SEGMENTED):
+                    if token > 0 and segment_bounds[batch, token, 0] == token:
+                        for column in range(KEY_SIZE):
+                            past[batch, value_head, column, value_column] = 0.0
                 decay_value = decay[batch, token, value_head]
                 retrieved = wp.float32(0.0)
                 for column in range(KEY_SIZE):
@@ -143,6 +160,7 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
         local_log_decay: wp.array3d(dtype=wp.float32),
         beta: wp.array3d(dtype=wp.float32),
         lengths: wp.array1d(dtype=wp.int32),
+        segment_bounds: wp.array3d(dtype=wp.int32),
         past: wp.array2d(dtype=wp.float32),
         output: wp.array2d(dtype=DTYPE),
         transformed: wp.array2d(dtype=DTYPE),
@@ -213,6 +231,9 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
             for row in range(_CHUNK):
                 token = token_start + row
                 if token < sequence and token < length:
+                    segment_start = token_start
+                    if wp.static(SEGMENTED):
+                        segment_start = segment_bounds[batch, token, 0]
                     log_value = local_log_decay[batch, value_head, token]
                     beta_value = beta[batch, token, value_head]
                     value_row = wp.tile_view(
@@ -221,54 +242,63 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
                     retrieved_row = wp.tile_view(
                         retrieved, offset=(row, 0), shape=(1, VALUE_TILE)
                     )
+                    base_factor = wp.float32(0.0)
+                    if segment_start <= token_start:
+                        base_factor = wp.exp(log_value)
                     delta_row = beta_value * (
-                        wp.tile_map(to_fp32, value_row)
-                        - wp.exp(log_value) * retrieved_row
+                        wp.tile_map(to_fp32, value_row) - base_factor * retrieved_row
                     )
                     for prior in range(row):
-                        prior_log = local_log_decay[
-                            batch, value_head, token_start + prior
-                        ]
-                        coefficient = (
-                            beta_value
-                            * wp.tile_extract(key_products, row, prior)
-                            * wp.exp(log_value - prior_log)
-                        )
-                        prior_delta = wp.tile_view(
-                            deltas,
-                            offset=(prior, 0),
-                            shape=(1, VALUE_TILE),
-                        )
-                        delta_row -= coefficient * wp.tile_map(to_fp32, prior_delta)
+                        if token_start + prior >= segment_start:
+                            prior_log = local_log_decay[
+                                batch, value_head, token_start + prior
+                            ]
+                            coefficient = (
+                                beta_value
+                                * wp.tile_extract(key_products, row, prior)
+                                * wp.exp(log_value - prior_log)
+                            )
+                            prior_delta = wp.tile_view(
+                                deltas,
+                                offset=(prior, 0),
+                                shape=(1, VALUE_TILE),
+                            )
+                            delta_row -= coefficient * wp.tile_map(to_fp32, prior_delta)
                     stored_delta = wp.tile_map(to_storage, delta_row)
                     wp.tile_assign(deltas, stored_delta, offset=(row, 0))
-                    output_row = wp.exp(log_value) * wp.tile_view(
+                    output_row = base_factor * wp.tile_view(
                         base_output,
                         offset=(row, 0),
                         shape=(1, VALUE_TILE),
                     )
                     for prior in range(row + 1):
-                        prior_log = local_log_decay[
-                            batch, value_head, token_start + prior
-                        ]
-                        coefficient = wp.tile_extract(
-                            query_products, row, prior
-                        ) * wp.exp(log_value - prior_log)
-                        prior_delta = wp.tile_view(
-                            deltas,
-                            offset=(prior, 0),
-                            shape=(1, VALUE_TILE),
-                        )
-                        output_row += coefficient * wp.tile_map(to_fp32, prior_delta)
+                        if token_start + prior >= segment_start:
+                            prior_log = local_log_decay[
+                                batch, value_head, token_start + prior
+                            ]
+                            coefficient = wp.tile_extract(
+                                query_products, row, prior
+                            ) * wp.exp(log_value - prior_log)
+                            prior_delta = wp.tile_view(
+                                deltas,
+                                offset=(prior, 0),
+                                shape=(1, VALUE_TILE),
+                            )
+                            output_row += coefficient * wp.tile_map(
+                                to_fp32, prior_delta
+                            )
                     wp.tile_assign(outputs, output_row, offset=(row, 0))
 
             valid_end = wp.min(length, wp.min(sequence, token_start + _CHUNK))
             end_log = wp.float32(0.0)
+            final_segment_start = token_start
             if valid_end > token_start:
                 end_log = local_log_decay[batch, value_head, valid_end - 1]
+                if wp.static(SEGMENTED):
+                    final_segment_start = segment_bounds[batch, valid_end - 1, 0]
             for row in range(_CHUNK):
                 token = token_start + row
-                if token < sequence and token < length:
+                if token < sequence and token < length and token >= final_segment_start:
                     factor = wp.exp(end_log - local_log_decay[batch, value_head, token])
                     wp.tile_assign(
                         weighted,
@@ -283,7 +313,10 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
                         ),
                         offset=(row, 0),
                     )
-            state *= wp.exp(end_log)
+            if final_segment_start > token_start:
+                state = wp.tile_zeros(shape=(KEY_SIZE, VALUE_TILE), dtype=wp.float32)
+            else:
+                state *= wp.exp(end_log)
             wp.tile_matmul(wp.tile_transpose(keys), weighted, state)
             wp.tile_store(
                 transformed,
@@ -303,6 +336,7 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
         key: wp.array2d(dtype=DTYPE),
         decay: wp.array3d(dtype=wp.float32),
         lengths: wp.array1d(dtype=wp.int32),
+        segment_bounds: wp.array3d(dtype=wp.int32),
         transformed: wp.array2d(dtype=DTYPE),
         checkpoints: wp.array2d(dtype=wp.float32),
         states: wp.array2d(dtype=wp.float32),
@@ -332,6 +366,11 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
             for row in range(_CHUNK):
                 token = chunk * _CHUNK + row
                 if token < length:
+                    if wp.static(SEGMENTED):
+                        if token > 0 and segment_bounds[batch, token, 0] == token:
+                            state = wp.tile_zeros(
+                                shape=(KEY_SIZE, MATERIALIZE_TILE), dtype=wp.float32
+                            )
                     state_base = (
                         (batch * value_heads + value_head) * sequence + token
                     ) * KEY_SIZE
@@ -355,6 +394,7 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
         decay: wp.array3d(dtype=wp.float32),
         beta: wp.array3d(dtype=wp.float32),
         lengths: wp.array1d(dtype=wp.int32),
+        segment_bounds: wp.array3d(dtype=wp.int32),
         transformed: wp.array2d(dtype=DTYPE),
         present: wp.array2d(dtype=wp.float32),
         states: wp.array2d(dtype=wp.float32),
@@ -488,6 +528,11 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
                     retrieved_gradient_storage,
                     state_gradient,
                 )
+                if wp.static(SEGMENTED):
+                    if token > 0 and segment_bounds[batch, token, 0] == token:
+                        state_gradient = wp.tile_zeros(
+                            shape=(KEY_SIZE, REVERSE_TILE), dtype=wp.float32
+                        )
                 if accumulate:
                     value_gradient += wp.tile_load(
                         value_grad,
@@ -554,6 +599,18 @@ def _kernels(dtype: type, key_size: int, value_size: int, value_tile: int):
                         ),
                         offset=(batch, token, value_head),
                     )
+            elif wp.static(DETERMINISTIC_PARTIALS):
+                token_state_base = (
+                    (batch * value_heads + value_head) * sequence + token
+                ) * KEY_SIZE
+                wp.tile_store(
+                    states,
+                    wp.tile_zeros(
+                        shape=(ZERO_PARTIAL_ROWS, REVERSE_TILE),
+                        dtype=wp.float32,
+                    ),
+                    offset=(token_state_base, value_offset),
+                )
 
         if accumulate:
             state_gradient += wp.tile_load(
@@ -673,6 +730,12 @@ class GatedDeltaRulePlan:
             key_size, self.value_tile
         )
         self._kernels = _kernels(dtype, key_size, value_size, self.value_tile)
+        self._segmented_kernels = _kernels(
+            dtype, key_size, value_size, self.value_tile, True
+        )
+        self._dummy_segment_bounds = wp.empty(
+            (1, 1, 1), dtype=wp.int32, device=self.device
+        )
         self.local_log_decay = wp.empty(
             (batch, value_heads, sequence), dtype=wp.float32, device=self.device
         )
@@ -733,20 +796,35 @@ class GatedDeltaRulePlan:
             and (self.dtype != wp.float16 or self.device.arch >= 70)
         )
 
-    def forward(self, query, key, value, decay, beta, lengths, past):
+    def forward(
+        self,
+        query,
+        key,
+        value,
+        decay,
+        beta,
+        lengths,
+        past,
+        *,
+        segment_bounds=None,
+    ):
         """Return output and final state while retaining reversible token deltas."""
         self._validate(query, key, value, decay, beta, lengths, past)
+        bounds = self._validate_segment_bounds(segment_bounds)
+        kernels = (
+            self._segmented_kernels if segment_bounds is not None else self._kernels
+        )
         wp.launch(
-            self._kernels.log_decay,
+            kernels.log_decay,
             dim=(self.batch, self.value_heads, self.chunks),
-            inputs=[decay, lengths],
+            inputs=[decay, lengths, bounds],
             outputs=[self.local_log_decay],
             device=self.device,
         )
         if self.uses_tensor_cores:
             value_tiles = self.value_size // self.value_tile
             wp.launch_tiled(
-                self._kernels.chunkwise,
+                kernels.chunkwise,
                 dim=self.batch * self.value_heads * value_tiles,
                 inputs=[
                     query.reshape(
@@ -761,6 +839,7 @@ class GatedDeltaRulePlan:
                     self.local_log_decay,
                     beta,
                     lengths,
+                    bounds,
                     past.reshape(
                         (self.batch * self.value_heads * self.key_size, self.value_size)
                     ),
@@ -791,7 +870,7 @@ class GatedDeltaRulePlan:
         else:
             wp.copy(self.present, past)
             wp.launch(
-                self._kernels.scalar,
+                kernels.scalar,
                 dim=(self.batch, self.value_heads, self.value_size),
                 inputs=[
                     query,
@@ -800,6 +879,7 @@ class GatedDeltaRulePlan:
                     decay,
                     beta,
                     lengths,
+                    bounds,
                     self.present,
                     self.output,
                     self.transformed,
@@ -822,11 +902,16 @@ class GatedDeltaRulePlan:
         past,
         output_grad,
         *,
+        segment_bounds=None,
         present_grad=None,
         accumulate: bool = False,
     ):
         """Reverse the recurrence into FP32 Q/K/V, gate, and past-state gradients."""
         self._validate(query, key, value, decay, beta, lengths, past)
+        bounds = self._validate_segment_bounds(segment_bounds)
+        kernels = (
+            self._segmented_kernels if segment_bounds is not None else self._kernels
+        )
         value_shape = (self.batch, self.value_heads, self.sequence, self.value_size)
         state_shape = (self.batch, self.value_heads, self.key_size, self.value_size)
         self._validate_gradient(output_grad, value_shape, "output")
@@ -849,12 +934,13 @@ class GatedDeltaRulePlan:
         value_tiles = self.value_size // min(16, self.value_tile)
         materialize_tiles = self.value_size // min(8, self.value_tile)
         wp.launch_tiled(
-            self._kernels.materialize_states,
+            kernels.materialize_states,
             dim=self.batch * self.value_heads * materialize_tiles,
             inputs=[
                 key.reshape((query_rows, self.key_size)),
                 decay,
                 lengths,
+                bounds,
                 self.transformed.reshape((value_rows, self.value_size)),
                 self.checkpoints.reshape(
                     (
@@ -872,7 +958,7 @@ class GatedDeltaRulePlan:
             device=self.device,
         )
         wp.launch_tiled(
-            self._kernels.reverse,
+            kernels.reverse,
             dim=self.batch * self.value_heads * value_tiles,
             inputs=[
                 query.reshape((query_rows, self.key_size)),
@@ -881,6 +967,7 @@ class GatedDeltaRulePlan:
                 decay,
                 beta,
                 lengths,
+                bounds,
                 self.transformed.reshape((value_rows, self.value_size)),
                 self.present.reshape((state_rows, self.value_size)),
                 self.state_workspace,
@@ -937,6 +1024,23 @@ class GatedDeltaRulePlan:
                 f"Gated Delta {name} gradient must be contiguous FP32 {shape} "
                 f"on {self.device}"
             )
+
+    def _validate_segment_bounds(self, segment_bounds):
+        if segment_bounds is None:
+            return self._dummy_segment_bounds
+        shape = (self.batch, self.sequence, 2)
+        if (
+            not isinstance(segment_bounds, wp.array)
+            or segment_bounds.shape != shape
+            or segment_bounds.dtype != wp.int32
+            or segment_bounds.device != self.device
+            or not segment_bounds.is_contiguous
+        ):
+            raise ValueError(
+                f"Gated Delta segment bounds must be contiguous INT32 {shape} "
+                f"on {self.device}"
+            )
+        return segment_bounds
 
     def _validate(self, query, key, value, decay, beta, lengths, past):
         expected = (

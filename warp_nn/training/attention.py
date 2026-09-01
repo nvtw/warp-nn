@@ -510,6 +510,20 @@ def _validate_array(array, shape, dtype, device, name: str) -> None:
         raise ValueError(f"GQA {name} must be on the query device")
 
 
+def _validate_segment_bounds(segment_bounds, batch: int, sequence: int, device) -> None:
+    if segment_bounds is None:
+        return
+    _validate_array(
+        segment_bounds,
+        (batch, sequence, 2),
+        wp.int32,
+        device,
+        "segment bounds",
+    )
+    if not segment_bounds.is_contiguous:
+        raise ValueError("GQA segment bounds must be contiguous")
+
+
 def gqa_attention_forward(
     query,
     key,
@@ -519,6 +533,7 @@ def gqa_attention_forward(
     lse,
     accumulator,
     *,
+    segment_bounds=None,
     scale: float | None = None,
     window: int = 0,
 ) -> None:
@@ -545,6 +560,7 @@ def gqa_attention_forward(
     effective_scale = head_size**-0.5 if scale is None else float(scale)
     if not math.isfinite(effective_scale):
         raise ValueError("GQA scale must be finite")
+    _validate_segment_bounds(segment_bounds, batch, sequence, query.device)
 
     if query.device.is_cuda:
         if head_size % 8 == 0:
@@ -556,10 +572,13 @@ def gqa_attention_forward(
                 output,
                 lse,
                 accumulator,
+                segment_bounds=segment_bounds,
                 scale=effective_scale,
                 window=window,
             )
             return
+        if segment_bounds is not None:
+            raise ValueError("segmented GQA requires the tensor-core attention path")
         kernels = _attention_kernels(query.dtype, head_size)
         block_dim = min(1024, max(32, 1 << (head_size - 1).bit_length()))
         wp.launch_tiled(
@@ -581,6 +600,8 @@ def gqa_attention_forward(
         )
         return
 
+    if segment_bounds is not None:
+        raise ValueError("segmented GQA is currently GPU-only")
     kernels = _attention_kernels(query.dtype)
     accumulator.zero_()
     wp.launch(
@@ -612,6 +633,7 @@ def gqa_attention_backward(
     value_grad,
     delta,
     *,
+    segment_bounds=None,
     scale: float | None = None,
     window: int = 0,
     accumulate: bool = False,
@@ -644,6 +666,7 @@ def gqa_attention_backward(
     effective_scale = head_size**-0.5 if scale is None else float(scale)
     if not math.isfinite(effective_scale):
         raise ValueError("GQA scale must be finite")
+    _validate_segment_bounds(segment_bounds, batch, sequence, query.device)
 
     if query.device.is_cuda:
         kernels = _attention_kernels(query.dtype, head_size)
@@ -658,11 +681,16 @@ def gqa_attention_backward(
                 lse,
                 delta,
                 query_grad,
+                segment_bounds=segment_bounds,
                 scale=effective_scale,
                 window=window,
                 accumulate=accumulate,
             )
         else:
+            if segment_bounds is not None:
+                raise ValueError(
+                    "segmented GQA requires the tensor-core attention path"
+                )
             wp.launch_tiled(
                 kernels[1],
                 dim=batch * query_heads * sequence,
@@ -693,6 +721,7 @@ def gqa_attention_backward(
                 delta,
                 key_grad,
                 value_grad,
+                segment_bounds=segment_bounds,
                 scale=effective_scale,
                 window=window,
                 accumulate=accumulate,
@@ -720,6 +749,8 @@ def gqa_attention_backward(
             )
         return
 
+    if segment_bounds is not None:
+        raise ValueError("segmented GQA is currently GPU-only")
     kernels = _attention_kernels(query.dtype)
     if not accumulate:
         query_grad.zero_()

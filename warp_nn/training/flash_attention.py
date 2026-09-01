@@ -15,12 +15,21 @@ _SUPPORTED_DTYPES = (wp.float16, wp.bfloat16)
 
 
 @lru_cache(maxsize=None)
-def _forward_kernel(dtype: type, head_size: int):
+def _forward_kernel(dtype: type, head_size: int, segmented: bool = False):
     DTYPE = dtype
     HEAD_SIZE = head_size
+    SEGMENTED = segmented
 
     @wp.func
     def maximum(left: wp.float32, right: wp.float32):
+        return wp.max(left, right)
+
+    @wp.func
+    def minimum(left: wp.int32, right: wp.int32):
+        return wp.min(left, right)
+
+    @wp.func
+    def maximum_int(left: wp.int32, right: wp.int32):
         return wp.max(left, right)
 
     @wp.func
@@ -79,6 +88,7 @@ def _forward_kernel(dtype: type, head_size: int):
         key: wp.array2d(dtype=DTYPE),
         value: wp.array2d(dtype=DTYPE),
         lengths: wp.array1d(dtype=wp.int32),
+        segment_bounds: wp.array2d(dtype=wp.int32),
         output: wp.array2d(dtype=DTYPE),
         lse: wp.array1d(dtype=wp.float32),
         workspace: wp.array2d(dtype=wp.float32),
@@ -114,6 +124,19 @@ def _forward_kernel(dtype: type, head_size: int):
         query_offsets = wp.tile_arange(_QUERY_TILE, dtype=wp.int32)
         row_ends = wp.tile_map(row_end, query_offsets, query_start)
         row_firsts = wp.tile_map(row_first, row_ends, window)
+        if wp.static(SEGMENTED):
+            bounds = wp.tile_load(
+                segment_bounds,
+                shape=(_QUERY_TILE, 2),
+                offset=(batch * sequence + query_start, 0),
+            )
+            segment_first_column = wp.tile_zeros(shape=(_QUERY_TILE, 1), dtype=wp.int32)
+            wp.tile_assign(
+                segment_first_column,
+                wp.tile_view(bounds, offset=(0, 0), shape=(_QUERY_TILE, 1)),
+            )
+            segment_firsts = wp.tile_reshape(segment_first_column, shape=(_QUERY_TILE,))
+            row_firsts = wp.tile_map(maximum_int, row_firsts, segment_firsts)
         row_end_group = wp.tile_broadcast(
             wp.tile_reshape(row_ends, shape=(_QUERY_TILE, 1)),
             shape=(_QUERY_TILE, _KEY_TILE),
@@ -124,8 +147,12 @@ def _forward_kernel(dtype: type, head_size: int):
         )
         key_offsets = wp.tile_arange(_KEY_TILE, dtype=wp.int32)
         key_limit = wp.min(length, query_start + _QUERY_TILE)
+        key_begin = wp.int32(0)
+        if wp.static(SEGMENTED):
+            first = wp.tile_extract(wp.tile_reduce(minimum, row_firsts), 0)
+            key_begin = (first / _KEY_TILE) * _KEY_TILE
 
-        for key_start in range(0, key_limit, _KEY_TILE):
+        for key_start in range(key_begin, key_limit, _KEY_TILE):
             keys = wp.tile_load(
                 key,
                 shape=(_KEY_TILE, HEAD_SIZE),
@@ -217,11 +244,20 @@ def _backward_tile_shape(head_size: int) -> tuple[int, int]:
 
 
 @lru_cache(maxsize=None)
-def _query_backward_kernel(dtype: type, head_size: int):
+def _query_backward_kernel(dtype: type, head_size: int, segmented: bool = False):
     """Build the tensor-core softmax-delta and query-gradient pass."""
     DTYPE = dtype
     HEAD_SIZE = head_size
     QUERY_TILE, KEY_TILE = _backward_tile_shape(head_size)
+    SEGMENTED = segmented
+
+    @wp.func
+    def maximum(left: wp.int32, right: wp.int32):
+        return wp.max(left, right)
+
+    @wp.func
+    def minimum(left: wp.int32, right: wp.int32):
+        return wp.min(left, right)
 
     @wp.func
     def add_offset(offset: wp.int32, base: wp.int32):
@@ -267,6 +303,7 @@ def _query_backward_kernel(dtype: type, head_size: int):
         value: wp.array2d(dtype=DTYPE),
         output_grad: wp.array2d(dtype=DTYPE),
         lengths: wp.array1d(dtype=wp.int32),
+        segment_bounds: wp.array2d(dtype=wp.int32),
         lse: wp.array1d(dtype=wp.float32),
         delta: wp.array1d(dtype=wp.float32),
         query_grad: wp.array2d(dtype=wp.float32),
@@ -308,6 +345,19 @@ def _query_backward_kernel(dtype: type, head_size: int):
         query_offsets = wp.tile_arange(QUERY_TILE, dtype=wp.int32)
         ends = wp.tile_map(row_end, query_offsets, query_start)
         firsts = wp.tile_map(row_first, ends, window)
+        if wp.static(SEGMENTED):
+            bounds = wp.tile_load(
+                segment_bounds,
+                shape=(QUERY_TILE, 2),
+                offset=(batch * sequence + query_start, 0),
+            )
+            segment_first_column = wp.tile_zeros(shape=(QUERY_TILE, 1), dtype=wp.int32)
+            wp.tile_assign(
+                segment_first_column,
+                wp.tile_view(bounds, offset=(0, 0), shape=(QUERY_TILE, 1)),
+            )
+            segment_firsts = wp.tile_reshape(segment_first_column, shape=(QUERY_TILE,))
+            firsts = wp.tile_map(maximum, firsts, segment_firsts)
         end_group = wp.tile_broadcast(
             wp.tile_reshape(ends, shape=(QUERY_TILE, 1)),
             shape=(QUERY_TILE, KEY_TILE),
@@ -318,9 +368,13 @@ def _query_backward_kernel(dtype: type, head_size: int):
         )
         key_offsets = wp.tile_arange(KEY_TILE, dtype=wp.int32)
         key_limit = wp.min(length, query_start + QUERY_TILE)
+        key_begin = wp.int32(0)
+        if wp.static(SEGMENTED):
+            first = wp.tile_extract(wp.tile_reduce(minimum, firsts), 0)
+            key_begin = (first / KEY_TILE) * KEY_TILE
         delta_values = wp.tile_zeros(shape=(QUERY_TILE,), dtype=wp.float32)
 
-        for key_start in range(0, key_limit, KEY_TILE):
+        for key_start in range(key_begin, key_limit, KEY_TILE):
             keys = wp.tile_load(
                 key,
                 shape=(KEY_TILE, HEAD_SIZE),
@@ -369,7 +423,7 @@ def _query_backward_kernel(dtype: type, head_size: int):
             wp.tile_reshape(delta_values, shape=(QUERY_TILE, 1)),
             shape=(QUERY_TILE, KEY_TILE),
         )
-        for key_start in range(0, key_limit, KEY_TILE):
+        for key_start in range(key_begin, key_limit, KEY_TILE):
             keys = wp.tile_load(
                 key,
                 shape=(KEY_TILE, HEAD_SIZE),
@@ -441,6 +495,7 @@ def flash_gqa_query_backward(
     delta,
     query_grad,
     *,
+    segment_bounds=None,
     scale: float,
     window: int,
     accumulate: bool,
@@ -451,8 +506,9 @@ def flash_gqa_query_backward(
     query_tile, _ = _backward_tile_shape(head_size)
     query_rows = batch * query_heads * sequence
     kv_rows = batch * kv_heads * sequence
+    bounds = _checked_segment_bounds(segment_bounds, lengths, batch, sequence)
     wp.launch_tiled(
-        _query_backward_kernel(query.dtype, head_size),
+        _query_backward_kernel(query.dtype, head_size, segment_bounds is not None),
         dim=batch * query_heads * ((sequence + query_tile - 1) // query_tile),
         inputs=[
             query.reshape((query_rows, head_size)),
@@ -460,6 +516,7 @@ def flash_gqa_query_backward(
             value.reshape((kv_rows, head_size)),
             output_grad.reshape((query_rows, head_size)),
             lengths,
+            bounds,
             lse.flatten(),
             delta.flatten(),
             query_grad.reshape((query_rows, head_size)),
@@ -476,11 +533,16 @@ def flash_gqa_query_backward(
 
 
 @lru_cache(maxsize=None)
-def _key_value_backward_kernel(dtype: type, head_size: int):
+def _key_value_backward_kernel(dtype: type, head_size: int, segmented: bool = False):
     """Build the unique-writer tensor-core key/value-gradient pass."""
     DTYPE = dtype
     HEAD_SIZE = head_size
     QUERY_TILE, KEY_TILE = _backward_tile_shape(head_size)
+    SEGMENTED = segmented
+
+    @wp.func
+    def maximum(left: wp.int32, right: wp.int32):
+        return wp.max(left, right)
 
     @wp.func
     def add_offset(offset: wp.int32, base: wp.int32):
@@ -526,6 +588,7 @@ def _key_value_backward_kernel(dtype: type, head_size: int):
         value: wp.array2d(dtype=DTYPE),
         output_grad: wp.array2d(dtype=DTYPE),
         lengths: wp.array1d(dtype=wp.int32),
+        segment_bounds: wp.array2d(dtype=wp.int32),
         lse: wp.array1d(dtype=wp.float32),
         delta: wp.array1d(dtype=wp.float32),
         key_grad: wp.array2d(dtype=wp.float32),
@@ -577,9 +640,28 @@ def _key_value_backward_kernel(dtype: type, head_size: int):
         )
         query_offsets = wp.tile_arange(QUERY_TILE, dtype=wp.int32)
         heads_per_kv = query_heads / kv_heads
+        query_begin = wp.int32(0)
+        query_limit = length
+        if wp.static(SEGMENTED):
+            bounds = wp.tile_load(
+                segment_bounds,
+                shape=(KEY_TILE, 2),
+                offset=(batch * sequence + key_start, 0),
+            )
+            segment_end_column = wp.tile_zeros(shape=(KEY_TILE, 1), dtype=wp.int32)
+            wp.tile_assign(
+                segment_end_column,
+                wp.tile_view(bounds, offset=(0, 1), shape=(KEY_TILE, 1)),
+            )
+            segment_ends = wp.tile_reshape(segment_end_column, shape=(KEY_TILE,))
+            query_begin = (key_start / QUERY_TILE) * QUERY_TILE
+            query_limit = wp.min(
+                length,
+                wp.tile_extract(wp.tile_reduce(maximum, segment_ends), 0),
+            )
         for query_head in range(kv_head * heads_per_kv, (kv_head + 1) * heads_per_kv):
             query_base = (batch * query_heads + query_head) * sequence
-            for query_start in range(0, length, QUERY_TILE):
+            for query_start in range(query_begin, query_limit, QUERY_TILE):
                 query_end = wp.min(length, query_start + QUERY_TILE)
                 common_first = wp.max(0, query_start + 1 - window) if window > 0 else 0
                 if key_start < query_end and key_start + KEY_TILE > common_first:
@@ -605,6 +687,27 @@ def _key_value_backward_kernel(dtype: type, head_size: int):
                     )
                     ends = wp.tile_map(row_end, query_offsets, query_start)
                     firsts = wp.tile_map(row_first, ends, window)
+                    if wp.static(SEGMENTED):
+                        query_bounds = wp.tile_load(
+                            segment_bounds,
+                            shape=(QUERY_TILE, 2),
+                            offset=(batch * sequence + query_start, 0),
+                        )
+                        segment_first_column = wp.tile_zeros(
+                            shape=(QUERY_TILE, 1), dtype=wp.int32
+                        )
+                        wp.tile_assign(
+                            segment_first_column,
+                            wp.tile_view(
+                                query_bounds,
+                                offset=(0, 0),
+                                shape=(QUERY_TILE, 1),
+                            ),
+                        )
+                        segment_firsts = wp.tile_reshape(
+                            segment_first_column, shape=(QUERY_TILE,)
+                        )
+                        firsts = wp.tile_map(maximum, firsts, segment_firsts)
                     end_group = wp.tile_broadcast(
                         wp.tile_reshape(ends, shape=(QUERY_TILE, 1)),
                         shape=(QUERY_TILE, KEY_TILE),
@@ -688,6 +791,7 @@ def flash_gqa_key_value_backward(
     key_grad,
     value_grad,
     *,
+    segment_bounds=None,
     scale: float,
     window: int,
     accumulate: bool,
@@ -698,8 +802,9 @@ def flash_gqa_key_value_backward(
     query_rows = batch * query_heads * sequence
     _, key_tile = _backward_tile_shape(head_size)
     kv_rows = batch * kv_heads * sequence
+    bounds = _checked_segment_bounds(segment_bounds, lengths, batch, sequence)
     wp.launch_tiled(
-        _key_value_backward_kernel(query.dtype, head_size),
+        _key_value_backward_kernel(query.dtype, head_size, segment_bounds is not None),
         dim=batch * kv_heads * ((sequence + key_tile - 1) // key_tile),
         inputs=[
             query.reshape((query_rows, head_size)),
@@ -707,6 +812,7 @@ def flash_gqa_key_value_backward(
             value.reshape((kv_rows, head_size)),
             output_grad.reshape((query_rows, head_size)),
             lengths,
+            bounds,
             lse.flatten(),
             delta.flatten(),
             key_grad.reshape((kv_rows, head_size)),
@@ -723,6 +829,21 @@ def flash_gqa_key_value_backward(
     )
 
 
+def _checked_segment_bounds(segment_bounds, lengths, batch: int, sequence: int):
+    if segment_bounds is None:
+        return lengths.reshape((batch, 1))
+    if (
+        segment_bounds.shape != (batch, sequence, 2)
+        or segment_bounds.dtype != wp.int32
+        or segment_bounds.device != lengths.device
+        or not segment_bounds.is_contiguous
+    ):
+        raise ValueError(
+            "segment_bounds must be contiguous int32 [batch, sequence, 2] on the input device"
+        )
+    return segment_bounds.reshape((batch * sequence, 2))
+
+
 def flash_gqa_forward(
     query,
     key,
@@ -732,6 +853,7 @@ def flash_gqa_forward(
     lse,
     workspace,
     *,
+    segment_bounds=None,
     scale: float | None = None,
     window: int = 0,
 ) -> None:
@@ -785,14 +907,16 @@ def flash_gqa_forward(
     output_2d = output.reshape((batch * query_heads * sequence, head_size))
     lse_1d = lse.flatten()
     workspace_2d = workspace.reshape((batch * query_heads * sequence, head_size))
+    bounds = _checked_segment_bounds(segment_bounds, lengths, batch, sequence)
     wp.launch_tiled(
-        _forward_kernel(query.dtype, head_size),
+        _forward_kernel(query.dtype, head_size, segment_bounds is not None),
         dim=batch * query_heads * ((sequence + _QUERY_TILE - 1) // _QUERY_TILE),
         inputs=[
             query_2d,
             key_2d,
             value_2d,
             lengths,
+            bounds,
             output_2d,
             lse_1d,
             workspace_2d,

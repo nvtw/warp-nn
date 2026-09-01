@@ -321,7 +321,14 @@ class GQALoRAAttentionPlan:
         return self.adapters.targets[self.names[3]].plan.output
 
     def forward(
-        self, x: wp.array, lengths: wp.array, positions=None, cosine=None, sine=None
+        self,
+        x: wp.array,
+        lengths: wp.array,
+        positions=None,
+        cosine=None,
+        sine=None,
+        *,
+        segment_bounds=None,
     ) -> wp.array:
         """Execute Q/K/V projections, exact GQA, and the O projection."""
         query_name, key_name, value_name, output_name = self.names
@@ -370,6 +377,7 @@ class GQALoRAAttentionPlan:
             self.core,
             self.lse,
             self.workspace,
+            segment_bounds=segment_bounds,
             scale=self.scale,
             window=self.window,
         )
@@ -395,6 +403,7 @@ class GQALoRAAttentionPlan:
         cosine=None,
         sine=None,
         *,
+        segment_bounds=None,
         accumulate: bool = False,
     ) -> wp.array:
         """Run O, Flash-GQA, and Q/K/V backward into fixed FP32 input gradient."""
@@ -449,6 +458,7 @@ class GQALoRAAttentionPlan:
             self.key_grad,
             self.value_grad,
             self.delta,
+            segment_bounds=segment_bounds,
             scale=self.scale,
             window=self.window,
         )

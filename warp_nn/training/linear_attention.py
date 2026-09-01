@@ -192,7 +192,9 @@ class QwenGatedDeltaLoRAAttentionPlan:
     def recurrent_state_grad(self) -> wp.array:
         return self.rule.past_grad
 
-    def forward(self, x, lengths, positions=None, cosine=None, sine=None):
+    def forward(
+        self, x, lengths, positions=None, cosine=None, sine=None, *, segment_bounds=None
+    ):
         del positions, cosine, sine
         qkv_name, gate_name, decay_name, beta_name, output_name = self.names
         qkv = self.adapters.forward(qkv_name, x)
@@ -207,6 +209,7 @@ class QwenGatedDeltaLoRAAttentionPlan:
             self.conv_state,
             self.a_log,
             self.dt_bias,
+            segment_bounds=segment_bounds,
         )
         core, _ = self.rule.forward(
             query,
@@ -216,6 +219,7 @@ class QwenGatedDeltaLoRAAttentionPlan:
             beta_values,
             lengths,
             self.recurrent_state,
+            segment_bounds=segment_bounds,
         )
         split_heads(gate, self.gate_heads)
         gated = self.gated_norm.forward(
@@ -245,6 +249,7 @@ class QwenGatedDeltaLoRAAttentionPlan:
         cosine=None,
         sine=None,
         *,
+        segment_bounds=None,
         accumulate: bool = False,
     ):
         del positions, cosine, sine
@@ -287,6 +292,7 @@ class QwenGatedDeltaLoRAAttentionPlan:
             lengths,
             self.recurrent_state,
             core_grad.reshape(self.rule.output.shape),
+            segment_bounds=segment_bounds,
         )
         qkv = self.adapters.targets[qkv_name].plan.output
         decay = self.adapters.targets[decay_name].plan.output
@@ -301,6 +307,7 @@ class QwenGatedDeltaLoRAAttentionPlan:
             v_grad,
             decay_grad,
             beta_grad,
+            segment_bounds=segment_bounds,
         )
         input_gradients = (
             self.adapters.backward(qkv_name, x, qkv_grad, accumulate=accumulate),

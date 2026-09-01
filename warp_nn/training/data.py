@@ -26,6 +26,7 @@ class SFTBatch:
     targets: np.ndarray
     lengths: np.ndarray
     positions: np.ndarray
+    segment_bounds: np.ndarray | None = None
 
     @property
     def batch(self) -> int:
@@ -77,7 +78,100 @@ def prepare_sft_batch(
     positions = np.broadcast_to(
         np.arange(sequence, dtype=np.int64), (batch, sequence)
     ).copy()
+    prepared = _prepare_examples(
+        examples,
+        sequence,
+        eos_token_id=eos_token_id,
+        ignore_index=ignore_index,
+        train_on_prompt=train_on_prompt,
+        truncation=truncation,
+    )
+    for row, (example_inputs, example_targets) in enumerate(prepared):
+        length = len(example_inputs)
+        inputs[row, :length] = example_inputs
+        targets[row, :length] = example_targets
+        lengths[row] = length
+    return SFTBatch(inputs, targets, lengths, positions)
+
+
+def prepare_packed_sft_batch(
+    examples: Sequence[SFTExample],
+    batch: int,
+    sequence: int,
+    *,
+    pad_token_id: int,
+    eos_token_id: int | None = None,
+    ignore_index: int = -100,
+    train_on_prompt: bool = False,
+    truncation: str = "error",
+) -> SFTBatch:
+    """Best-fit short examples into fixed rows with explicit isolation metadata."""
+    examples = tuple(examples)
+    if not examples:
+        raise ValueError("an SFT batch requires at least one example")
+    if batch <= 0 or sequence <= 0:
+        raise ValueError("batch and sequence must be positive")
+    if truncation not in ("error", "right"):
+        raise ValueError("truncation must be 'error' or 'right'")
+    prepared = _prepare_examples(
+        examples,
+        sequence,
+        eos_token_id=eos_token_id,
+        ignore_index=ignore_index,
+        train_on_prompt=train_on_prompt,
+        truncation=truncation,
+    )
+    rows: list[list[tuple[list[int], list[int]]]] = [[] for _ in range(batch)]
+    used = [0] * batch
+    for index in sorted(range(len(prepared)), key=lambda item: -len(prepared[item][0])):
+        example_inputs, example_targets = prepared[index]
+        length = len(example_inputs)
+        candidates = [row for row in range(batch) if used[row] + length <= sequence]
+        if not candidates:
+            raise ValueError(
+                f"{len(examples)} examples do not fit in batch={batch}, "
+                f"sequence={sequence}"
+            )
+        row = min(candidates, key=lambda item: sequence - used[item] - length)
+        rows[row].append((example_inputs, example_targets))
+        used[row] += length
+
+    inputs = np.full((batch, sequence), pad_token_id, dtype=np.int32)
+    targets = np.full((batch, sequence), ignore_index, dtype=np.int32)
+    positions = np.zeros((batch, sequence), dtype=np.int64)
+    token_offsets = np.arange(sequence, dtype=np.int32)
+    segment_bounds = np.stack((token_offsets, token_offsets), axis=-1)
+    segment_bounds = np.broadcast_to(segment_bounds, (batch, sequence, 2)).copy()
+    for row, packed in enumerate(rows):
+        offset = 0
+        for example_inputs, example_targets in packed:
+            end = offset + len(example_inputs)
+            inputs[row, offset:end] = example_inputs
+            targets[row, offset:end] = example_targets
+            positions[row, offset:end] = np.arange(end - offset, dtype=np.int64)
+            segment_bounds[row, offset:end, 0] = offset
+            segment_bounds[row, offset:end, 1] = end
+            offset = end
+    return SFTBatch(
+        inputs,
+        targets,
+        np.asarray(used, dtype=np.int32),
+        positions,
+        segment_bounds,
+    )
+
+
+def _prepare_examples(
+    examples: Sequence[SFTExample],
+    sequence: int,
+    *,
+    eos_token_id: int | None,
+    ignore_index: int,
+    train_on_prompt: bool,
+    truncation: str,
+) -> list[tuple[list[int], list[int]]]:
     maximum_tokens = sequence + 1
+    prepared = []
     for row, example in enumerate(examples):
         prompt = [int(token) for token in example.prompt]
         response = [int(token) for token in example.response]
@@ -98,10 +192,9 @@ def prepare_sft_batch(
             raise ValueError(
                 f"SFT example {row} has no response target after truncation"
             )
-        inputs[row, :length] = tokens[:-1]
-        targets[row, :length] = tokens[1:]
+        targets = tokens[1:]
         if not train_on_prompt:
             prompt_targets = min(max(len(prompt) - 1, 0), length)
-            targets[row, :prompt_targets] = ignore_index
-        lengths[row] = length
-    return SFTBatch(inputs, targets, lengths, positions)
+            targets[:prompt_targets] = [ignore_index] * prompt_targets
+        prepared.append((tokens[:-1], targets))
+    return prepared

@@ -26,11 +26,18 @@ class _Kernels:
 
 
 @lru_cache(maxsize=None)
-def _kernels(dtype: type, key_size: int, value_size: int, kernel_size: int):
+def _kernels(
+    dtype: type,
+    key_size: int,
+    value_size: int,
+    kernel_size: int,
+    segmented: bool = False,
+):
     DTYPE = dtype
     KEY_SIZE = key_size
     VALUE_SIZE = value_size
     KERNEL_SIZE = kernel_size
+    SEGMENTED = segmented
 
     @wp.func
     def sigmoid(value: wp.float32):
@@ -64,6 +71,7 @@ def _kernels(dtype: type, key_size: int, value_size: int, kernel_size: int):
         x: wp.array3d(dtype=DTYPE),
         weight: wp.array2d(dtype=DTYPE),
         state: wp.array3d(dtype=DTYPE),
+        segment_bounds: wp.array3d(dtype=wp.int32),
         preactivation: wp.array3d(dtype=wp.float32),
         output: wp.array3d(dtype=DTYPE),
     ):
@@ -71,11 +79,14 @@ def _kernels(dtype: type, key_size: int, value_size: int, kernel_size: int):
         total = wp.float32(0.0)
         for kernel_index in range(KERNEL_SIZE):
             source = token + kernel_index - (KERNEL_SIZE - 1)
-            value = (
-                wp.float32(state[batch, channel, source + KERNEL_SIZE - 1])
-                if source < 0
-                else wp.float32(x[batch, source, channel])
-            )
+            value = wp.float32(0.0)
+            if source < 0:
+                if wp.static(not SEGMENTED):
+                    value = wp.float32(state[batch, channel, source + KERNEL_SIZE - 1])
+                elif segment_bounds[batch, token, 0] == 0:
+                    value = wp.float32(state[batch, channel, source + KERNEL_SIZE - 1])
+            elif wp.static(not SEGMENTED) or source >= segment_bounds[batch, token, 0]:
+                value = wp.float32(x[batch, source, channel])
             total += value * wp.float32(weight[channel, kernel_index])
         preactivation[batch, token, channel] = total
         output[batch, token, channel] = DTYPE(total * sigmoid(total))
@@ -186,6 +197,7 @@ def _kernels(dtype: type, key_size: int, value_size: int, kernel_size: int):
         q_grad: wp.array4d(dtype=wp.float32),
         k_grad: wp.array4d(dtype=wp.float32),
         v_grad: wp.array4d(dtype=wp.float32),
+        segment_bounds: wp.array3d(dtype=wp.int32),
         output: wp.array3d(dtype=DTYPE),
     ):
         batch, token, channel = wp.tid()
@@ -193,7 +205,10 @@ def _kernels(dtype: type, key_size: int, value_size: int, kernel_size: int):
         key_width = q_grad.shape[1] * KEY_SIZE
         for kernel_index in range(KERNEL_SIZE):
             output_token = token + KERNEL_SIZE - 1 - kernel_index
-            if output_token < output.shape[1]:
+            if output_token < output.shape[1] and (
+                wp.static(not SEGMENTED)
+                or token >= segment_bounds[batch, output_token, 0]
+            ):
                 value = preactivation[batch, output_token, channel]
                 activation = sigmoid(value)
                 derivative = activation * (
@@ -221,13 +236,18 @@ def _kernels(dtype: type, key_size: int, value_size: int, kernel_size: int):
         q_grad: wp.array4d(dtype=wp.float32),
         k_grad: wp.array4d(dtype=wp.float32),
         v_grad: wp.array4d(dtype=wp.float32),
+        segment_bounds: wp.array3d(dtype=wp.int32),
         output: wp.array3d(dtype=wp.float32),
     ):
         batch, channel, state_index = wp.tid()
         total = wp.float32(0.0)
         key_width = q_grad.shape[1] * KEY_SIZE
         for token in range(KERNEL_SIZE - 1):
-            if token <= state_index and token < preactivation.shape[1]:
+            if (
+                token <= state_index
+                and token < preactivation.shape[1]
+                and (wp.static(not SEGMENTED) or segment_bounds[batch, token, 0] == 0)
+            ):
                 kernel_index = state_index - token
                 value = preactivation[batch, token, channel]
                 activation = sigmoid(value)
@@ -324,6 +344,12 @@ class GatedDeltaInputPlan:
         self.key_width = key_heads * key_size
         self.conv_width = 2 * self.key_width + value_heads * value_size
         self._kernels = _kernels(dtype, key_size, value_size, kernel_size)
+        self._segmented_kernels = _kernels(
+            dtype, key_size, value_size, kernel_size, True
+        )
+        self._dummy_segment_bounds = wp.empty(
+            (1, 1, 1), dtype=wp.int32, device=self.device
+        )
         conv_shape = (batch, sequence, self.conv_width)
         key_shape = (batch, key_heads, sequence, key_size)
         value_shape = (batch, value_heads, sequence, value_size)
@@ -350,15 +376,30 @@ class GatedDeltaInputPlan:
             device=self.device,
         )
 
-    def forward(self, qkv, a, b, conv_weight, conv_state, a_log, dt_bias):
+    def forward(
+        self,
+        qkv,
+        a,
+        b,
+        conv_weight,
+        conv_state,
+        a_log,
+        dt_bias,
+        *,
+        segment_bounds=None,
+    ):
         """Run convolution, Q/K normalization, V split, and gate preparation."""
         self._validate(qkv, a, b, conv_weight, conv_state, a_log, dt_bias)
         qkv3 = qkv.reshape((self.batch, self.sequence, self.conv_width))
+        bounds = self._validate_segment_bounds(segment_bounds)
+        kernels = (
+            self._segmented_kernels if segment_bounds is not None else self._kernels
+        )
         gate3 = (self.batch, self.sequence, self.value_heads)
         wp.launch(
-            self._kernels.convolution,
+            kernels.convolution,
             dim=qkv3.shape,
-            inputs=[qkv3, conv_weight, conv_state],
+            inputs=[qkv3, conv_weight, conv_state, bounds],
             outputs=[self.preactivation, self.convolved],
             device=self.device,
         )
@@ -407,6 +448,8 @@ class GatedDeltaInputPlan:
         value_grad,
         decay_grad,
         beta_grad,
+        *,
+        segment_bounds=None,
     ):
         """Return low-precision QKV/A/B gradients and FP32 prefix-state gradients."""
         self._validate_backward(
@@ -422,6 +465,10 @@ class GatedDeltaInputPlan:
             beta_grad,
         )
         qkv3 = qkv.reshape((self.batch, self.sequence, self.conv_width))
+        bounds = self._validate_segment_bounds(segment_bounds)
+        kernels = (
+            self._segmented_kernels if segment_bounds is not None else self._kernels
+        )
         items = self.batch * self.key_heads * self.sequence
         for gradient, inverse, output, offset in (
             (query_grad, self.query_inverse, self.query_raw_grad, 0),
@@ -435,7 +482,7 @@ class GatedDeltaInputPlan:
                 device=self.device,
             )
         wp.launch(
-            self._kernels.convolution_backward,
+            kernels.convolution_backward,
             dim=qkv3.shape,
             inputs=[
                 conv_weight,
@@ -443,12 +490,13 @@ class GatedDeltaInputPlan:
                 self.query_raw_grad,
                 self.key_raw_grad,
                 value_grad,
+                bounds,
             ],
             outputs=[self.qkv_grad],
             device=self.device,
         )
         wp.launch(
-            self._kernels.state_backward,
+            kernels.state_backward,
             dim=self.state_grad.shape,
             inputs=[
                 conv_weight,
@@ -456,6 +504,7 @@ class GatedDeltaInputPlan:
                 self.query_raw_grad,
                 self.key_raw_grad,
                 value_grad,
+                bounds,
             ],
             outputs=[self.state_grad],
             device=self.device,
@@ -483,6 +532,22 @@ class GatedDeltaInputPlan:
             self.b_grad.reshape((self.rows, self.value_heads)),
             self.state_grad,
         )
+
+    def _validate_segment_bounds(self, segment_bounds):
+        if segment_bounds is None:
+            return self._dummy_segment_bounds
+        if (
+            not isinstance(segment_bounds, wp.array)
+            or segment_bounds.shape != (self.batch, self.sequence, 2)
+            or segment_bounds.dtype != wp.int32
+            or segment_bounds.device != self.device
+            or not segment_bounds.is_contiguous
+        ):
+            raise ValueError(
+                "Gated DeltaNet segment bounds must be contiguous INT32 "
+                f"{(self.batch, self.sequence, 2)} on {self.device}"
+            )
+        return segment_bounds
 
     def _validate(self, qkv, a, b, weight, state, a_log, dt_bias):
         expected = (

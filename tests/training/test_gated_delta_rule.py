@@ -9,7 +9,7 @@ import warp as wp
 from warp_nn.training.gated_delta_rule import GatedDeltaRulePlan
 
 
-def _trace(query, key, value, decay, beta, lengths, past, scale):
+def _trace(query, key, value, decay, beta, lengths, past, scale, segment_bounds=None):
     batch, key_heads, sequence, _ = query.shape
     value_heads, value_size = value.shape[1], value.shape[3]
     state = past.astype(np.float32).copy()
@@ -23,6 +23,13 @@ def _trace(query, key, value, decay, beta, lengths, past, scale):
     for batch_index in range(batch):
         for token in range(sequence):
             if token < int(lengths[batch_index]):
+                if (
+                    segment_bounds is not None
+                    and token > 0
+                    and int(segment_bounds[batch_index, token, 0]) == token
+                ):
+                    state[batch_index] = 0.0
+                    history[batch_index, :, token] = 0.0
                 for value_head in range(value_heads):
                     key_head = value_head * key_heads // value_heads
                     q = query[batch_index, key_head, token].astype(np.float32)
@@ -42,9 +49,11 @@ def _trace(query, key, value, decay, beta, lengths, past, scale):
     return output, transformed, state, history
 
 
-def _reference(query, key, value, decay, beta, lengths, past, scale):
+def _reference(
+    query, key, value, decay, beta, lengths, past, scale, segment_bounds=None
+):
     output, transformed, state, _ = _trace(
-        query, key, value, decay, beta, lengths, past, scale
+        query, key, value, decay, beta, lengths, past, scale, segment_bounds
     )
     return output, transformed, state
 
@@ -60,9 +69,10 @@ def _backward_reference(
     scale,
     output_grad,
     present_grad,
+    segment_bounds=None,
 ):
     _, transformed, _, history = _trace(
-        query, key, value, decay, beta, lengths, past, scale
+        query, key, value, decay, beta, lengths, past, scale, segment_bounds
     )
     query_grad = np.zeros_like(query, dtype=np.float32)
     key_grad = np.zeros_like(key, dtype=np.float32)
@@ -105,6 +115,12 @@ def _backward_reference(
                 retrieved_gradient = -bt * d * delta_gradient
                 key_grad[batch_index, key_head, token] += previous @ retrieved_gradient
                 state_gradient = d * state_gradient + np.outer(k, retrieved_gradient)
+                if (
+                    segment_bounds is not None
+                    and token > 0
+                    and int(segment_bounds[batch_index, token, 0]) == token
+                ):
+                    state_gradient.fill(0.0)
             past_grad[batch_index, value_head] = state_gradient
     return query_grad, key_grad, value_grad, decay_grad, beta_grad, past_grad
 
@@ -190,6 +206,93 @@ def test_gated_delta_rule_cpu_matches_recurrence_and_padding():
 
 
 CUDA_DEVICES = [device for device in wp.get_devices() if device.is_cuda]
+
+
+@pytest.mark.skipif(not CUDA_DEVICES, reason="CUDA device required")
+def test_gated_delta_rule_segmented_gpu_matches_isolated_recurrences():
+    device = CUDA_DEVICES[0]
+    inputs = _inputs(device, wp.bfloat16, key_size=8, value_size=8, sequence=7)
+    plan = GatedDeltaRulePlan(2, 7, 1, 2, 8, 8, wp.bfloat16, device=device)
+    bounds_np = np.empty((2, 7, 2), dtype=np.int32)
+    bounds_np[0, :3] = (0, 3)
+    bounds_np[0, 3:] = (3, 7)
+    bounds_np[1, :2] = (0, 2)
+    bounds_np[1, 2:6] = (2, 6)
+    bounds_np[1, 6] = (6, 6)
+    bounds = wp.array(bounds_np, dtype=wp.int32, device=device)
+    output, present = plan.forward(*inputs, segment_bounds=bounds)
+    rng = np.random.default_rng(151)
+    output_gradient_np = rng.normal(0.0, 0.1, output.shape).astype(np.float32)
+    present_gradient_np = rng.normal(0.0, 0.1, present.shape).astype(np.float32)
+    gradients = plan.backward(
+        *inputs,
+        wp.array(output_gradient_np, dtype=wp.float32, device=device),
+        segment_bounds=bounds,
+        present_grad=wp.array(present_gradient_np, dtype=wp.float32, device=device),
+    )
+    values = tuple(_numpy(value) for value in inputs[:5])
+    lengths_np = inputs[5].numpy()
+    past_np = _numpy(inputs[6])
+    expected = _reference(*values, lengths_np, past_np, plan.scale, bounds_np)
+    expected_gradients = _backward_reference(
+        *values,
+        lengths_np,
+        past_np,
+        plan.scale,
+        output_gradient_np,
+        present_gradient_np,
+        bounds_np,
+    )
+    np.testing.assert_allclose(_numpy(output), expected[0], rtol=3.0e-2, atol=5.0e-3)
+    np.testing.assert_allclose(_numpy(present), expected[2], rtol=3.0e-2, atol=5.0e-3)
+    for actual, reference in zip(gradients, expected_gradients):
+        np.testing.assert_allclose(_numpy(actual), reference, rtol=1.0e-1, atol=1.5e-2)
+
+
+@pytest.mark.skipif(not CUDA_DEVICES, reason="CUDA device required")
+def test_gated_delta_rule_segmented_chunkwise_matches_isolated_recurrences():
+    device = CUDA_DEVICES[0]
+    if device.arch < 80:
+        pytest.skip("BF16 tensor cores require SM80")
+    sequence = 32
+    inputs = _inputs(
+        device, wp.bfloat16, key_size=128, value_size=128, sequence=sequence
+    )
+    plan = GatedDeltaRulePlan(2, sequence, 1, 2, 128, 128, wp.bfloat16, device=device)
+    bounds_np = np.empty((2, sequence, 2), dtype=np.int32)
+    for row, (length, cuts) in enumerate(((32, (0, 7, 21, 32)), (27, (0, 9, 20, 27)))):
+        for start, end in zip(cuts, cuts[1:]):
+            bounds_np[row, start:end] = (start, end)
+        for token in range(length, sequence):
+            bounds_np[row, token] = (token, token)
+    bounds = wp.array(bounds_np, dtype=wp.int32, device=device)
+    output, present = plan.forward(*inputs, segment_bounds=bounds)
+    rng = np.random.default_rng(157)
+    output_gradient_np = rng.normal(0.0, 0.1, output.shape).astype(np.float32)
+    present_gradient_np = rng.normal(0.0, 0.1, present.shape).astype(np.float32)
+    gradients = plan.backward(
+        *inputs,
+        wp.array(output_gradient_np, dtype=wp.float32, device=device),
+        segment_bounds=bounds,
+        present_grad=wp.array(present_gradient_np, dtype=wp.float32, device=device),
+    )
+    values = tuple(_numpy(value) for value in inputs[:5])
+    lengths_np = inputs[5].numpy()
+    past_np = _numpy(inputs[6])
+    expected = _reference(*values, lengths_np, past_np, plan.scale, bounds_np)
+    expected_gradients = _backward_reference(
+        *values,
+        lengths_np,
+        past_np,
+        plan.scale,
+        output_gradient_np,
+        present_gradient_np,
+        bounds_np,
+    )
+    np.testing.assert_allclose(_numpy(output), expected[0], rtol=2.0e-2, atol=4.0e-3)
+    np.testing.assert_allclose(_numpy(present), expected[2], rtol=2.0e-2, atol=4.0e-3)
+    for actual, reference in zip(gradients, expected_gradients):
+        np.testing.assert_allclose(_numpy(actual), reference, rtol=1.0e-1, atol=1.5e-2)
 
 
 @pytest.mark.skipif(not CUDA_DEVICES, reason="CUDA device required")

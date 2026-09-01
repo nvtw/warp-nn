@@ -110,10 +110,18 @@ class CausalLMTrainingPlan:
         cosine=None,
         sine=None,
         *,
+        segment_bounds=None,
         reduction: str = "mean",
     ) -> wp.array:
         hidden = self.embedding(self.embedding_weight, input_ids)
-        hidden = self.stack.forward(hidden, lengths, positions, cosine, sine)
+        hidden = self.stack.forward(
+            hidden,
+            lengths,
+            positions,
+            cosine,
+            sine,
+            segment_bounds=segment_bounds,
+        )
         return self.output.forward(hidden, targets, reduction=reduction)
 
     def backward(
@@ -125,6 +133,7 @@ class CausalLMTrainingPlan:
         cosine=None,
         sine=None,
         *,
+        segment_bounds=None,
         loss_scale: float = 1.0,
         reduction: str = "mean",
         accumulate: bool = False,
@@ -144,6 +153,7 @@ class CausalLMTrainingPlan:
             positions,
             cosine,
             sine,
+            segment_bounds=segment_bounds,
             accumulate=accumulate,
         )
 
@@ -156,6 +166,7 @@ class CausalLMTrainingPlan:
         cosine=None,
         sine=None,
         *,
+        segment_bounds=None,
         loss_scale: float = 1.0,
         reduction: str = "mean",
     ) -> wp.array:
@@ -168,6 +179,7 @@ class CausalLMTrainingPlan:
             positions,
             cosine,
             sine,
+            segment_bounds=segment_bounds,
             reduction=reduction,
         )
         self.backward(
@@ -177,6 +189,7 @@ class CausalLMTrainingPlan:
             positions,
             cosine,
             sine,
+            segment_bounds=segment_bounds,
             loss_scale=loss_scale,
             reduction=reduction,
         )

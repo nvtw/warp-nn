@@ -162,6 +162,126 @@ def test_gated_delta_input_forward_and_backward_finite_difference_cpu():
 CUDA_DEVICES = [device for device in wp.get_devices() if device.is_cuda]
 
 
+def test_segmented_gated_delta_input_matches_two_isolated_examples_cpu():
+    rng = np.random.default_rng(211)
+    batch, sequence, split = 1, 4, 2
+    key_heads, value_heads, key_size, value_size, kernel_size = 1, 2, 2, 2, 3
+    width = 2 * key_heads * key_size + value_heads * value_size
+
+    def array(value):
+        return wp.array(value, dtype=wp.float32, device="cpu")
+
+    qkv_np = rng.normal(0.0, 0.2, (sequence, width)).astype(np.float32)
+    a_np = rng.normal(0.0, 0.2, (sequence, value_heads)).astype(np.float32)
+    b_np = rng.normal(0.0, 0.2, (sequence, value_heads)).astype(np.float32)
+    weight = array(rng.normal(0.0, 0.2, (width, kernel_size)))
+    state = array(rng.normal(0.0, 0.2, (batch, width, kernel_size - 1)))
+    zero_state = wp.zeros_like(state)
+    a_log = array(rng.normal(-0.5, 0.1, value_heads))
+    dt_bias = array(rng.normal(0.0, 0.1, value_heads))
+    qkv, a, b = array(qkv_np), array(a_np), array(b_np)
+    bounds_np = np.empty((batch, sequence, 2), dtype=np.int32)
+    bounds_np[:, :split] = (0, split)
+    bounds_np[:, split:] = (split, sequence)
+    bounds = wp.array(bounds_np, dtype=wp.int32, device="cpu")
+
+    packed = GatedDeltaInputPlan(
+        batch,
+        sequence,
+        key_heads,
+        value_heads,
+        key_size,
+        value_size,
+        kernel_size,
+        wp.float32,
+        device="cpu",
+    )
+    packed_outputs = packed.forward(
+        qkv, a, b, weight, state, a_log, dt_bias, segment_bounds=bounds
+    )
+    isolated_outputs = []
+    isolated_plans = []
+    for start, end, initial in ((0, split, state), (split, sequence, zero_state)):
+        plan = GatedDeltaInputPlan(
+            batch,
+            end - start,
+            key_heads,
+            value_heads,
+            key_size,
+            value_size,
+            kernel_size,
+            wp.float32,
+            device="cpu",
+        )
+        outputs = plan.forward(
+            array(qkv_np[start:end]),
+            array(a_np[start:end]),
+            array(b_np[start:end]),
+            weight,
+            initial,
+            a_log,
+            dt_bias,
+        )
+        isolated_plans.append(plan)
+        isolated_outputs.append(outputs)
+    for output_index, actual in enumerate(packed_outputs):
+        axis = 2 if output_index < 3 else 1
+        expected = np.concatenate(
+            [outputs[output_index].numpy() for outputs in isolated_outputs], axis=axis
+        )
+        np.testing.assert_allclose(actual.numpy(), expected, rtol=2.0e-5, atol=2.0e-6)
+
+    gradients = (
+        rng.normal(0.0, 0.2, packed.query.shape).astype(np.float32),
+        rng.normal(0.0, 0.2, packed.key.shape).astype(np.float32),
+        rng.normal(0.0, 0.2, packed.value.shape).astype(np.float32),
+        rng.normal(0.0, 0.2, packed.decay.shape).astype(np.float32),
+        rng.normal(0.0, 0.2, packed.beta.shape).astype(np.float32),
+    )
+    packed_gradients = packed.backward(
+        qkv,
+        a,
+        weight,
+        a_log,
+        dt_bias,
+        *(array(value) for value in gradients),
+        segment_bounds=bounds,
+    )
+    isolated_gradients = []
+    for index, (start, end) in enumerate(((0, split), (split, sequence))):
+        plan = isolated_plans[index]
+        sliced = (
+            gradients[0][:, :, start:end],
+            gradients[1][:, :, start:end],
+            gradients[2][:, :, start:end],
+            gradients[3][:, start:end],
+            gradients[4][:, start:end],
+        )
+        isolated_gradients.append(
+            plan.backward(
+                array(qkv_np[start:end]),
+                array(a_np[start:end]),
+                weight,
+                a_log,
+                dt_bias,
+                *(array(value) for value in sliced),
+            )
+        )
+    for index in range(3):
+        expected = np.concatenate(
+            [gradients_[index].numpy() for gradients_ in isolated_gradients], axis=0
+        )
+        np.testing.assert_allclose(
+            packed_gradients[index].numpy(), expected, rtol=2.0e-5, atol=2.0e-6
+        )
+    np.testing.assert_allclose(
+        packed_gradients[3].numpy(),
+        isolated_gradients[0][3].numpy(),
+        rtol=2.0e-5,
+        atol=2.0e-6,
+    )
+
+
 @pytest.mark.skipif(not CUDA_DEVICES, reason="CUDA device required")
 def test_gated_delta_input_bfloat16_cuda_graph_replay():
     device = CUDA_DEVICES[0]

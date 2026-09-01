@@ -71,13 +71,25 @@ class LoRATransformerStackPlan:
             raise ValueError(f"{name} must be contiguous")
 
     def forward(
-        self, x: wp.array, lengths: wp.array, positions=None, cosine=None, sine=None
+        self,
+        x: wp.array,
+        lengths: wp.array,
+        positions=None,
+        cosine=None,
+        sine=None,
+        *,
+        segment_bounds=None,
     ) -> wp.array:
         """Execute all layers in model order into their fixed output buffers."""
         self._input(x, "x")
         value = x
+        segment_options = (
+            {} if segment_bounds is None else {"segment_bounds": segment_bounds}
+        )
         for block in self.blocks:
-            value = block.forward(value, lengths, positions, cosine, sine)
+            value = block.forward(
+                value, lengths, positions, cosine, sine, **segment_options
+            )
         return value
 
     def backward(
@@ -89,12 +101,16 @@ class LoRATransformerStackPlan:
         cosine=None,
         sine=None,
         *,
+        segment_bounds=None,
         accumulate: bool = False,
     ) -> wp.array:
         """Reverse every layer and return the first layer's fixed FP32 gradient."""
         self._input(x, "x")
         self._input(grad_output, "grad_output")
         gradient = grad_output
+        segment_options = (
+            {} if segment_bounds is None else {"segment_bounds": segment_bounds}
+        )
         for index in range(len(self.blocks) - 1, -1, -1):
             block = self.blocks[index]
             block_input = x if index == 0 else self.blocks[index - 1].output
@@ -106,6 +122,7 @@ class LoRATransformerStackPlan:
                 cosine,
                 sine,
                 accumulate=accumulate,
+                **segment_options,
             )
             if index:
                 cast_from_float32(input_gradient, self.boundary_grad)

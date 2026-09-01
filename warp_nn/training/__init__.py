@@ -20,7 +20,7 @@ from .checkpoint import (
     save_lora_collection,
     save_lora_safetensors,
 )
-from .data import SFTBatch, SFTExample, prepare_sft_batch
+from .data import SFTBatch, SFTExample, prepare_packed_sft_batch, prepare_sft_batch
 from .gated_delta import GatedDeltaInputPlan
 from .gated_delta_rule import GatedDeltaRulePlan
 from .gated_norm import GatedRMSNormPlan
@@ -90,6 +90,7 @@ __all__ = [
     "lora_forward",
     "merge_heads",
     "prepare_sft_batch",
+    "prepare_packed_sft_batch",
     "save_lora_safetensors",
     "save_lora_collection",
     "split_heads",
