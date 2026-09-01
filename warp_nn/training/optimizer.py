@@ -12,6 +12,63 @@ import warp as wp
 
 
 _PARAMETER_DTYPES = (wp.float16, wp.bfloat16, wp.float32)
+_NORM_TILE_SIZE = 256
+
+
+@wp.func
+def _square(value: wp.float32):
+    return value * value
+
+
+@wp.kernel(enable_backward=False)
+def _gradient_square_partials(
+    gradient: wp.array1d[wp.float32],
+    partials: wp.array1d[wp.float32],
+    multiplier: wp.array1d[wp.float32],
+    output_offset: int,
+):
+    tile = wp.tid()
+    values = wp.tile_load(
+        gradient, shape=(_NORM_TILE_SIZE,), offset=(tile * _NORM_TILE_SIZE,)
+    )
+    values *= multiplier[0]
+    wp.tile_store(
+        partials, wp.tile_sum(wp.tile_map(_square, values)), offset=output_offset + tile
+    )
+
+
+@wp.kernel(enable_backward=False)
+def _reduce_norm_partials(
+    source: wp.array1d[wp.float32], destination: wp.array1d[wp.float32]
+):
+    tile = wp.tid()
+    values = wp.tile_load(
+        source, shape=(_NORM_TILE_SIZE,), offset=(tile * _NORM_TILE_SIZE,)
+    )
+    wp.tile_store(destination, wp.tile_sum(values), offset=tile)
+
+
+@wp.kernel(enable_backward=False)
+def _apply_global_norm_clip(
+    sum_squares: wp.array1d[wp.float32],
+    multiplier: wp.array1d[wp.float32],
+    all_finite: wp.array1d[wp.int32],
+    step_enabled: wp.array1d[wp.int32],
+    global_grad_norm: wp.array1d[wp.float32],
+    clip_scale: wp.array1d[wp.float32],
+    max_grad_norm: wp.float32,
+):
+    norm = wp.sqrt(sum_squares[0])
+    global_grad_norm[0] = norm
+    clip_scale[0] = wp.float32(1.0)
+    maximum = wp.float32(3.402823466e38)
+    if not (norm <= maximum):
+        all_finite[0] = 0
+    elif step_enabled[0] != 0:
+        if norm > max_grad_norm:
+            scale = max_grad_norm / norm
+            clip_scale[0] = scale
+            multiplier[0] *= scale
 
 
 @wp.kernel(enable_backward=False)
@@ -192,6 +249,7 @@ class AdamWPlan:
         warmup_steps: int = 0,
         total_steps: int | None = None,
         min_learning_rate_ratio: float = 0.0,
+        max_grad_norm: float | None = None,
     ):
         if not parameters or len(parameters) != len(gradients):
             raise ValueError(
@@ -232,6 +290,10 @@ class AdamWPlan:
             0.0 <= min_learning_rate_ratio <= 1.0
         ):
             raise ValueError("min_learning_rate_ratio must be in [0, 1]")
+        if max_grad_norm is not None and (
+            not math.isfinite(max_grad_norm) or max_grad_norm <= 0.0
+        ):
+            raise ValueError("max_grad_norm must be positive and finite or None")
 
         device = parameters[0].device
         slots = []
@@ -290,6 +352,30 @@ class AdamWPlan:
         self.warmup_steps = int(warmup_steps)
         self.total_steps = 0 if total_steps is None else int(total_steps)
         self.min_learning_rate_ratio = float(min_learning_rate_ratio)
+        self.max_grad_norm = None if max_grad_norm is None else float(max_grad_norm)
+        self._gradient_norm_levels: tuple[wp.array, ...] = ()
+        self._gradient_norm_offsets: tuple[int, ...] = ()
+        self.global_grad_norm: wp.array | None = None
+        self.clip_scale: wp.array | None = None
+        if self.max_grad_norm is not None:
+            partial_counts = tuple(
+                (slot.gradient.size + _NORM_TILE_SIZE - 1) // _NORM_TILE_SIZE
+                for slot in self._slots
+            )
+            total_partials = sum(partial_counts)
+            levels = [wp.empty(total_partials, dtype=wp.float32, device=device)]
+            while levels[-1].size > 1:
+                size = (levels[-1].size + _NORM_TILE_SIZE - 1) // _NORM_TILE_SIZE
+                levels.append(wp.empty(size, dtype=wp.float32, device=device))
+            offsets = []
+            offset = 0
+            for count in partial_counts:
+                offsets.append(offset)
+                offset += count
+            self._gradient_norm_levels = tuple(levels)
+            self._gradient_norm_offsets = tuple(offsets)
+            self.global_grad_norm = wp.empty(1, dtype=wp.float32, device=device)
+            self.clip_scale = wp.empty(1, dtype=wp.float32, device=device)
 
     @property
     def first_moments(self) -> tuple[wp.array, ...]:
@@ -359,17 +445,57 @@ class AdamWPlan:
             ],
             device=self.device,
         )
-        for slot in self._slots:
+        if self.max_grad_norm is not None:
+            partials = self._gradient_norm_levels[0]
+            for slot, offset in zip(self._slots, self._gradient_norm_offsets):
+                wp.launch_tiled(
+                    _gradient_square_partials,
+                    dim=(slot.gradient.size + _NORM_TILE_SIZE - 1) // _NORM_TILE_SIZE,
+                    inputs=[
+                        slot.gradient,
+                        partials,
+                        self.normalization_multiplier,
+                        offset,
+                    ],
+                    device=self.device,
+                    block_dim=128,
+                )
+            for source, destination in zip(
+                self._gradient_norm_levels, self._gradient_norm_levels[1:]
+            ):
+                wp.launch_tiled(
+                    _reduce_norm_partials,
+                    dim=destination.size,
+                    inputs=[source, destination],
+                    device=self.device,
+                    block_dim=128,
+                )
             wp.launch(
-                _check_finite,
-                dim=slot.gradient.size,
+                _apply_global_norm_clip,
+                dim=1,
                 inputs=[
-                    slot.gradient,
+                    self._gradient_norm_levels[-1],
                     self.normalization_multiplier,
                     self.all_finite,
+                    self.step_enabled,
+                    self.global_grad_norm,
+                    self.clip_scale,
+                    self.max_grad_norm,
                 ],
                 device=self.device,
             )
+        else:
+            for slot in self._slots:
+                wp.launch(
+                    _check_finite,
+                    dim=slot.gradient.size,
+                    inputs=[
+                        slot.gradient,
+                        self.normalization_multiplier,
+                        self.all_finite,
+                    ],
+                    device=self.device,
+                )
         wp.launch(
             _advance_step,
             dim=1,

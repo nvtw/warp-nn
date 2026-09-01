@@ -262,3 +262,96 @@ class LoRAAdapterCollection:
             cast_from_float32(master, self.named_parameters[name])
         self.optimizer.reset_state()
         self.zero_grad()
+
+    def load_training_state(
+        self,
+        tensors: Mapping[str, np.ndarray],
+        configs: Mapping[str, LoRAAdapterConfig],
+        optimizer_fingerprint: Mapping[str, object],
+        parameter_dtypes: Mapping[str, str],
+        backend: str,
+    ) -> None:
+        """Restore exact AdamW trajectory state without replacing any buffers."""
+        current_backend = "cublas" if self.cublas is not None else "warp"
+        if backend != current_backend:
+            raise ValueError("training-state execution backend does not match")
+        if set(configs) != set(self.configs) or any(
+            configs[name].rank != current.rank or configs[name].scale != current.scale
+            for name, current in self.configs.items()
+        ):
+            raise ValueError("training-state LoRA configs do not match")
+        dtype_names = {wp.float16: "F16", wp.bfloat16: "BF16", wp.float32: "F32"}
+        current_dtypes = {
+            name: dtype_names[parameter.dtype]
+            for name, parameter in self.named_parameters.items()
+        }
+        if dict(parameter_dtypes) != current_dtypes:
+            raise ValueError("training-state parameter dtypes do not match")
+        optimizer = self.optimizer
+        current_optimizer = {
+            name: getattr(optimizer, name)
+            for name in (
+                "beta1",
+                "beta2",
+                "epsilon",
+                "gradient_multiplier",
+                "learning_rate",
+                "loss_scale",
+                "max_grad_norm",
+                "min_learning_rate_ratio",
+                "normalize_by_valid_tokens",
+                "total_steps",
+                "warmup_steps",
+                "weight_decay",
+            )
+        }
+        if dict(optimizer_fingerprint) != current_optimizer:
+            raise ValueError("training-state optimizer configuration does not match")
+        expected = {"optimizer.step_count"}
+        for name in self.named_masters:
+            expected.update(
+                (
+                    f"{name}.master",
+                    f"{name}.first_moment",
+                    f"{name}.second_moment",
+                )
+            )
+        if set(tensors) != expected:
+            raise ValueError("training-state tensor names do not match")
+        step = tensors["optimizer.step_count"]
+        if (
+            not isinstance(step, np.ndarray)
+            or step.dtype != np.int32
+            or step.shape != (1,)
+        ):
+            raise TypeError("training-state step_count must be INT32 with shape (1,)")
+        ordered = []
+        for index, (name, master) in enumerate(self.named_masters.items()):
+            values = tuple(
+                tensors[f"{name}.{suffix}"]
+                for suffix in ("master", "first_moment", "second_moment")
+            )
+            if any(
+                not isinstance(value, np.ndarray)
+                or value.dtype != np.float32
+                or value.shape != master.shape
+                for value in values
+            ):
+                raise ValueError(f"training-state tensors do not match {name!r}")
+            ordered.append((index, name, master, values))
+
+        for index, name, master, values in ordered:
+            master.assign(values[0])
+            optimizer.first_moments[index].assign(values[1].reshape(-1))
+            optimizer.second_moments[index].assign(values[2].reshape(-1))
+            cast_from_float32(master, self.named_parameters[name])
+        optimizer.step_count.assign(step)
+        self.zero_grad()
+        optimizer.all_finite.fill_(1)
+        optimizer.step_enabled.fill_(1)
+        optimizer.normalization_multiplier.zero_()
+        optimizer.effective_learning_rate.zero_()
+        if optimizer.global_grad_norm is not None:
+            optimizer.global_grad_norm.zero_()
+        if optimizer.clip_scale is not None:
+            optimizer.clip_scale.zero_()

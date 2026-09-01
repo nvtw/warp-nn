@@ -8,7 +8,12 @@ from typing import Mapping
 
 import warp as wp
 
-from .checkpoint import restore_lora_collection, save_lora_collection
+from .checkpoint import (
+    restore_lora_collection,
+    restore_lora_training_state,
+    save_lora_collection,
+    save_lora_training_state,
+)
 from .data import SFTBatch
 from .model import CausalLMTrainingPlan
 
@@ -237,3 +242,23 @@ class LoRATrainer:
     def load_adapters(self, path: str | Path):
         """Restore adapters in place; AdamW moments and step restart from zero."""
         return restore_lora_collection(path, self.model.adapters)
+
+    def save_training_state(
+        self, path: str | Path, *, base_identifier: str | None = None
+    ) -> None:
+        """Save exact-resume LoRA and AdamW state separately from adapter export."""
+        if self._accumulating:
+            raise RuntimeError("finish gradient accumulation before checkpointing")
+        save_lora_training_state(
+            path, self.model.adapters, base_identifier=base_identifier
+        )
+
+    def load_training_state(
+        self, path: str | Path, *, base_identifier: str | None = None
+    ):
+        """Restore an exact trajectory in place without invalidating CUDA graphs."""
+        if self._accumulating:
+            raise RuntimeError("finish gradient accumulation before checkpointing")
+        return restore_lora_training_state(
+            path, self.model.adapters, base_identifier=base_identifier
+        )

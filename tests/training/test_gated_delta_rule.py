@@ -211,8 +211,9 @@ CUDA_DEVICES = [device for device in wp.get_devices() if device.is_cuda]
 @pytest.mark.skipif(not CUDA_DEVICES, reason="CUDA device required")
 def test_gated_delta_rule_segmented_gpu_matches_isolated_recurrences():
     device = CUDA_DEVICES[0]
-    inputs = _inputs(device, wp.bfloat16, key_size=8, value_size=8, sequence=7)
-    plan = GatedDeltaRulePlan(2, 7, 1, 2, 8, 8, wp.bfloat16, device=device)
+    inputs = _inputs(device, wp.bfloat16, key_size=4, value_size=8, sequence=7)
+    plan = GatedDeltaRulePlan(2, 7, 1, 2, 4, 8, wp.bfloat16, device=device)
+    assert not plan._partials_in_state_workspace
     bounds_np = np.empty((2, 7, 2), dtype=np.int32)
     bounds_np[0, :3] = (0, 3)
     bounds_np[0, 3:] = (3, 7)
@@ -224,11 +225,13 @@ def test_gated_delta_rule_segmented_gpu_matches_isolated_recurrences():
     rng = np.random.default_rng(151)
     output_gradient_np = rng.normal(0.0, 0.1, output.shape).astype(np.float32)
     present_gradient_np = rng.normal(0.0, 0.1, present.shape).astype(np.float32)
+    output_gradient = wp.array(output_gradient_np, dtype=wp.float32, device=device)
+    present_gradient = wp.array(present_gradient_np, dtype=wp.float32, device=device)
     gradients = plan.backward(
         *inputs,
-        wp.array(output_gradient_np, dtype=wp.float32, device=device),
+        output_gradient,
         segment_bounds=bounds,
-        present_grad=wp.array(present_gradient_np, dtype=wp.float32, device=device),
+        present_grad=present_gradient,
     )
     values = tuple(_numpy(value) for value in inputs[:5])
     lengths_np = inputs[5].numpy()
@@ -247,6 +250,33 @@ def test_gated_delta_rule_segmented_gpu_matches_isolated_recurrences():
     np.testing.assert_allclose(_numpy(present), expected[2], rtol=3.0e-2, atol=5.0e-3)
     for actual, reference in zip(gradients, expected_gradients):
         np.testing.assert_allclose(_numpy(actual), reference, rtol=1.0e-1, atol=1.5e-2)
+    snapshot = tuple(_numpy(gradient) for gradient in gradients)
+    repeated = plan.backward(
+        *inputs,
+        output_gradient,
+        segment_bounds=bounds,
+        present_grad=present_gradient,
+    )
+    for actual, expected in zip(repeated, snapshot):
+        np.testing.assert_array_equal(_numpy(actual), expected)
+
+    wp.capture_begin(device=device)
+    try:
+        plan.backward(
+            *inputs,
+            output_gradient,
+            segment_bounds=bounds,
+            present_grad=present_gradient,
+        )
+        graph = wp.capture_end(device=device)
+    except Exception:
+        wp.capture_end(device=device)
+        raise
+    wp.capture_launch(graph)
+    captured = tuple(_numpy(gradient) for gradient in gradients)
+    wp.capture_launch(graph)
+    for actual, expected in zip(gradients, captured):
+        np.testing.assert_array_equal(_numpy(actual), expected)
 
 
 @pytest.mark.skipif(not CUDA_DEVICES, reason="CUDA device required")

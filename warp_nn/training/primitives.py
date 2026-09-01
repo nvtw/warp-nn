@@ -24,7 +24,6 @@ class _PrimitiveKernels:
     swiglu: object
     sigmoid_gate: object
     rope: object
-    mean_square: object
     rms_norm: object
     embedding: object
 
@@ -114,12 +113,6 @@ def _get_primitive_kernels(dtype: type) -> _PrimitiveKernels:
             output[row, column] = x[row, column]
 
     @wp.kernel(module="unique")
-    def mean_square(x: wp.array2d(dtype=DTYPE), output: wp.array1d(dtype=wp.float32)):
-        row, column = wp.tid()
-        value = wp.float32(x[row, column])
-        wp.atomic_add(output, row, value * value / wp.float32(x.shape[1]))
-
-    @wp.kernel(module="unique")
     def rms_norm(
         x: wp.array2d(dtype=DTYPE),
         inverse_rms: wp.array1d(dtype=wp.float32),
@@ -141,8 +134,45 @@ def _get_primitive_kernels(dtype: type) -> _PrimitiveKernels:
         output[token, column] = table[token_ids[token], column]
 
     return _PrimitiveKernels(
-        residual, scale, swiglu, sigmoid_gate, rope, mean_square, rms_norm, embedding
+        residual, scale, swiglu, sigmoid_gate, rope, rms_norm, embedding
     )
+
+
+@lru_cache(maxsize=None)
+def _get_mean_square_kernels(dtype: type, width: int):
+    """Return deterministic autodiff-safe kernels for one hidden width.
+
+    Warp's tile reduction adjoint is not correct for this reduction yet, so use a
+    fixed two-level scalar tree. Each partial and final result has one writer.
+    """
+
+    DTYPE = dtype
+    WIDTH = width
+    CHUNK = 64
+    PARTIALS = (width + CHUNK - 1) // CHUNK
+
+    @wp.kernel(module="unique")
+    def partial(x: wp.array2d(dtype=DTYPE), output: wp.array2d(dtype=wp.float32)):
+        row, chunk = wp.tid()
+        start = chunk * CHUNK
+        stop = wp.min(start + CHUNK, WIDTH)
+        total = wp.float32(0.0)
+        for column in range(start, stop):
+            value = wp.float32(x[row, column])
+            total += value * value
+        output[row, chunk] = total
+
+    @wp.kernel(module="unique")
+    def reduce(
+        partials: wp.array2d(dtype=wp.float32), output: wp.array1d(dtype=wp.float32)
+    ):
+        row = wp.tid()
+        total = wp.float32(0.0)
+        for chunk in range(PARTIALS):
+            total += partials[row, chunk]
+        output[row] = total / wp.float32(WIDTH)
+
+    return partial, reduce
 
 
 @wp.kernel
@@ -309,10 +339,17 @@ class TransformerPrimitivePlan(_FixedPlan):
         self.width = width
         self.dtype = dtype
         self._kernels = _get_primitive_kernels(dtype)
+        self._mean_square_kernels = _get_mean_square_kernels(dtype, width)
         self.rotary_dim = rotary_dim
         self.epsilon = float(epsilon)
         self._mean_square = wp.empty(
             rows, dtype=wp.float32, device=self.device, requires_grad=True
+        )
+        self._mean_square_partials = wp.empty(
+            (rows, (width + 63) // 64),
+            dtype=wp.float32,
+            device=self.device,
+            requires_grad=True,
         )
         self._inverse_rms = wp.empty(
             rows, dtype=wp.float32, device=self.device, requires_grad=True
@@ -405,11 +442,17 @@ class TransformerPrimitivePlan(_FixedPlan):
         self._matrix(x, "x")
         self._check(weight, (self.width,), self.dtype, "weight")
         output = self._outputs["rms_norm"]
-        self._mean_square.zero_()
         wp.launch(
-            self._kernels.mean_square,
-            dim=self.shape,
+            self._mean_square_kernels[0],
+            dim=self._mean_square_partials.shape,
             inputs=[x],
+            outputs=[self._mean_square_partials],
+            device=self.device,
+        )
+        wp.launch(
+            self._mean_square_kernels[1],
+            dim=self.rows,
+            inputs=[self._mean_square_partials],
             outputs=[self._mean_square],
             device=self.device,
         )

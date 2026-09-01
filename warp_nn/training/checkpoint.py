@@ -24,6 +24,8 @@ from .adapters import LoRAAdapterConfig
 
 _FORMAT = "warp-nn-lora"
 _VERSION = 1
+_TRAINING_FORMAT = "warp-nn-lora-training-state"
+_TRAINING_VERSION = 1
 _MAX_HEADER_BYTES = 16 * 1024 * 1024
 _MAX_METADATA_BYTES = 64 * 1024
 _MAX_TEXT_LENGTH = 4096
@@ -37,6 +39,18 @@ class LoRACheckpoint:
     configs: dict[str, LoRAAdapterConfig]
     base_identifier: str | None
     caller_metadata: dict[str, str | int | float | bool | None]
+
+
+@dataclass(frozen=True)
+class LoRATrainingCheckpoint:
+    """Loaded exact-resume optimizer state and validated metadata."""
+
+    tensors: dict[str, np.ndarray]
+    configs: dict[str, LoRAAdapterConfig]
+    optimizer: dict[str, Any]
+    parameter_dtypes: dict[str, str]
+    backend: str
+    base_identifier: str | None
 
 
 def _object_without_duplicates(pairs):
@@ -181,6 +195,181 @@ def _fp32_numpy(value: np.ndarray | wp.array, name: str) -> np.ndarray:
     return np.ascontiguousarray(value, dtype="<f4")
 
 
+def _write_safetensors(
+    path: str | Path,
+    metadata: Mapping[str, str],
+    tensors: Mapping[str, np.ndarray],
+) -> None:
+    """Write sorted F32/I32 tensors atomically with standard safetensors layout."""
+    header: dict[str, Any] = {"__metadata__": dict(metadata)}
+    normalized = {}
+    offset = 0
+    formats = {
+        np.dtype("float32"): ("F32", "<f4"),
+        np.dtype("int32"): ("I32", "<i4"),
+    }
+    for name in sorted(tensors):
+        _validate_tensor_name(name)
+        tensor = np.ascontiguousarray(tensors[name])
+        if tensor.dtype not in formats:
+            raise TypeError(f"Tensor {name!r} has unsupported checkpoint dtype")
+        dtype, numpy_dtype = formats[tensor.dtype]
+        tensor = tensor.astype(numpy_dtype, copy=False)
+        if tensor.size == 0 or not tensor.shape:
+            raise ValueError(f"Tensor {name!r} must be non-empty")
+        normalized[name] = tensor
+        end = offset + tensor.nbytes
+        header[name] = {
+            "dtype": dtype,
+            "shape": list(tensor.shape),
+            "data_offsets": [offset, end],
+        }
+        offset = end
+    encoded = json.dumps(
+        header, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    encoded += b" " * (-len(encoded) % 8)
+    if len(encoded) > _MAX_HEADER_BYTES:
+        raise ValueError("Safetensors header is too large")
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=destination.parent,
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            stream.write(struct.pack("<Q", len(encoded)))
+            stream.write(encoded)
+            for name in sorted(normalized):
+                stream.write(normalized[name].tobytes(order="C"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, destination)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _read_safetensors(
+    path: str | Path,
+    *,
+    format: str,
+    version: int,
+    metadata_key: str,
+) -> tuple[str, dict[str, tuple[str, np.ndarray]]]:
+    """Read one strictly contiguous F32/I32 safetensors file."""
+    source = Path(path)
+    file_size = source.stat().st_size
+    with source.open("rb") as stream:
+        length_bytes = stream.read(8)
+        if len(length_bytes) != 8:
+            raise ValueError("Safetensors file has no complete header length")
+        header_length = struct.unpack("<Q", length_bytes)[0]
+        if header_length == 0 or header_length > _MAX_HEADER_BYTES:
+            raise ValueError("Safetensors header length is invalid")
+        if header_length > file_size - 8:
+            raise ValueError("Safetensors file has a truncated header")
+        header = _parse_json(stream.read(header_length), "safetensors JSON header")
+        if not isinstance(header, dict):
+            raise ValueError("Safetensors header must be an object")
+        raw_metadata = header.get("__metadata__")
+        if not isinstance(raw_metadata, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in raw_metadata.items()
+        ):
+            raise ValueError("Safetensors metadata must contain string pairs")
+        if raw_metadata.get("format") != format or raw_metadata.get("version") != str(
+            version
+        ):
+            raise ValueError("Unsupported checkpoint format or version")
+        metadata_payload = raw_metadata.get(metadata_key)
+        if (
+            metadata_payload is None
+            or len(metadata_payload.encode("utf-8")) > _MAX_METADATA_BYTES
+        ):
+            raise ValueError("Checkpoint metadata is missing or too large")
+
+        data_start = 8 + header_length
+        data_size = file_size - data_start
+        entries = []
+        formats = {"F32": ("<f4", 4), "I32": ("<i4", 4)}
+        for raw_name, entry in header.items():
+            if raw_name == "__metadata__":
+                continue
+            name = _validate_tensor_name(raw_name)
+            if not isinstance(entry, dict) or set(entry) != {
+                "dtype",
+                "shape",
+                "data_offsets",
+            }:
+                raise ValueError(f"Invalid metadata for tensor {name!r}")
+            dtype, shape, offsets = (
+                entry["dtype"],
+                entry["shape"],
+                entry["data_offsets"],
+            )
+            if dtype not in formats:
+                raise ValueError(f"Unsupported dtype for tensor {name!r}")
+            if (
+                not isinstance(shape, list)
+                or not shape
+                or any(
+                    isinstance(dimension, bool)
+                    or not isinstance(dimension, int)
+                    or dimension <= 0
+                    for dimension in shape
+                )
+            ):
+                raise ValueError(f"Invalid shape for tensor {name!r}")
+            if (
+                not isinstance(offsets, list)
+                or len(offsets) != 2
+                or any(
+                    isinstance(value, bool) or not isinstance(value, int)
+                    for value in offsets
+                )
+            ):
+                raise ValueError(f"Invalid offsets for tensor {name!r}")
+            begin, end = offsets
+            itemsize = formats[dtype][1]
+            if (
+                begin < 0
+                or end - begin != math.prod(shape) * itemsize
+                or end > data_size
+            ):
+                raise ValueError(f"Invalid data range for tensor {name!r}")
+            entries.append((begin, end, name, tuple(shape), dtype))
+        if not entries:
+            raise ValueError("Checkpoint contains no tensors")
+        entries.sort()
+        cursor = 0
+        for begin, end, name, _, _ in entries:
+            if begin != cursor:
+                raise ValueError(
+                    f"Overlapping or non-contiguous data for tensor {name!r}"
+                )
+            cursor = end
+        if cursor != data_size:
+            raise ValueError("Safetensors file has trailing or missing tensor data")
+        tensors = {}
+        for begin, end, name, shape, dtype in entries:
+            stream.seek(data_start + begin)
+            payload = stream.read(end - begin)
+            if len(payload) != end - begin:
+                raise ValueError(f"Truncated data for tensor {name!r}")
+            tensors[name] = (
+                dtype,
+                np.frombuffer(payload, dtype=formats[dtype][0]).reshape(shape).copy(),
+            )
+    return metadata_payload, tensors
+
+
 def save_lora_safetensors(
     path: str | Path,
     adapters: Mapping[str, np.ndarray | wp.array],
@@ -221,179 +410,45 @@ def save_lora_safetensors(
         if rank_dimension != rank:
             raise ValueError(f"Adapter {name!r} does not match configured rank {rank}")
 
-    header: dict[str, Any] = {
-        "__metadata__": {
-            "format": _FORMAT,
-            "version": str(_VERSION),
-            "warp_nn_lora": metadata_json,
-        }
-    }
-    offset = 0
-    for name in sorted(tensors):
-        tensor = tensors[name]
-        end = offset + tensor.nbytes
-        header[name] = {
-            "dtype": "F32",
-            "shape": list(tensor.shape),
-            "data_offsets": [offset, end],
-        }
-        offset = end
-    encoded = json.dumps(
-        header, sort_keys=True, separators=(",", ":"), allow_nan=False
-    ).encode("utf-8")
-    encoded += b" " * (-len(encoded) % 8)
-    if len(encoded) > _MAX_HEADER_BYTES:
-        raise ValueError("Safetensors header is too large")
-
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            prefix=f".{destination.name}.",
-            suffix=".tmp",
-            dir=destination.parent,
-            delete=False,
-        ) as stream:
-            temporary_path = Path(stream.name)
-            stream.write(struct.pack("<Q", len(encoded)))
-            stream.write(encoded)
-            for name in sorted(tensors):
-                stream.write(tensors[name].tobytes(order="C"))
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary_path, destination)
-    finally:
-        if temporary_path is not None and temporary_path.exists():
-            temporary_path.unlink()
+    _write_safetensors(
+        path,
+        {"format": _FORMAT, "version": str(_VERSION), "warp_nn_lora": metadata_json},
+        tensors,
+    )
 
 
 def load_lora_safetensors(path: str | Path, *, as_warp: bool = False) -> LoRACheckpoint:
     """Load validated adapter state into NumPy or CPU Warp arrays."""
-    source = Path(path)
-    file_size = source.stat().st_size
-    with source.open("rb") as stream:
-        length_bytes = stream.read(8)
-        if len(length_bytes) != 8:
-            raise ValueError("Safetensors file has no complete header length")
-        header_length = struct.unpack("<Q", length_bytes)[0]
-        if header_length == 0 or header_length > _MAX_HEADER_BYTES:
-            raise ValueError("Safetensors header length is invalid")
-        if header_length > file_size - 8:
-            raise ValueError("Safetensors file has a truncated header")
-        header = _parse_json(stream.read(header_length), "safetensors JSON header")
-        if not isinstance(header, dict):
-            raise ValueError("Safetensors header must be an object")
-        raw_metadata = header.get("__metadata__")
-        if not isinstance(raw_metadata, dict) or any(
-            not isinstance(key, str) or not isinstance(value, str)
-            for key, value in raw_metadata.items()
-        ):
-            raise ValueError("Safetensors metadata must contain string pairs")
-        if raw_metadata.get("format") != _FORMAT or raw_metadata.get("version") != str(
-            _VERSION
-        ):
-            raise ValueError("Unsupported LoRA checkpoint format or version")
-        metadata_payload = raw_metadata.get("warp_nn_lora")
-        if (
-            metadata_payload is None
-            or len(metadata_payload.encode("utf-8")) > _MAX_METADATA_BYTES
-        ):
-            raise ValueError("LoRA metadata is missing or too large")
-        metadata = _validate_metadata(
-            _parse_json(metadata_payload, "LoRA checkpoint metadata")
+    metadata_payload, stored = _read_safetensors(
+        path, format=_FORMAT, version=_VERSION, metadata_key="warp_nn_lora"
+    )
+    metadata = _validate_metadata(
+        _parse_json(metadata_payload, "LoRA checkpoint metadata")
+    )
+    expected = _expected_tensors(metadata["configs"])
+    if set(stored) != set(expected):
+        missing = sorted(set(expected) - set(stored))
+        extra = sorted(set(stored) - set(expected))
+        raise ValueError(
+            f"Adapter tensors do not match configs; missing={missing}, extra={extra}"
         )
-        expected = _expected_tensors(metadata["configs"])
-        tensor_names = set(header) - {"__metadata__"}
-        if tensor_names != set(expected):
-            missing = sorted(set(expected) - tensor_names)
-            extra = sorted(tensor_names - set(expected))
+    output: dict[str, np.ndarray | wp.array] = {}
+    for name in sorted(stored):
+        dtype, array = stored[name]
+        target, side = expected[name]
+        rank = metadata["configs"][target].rank
+        rank_dimension = (
+            array.shape[0]
+            if side == "A" and array.ndim == 2
+            else (array.shape[1] if side == "B" and array.ndim == 2 else None)
+        )
+        if dtype != "F32" or rank_dimension != rank:
             raise ValueError(
-                f"Adapter tensors do not match configs; missing={missing}, extra={extra}"
+                f"Adapter {name!r} must be 2-D and match configured rank {rank} with F32 storage"
             )
-
-        data_start = 8 + header_length
-        data_size = file_size - data_start
-        entries = []
-        for raw_name, entry in header.items():
-            if raw_name == "__metadata__":
-                continue
-            name = _validate_tensor_name(raw_name)
-            if not isinstance(entry, dict) or set(entry) != {
-                "dtype",
-                "shape",
-                "data_offsets",
-            }:
-                raise ValueError(f"Invalid metadata for adapter {name!r}")
-            shape = entry["shape"]
-            offsets = entry["data_offsets"]
-            if entry["dtype"] != "F32":
-                raise ValueError(f"Adapter {name!r} must use F32 storage")
-            if (
-                not isinstance(shape, list)
-                or not shape
-                or any(
-                    isinstance(dimension, bool)
-                    or not isinstance(dimension, int)
-                    or dimension <= 0
-                    for dimension in shape
-                )
-            ):
-                raise ValueError(f"Invalid shape for adapter {name!r}")
-            if (
-                not isinstance(offsets, list)
-                or len(offsets) != 2
-                or any(
-                    isinstance(value, bool) or not isinstance(value, int)
-                    for value in offsets
-                )
-            ):
-                raise ValueError(f"Invalid offsets for adapter {name!r}")
-            begin, end = offsets
-            elements = math.prod(shape)
-            if (
-                begin < 0
-                or end < begin
-                or end - begin != elements * 4
-                or end > data_size
-            ):
-                raise ValueError(f"Invalid data range for adapter {name!r}")
-            target, side = expected[name]
-            rank = metadata["configs"][target].rank
-            rank_dimension = (
-                shape[0]
-                if side == "A" and len(shape) == 2
-                else (shape[1] if side == "B" and len(shape) == 2 else None)
-            )
-            if rank_dimension != rank:
-                raise ValueError(
-                    f"Adapter {name!r} must be 2-D and match configured rank {rank}"
-                )
-            entries.append((begin, end, name, tuple(shape)))
-        if not entries:
-            raise ValueError("LoRA checkpoint contains no adapter tensors")
-        entries.sort()
-        cursor = 0
-        for begin, end, name, _ in entries:
-            if begin != cursor:
-                raise ValueError(
-                    f"Overlapping or non-contiguous data for adapter {name!r}"
-                )
-            cursor = end
-        if cursor != data_size:
-            raise ValueError("Safetensors file has trailing or missing tensor data")
-
-        output: dict[str, np.ndarray | wp.array] = {}
-        for begin, end, name, shape in entries:
-            stream.seek(data_start + begin)
-            payload = stream.read(end - begin)
-            if len(payload) != end - begin:
-                raise ValueError(f"Truncated data for adapter {name!r}")
-            array = np.frombuffer(payload, dtype="<f4").reshape(shape).copy()
-            output[name] = (
-                wp.array(array, dtype=wp.float32, device="cpu") if as_warp else array
-            )
+        output[name] = (
+            wp.array(array, dtype=wp.float32, device="cpu") if as_warp else array
+        )
     return LoRACheckpoint(
         output,
         metadata["configs"],
@@ -423,4 +478,209 @@ def restore_lora_collection(path: str | Path, collection) -> LoRACheckpoint:
     """Restore adapter weights into fixed buffers and reset AdamW state."""
     checkpoint = load_lora_safetensors(path)
     collection.load_fp32_state(checkpoint.tensors, checkpoint.configs)
+    return checkpoint
+
+
+_OPTIMIZER_FIELDS = (
+    "beta1",
+    "beta2",
+    "epsilon",
+    "gradient_multiplier",
+    "learning_rate",
+    "loss_scale",
+    "max_grad_norm",
+    "min_learning_rate_ratio",
+    "normalize_by_valid_tokens",
+    "total_steps",
+    "warmup_steps",
+    "weight_decay",
+)
+
+
+def _parameter_dtype_name(value: wp.array) -> str:
+    names = {wp.float16: "F16", wp.bfloat16: "BF16", wp.float32: "F32"}
+    if value.dtype not in names:
+        raise TypeError("LoRA parameters must use FP16, BF16, or FP32")
+    return names[value.dtype]
+
+
+def _optimizer_fingerprint(optimizer) -> dict[str, Any]:
+    return {name: getattr(optimizer, name) for name in _OPTIMIZER_FIELDS}
+
+
+def _validate_optimizer_fingerprint(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != set(_OPTIMIZER_FIELDS):
+        raise ValueError("Invalid optimizer fingerprint")
+    checked = {}
+    float_fields = set(_OPTIMIZER_FIELDS) - {
+        "normalize_by_valid_tokens",
+        "total_steps",
+        "warmup_steps",
+        "max_grad_norm",
+    }
+    for name in sorted(float_fields):
+        item = value[name]
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise ValueError(f"Invalid optimizer fingerprint value {name!r}")
+        item = float(item)
+        if not math.isfinite(item):
+            raise ValueError(f"Invalid optimizer fingerprint value {name!r}")
+        checked[name] = item
+    for name in ("total_steps", "warmup_steps"):
+        item = value[name]
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise ValueError(f"Invalid optimizer fingerprint value {name!r}")
+        checked[name] = item
+    normalized = value["normalize_by_valid_tokens"]
+    if not isinstance(normalized, bool):
+        raise ValueError("Invalid optimizer gradient normalization")
+    checked["normalize_by_valid_tokens"] = normalized
+    maximum = value["max_grad_norm"]
+    if maximum is not None:
+        if isinstance(maximum, bool) or not isinstance(maximum, (int, float)):
+            raise ValueError("Invalid optimizer max_grad_norm")
+        maximum = float(maximum)
+        if not math.isfinite(maximum) or maximum <= 0.0:
+            raise ValueError("Invalid optimizer max_grad_norm")
+    checked["max_grad_norm"] = maximum
+    return checked
+
+
+def _training_tensor_names(parameter_names) -> set[str]:
+    names = {"optimizer.step_count"}
+    for name in parameter_names:
+        names.update(
+            (f"{name}.master", f"{name}.first_moment", f"{name}.second_moment")
+        )
+    return names
+
+
+def save_lora_training_state(
+    path: str | Path,
+    collection,
+    *,
+    base_identifier: str | None = None,
+) -> None:
+    """Atomically save full LoRA/AdamW state for bitwise continuation."""
+    if base_identifier is not None:
+        _validate_text(base_identifier, "base_identifier")
+    optimizer = collection.optimizer
+    raw_lora, _ = _serialized_metadata(collection.configs, base_identifier, None)
+    metadata = {
+        "backend": "cublas" if collection.cublas is not None else "warp",
+        "base_identifier": base_identifier,
+        "configs": raw_lora["configs"],
+        "optimizer": _optimizer_fingerprint(optimizer),
+        "parameter_dtypes": {
+            name: _parameter_dtype_name(parameter)
+            for name, parameter in sorted(collection.named_parameters.items())
+        },
+    }
+    metadata_json = json.dumps(
+        metadata, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    if len(metadata_json.encode("utf-8")) > _MAX_METADATA_BYTES:
+        raise ValueError("LoRA training-state metadata is too large")
+    tensors = {"optimizer.step_count": optimizer.step_count.numpy()}
+    # Optimizer slots and named masters deliberately share insertion order.
+    for index, (name, master) in enumerate(collection.named_masters.items()):
+        tensors[f"{name}.master"] = master.numpy()
+        tensors[f"{name}.first_moment"] = (
+            optimizer.first_moments[index].numpy().reshape(master.shape)
+        )
+        tensors[f"{name}.second_moment"] = (
+            optimizer.second_moments[index].numpy().reshape(master.shape)
+        )
+    _write_safetensors(
+        path,
+        {
+            "format": _TRAINING_FORMAT,
+            "version": str(_TRAINING_VERSION),
+            "warp_nn_lora_training": metadata_json,
+        },
+        tensors,
+    )
+
+
+def load_lora_training_state(path: str | Path) -> LoRATrainingCheckpoint:
+    """Load and structurally validate an exact-resume LoRA training state."""
+    payload, stored = _read_safetensors(
+        path,
+        format=_TRAINING_FORMAT,
+        version=_TRAINING_VERSION,
+        metadata_key="warp_nn_lora_training",
+    )
+    metadata = _parse_json(payload, "LoRA training-state metadata")
+    if not isinstance(metadata, dict) or set(metadata) != {
+        "backend",
+        "base_identifier",
+        "configs",
+        "optimizer",
+        "parameter_dtypes",
+    }:
+        raise ValueError("Invalid LoRA training-state metadata")
+    lora_metadata = _validate_metadata(
+        {
+            "configs": metadata["configs"],
+            "base_identifier": metadata["base_identifier"],
+            "caller_metadata": {},
+        }
+    )
+    configs = lora_metadata["configs"]
+    optimizer = _validate_optimizer_fingerprint(metadata["optimizer"])
+    base_identifier = lora_metadata["base_identifier"]
+    backend = metadata["backend"]
+    if backend not in {"warp", "cublas"}:
+        raise ValueError("Invalid training-state backend")
+    parameter_dtypes = metadata["parameter_dtypes"]
+    if not isinstance(parameter_dtypes, dict) or not parameter_dtypes:
+        raise ValueError("parameter_dtypes must be a non-empty object")
+    for name, dtype in parameter_dtypes.items():
+        _validate_tensor_name(name)
+        if dtype not in {"F16", "BF16", "F32"}:
+            raise ValueError(f"Invalid parameter dtype for {name!r}")
+    expected = _training_tensor_names(parameter_dtypes)
+    if set(stored) != expected:
+        missing = sorted(expected - set(stored))
+        extra = sorted(set(stored) - expected)
+        raise ValueError(
+            "Training-state tensors do not match parameters; "
+            f"missing={missing}, extra={extra}"
+        )
+    tensors = {}
+    for name, (dtype, tensor) in stored.items():
+        required_dtype = "I32" if name == "optimizer.step_count" else "F32"
+        if dtype != required_dtype:
+            raise ValueError(f"Invalid dtype for training-state tensor {name!r}")
+        tensors[name] = tensor
+    step = tensors["optimizer.step_count"]
+    if step.shape != (1,) or step[0] < 0:
+        raise ValueError("optimizer step_count must be one non-negative INT32 value")
+    return LoRATrainingCheckpoint(
+        tensors,
+        configs,
+        optimizer,
+        dict(sorted(parameter_dtypes.items())),
+        backend,
+        base_identifier,
+    )
+
+
+def restore_lora_training_state(
+    path: str | Path,
+    collection,
+    *,
+    base_identifier: str | None = None,
+) -> LoRATrainingCheckpoint:
+    """Restore full optimizer state into existing fixed collection buffers."""
+    checkpoint = load_lora_training_state(path)
+    if base_identifier is not None and checkpoint.base_identifier != base_identifier:
+        raise ValueError("training-state base identifier does not match")
+    collection.load_training_state(
+        checkpoint.tensors,
+        checkpoint.configs,
+        checkpoint.optimizer,
+        checkpoint.parameter_dtypes,
+        checkpoint.backend,
+    )
     return checkpoint

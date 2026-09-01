@@ -148,10 +148,13 @@ def test_adamw_normalizes_once_by_accumulated_valid_tokens_cpu():
     np.testing.assert_array_equal(plan.step_count.numpy(), [1])
 
 
-def test_adamw_nonfinite_gradient_skips_all_step_state_cpu():
+@pytest.mark.parametrize("max_grad_norm", [None, 1.0])
+def test_adamw_nonfinite_gradient_skips_all_step_state_cpu(max_grad_norm):
     parameter = wp.array([0.5, -1.0], dtype=wp.bfloat16, device="cpu")
     gradient = wp.array([np.nan, np.inf], dtype=wp.float32, device="cpu")
-    plan = AdamWPlan([parameter], [gradient], learning_rate=0.1)
+    plan = AdamWPlan(
+        [parameter], [gradient], learning_rate=0.1, max_grad_norm=max_grad_norm
+    )
     parameter_before = parameter.numpy().copy()
     master_before = plan.masters[0].numpy().copy()
     first_before = plan.first_moments[0].numpy().copy()
@@ -165,6 +168,82 @@ def test_adamw_nonfinite_gradient_skips_all_step_state_cpu():
     np.testing.assert_array_equal(plan.masters[0].numpy(), master_before)
     np.testing.assert_array_equal(plan.first_moments[0].numpy(), first_before)
     np.testing.assert_array_equal(plan.second_moments[0].numpy(), second_before)
+    if max_grad_norm is not None:
+        assert np.isnan(plan.global_grad_norm.numpy()[0])
+
+
+def test_adamw_clips_global_normalized_gradient_norm_cpu():
+    parameters = [
+        wp.array([0.5, -1.0], dtype=wp.float32, device="cpu"),
+        wp.array([2.0], dtype=wp.float32, device="cpu"),
+    ]
+    gradients = [
+        wp.array([6.0, 8.0], dtype=wp.float32, device="cpu"),
+        wp.array([0.0], dtype=wp.float32, device="cpu"),
+    ]
+    plan = AdamWPlan(
+        parameters,
+        gradients,
+        learning_rate=0.1,
+        beta1=0.0,
+        beta2=0.0,
+        epsilon=1.0,
+        loss_scale=2.0,
+        max_grad_norm=1.0,
+    )
+
+    plan.step()
+
+    # The unscaled norm is five, so clipping composes a 0.2 factor with unscaling.
+    np.testing.assert_allclose(plan.normalization_multiplier.numpy(), [0.1])
+    clipped = np.array([0.6, 0.8], dtype=np.float32)
+    expected = np.array([0.5, -1.0], dtype=np.float32) - 0.1 * clipped / (
+        np.abs(clipped) + 1.0
+    )
+    np.testing.assert_allclose(parameters[0].numpy(), expected, atol=2.0e-6)
+    np.testing.assert_allclose(plan.first_moments[0].numpy(), clipped, atol=2.0e-6)
+    np.testing.assert_array_equal(parameters[1].numpy(), [2.0])
+
+
+def test_adamw_global_norm_clip_is_deterministic_and_graph_safe_cuda():
+    if not wp.is_cuda_available():
+        pytest.skip("CUDA is unavailable")
+    device = wp.get_device("cuda:0")
+    gradient_np = np.linspace(-2.0, 3.0, 513, dtype=np.float32)
+    parameter = wp.zeros(gradient_np.size, dtype=wp.float32, device=device)
+    gradient = wp.array(gradient_np, dtype=wp.float32, device=device)
+    plan = AdamWPlan(
+        [parameter],
+        [gradient],
+        learning_rate=0.1,
+        beta1=0.0,
+        beta2=0.0,
+        epsilon=1.0,
+        max_grad_norm=1.0,
+    )
+    wp.synchronize_device(device)
+    with wp.ScopedCapture(device=device) as capture:
+        plan.step()
+
+    observed = []
+    for _ in range(3):
+        plan.reset_state()
+        wp.capture_launch(capture.graph)
+        wp.synchronize_device(device)
+        observed.append(plan.normalization_multiplier.numpy())
+
+    np.testing.assert_array_equal(observed[0], observed[1])
+    np.testing.assert_array_equal(observed[0], observed[2])
+    expected_multiplier = 1.0 / np.linalg.norm(gradient_np.astype(np.float64))
+    np.testing.assert_allclose(
+        plan.normalization_multiplier.numpy(), [expected_multiplier], rtol=2.0e-6
+    )
+    np.testing.assert_allclose(
+        plan.global_grad_norm.numpy(), [1.0 / expected_multiplier], rtol=2.0e-6
+    )
+    np.testing.assert_allclose(
+        plan.clip_scale.numpy(), [expected_multiplier], rtol=2.0e-6
+    )
 
 
 def test_adamw_cosine_warmup_schedule_and_skipped_step_cpu():
@@ -213,6 +292,7 @@ def test_adamw_cosine_warmup_schedule_and_skipped_step_cpu():
         ({"total_steps": 0}, "positive integer"),
         ({"total_steps": 2, "warmup_steps": 2}, "smaller"),
         ({"total_steps": 2, "min_learning_rate_ratio": 1.1}, "\\[0, 1\\]"),
+        ({"max_grad_norm": 0.0}, "positive and finite"),
     ],
 )
 def test_adamw_rejects_invalid_schedule_cpu(options, message):

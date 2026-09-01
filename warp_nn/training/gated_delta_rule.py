@@ -15,7 +15,7 @@ _CUDA_DTYPES = (wp.float16, wp.bfloat16)
 _STORAGE_DTYPES = (wp.float32, *_CUDA_DTYPES)
 
 
-def _can_store_backward_partials(key_size: int, value_tile: int) -> bool:
+def _can_reuse_state_for_backward_partials(key_size: int, value_tile: int) -> bool:
     reverse_tile = min(16, value_tile)
     partial_rows = key_size // reverse_tile if key_size % reverse_tile == 0 else 0
     return reverse_tile >= 2 and partial_rows > 0 and 2 * partial_rows < key_size
@@ -47,7 +47,9 @@ def _kernels(
     MATERIALIZE_TILE = min(8, VALUE_TILE)
     PARTIAL_ROWS = KEY_SIZE // REVERSE_TILE if KEY_SIZE % REVERSE_TILE == 0 else 0
     ZERO_PARTIAL_ROWS = 2 * PARTIAL_ROWS + 1
-    DETERMINISTIC_PARTIALS = _can_store_backward_partials(KEY_SIZE, VALUE_TILE)
+    PARTIALS_IN_STATE_WORKSPACE = _can_reuse_state_for_backward_partials(
+        KEY_SIZE, VALUE_TILE
+    )
     SEGMENTED = segmented
 
     @wp.func
@@ -404,6 +406,7 @@ def _kernels(
         decay_grad: wp.array3d(dtype=wp.float32),
         beta_grad: wp.array3d(dtype=wp.float32),
         past_grad: wp.array2d(dtype=wp.float32),
+        fallback_partial: wp.array2d(dtype=wp.float32),
         key_heads: wp.int32,
         value_heads: wp.int32,
         sequence: wp.int32,
@@ -462,12 +465,6 @@ def _kernels(
                     query_partial,
                     alpha=scale,
                 )
-                if wp.static(not DETERMINISTIC_PARTIALS):
-                    wp.tile_atomic_add(
-                        query_grad,
-                        wp.tile_transpose(query_partial),
-                        offset=(key_row, 0),
-                    )
                 wp.tile_matmul(
                     wp.tile_transpose(queries),
                     output_gradient_storage,
@@ -514,12 +511,6 @@ def _kernels(
                     wp.tile_transpose(retrieved_gradient_storage),
                     key_partial,
                 )
-                if wp.static(not DETERMINISTIC_PARTIALS):
-                    wp.tile_atomic_add(
-                        key_grad,
-                        wp.tile_transpose(key_partial),
-                        offset=(key_row, 0),
-                    )
                 state_gradient *= decay_value
                 wp.tile_matmul(
                     wp.tile_transpose(keys),
@@ -540,7 +531,7 @@ def _kernels(
                 wp.tile_store(
                     value_grad, value_gradient, offset=(value_row, value_offset)
                 )
-                if wp.static(DETERMINISTIC_PARTIALS):
+                if wp.static(PARTIALS_IN_STATE_WORKSPACE):
                     wp.tile_store(
                         states,
                         wp.tile_reshape(
@@ -579,36 +570,58 @@ def _kernels(
                         ),
                     )
                 else:
-                    wp.tile_atomic_add(
-                        decay_grad,
-                        wp.tile_full(
-                            shape=(1, 1, 1),
-                            value=decay_contribution,
+                    partial_base = (
+                        (batch * value_heads + value_head) * sequence + token
+                    ) * (2 * KEY_SIZE + 2)
+                    wp.tile_store(
+                        fallback_partial,
+                        query_partial,
+                        offset=(partial_base, value_tile_index),
+                    )
+                    wp.tile_store(
+                        fallback_partial,
+                        key_partial,
+                        offset=(partial_base + KEY_SIZE, value_tile_index),
+                    )
+                    fallback_partial[partial_base + 2 * KEY_SIZE, value_tile_index] = (
+                        decay_contribution
+                    )
+                    fallback_partial[
+                        partial_base + 2 * KEY_SIZE + 1, value_tile_index
+                    ] = beta_contribution
+            else:
+                if wp.static(PARTIALS_IN_STATE_WORKSPACE):
+                    token_state_base = (
+                        (batch * value_heads + value_head) * sequence + token
+                    ) * KEY_SIZE
+                    wp.tile_store(
+                        states,
+                        wp.tile_zeros(
+                            shape=(ZERO_PARTIAL_ROWS, REVERSE_TILE),
                             dtype=wp.float32,
                         ),
-                        offset=(batch, token, value_head),
+                        offset=(token_state_base, value_offset),
                     )
-                    wp.tile_atomic_add(
-                        beta_grad,
-                        wp.tile_full(
-                            shape=(1, 1, 1),
-                            value=beta_contribution,
-                            dtype=wp.float32,
-                        ),
-                        offset=(batch, token, value_head),
+                else:
+                    partial_base = (
+                        (batch * value_heads + value_head) * sequence + token
+                    ) * (2 * KEY_SIZE + 2)
+                    wp.tile_store(
+                        fallback_partial,
+                        wp.tile_zeros(shape=(KEY_SIZE, 1), dtype=wp.float32),
+                        offset=(partial_base, value_tile_index),
                     )
-            elif wp.static(DETERMINISTIC_PARTIALS):
-                token_state_base = (
-                    (batch * value_heads + value_head) * sequence + token
-                ) * KEY_SIZE
-                wp.tile_store(
-                    states,
-                    wp.tile_zeros(
-                        shape=(ZERO_PARTIAL_ROWS, REVERSE_TILE),
-                        dtype=wp.float32,
-                    ),
-                    offset=(token_state_base, value_offset),
-                )
+                    wp.tile_store(
+                        fallback_partial,
+                        wp.tile_zeros(shape=(KEY_SIZE, 1), dtype=wp.float32),
+                        offset=(partial_base + KEY_SIZE, value_tile_index),
+                    )
+                    fallback_partial[partial_base + 2 * KEY_SIZE, value_tile_index] = (
+                        wp.float32(0.0)
+                    )
+                    fallback_partial[
+                        partial_base + 2 * KEY_SIZE + 1, value_tile_index
+                    ] = wp.float32(0.0)
 
         if accumulate:
             state_gradient += wp.tile_load(
@@ -621,6 +634,7 @@ def _kernels(
     @wp.kernel(enable_backward=False, module="unique")
     def reduce_gradients(
         partial: wp.array2d(dtype=wp.float32),
+        fallback_partial: wp.array2d(dtype=wp.float32),
         query_grad: wp.array4d(dtype=wp.float32),
         key_grad: wp.array4d(dtype=wp.float32),
         decay_grad: wp.array3d(dtype=wp.float32),
@@ -636,22 +650,31 @@ def _kernels(
             key_total = key_grad[batch, key_head, token, column]
         value_head_start = key_head * value_heads // query_grad.shape[1]
         value_head_end = (key_head + 1) * value_heads // query_grad.shape[1]
-        partial_row = column // REVERSE_TILE
-        partial_column = column % REVERSE_TILE
         for value_head in range(value_head_start, value_head_end):
             token_state_base = (
                 (batch * value_heads + value_head) * query_grad.shape[2] + token
             ) * KEY_SIZE
             for value_tile in range(VALUE_SIZE // REVERSE_TILE):
-                value_offset = value_tile * REVERSE_TILE
-                query_total += partial[
-                    token_state_base + partial_row,
-                    value_offset + partial_column,
-                ]
-                key_total += partial[
-                    token_state_base + PARTIAL_ROWS + partial_row,
-                    value_offset + partial_column,
-                ]
+                if wp.static(PARTIALS_IN_STATE_WORKSPACE):
+                    value_offset = value_tile * REVERSE_TILE
+                    partial_row = column // REVERSE_TILE
+                    partial_column = column % REVERSE_TILE
+                    query_total += partial[
+                        token_state_base + partial_row,
+                        value_offset + partial_column,
+                    ]
+                    key_total += partial[
+                        token_state_base + PARTIAL_ROWS + partial_row,
+                        value_offset + partial_column,
+                    ]
+                else:
+                    fallback_base = (
+                        (batch * value_heads + value_head) * query_grad.shape[2] + token
+                    ) * (2 * KEY_SIZE + 2)
+                    query_total += fallback_partial[fallback_base + column, value_tile]
+                    key_total += fallback_partial[
+                        fallback_base + KEY_SIZE + column, value_tile
+                    ]
         query_grad[batch, key_head, token, column] = query_total
         key_grad[batch, key_head, token, column] = key_total
 
@@ -667,15 +690,26 @@ def _kernels(
                 (batch * value_heads + value_head) * query_grad.shape[2] + token
             ) * KEY_SIZE
             for value_tile in range(VALUE_SIZE // REVERSE_TILE):
-                value_offset = value_tile * REVERSE_TILE
-                decay_total += partial[
-                    token_state_base + 2 * PARTIAL_ROWS,
-                    value_offset,
-                ]
-                beta_total += partial[
-                    token_state_base + 2 * PARTIAL_ROWS,
-                    value_offset + 1,
-                ]
+                if wp.static(PARTIALS_IN_STATE_WORKSPACE):
+                    value_offset = value_tile * REVERSE_TILE
+                    decay_total += partial[
+                        token_state_base + 2 * PARTIAL_ROWS,
+                        value_offset,
+                    ]
+                    beta_total += partial[
+                        token_state_base + 2 * PARTIAL_ROWS,
+                        value_offset + 1,
+                    ]
+                else:
+                    fallback_base = (
+                        (batch * value_heads + value_head) * query_grad.shape[2] + token
+                    ) * (2 * KEY_SIZE + 2)
+                    decay_total += fallback_partial[
+                        fallback_base + 2 * KEY_SIZE, value_tile
+                    ]
+                    beta_total += fallback_partial[
+                        fallback_base + 2 * KEY_SIZE + 1, value_tile
+                    ]
             decay_grad[batch, token, value_head] = decay_total
             beta_grad[batch, token, value_head] = beta_total
 
@@ -724,7 +758,7 @@ class GatedDeltaRulePlan:
             raise ValueError("Gated Delta scale must be finite")
         self.chunks = (sequence + _CHUNK - 1) // _CHUNK
         self.value_tile = min(32, value_size & -value_size)
-        self._deterministic_partials = _can_store_backward_partials(
+        self._partials_in_state_workspace = _can_reuse_state_for_backward_partials(
             key_size, self.value_tile
         )
         self._kernels = _kernels(dtype, key_size, value_size, self.value_tile)
@@ -764,6 +798,17 @@ class GatedDeltaRulePlan:
                 f"{workspace_shape} on {self.device}"
             )
         self.state_workspace = state_workspace
+        if self._partials_in_state_workspace:
+            self._fallback_partial = state_workspace
+        else:
+            self._fallback_partial = wp.empty(
+                (
+                    batch * value_heads * sequence * (2 * key_size + 2),
+                    value_size // min(16, self.value_tile),
+                ),
+                dtype=wp.float32,
+                device=self.device,
+            )
         query_shape = (batch, key_heads, sequence, key_size)
         self.query_grad = wp.empty(query_shape, dtype=wp.float32, device=self.device)
         self.key_grad = wp.empty(query_shape, dtype=wp.float32, device=self.device)
@@ -974,6 +1019,7 @@ class GatedDeltaRulePlan:
                 self.decay_grad,
                 self.beta_grad,
                 self.past_grad.reshape((state_rows, self.value_size)),
+                self._fallback_partial,
                 self.key_heads,
                 self.value_heads,
                 self.sequence,
@@ -983,21 +1029,21 @@ class GatedDeltaRulePlan:
             block_dim=128,
             device=self.device,
         )
-        if self._deterministic_partials:
-            wp.launch(
-                self._kernels.reduce_gradients,
-                dim=self.query_grad.shape,
-                inputs=[
-                    self.state_workspace,
-                    self.query_grad,
-                    self.key_grad,
-                    self.decay_grad,
-                    self.beta_grad,
-                    self.value_heads,
-                    accumulate,
-                ],
-                device=self.device,
-            )
+        wp.launch(
+            kernels.reduce_gradients,
+            dim=self.query_grad.shape,
+            inputs=[
+                self.state_workspace,
+                self._fallback_partial,
+                self.query_grad,
+                self.key_grad,
+                self.decay_grad,
+                self.beta_grad,
+                self.value_heads,
+                accumulate,
+            ],
+            device=self.device,
+        )
         return (
             self.query_grad,
             self.key_grad,

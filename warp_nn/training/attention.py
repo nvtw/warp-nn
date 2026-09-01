@@ -72,45 +72,39 @@ def _attention_kernels(dtype: type, head_size: int | None = None):
         lengths: wp.array1d[wp.int32],
         lse: wp.array3d[wp.float32],
         accumulator: wp.array4d[wp.float32],
+        output: wp.array4d(dtype=DTYPE),
         scale: wp.float32,
         window: wp.int32,
     ):
         item = wp.tid()
         sequence = query.shape[2]
-        key_token = item % sequence
-        query_token = (item / sequence) % sequence
-        query_head = (item / (sequence * sequence)) % query.shape[1]
-        batch = item / (query.shape[1] * sequence * sequence)
+        query_head = (item / sequence) % query.shape[1]
+        batch = item / (query.shape[1] * sequence)
+        query_token = item % sequence
         length = wp.clamp(lengths[batch], 0, sequence)
         first_key = wp.max(0, query_token + 1 - window) if window > 0 else 0
-        if query_token >= length or key_token < first_key or key_token > query_token:
-            return
-
-        kv_head = query_head / (query.shape[1] / key.shape[1])
-        score = wp.float32(0.0)
         for column in range(query.shape[3]):
-            score += wp.float32(
-                query[batch, query_head, query_token, column]
-            ) * wp.float32(key[batch, kv_head, key_token, column])
-        probability = wp.exp(score * scale - lse[batch, query_head, query_token])
+            accumulator[batch, query_head, query_token, column] = wp.float32(0.0)
+        if query_token < length:
+            kv_head = query_head / (query.shape[1] / key.shape[1])
+            for key_token in range(first_key, query_token + 1):
+                score = wp.float32(0.0)
+                for column in range(query.shape[3]):
+                    score += wp.float32(
+                        query[batch, query_head, query_token, column]
+                    ) * wp.float32(key[batch, kv_head, key_token, column])
+                probability = wp.exp(
+                    score * scale - lse[batch, query_head, query_token]
+                )
+                for column in range(query.shape[3]):
+                    accumulator[batch, query_head, query_token, column] += (
+                        probability
+                        * wp.float32(value[batch, kv_head, key_token, column])
+                    )
         for column in range(query.shape[3]):
-            wp.atomic_add(
-                accumulator,
-                batch,
-                query_head,
-                query_token,
-                column,
-                probability * wp.float32(value[batch, kv_head, key_token, column]),
+            output[batch, query_head, query_token, column] = DTYPE(
+                accumulator[batch, query_head, query_token, column]
             )
-
-    @wp.kernel(enable_backward=False, module="unique")
-    def cast_output(
-        accumulator: wp.array4d[wp.float32], output: wp.array4d(dtype=DTYPE)
-    ):
-        batch, head, token, column = wp.tid()
-        output[batch, head, token, column] = DTYPE(
-            accumulator[batch, head, token, column]
-        )
 
     @wp.kernel(enable_backward=False, module="unique")
     def softmax_delta(
@@ -152,7 +146,7 @@ def _attention_kernels(dtype: type, head_size: int | None = None):
         delta[batch, query_head, query_token] = total
 
     @wp.kernel(enable_backward=False, module="unique")
-    def accumulate_gradients(
+    def query_gradient(
         query: wp.array4d(dtype=DTYPE),
         key: wp.array4d(dtype=DTYPE),
         value: wp.array4d(dtype=DTYPE),
@@ -161,6 +155,50 @@ def _attention_kernels(dtype: type, head_size: int | None = None):
         lse: wp.array3d[wp.float32],
         delta: wp.array3d[wp.float32],
         query_grad: wp.array4d[wp.float32],
+        scale: wp.float32,
+        window: wp.int32,
+    ):
+        item = wp.tid()
+        sequence = query.shape[2]
+        query_head = (item / sequence) % query.shape[1]
+        batch = item / (query.shape[1] * sequence)
+        query_token = item % sequence
+        length = wp.clamp(lengths[batch], 0, sequence)
+        first_key = wp.max(0, query_token + 1 - window) if window > 0 else 0
+        if query_token < length:
+            kv_head = query_head / (query.shape[1] / key.shape[1])
+            for key_token in range(first_key, query_token + 1):
+                score = wp.float32(0.0)
+                probability_grad = wp.float32(0.0)
+                for column in range(query.shape[3]):
+                    score += wp.float32(
+                        query[batch, query_head, query_token, column]
+                    ) * wp.float32(key[batch, kv_head, key_token, column])
+                    probability_grad += wp.float32(
+                        output_grad[batch, query_head, query_token, column]
+                    ) * wp.float32(value[batch, kv_head, key_token, column])
+                probability = wp.exp(
+                    score * scale - lse[batch, query_head, query_token]
+                )
+                score_grad = (
+                    probability
+                    * (probability_grad - delta[batch, query_head, query_token])
+                    * scale
+                )
+                for column in range(query.shape[3]):
+                    query_grad[batch, query_head, query_token, column] += (
+                        score_grad * wp.float32(key[batch, kv_head, key_token, column])
+                    )
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def key_value_gradient(
+        query: wp.array4d(dtype=DTYPE),
+        key: wp.array4d(dtype=DTYPE),
+        value: wp.array4d(dtype=DTYPE),
+        output_grad: wp.array4d(dtype=DTYPE),
+        lengths: wp.array1d[wp.int32],
+        lse: wp.array3d[wp.float32],
+        delta: wp.array3d[wp.float32],
         key_grad: wp.array4d[wp.float32],
         value_grad: wp.array4d[wp.float32],
         scale: wp.float32,
@@ -169,66 +207,52 @@ def _attention_kernels(dtype: type, head_size: int | None = None):
         item = wp.tid()
         sequence = query.shape[2]
         key_token = item % sequence
-        query_token = (item / sequence) % sequence
-        query_head = (item / (sequence * sequence)) % query.shape[1]
-        batch = item / (query.shape[1] * sequence * sequence)
-        length = wp.clamp(lengths[batch], 0, sequence)
-        first_key = wp.max(0, query_token + 1 - window) if window > 0 else 0
-        if query_token >= length or key_token < first_key or key_token > query_token:
-            return
-
-        kv_head = query_head / (query.shape[1] / key.shape[1])
-        score = wp.float32(0.0)
-        probability_grad = wp.float32(0.0)
-        for column in range(query.shape[3]):
-            score += wp.float32(
-                query[batch, query_head, query_token, column]
-            ) * wp.float32(key[batch, kv_head, key_token, column])
-            probability_grad += wp.float32(
-                output_grad[batch, query_head, query_token, column]
-            ) * wp.float32(value[batch, kv_head, key_token, column])
-        probability = wp.exp(score * scale - lse[batch, query_head, query_token])
-        score_grad = (
-            probability
-            * (probability_grad - delta[batch, query_head, query_token])
-            * scale
-        )
-        for column in range(query.shape[3]):
-            output_gradient = wp.float32(
-                output_grad[batch, query_head, query_token, column]
-            )
-            wp.atomic_add(
-                query_grad,
-                batch,
-                query_head,
-                query_token,
-                column,
-                score_grad * wp.float32(key[batch, kv_head, key_token, column]),
-            )
-            wp.atomic_add(
-                key_grad,
-                batch,
-                kv_head,
-                key_token,
-                column,
-                score_grad * wp.float32(query[batch, query_head, query_token, column]),
-            )
-            wp.atomic_add(
-                value_grad,
-                batch,
-                kv_head,
-                key_token,
-                column,
-                probability * output_gradient,
-            )
+        kv_head = (item / sequence) % key.shape[1]
+        batch = item / (key.shape[1] * sequence)
+        length = wp.clamp(lengths[batch], 0, query.shape[2])
+        heads_per_kv = query.shape[1] / key.shape[1]
+        first_query = key_token
+        for local_head in range(heads_per_kv):
+            query_head = kv_head * heads_per_kv + local_head
+            for query_token in range(first_query, length):
+                first_key = wp.max(0, query_token + 1 - window) if window > 0 else 0
+                if key_token >= first_key:
+                    score = wp.float32(0.0)
+                    probability_grad = wp.float32(0.0)
+                    for column in range(query.shape[3]):
+                        score += wp.float32(
+                            query[batch, query_head, query_token, column]
+                        ) * wp.float32(key[batch, kv_head, key_token, column])
+                        probability_grad += wp.float32(
+                            output_grad[batch, query_head, query_token, column]
+                        ) * wp.float32(value[batch, kv_head, key_token, column])
+                    probability = wp.exp(
+                        score * scale - lse[batch, query_head, query_token]
+                    )
+                    score_grad = (
+                        probability
+                        * (probability_grad - delta[batch, query_head, query_token])
+                        * scale
+                    )
+                    for column in range(query.shape[3]):
+                        key_grad[batch, kv_head, key_token, column] += (
+                            score_grad
+                            * wp.float32(query[batch, query_head, query_token, column])
+                        )
+                        value_grad[batch, kv_head, key_token, column] += (
+                            probability
+                            * wp.float32(
+                                output_grad[batch, query_head, query_token, column]
+                            )
+                        )
 
     if head_size is None:
         return (
             logsumexp,
             accumulate_output,
-            cast_output,
             softmax_delta,
-            accumulate_gradients,
+            query_gradient,
+            key_value_gradient,
         )
 
     HEAD_SIZE = head_size
@@ -603,7 +627,6 @@ def gqa_attention_forward(
     if segment_bounds is not None:
         raise ValueError("segmented GQA is currently GPU-only")
     kernels = _attention_kernels(query.dtype)
-    accumulator.zero_()
     wp.launch(
         kernels[0],
         dim=batch * query_heads * sequence,
@@ -612,12 +635,19 @@ def gqa_attention_forward(
     )
     wp.launch(
         kernels[1],
-        dim=batch * query_heads * sequence * sequence,
-        inputs=[query, key, value, lengths, lse, accumulator, effective_scale, window],
+        dim=batch * query_heads * sequence,
+        inputs=[
+            query,
+            key,
+            value,
+            lengths,
+            lse,
+            accumulator,
+            output,
+            effective_scale,
+            window,
+        ],
         device=query.device,
-    )
-    wp.launch(
-        kernels[2], dim=query.shape, inputs=[accumulator, output], device=query.device
     )
 
 
@@ -757,7 +787,7 @@ def gqa_attention_backward(
         key_grad.zero_()
         value_grad.zero_()
     wp.launch(
-        kernels[3],
+        kernels[2],
         dim=batch * query_heads * sequence,
         inputs=[
             query,
@@ -773,8 +803,8 @@ def gqa_attention_backward(
         device=query.device,
     )
     wp.launch(
-        kernels[4],
-        dim=batch * query_heads * sequence * sequence,
+        kernels[3],
+        dim=batch * query_heads * sequence,
         inputs=[
             query,
             key,
@@ -784,6 +814,22 @@ def gqa_attention_backward(
             lse,
             delta,
             query_grad,
+            effective_scale,
+            window,
+        ],
+        device=query.device,
+    )
+    wp.launch(
+        kernels[4],
+        dim=batch * key.shape[1] * sequence,
+        inputs=[
+            query,
+            key,
+            value,
+            output_grad,
+            lengths,
+            lse,
+            delta,
             key_grad,
             value_grad,
             effective_scale,
