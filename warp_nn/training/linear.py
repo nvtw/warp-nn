@@ -550,7 +550,7 @@ def _native_split_k_geometry(
         splits = 1 << (limit.bit_length() - 1)
     elif transposed_right and output_blocks >= device.sm_count:
         splits = 8
-    while splits > 1 and reduction % (32 * splits):
+    while splits > 1 and reduction % (64 * splits):
         splits //= 2
     return 64, tile_n, splits
 
