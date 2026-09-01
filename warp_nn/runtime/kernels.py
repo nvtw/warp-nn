@@ -302,10 +302,10 @@ def _get_q8_prefill_mma_linear_kernel(dtype: type, tile_m: int):
     return _create_q8_prefill_mma_linear_kernel(dtype, tile_m)
 
 
-def _create_nvfp4_mma_linear_kernel(dtype: type):
+def _create_nvfp4_mma_linear_kernel(dtype: type, reuse_weights: bool, split_k: int):
     """Build the exact-SM120 native NVFP4 projection wrapper."""
     DTYPE = dtype
-    project = get_nvfp4_mma_projection(dtype)
+    project = get_nvfp4_mma_projection(dtype, reuse_weights, split_k)
 
     @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
     def kernel(
@@ -337,8 +337,10 @@ def _create_nvfp4_mma_linear_kernel(dtype: type):
 
 
 @lru_cache(maxsize=None)
-def _get_nvfp4_mma_linear_kernel(dtype: type):
-    return _create_nvfp4_mma_linear_kernel(dtype)
+def _get_nvfp4_mma_linear_kernel(
+    dtype: type, reuse_weights: bool = False, split_k: int = 0
+):
+    return _create_nvfp4_mma_linear_kernel(dtype, reuse_weights, split_k)
 
 
 def _create_linear_tiled_kernel(dtype: type, tile_m: int, tile_k: int):

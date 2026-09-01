@@ -281,23 +281,20 @@ def _exec_linear(op, tensors, shapes, device):
                 // 16
                 * (op.attrs["_columns"] // 8)
                 * 32
+                * op.attrs.get("_nvfp4_grid_multiplier", 1)
             ),
             inputs=[
                 op.attrs["_nvfp4_activations"],
                 op.attrs["_nvfp4_scales"],
                 op.attrs["_nvfp4_global_scales"],
-                weight.values.reshape(
-                    (op.attrs["_columns"], op.attrs["_inner"] // 2)
-                ),
-                weight.scales.reshape(
-                    (op.attrs["_columns"], op.attrs["_inner"] // 16)
-                ),
+                weight.values.reshape((op.attrs["_columns"], op.attrs["_inner"] // 2)),
+                weight.scales.reshape((op.attrs["_columns"], op.attrs["_inner"] // 16)),
                 op.attrs["_nvfp4_output"],
                 op.attrs["_columns"],
                 op.attrs["_inner"] // 64,
                 float(op.attrs.get("_output_scale", 1.0)),
             ],
-            block_dim=128,
+            block_dim=op.attrs.get("_nvfp4_block_dim", 128),
             device=device,
         )
         return
@@ -490,9 +487,7 @@ def plan_linear(
                 weight = repack_gguf_nvfp4_weight(weight)
                 tensors[op.inputs[1]] = weight
             padded_rows = (rows + 15) // 16 * 16
-            padded_output = wp.empty(
-                (padded_rows, columns), dtype=dtype, device=device
-            )
+            padded_output = wp.empty((padded_rows, columns), dtype=dtype, device=device)
             output = wp.array(
                 ptr=padded_output.ptr,
                 dtype=dtype,
@@ -526,13 +521,15 @@ def plan_linear(
                 )
                 if quantized_activation_cache is not None:
                     quantized_activation_cache[cache_key] = cached_activation
-                op.attrs["_nvfp4_quantize_kernel"] = _get_quantize_nvfp4_kernel(
-                    dtype
-                )
-                op.attrs["_nvfp4_row_scale_kernel"] = (
-                    _get_nvfp4_row_scale_kernel(dtype)
-                )
+                op.attrs["_nvfp4_quantize_kernel"] = _get_quantize_nvfp4_kernel(dtype)
+                op.attrs["_nvfp4_row_scale_kernel"] = _get_nvfp4_row_scale_kernel(dtype)
             quantized, activation_scales, activation_global_scales = cached_activation
+            # Prefill reuses each K256 weight tile across four M16 warps. Decode's
+            # long-K down projection instead needs more warps to saturate SM120.
+            reuse_weights = padded_rows >= 64 and padded_rows % 64 == 0
+            split_k = (
+                8 if padded_rows == 16 and columns >= 1024 and inner >= 8192 else 0
+            )
             op.attrs.update(
                 {
                     "_rows": rows,
@@ -543,7 +540,11 @@ def plan_linear(
                     "_nvfp4_scales": activation_scales,
                     "_nvfp4_global_scales": activation_global_scales,
                     "_nvfp4_output": padded_output,
-                    "_nvfp4_mma_kernel": _get_nvfp4_mma_linear_kernel(dtype),
+                    "_nvfp4_mma_kernel": _get_nvfp4_mma_linear_kernel(
+                        dtype, reuse_weights, split_k
+                    ),
+                    "_nvfp4_grid_multiplier": split_k or 1,
+                    "_nvfp4_block_dim": max(128, split_k * 32),
                 }
             )
             return
@@ -1518,7 +1519,9 @@ def reuse_operation_outputs(
                     ):
                         padded = value.attrs["_nvfp4_output"]
                         if shared.capacity < padded.capacity:
-                            raise ValueError("shared output cannot hold NVFP4 row padding")
+                            raise ValueError(
+                                "shared output cannot hold NVFP4 row padding"
+                            )
                         value.attrs["_nvfp4_output"] = wp.array(
                             ptr=shared.ptr,
                             dtype=shared.dtype,

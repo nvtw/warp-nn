@@ -50,9 +50,7 @@ def _dequantize(packed, scales, inner, global_scales=None):
             code = (packed[row, column // 2] >> (4 * (column & 1))) & 15
             sign = -1.0 if code & 8 else 1.0
             output[row, column] = (
-                sign
-                * _E2M1[code & 7]
-                * _decode_e4m3(scales[row, column // 16])
+                sign * _E2M1[code & 7] * _decode_e4m3(scales[row, column // 16])
             )
     if global_scales is not None:
         output *= np.asarray(global_scales, dtype=np.float32)[:, None]
@@ -111,9 +109,7 @@ def test_nvfp4_two_level_scaling_prevents_small_activation_underflow():
     direct_values = wp.empty((1, 128), dtype=wp.uint8, device=device)
     direct_scales = wp.empty((1, 16), dtype=wp.uint8, device=device)
     direct_global = wp.ones(1, dtype=wp.float32, device=device)
-    launch_quantize_nvfp4(
-        values, dynamic_values, dynamic_scales, dynamic_global
-    )
+    launch_quantize_nvfp4(values, dynamic_values, dynamic_scales, dynamic_global)
     launch_quantize_nvfp4(
         values,
         direct_values,
@@ -140,20 +136,28 @@ def test_nvfp4_two_level_scaling_prevents_small_activation_underflow():
 
 
 @pytest.mark.parametrize("inner", [128, 5120])
-def test_nvfp4_mma_random_reference_and_graph(inner):
+@pytest.mark.parametrize(
+    ("rows", "split_k", "reuse_weights"),
+    [
+        (16, 1, False),
+        (16, 8, False),
+        (64, 1, True),
+    ],
+)
+def test_nvfp4_mma_random_reference_and_graph(inner, rows, split_k, reuse_weights):
     device = _sm120()
     rng = np.random.default_rng(123)
-    activations_host = rng.normal(0.0, 0.7, (16, inner)).astype(np.float32)
+    activations_host = rng.normal(0.0, 0.7, (rows, inner)).astype(np.float32)
     weights_host = rng.normal(0.0, 0.7, (16, inner)).astype(np.float32)
     activations = wp.array(activations_host, dtype=wp.bfloat16, device=device)
     weights = wp.array(weights_host, dtype=wp.bfloat16, device=device)
-    activation_values = wp.empty((16, inner // 2), dtype=wp.uint8, device=device)
-    activation_scales = wp.empty((16, inner // 16), dtype=wp.uint8, device=device)
-    activation_global_scales = wp.empty(16, dtype=wp.float32, device=device)
+    activation_values = wp.empty((rows, inner // 2), dtype=wp.uint8, device=device)
+    activation_scales = wp.empty((rows, inner // 16), dtype=wp.uint8, device=device)
+    activation_global_scales = wp.empty(rows, dtype=wp.float32, device=device)
     weight_values = wp.empty((16, inner // 2), dtype=wp.uint8, device=device)
     weight_scales = wp.empty((16, inner // 16), dtype=wp.uint8, device=device)
     weight_global_scales = wp.ones(16, dtype=wp.float32, device=device)
-    output = wp.empty((16, 16), dtype=wp.bfloat16, device=device)
+    output = wp.empty((rows, 16), dtype=wp.bfloat16, device=device)
 
     def launch():
         launch_quantize_nvfp4(
@@ -176,6 +180,8 @@ def test_nvfp4_mma_random_reference_and_graph(inner):
             weight_values,
             weight_scales,
             output,
+            reuse_weights=reuse_weights,
+            split_k=split_k,
         )
 
     launch()
@@ -236,7 +242,9 @@ def test_nvfp4_linear_operation_pads_single_row():
     shapes = {"x": (rows, inner), "weight": (columns, inner)}
     operations = [
         Operation(
-            "Linear", ["x", "weight"], [f"output.{index}"],
+            "Linear",
+            ["x", "weight"],
+            [f"output.{index}"],
             {"_output_scale": 0.5 / (index + 1)},
         )
         for index in range(2)
@@ -312,9 +320,7 @@ def test_nvfp4_archive_load_prepares_weight_once_for_all_plans():
                 copy=False,
             )
             return {
-                "weight": BlockQuantizedTensor(
-                    values, words, scales, (8, 64), "NVFP4"
-                )
+                "weight": BlockQuantizedTensor(values, words, scales, (8, 64), "NVFP4")
             }
 
     archive = Archive()
@@ -329,8 +335,7 @@ def test_nvfp4_archive_load_prepares_weight_once_for_all_plans():
     shapes = {"x": (1, 64), "weight": (8, 64)}
     cache = {}
     operations = [
-        Operation("Linear", ["x", "weight"], [f"output.{index}"])
-        for index in range(2)
+        Operation("Linear", ["x", "weight"], [f"output.{index}"]) for index in range(2)
     ]
     for operation in operations:
         plan_linear(

@@ -993,17 +993,38 @@ def get_q8_prefill_mma_projection(dtype: type, tile_m: int):
 _NVFP4_MMA_PROJECTION = r"""
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
     const int lane = tid & 31;
-    const int warp = tid >> 5;
     const int group = lane >> 2;
     const int thread_in_group = lane & 3;
     const int column_tiles = columns >> 3;
+#if REUSE_WEIGHTS
+    __shared__ unsigned shared_weight_words[256];
+    __shared__ unsigned shared_scale_words[32];
+    const int tile = blockIdx.x;
+    const int row_base = ((tile / column_tiles) << 6) + ((threadIdx.x >> 5) << 4);
+    const int column_base = (tile - (tile / column_tiles) * column_tiles) << 3;
+#elif SPLIT_K
+    __shared__ float split_partials[1024];
+    const int local_warp = threadIdx.x >> 5;
+    const int tiles_per_block = WARPS_PER_BLOCK / SPLIT_K;
+    const int tile = blockIdx.x * tiles_per_block + local_warp / SPLIT_K;
+    const int row_tile = tile / column_tiles;
+    const int row_base = row_tile << 4;
+    const int column_base = (tile - row_tile * column_tiles) << 3;
+#else
+    const int warp = tid >> 5;
     const int row_tile = warp / column_tiles;
     const int row_base = row_tile << 4;
     const int column_base = (warp - row_tile * column_tiles) << 3;
+#endif
     float total_0 = 0.0f, total_1 = 0.0f, total_2 = 0.0f, total_3 = 0.0f;
 
+#if SPLIT_K
+    for (int block = local_warp % SPLIT_K; block < blocks64; block += SPLIT_K) {
+#else
     for (int block = 0; block < blocks64; ++block) {
+#endif
         const int packed_base = block << 5;
+        const int scale_base = block << 2;
         const int fragment = thread_in_group << 2;
         const unsigned char* a_row_0 = activations.data +
             (row_base + group) * activations.shape[1] + packed_base;
@@ -1013,19 +1034,62 @@ _NVFP4_MMA_PROJECTION = r"""
         const unsigned a1 = *reinterpret_cast<const unsigned*>(a_row_1 + fragment);
         const unsigned a2 = *reinterpret_cast<const unsigned*>(a_row_0 + fragment + 16);
         const unsigned a3 = *reinterpret_cast<const unsigned*>(a_row_1 + fragment + 16);
+#if REUSE_WEIGHTS
+        const int staged = block & 3;
+        if (staged == 0) {
+            for (int load_group = 0; load_group < 2; ++load_group) {
+                const int index = threadIdx.x + load_group * 128;
+                const int staged_block = index >> 6;
+                const int offset = index & 63;
+                const int source_block = block + staged_block;
+                unsigned value = 0;
+                if (source_block < blocks64) {
+                    const int shared_row = offset >> 3;
+                    const int shared_word = offset & 7;
+                    const unsigned char* source = weights.data +
+                        (column_base + shared_row) * weights.shape[1] +
+                        (source_block << 5);
+                    value = *reinterpret_cast<const unsigned*>(
+                        source + (shared_word << 2));
+                }
+                shared_weight_words[index] = value;
+            }
+            if (threadIdx.x < 32) {
+                const int staged_block = threadIdx.x >> 3;
+                const int shared_row = threadIdx.x & 7;
+                const int source_block = block + staged_block;
+                unsigned value = 0;
+                if (source_block < blocks64) {
+                    const unsigned char* source = weight_scales.data +
+                        (column_base + shared_row) * weight_scales.shape[1] +
+                        (source_block << 2);
+                    value = *reinterpret_cast<const unsigned*>(source);
+                }
+                shared_scale_words[threadIdx.x] = value;
+            }
+            __syncthreads();
+        }
+        const unsigned char* b_row = reinterpret_cast<const unsigned char*>(
+            shared_weight_words + staged * 64 + (group << 3));
+#else
         const unsigned char* b_row = weights.data +
             (column_base + group) * weights.shape[1] + packed_base;
+#endif
         const unsigned b0 = *reinterpret_cast<const unsigned*>(b_row + fragment);
         const unsigned b1 = *reinterpret_cast<const unsigned*>(b_row + fragment + 16);
 
-        const int scale_base = block << 2;
         // CUTLASS SFALayout: thread strides <8,0,1>, value stride 16.
         const int a_scale_row = row_base + group + ((lane & 1) << 3);
         const unsigned char* as = activation_scales.data +
             a_scale_row * activation_scales.shape[1] + scale_base;
         // CUTLASS SFBLayout: thread strides <0,1>, value stride 8.
+#if REUSE_WEIGHTS
+        const unsigned char* bs = reinterpret_cast<const unsigned char*>(
+            shared_scale_words + staged * 8 + group);
+#else
         const unsigned char* bs = weight_scales.data +
             (column_base + group) * weight_scales.shape[1] + scale_base;
+#endif
         const unsigned sfa = *reinterpret_cast<const unsigned*>(as);
         const unsigned sfb = *reinterpret_cast<const unsigned*>(bs);
         const unsigned short selector = 0;
@@ -1043,23 +1107,54 @@ _NVFP4_MMA_PROJECTION = r"""
               "r"(sfa), "h"(selector), "h"(selector), "r"(sfb),
               "h"(selector), "h"(selector));
         total_0 += d0; total_1 += d1; total_2 += d2; total_3 += d3;
+#if REUSE_WEIGHTS
+        if (staged == 3 || block + 1 == blocks64) {
+            __syncthreads();
+        }
+#endif
     }
+
+#if SPLIT_K
+    const int partial_index = (threadIdx.x >> 5) * 128 + lane * 4;
+    split_partials[partial_index] = total_0;
+    split_partials[partial_index + 1] = total_1;
+    split_partials[partial_index + 2] = total_2;
+    split_partials[partial_index + 3] = total_3;
+    __syncthreads();
+    if (local_warp % SPLIT_K == 0) {
+        for (int split = 1; split < SPLIT_K; ++split) {
+            const int offset = partial_index + split * 128;
+            total_0 += split_partials[offset];
+            total_1 += split_partials[offset + 1];
+            total_2 += split_partials[offset + 2];
+            total_3 += split_partials[offset + 3];
+        }
+    }
+#endif
 
     const int row_0 = row_base + group;
     const int row_1 = row_0 + 8;
     const int column_0 = column_base + (thread_in_group << 1);
     const float output_scale_0 = activation_global_scales.data[row_0] * weight_global_scale;
     const float output_scale_1 = activation_global_scales.data[row_1] * weight_global_scale;
-    output.data[row_0 * columns + column_0] = NATIVE_TYPE(total_0 * output_scale_0);
-    output.data[row_0 * columns + column_0 + 1] = NATIVE_TYPE(total_1 * output_scale_0);
-    output.data[row_1 * columns + column_0] = NATIVE_TYPE(total_2 * output_scale_1);
-    output.data[row_1 * columns + column_0 + 1] = NATIVE_TYPE(total_3 * output_scale_1);
+#if SPLIT_K
+    if (local_warp % SPLIT_K == 0) {
+#endif
+        output.data[row_0 * columns + column_0] = NATIVE_TYPE(total_0 * output_scale_0);
+        output.data[row_0 * columns + column_0 + 1] = NATIVE_TYPE(total_1 * output_scale_0);
+        output.data[row_1 * columns + column_0] = NATIVE_TYPE(total_2 * output_scale_1);
+        output.data[row_1 * columns + column_0 + 1] = NATIVE_TYPE(total_3 * output_scale_1);
+#if SPLIT_K
+    }
+#endif
 #endif
 """
 
 
 @lru_cache(maxsize=None)
-def get_nvfp4_mma_projection(dtype: type):
+def get_nvfp4_mma_projection(
+    dtype: type, reuse_weights: bool = False, split_k: int = 0
+):
     """Return the SM120a m16n8k64 block-scaled NVFP4 projection."""
     if dtype == wp.float16:
         native_type = "wp::float16"
@@ -1068,7 +1163,13 @@ def get_nvfp4_mma_projection(dtype: type):
     else:
         raise TypeError("NVFP4 MMA output requires FP16 or BF16")
 
-    @wp.func_native(_NVFP4_MMA_PROJECTION.replace("NATIVE_TYPE", native_type))
+    source = _NVFP4_MMA_PROJECTION.replace("NATIVE_TYPE", native_type).replace(
+        "REUSE_WEIGHTS", "1" if reuse_weights else "0"
+    )
+    source = source.replace("SPLIT_K", str(split_k))
+    source = source.replace("WARPS_PER_BLOCK", str(max(4, split_k)))
+
+    @wp.func_native(source)
     def project(
         activations: wp.array2d[wp.uint8],
         activation_scales: wp.array2d[wp.uint8],

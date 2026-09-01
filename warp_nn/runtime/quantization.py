@@ -189,6 +189,8 @@ def launch_nvfp4_linear(
     output,
     *,
     global_scale: float = 1.0,
+    reuse_weights: bool = False,
+    split_k: int = 1,
     stream=None,
 ) -> None:
     """Launch native NVFP4 output = activations @ weights.T.
@@ -198,10 +200,21 @@ def launch_nvfp4_linear(
     pads short decode batches to M=16 so they reuse this same native kernel.
     """
     enable_nvfp4_native(output.device)
+    if split_k not in (1, 2, 4, 8):
+        raise ValueError("NVFP4 split_k must be 1, 2, 4, or 8")
+    if reuse_weights and split_k != 1:
+        raise ValueError("NVFP4 weight reuse and split-K are mutually exclusive")
     rows, columns = output.shape
+    if reuse_weights and rows % 64:
+        raise ValueError("NVFP4 weight reuse requires M divisible by 64")
     inner = activations.shape[1] * 2
     if rows % NVFP4_MMA_M or columns % NVFP4_MMA_N or inner % NVFP4_MMA_K:
         raise ValueError("native NVFP4 MMA requires M%16 == N%8 == K%64 == 0")
+    if split_k > 1:
+        output_tiles = (rows // NVFP4_MMA_M) * (columns // NVFP4_MMA_N)
+        tiles_per_block = 4 // split_k if split_k <= 4 else 1
+        if output_tiles % tiles_per_block:
+            raise ValueError("NVFP4 split-K output tiles do not fill a thread block")
     if weights.shape != (columns, inner // 2):
         raise ValueError("NVFP4 weight shape does not match output and inner size")
     expected_activation_scales = (rows, inner // NVFP4_BLOCK_SIZE)
@@ -213,8 +226,12 @@ def launch_nvfp4_linear(
     ):
         raise ValueError("NVFP4 scale shape does not match its packed matrix")
     wp.launch(
-        _get_nvfp4_mma_linear_kernel(output.dtype),
-        dim=(rows // NVFP4_MMA_M) * (columns // NVFP4_MMA_N) * 32,
+        _get_nvfp4_mma_linear_kernel(
+            output.dtype,
+            reuse_weights=reuse_weights,
+            split_k=split_k if split_k > 1 else 0,
+        ),
+        dim=((rows // NVFP4_MMA_M) * (columns // NVFP4_MMA_N) * 32 * split_k),
         inputs=[
             activations,
             activation_scales,
@@ -226,7 +243,7 @@ def launch_nvfp4_linear(
             inner // NVFP4_MMA_K,
             global_scale,
         ],
-        block_dim=128,
+        block_dim=max(128, split_k * 32),
         stream=stream,
     )
 
@@ -253,9 +270,7 @@ def load_native_weights(archive, device, names: Iterable[str], mode: str | None)
     mode = normalize_weight_quantization(mode)
     names = tuple(names)
     device = wp.get_device(device)
-    nvfp4 = {
-        name for name in names if archive.metadata(name).format == "NVFP4"
-    }
+    nvfp4 = {name for name in names if archive.metadata(name).format == "NVFP4"}
     if nvfp4:
         enable_nvfp4_native(device)
     if mode == "q8_0" and not device.is_cuda:
