@@ -12,7 +12,10 @@ from functools import lru_cache
 
 import warp as wp
 
-from warp_nn.runtime._cuda import get_prefill_mma_projection
+from warp_nn.runtime._cuda import (
+    get_prefill_mma_projection,
+    get_prefill_mma_split_k_projection,
+)
 
 
 _STORAGE_DTYPES = (wp.float16, wp.bfloat16)
@@ -222,6 +225,62 @@ def _get_native_linear_kernel(
     ):
         typed_zero = DTYPE(0.0)  # noqa: F841 - retain dtype in the Warp closure
         wp.static(project)(x, weight, output, wp.tid(), columns, inner)
+
+    kernel.module.options["enable_backward"] = False
+    return kernel
+
+
+@lru_cache(maxsize=None)
+def _get_native_split_k_linear_kernel(
+    dtype: type, tile_m: int, tile_n: int, *, transposed_right: bool = True
+):
+    """Wrap the shared SM80+ MMA primitive with an FP32 split-K output."""
+    DTYPE = dtype
+    project = get_prefill_mma_split_k_projection(
+        dtype, tile_m, tile_n, transposed_right=transposed_right
+    )
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(
+        x: wp.array2d(dtype=DTYPE),
+        weight: wp.array2d(dtype=DTYPE),
+        partial: wp.array2d(dtype=wp.float32),
+        rows: int,
+        columns: int,
+        inner: int,
+        splits: int,
+    ):
+        typed_zero = DTYPE(0.0)  # noqa: F841 - retain dtype in the Warp closure
+        wp.static(project)(
+            x,
+            weight,
+            partial,
+            wp.tid(),
+            rows,
+            columns,
+            inner,
+            splits,
+        )
+
+    kernel.module.options["enable_backward"] = False
+    return kernel
+
+
+@lru_cache(maxsize=None)
+def _get_native_split_k_combine_kernel(dtype: type):
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def kernel(
+        partial: wp.array2d(dtype=wp.float32),
+        output: wp.array2d(dtype=DTYPE),
+        splits: int,
+    ):
+        row, column = wp.tid()
+        total = wp.float32(0.0)
+        for split in range(splits):
+            total += partial[split * output.shape[0] + row, column]
+        output[row, column] = DTYPE(total)
 
     kernel.module.options["enable_backward"] = False
     return kernel
@@ -515,6 +574,102 @@ def _native_linear_geometry(
     return None
 
 
+def _native_split_k_geometry(
+    rows: int,
+    columns: int,
+    reduction: int,
+    dtype: type,
+    device,
+    *,
+    transposed_right: bool,
+) -> tuple[int, int, int] | None:
+    """Choose a portable SM80+ split-K geometry from matrix dimensions."""
+    if (
+        not device.is_cuda
+        or device.arch < 80
+        or dtype not in _STORAGE_DTYPES
+        or rows < 64
+        or rows % 64
+        or reduction % 128
+        or columns % 32
+    ):
+        return None
+
+    blocks_64 = (rows // 64) * (columns // 64)
+    tile_n = (
+        64
+        if columns % 64 == 0 and (columns <= reduction or blocks_64 >= device.sm_count)
+        else 32
+    )
+    output_blocks = (rows // 64) * (columns // tile_n)
+    if output_blocks >= 2 * device.sm_count:
+        return 64, tile_n, 1
+
+    splits = 4
+    if transposed_right and reduction >= 2 * columns:
+        # Long row-major weight rows need enough independent K partitions to
+        # cover memory latency; retain at least 512 reduction values per CTA.
+        limit = min(32, reduction // 512)
+        splits = 1 << (limit.bit_length() - 1)
+    elif transposed_right and output_blocks >= device.sm_count:
+        splits = 8
+    while splits > 1 and reduction % (32 * splits):
+        splits //= 2
+    return 64, tile_n, splits
+
+
+def _launch_native_split_k(
+    left: wp.array,
+    right: wp.array,
+    output: wp.array,
+    workspace: wp.array | None,
+    rows: int,
+    columns: int,
+    reduction: int,
+    *,
+    transposed_right: bool,
+) -> bool:
+    geometry = _native_split_k_geometry(
+        rows,
+        columns,
+        reduction,
+        left.dtype,
+        left.device,
+        transposed_right=transposed_right,
+    )
+    if geometry is None or geometry[2] == 1 or workspace is None:
+        return False
+    tile_m, tile_n, splits = geometry
+    _check_array(
+        "matmul_workspace",
+        workspace,
+        (splits * rows, columns),
+        wp.float32,
+        left.device,
+    )
+    if not all(
+        array.is_contiguous and array.ptr % 16 == 0 for array in (left, right, output)
+    ):
+        return False
+    block_dim = tile_m * tile_n // 8
+    wp.launch(
+        _get_native_split_k_linear_kernel(
+            left.dtype, tile_m, tile_n, transposed_right=transposed_right
+        ),
+        dim=(rows // tile_m) * (columns // tile_n) * splits * block_dim,
+        inputs=[left, right, workspace, rows, columns, reduction, splits],
+        block_dim=block_dim,
+        device=left.device,
+    )
+    wp.launch(
+        _get_native_split_k_combine_kernel(left.dtype),
+        dim=(rows, columns),
+        inputs=[workspace, output, splits],
+        device=left.device,
+    )
+    return True
+
+
 def _use_tiled(
     rows: int,
     columns: int,
@@ -619,7 +774,12 @@ def _launch_split_k_lora(
 
 
 def linear_forward(
-    x: wp.array, weight: wp.array, output: wp.array, *, cublas=None
+    x: wp.array,
+    weight: wp.array,
+    output: wp.array,
+    *,
+    cublas=None,
+    matmul_workspace: wp.array | None = None,
 ) -> None:
     """Launch ``output = x @ weight.T`` into a preallocated low-precision array."""
     rows, columns, inner = _linear_shapes(x, weight)
@@ -638,6 +798,17 @@ def linear_forward(
             wp.get_stream(x.device).cuda_stream,
             2 if x.dtype == wp.float16 else 14,
         )
+    elif _launch_native_split_k(
+        x,
+        weight,
+        output,
+        matmul_workspace,
+        rows,
+        columns,
+        inner,
+        transposed_right=True,
+    ):
+        pass
     elif native_geometry is not None:
         tile_m, tile_n = native_geometry
         block_dim = tile_m * tile_n // 8
@@ -677,6 +848,7 @@ def linear_backward(
     *,
     accumulate: bool = False,
     cublas=None,
+    matmul_workspace: wp.array | None = None,
 ) -> None:
     """Overwrite activation gradients and optionally accumulate FP32 weight gradients."""
     rows, columns, inner = _linear_shapes(x, weight)
@@ -696,6 +868,17 @@ def linear_backward(
             wp.get_stream(x.device).cuda_stream,
             2 if x.dtype == wp.float16 else 14,
         )
+    elif _launch_native_split_k(
+        grad_output,
+        weight,
+        grad_input,
+        matmul_workspace,
+        rows,
+        inner,
+        columns,
+        transposed_right=False,
+    ):
+        pass
     elif (
         native_geometry := _native_linear_geometry(
             rows,
@@ -784,6 +967,7 @@ def lora_forward(
     scale: float,
     *,
     cublas=None,
+    base_matmul_workspace: wp.array | None = None,
     matmul_workspace: wp.array | None = None,
     matmul_splits: int = 1,
 ) -> None:
@@ -839,7 +1023,13 @@ def lora_forward(
             outputs=[hidden],
             device=x.device,
         )
-    linear_forward(x, weight, output, cublas=cublas)
+    linear_forward(
+        x,
+        weight,
+        output,
+        cublas=cublas,
+        matmul_workspace=base_matmul_workspace,
+    )
     wp.launch(
         kernels.lora_output,
         dim=(rows, columns),
@@ -863,6 +1053,7 @@ def lora_backward(
     grad_weight: wp.array | None = None,
     *,
     accumulate: bool = False,
+    base_matmul_workspace: wp.array | None = None,
     matmul_workspace: wp.array | None = None,
     matmul_splits: int = 1,
     cublas=None,
@@ -939,6 +1130,7 @@ def lora_backward(
         grad_input,
         grad_weight,
         accumulate=accumulate,
+        matmul_workspace=base_matmul_workspace,
         cublas=cublas,
     )
     wp.launch(

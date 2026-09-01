@@ -216,6 +216,62 @@ def test_cuda_bfloat16_tiled_linear_tails_and_graph_replay():
     np.testing.assert_array_equal(_numpy(grad_weight), grad_weight_reference)
 
 
+def test_cuda_bfloat16_base_linear_split_k_and_graph_replay():
+    device = CUDA_DEVICES[0]
+    if device.arch < 80:
+        pytest.skip("BF16 split-K Linear requires SM80 or newer")
+
+    rows, columns, inner = 64, 256, 1024
+    rng = np.random.default_rng(127)
+    x = _array(rng.normal(0.0, 0.05, (rows, inner)), wp.bfloat16, device)
+    weight = _array(rng.normal(0.0, 0.05, (columns, inner)), wp.bfloat16, device)
+    grad_output = _array(rng.normal(0.0, 0.05, (rows, columns)), wp.bfloat16, device)
+    output = wp.empty((rows, columns), dtype=wp.bfloat16, device=device)
+    grad_input = wp.empty_like(x)
+    forward_workspace = wp.empty((2 * rows, columns), dtype=wp.float32, device=device)
+    backward_workspace = wp.empty((4 * rows, inner), dtype=wp.float32, device=device)
+
+    linear_forward(x, weight, output, matmul_workspace=forward_workspace)
+    linear_backward(
+        x,
+        weight,
+        grad_output,
+        grad_input,
+        matmul_workspace=backward_workspace,
+    )
+    output_reference = _numpy(x) @ _numpy(weight).T
+    grad_input_reference = _numpy(grad_output) @ _numpy(weight)
+    np.testing.assert_allclose(_numpy(output), output_reference, atol=0.08, rtol=0.02)
+    np.testing.assert_allclose(
+        _numpy(grad_input), grad_input_reference, atol=0.08, rtol=0.02
+    )
+    assert (
+        np.linalg.norm(_numpy(output) - output_reference)
+        / np.linalg.norm(output_reference)
+        < 0.006
+    )
+    assert (
+        np.linalg.norm(_numpy(grad_input) - grad_input_reference)
+        / np.linalg.norm(grad_input_reference)
+        < 0.006
+    )
+    references = (_numpy(output).copy(), _numpy(grad_input).copy())
+
+    with wp.ScopedCapture(device) as capture:
+        linear_forward(x, weight, output, matmul_workspace=forward_workspace)
+        linear_backward(
+            x,
+            weight,
+            grad_output,
+            grad_input,
+            matmul_workspace=backward_workspace,
+        )
+    wp.capture_launch(capture.graph)
+    wp.capture_launch(capture.graph)
+    np.testing.assert_array_equal(_numpy(output), references[0])
+    np.testing.assert_array_equal(_numpy(grad_input), references[1])
+
+
 @pytest.mark.parametrize("rank", [2, 16])
 @pytest.mark.parametrize("use_cublas", [False, True])
 def test_cuda_lora_split_k_tensor_cores_and_graph_replay(use_cublas, rank):

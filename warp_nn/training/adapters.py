@@ -119,6 +119,7 @@ class LoRAAdapterCollection:
                 config.rank,
                 weight.dtype,
                 device=device,
+                _defer_base_matmul_workspace=True,
                 cublas=shared_cublas,
             )
             targets[name] = LoRAAdapterTarget(
@@ -126,6 +127,24 @@ class LoRAAdapterCollection:
             )
             parameters.extend((lora_a, lora_b))
             gradients.extend((plan.grad_a, plan.grad_b))
+
+        workspace_elements = (
+            max(
+                target.plan.base_matmul_workspace_elements
+                for target in targets.values()
+            )
+            if shared_cublas is None
+            else 0
+        )
+        self.base_matmul_workspace = (
+            wp.empty(workspace_elements, dtype=wp.float32, device=device)
+            if workspace_elements
+            else None
+        )
+        if self.base_matmul_workspace is not None:
+            for target in targets.values():
+                if target.plan.base_matmul_workspace_elements:
+                    target.plan.bind_base_matmul_workspace(self.base_matmul_workspace)
 
         self.device = device
         self.cublas = shared_cublas

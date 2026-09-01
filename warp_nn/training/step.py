@@ -9,6 +9,7 @@ import warp as wp
 
 from .linear import (
     _lora_split_count,
+    _native_split_k_geometry,
     lora_backward,
     lora_forward,
 )
@@ -34,6 +35,7 @@ class LoRALinearTrainingPlan:
         *,
         train_base: bool = False,
         device: str | wp.context.Device | None = None,
+        _defer_base_matmul_workspace: bool = False,
         cublas=None,
     ):
         if min(rows, in_features, out_features, rank) <= 0:
@@ -80,6 +82,69 @@ class LoRALinearTrainingPlan:
             if workspace_splits > 1
             else None
         )
+        forward_geometry = _native_split_k_geometry(
+            rows,
+            out_features,
+            in_features,
+            dtype,
+            self.device,
+            transposed_right=True,
+        )
+        backward_geometry = _native_split_k_geometry(
+            rows,
+            in_features,
+            out_features,
+            dtype,
+            self.device,
+            transposed_right=False,
+        )
+        self.forward_base_workspace_shape = (
+            (forward_geometry[2] * rows, out_features)
+            if forward_geometry is not None and forward_geometry[2] > 1
+            else None
+        )
+        self.backward_base_workspace_shape = (
+            (backward_geometry[2] * rows, in_features)
+            if backward_geometry is not None and backward_geometry[2] > 1
+            else None
+        )
+        self.base_matmul_workspace_elements = max(
+            (
+                shape[0] * shape[1]
+                for shape in (
+                    self.forward_base_workspace_shape,
+                    self.backward_base_workspace_shape,
+                )
+                if shape is not None
+            ),
+            default=0,
+        )
+        self.forward_base_workspace = None
+        self.backward_base_workspace = None
+        if self.base_matmul_workspace_elements and not _defer_base_matmul_workspace:
+            self.bind_base_matmul_workspace(
+                wp.empty(
+                    self.base_matmul_workspace_elements,
+                    dtype=wp.float32,
+                    device=self.device,
+                )
+            )
+
+    def bind_base_matmul_workspace(self, workspace: wp.array) -> None:
+        """Bind one flat scratch allocation shared by sequential Linear plans."""
+        if (
+            not isinstance(workspace, wp.array)
+            or workspace.ndim != 1
+            or workspace.dtype != wp.float32
+            or workspace.device != self.device
+            or not workspace.is_contiguous
+            or workspace.size < self.base_matmul_workspace_elements
+        ):
+            raise ValueError("base Linear workspace must be a matching FP32 array")
+        for name in ("forward", "backward"):
+            shape = getattr(self, f"{name}_base_workspace_shape")
+            view = workspace[: shape[0] * shape[1]].reshape(shape) if shape else None
+            setattr(self, f"{name}_base_workspace", view)
 
     def forward(self, x, weight, lora_a, lora_b, *, scale: float) -> wp.array:
         lora_forward(
@@ -91,6 +156,7 @@ class LoRALinearTrainingPlan:
             self.output,
             scale,
             cublas=self.cublas,
+            base_matmul_workspace=self.forward_base_workspace,
             matmul_workspace=self.matmul_workspace,
             matmul_splits=self.forward_matmul_splits,
         )
@@ -121,6 +187,7 @@ class LoRALinearTrainingPlan:
             scale,
             self.grad_weight,
             accumulate=accumulate,
+            base_matmul_workspace=self.backward_base_workspace,
             matmul_workspace=self.matmul_workspace,
             matmul_splits=self.backward_matmul_splits,
             cublas=self.cublas,
