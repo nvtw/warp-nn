@@ -16,6 +16,21 @@ from warp_nn.runtime import (
 )
 from warp_nn.runtime.chat import ChatEncodingCache
 from warp_nn.runtime.tokenizers import _BYTE_ENCODER
+from warp_nn.runtime.qwen.qwen35 import _gguf_weight_map
+
+
+def test_qwen_gguf_map_includes_only_available_nvfp4_output_scales():
+    mapping = _gguf_weight_map(
+        {"layer_types": ["linear_attention"]},
+        {"blk.0.ffn_gate.scale", "blk.0.ffn_gate.input_scale"},
+    )
+
+    assert (
+        mapping["model.language_model.layers.0.mlp.gate_proj.scale"]
+        == "blk.0.ffn_gate.scale"
+    )
+    assert "model.language_model.layers.0.mlp.up_proj.scale" not in mapping
+    assert not any(name.endswith(".input_scale") for name in mapping)
 
 
 def _write_tokenizer(path: Path):

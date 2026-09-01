@@ -18,6 +18,7 @@ from warp_nn.runtime.batch_decode import NativeBatchDecoder
 from warp_nn.runtime.formats.gguf import (
     BlockQuantizedTensor,
     GGUFArchive,
+    PackedQuantizedTensor,
     find_gguf_files,
 )
 from warp_nn.runtime.kernels import (
@@ -30,6 +31,7 @@ from warp_nn.runtime.kernels import (
     _get_gated_rms_norm_kernel,
     _get_gated_delta_decode_batch_kernel,
     _get_gather_q8_0_rows_kernel,
+    _get_gather_q2_k_rows_kernel,
     _get_mrope_embedding_kernel,
     _get_mrope_decode_batch_kernel,
     _get_gqa_attention_kernel,
@@ -61,7 +63,7 @@ from warp_nn.runtime.operators import (
     plan_swiglu,
     reuse_linear_outputs,
 )
-from warp_nn.runtime.weights import MappedWeightArchive
+from warp_nn.runtime.weights import MappedWeightArchive, cast_weight
 from warp_nn.runtime.quantization import (
     estimate_loaded_weight_bytes,
     load_native_weights,
@@ -123,7 +125,9 @@ def _weight_names(config: dict) -> list[str]:
     return names
 
 
-def _gguf_weight_map(config: dict) -> dict[str, str]:
+def _gguf_weight_map(
+    config: dict, available_names: set[str] | None = None
+) -> dict[str, str]:
     names = {
         "model.language_model.embed_tokens.weight": "token_embd.weight",
         "model.language_model.norm.weight": "output_norm.weight",
@@ -162,6 +166,18 @@ def _gguf_weight_map(config: dict) -> dict[str, str]:
             {
                 prefix + target: f"blk.{index}.{source}"
                 for target, source in suffixes.items()
+            }
+        )
+    if available_names is not None:
+        names.update(
+            {
+                target.removesuffix(".weight") + ".scale": source.removesuffix(
+                    ".weight"
+                )
+                + ".scale"
+                for target, source in tuple(names.items())
+                if target.endswith(".weight")
+                and source.removesuffix(".weight") + ".scale" in available_names
             }
         )
     return names
@@ -291,9 +307,12 @@ class _Qwen35Plan:
         self.graphs = {}
 
     def _linear(
-        self, name: str, x: str, weight: str, q8_activation_cache=None
+        self, name: str, x: str, weight: str, quantized_activation_cache=None
     ) -> Operation:
         op = Operation("Linear", [x, weight], [name])
+        output_scale = self.runner.linear_output_scales.get(weight)
+        if output_scale is not None:
+            op.attrs["_output_scale"] = output_scale
         if self.decode_batch:
             op.attrs.update(_small_batch_decode=True, _small_batch_outputs_per_group=4)
         plan_linear(
@@ -302,7 +321,7 @@ class _Qwen35Plan:
             self.shapes,
             self.device,
             cublas=self.runner.cublas,
-            q8_activation_cache=q8_activation_cache,
+            quantized_activation_cache=quantized_activation_cache,
         )
         op.attrs["_sequence"] = (op,)
         return op
@@ -1108,6 +1127,17 @@ class _Qwen35Plan:
                 ],
                 device=self.device,
             )
+        elif isinstance(embedding_weight, PackedQuantizedTensor):
+            if embedding_weight.format != "Q2_K":
+                raise TypeError(
+                    f"Qwen embeddings do not support {embedding_weight.format}"
+                )
+            wp.launch(
+                _get_gather_q2_k_rows_kernel(self.dtype),
+                dim=self.embedding.shape,
+                inputs=[embedding_weight.blocks, self.input_ids, self.embedding],
+                device=self.device,
+            )
         else:
             wp.launch(
                 _gather_rows_kernel,
@@ -1219,12 +1249,18 @@ class Qwen35Runner(AutoregressiveRunner):
             self.ssm_a_is_decay = False
         else:
             archive = MappedWeightArchive(
-                gguf, _gguf_weight_map(self.config), gguf.tensor
+                gguf, _gguf_weight_map(self.config, set(gguf.names)), gguf.tensor
             )
             self.gguf_layout = True
             self.centered_norm_scales = False
             self.ssm_a_is_decay = True
         names = _weight_names(self.config)
+        names.extend(
+            name
+            for name in archive.names
+            if name.endswith(".scale")
+            and name.removesuffix(".scale") + ".weight" in names
+        )
         missing = set(names) - set(archive.names)
         if missing:
             raise ValueError(f"Qwen 3.5 checkpoint is missing {sorted(missing)[:5]}")
@@ -1246,6 +1282,13 @@ class Qwen35Runner(AutoregressiveRunner):
         self.weights = load_native_weights(
             archive, self.device, names, self.weight_quantization
         )
+        self.linear_output_scales = {
+            name.removesuffix(".scale") + ".weight": float(
+                self.weights.pop(name).numpy()[0]
+            )
+            for name in tuple(self.weights)
+            if name.endswith(".scale")
+        }
         if self.gguf_layout:
             for index, layer_type in enumerate(self.config["layer_types"]):
                 if layer_type == "linear_attention":
@@ -1259,11 +1302,20 @@ class Qwen35Runner(AutoregressiveRunner):
         embedding_weight = self.weights["model.language_model.embed_tokens.weight"]
         self.dtype = (
             wp.bfloat16
-            if isinstance(embedding_weight, BlockQuantizedTensor)
+            if isinstance(
+                embedding_weight, (BlockQuantizedTensor, PackedQuantizedTensor)
+            )
             else embedding_weight.dtype
         )
         if self.dtype not in (wp.float16, wp.bfloat16):
             raise TypeError("Qwen 3.5 activations require FP16 or BF16 weights")
+        for index, layer_type in enumerate(self.config["layer_types"]):
+            if layer_type == "linear_attention":
+                name = (
+                    f"model.language_model.layers.{index}."
+                    "linear_attn.in_proj_a.weight"
+                )
+                self.weights[name] = cast_weight(self.weights[name], self.dtype)
         self.zero_bias = wp.zeros(1, dtype=self.dtype, device=self.device)
         self.cublas = (
             try_create_cublas() if use_cublas and self.device.is_cuda else None

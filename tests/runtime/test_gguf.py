@@ -8,7 +8,7 @@ import pytest
 import warp as wp
 
 from tests.utilities import is_device_available
-from warp_nn.runtime.formats.gguf import GGUFArchive
+from warp_nn.runtime.formats.gguf import GGUFArchive, PackedQuantizedTensor
 
 
 def _string(value):
@@ -50,6 +50,14 @@ def _write_gguf(path, tensors, metadata=(), *, version=3, alignment=32):
         data += values.tobytes()
     header += b"\0" * ((-len(header)) % alignment)
     path.write_bytes(header + data)
+
+
+def _replace_tensor_bytes(path, name, raw):
+    archive = GGUFArchive(path)
+    data = bytearray(path.read_bytes())
+    offset = archive.tensor(name).offset
+    data[offset : offset + len(raw)] = raw.tobytes()
+    path.write_bytes(data)
 
 
 def test_gguf_loads_metadata_and_unquantized_tensors(tmp_path):
@@ -127,6 +135,61 @@ def test_gguf_indexes_q8_0_blocks_as_raw_storage(tmp_path):
     )
 
 
+def test_gguf_loads_nvfp4_values_and_scales_without_dequantizing(tmp_path):
+    raw = np.arange(72, dtype=np.uint8)
+    path = tmp_path / "nvfp4.gguf"
+    _write_gguf(path, [("weight", 40, np.zeros((2, 64), dtype=np.uint8))])
+    _replace_tensor_bytes(path, "weight", raw)
+
+    archive = GGUFArchive(path)
+    info = archive.tensor("weight")
+    loaded = archive.load("cpu")["weight"]
+
+    assert info.shape == (2, 64)
+    assert info.format == "NVFP4"
+    assert info.nbytes == 72
+    assert loaded.format == "NVFP4"
+    assert loaded.shape == (2, 64)
+    np.testing.assert_array_equal(
+        loaded.scales.numpy(), np.stack((raw[:4], raw[36:40]))[:, None, :]
+    )
+    np.testing.assert_array_equal(
+        loaded.values.numpy(), np.stack((raw[4:36], raw[40:72]))[:, None, :]
+    )
+    np.testing.assert_array_equal(
+        loaded.words.numpy().view(np.uint8), loaded.values.numpy()
+    )
+
+
+@pytest.mark.parametrize(
+    ("tensor_type", "format", "block_elements", "block_bytes"),
+    [(10, "Q2_K", 256, 84), (11, "Q3_K", 256, 110)],
+)
+def test_gguf_preserves_k_quantized_blocks(
+    tmp_path, tensor_type, format, block_elements, block_bytes
+):
+    raw = np.arange(block_bytes * 2, dtype=np.uint8)
+    path = tmp_path / f"{format.lower()}.gguf"
+    logical = np.zeros((2, block_elements), dtype=np.uint8)
+    _write_gguf(path, [("weight", tensor_type, logical)])
+    _replace_tensor_bytes(path, "weight", raw)
+
+    archive = GGUFArchive(path)
+    info = archive.tensor("weight")
+    loaded = archive.load("cpu")["weight"]
+
+    assert info.format == format
+    assert info.nbytes == block_bytes * 2
+    assert isinstance(loaded, PackedQuantizedTensor)
+    assert loaded.shape == (2, block_elements)
+    assert loaded.format == format
+    assert loaded.block_elements == block_elements
+    assert loaded.block_bytes == block_bytes
+    np.testing.assert_array_equal(
+        loaded.blocks.numpy(), raw.reshape((2, 1, block_bytes))
+    )
+
+
 def test_gguf_supports_v2_and_selected_loading(tmp_path):
     values = np.arange(6, dtype=np.float32).reshape(2, 3)
     path = tmp_path / "v2.gguf"
@@ -195,6 +258,18 @@ def test_gguf_rejects_partial_q8_0_rows(tmp_path):
     _write_gguf(path, [("weight", 8, np.zeros((2, 16), dtype=np.uint8))])
 
     with pytest.raises(ValueError, match="partial Q8_0 block"):
+        GGUFArchive(path)
+
+
+@pytest.mark.parametrize(
+    ("tensor_type", "format", "inner"),
+    [(10, "Q2_K", 128), (11, "Q3_K", 128), (40, "NVFP4", 32)],
+)
+def test_gguf_rejects_partial_packed_rows(tmp_path, tensor_type, format, inner):
+    path = tmp_path / f"partial-{format.lower()}.gguf"
+    _write_gguf(path, [("weight", tensor_type, np.zeros((2, inner), dtype=np.uint8))])
+
+    with pytest.raises(ValueError, match=f"partial {format} block"):
         GGUFArchive(path)
 
 

@@ -60,6 +60,26 @@ def merge_lora_weight(weight, a, b, scale):
     )
 
 
+def cast_weight(weight: wp.array, dtype: type) -> wp.array:
+    """Cast one floating weight on-device, returning it unchanged if possible."""
+    if dtype not in (wp.float16, wp.bfloat16, wp.float32):
+        raise TypeError("weight conversion target must be FP16, BF16, or FP32")
+    if weight.dtype == dtype:
+        return weight
+    if weight.dtype not in (wp.float16, wp.bfloat16, wp.float32):
+        raise TypeError("cannot cast a non-floating weight")
+    converted = wp.empty(weight.shape, dtype=dtype, device=weight.device)
+    wp.launch(
+        _cast_kernel_for_dtypes(weight.dtype, dtype),
+        dim=weight.size,
+        inputs=[weight.flatten(), converted.flatten()],
+        device=weight.device,
+    )
+    if weight.device.is_cuda:
+        wp.synchronize_stream(wp.get_stream(weight.device))
+    return converted
+
+
 def load_cast_weights(archive, names, device, dtype=None):
     """Load selected tensors one at a time and optionally cast floating weights.
 
@@ -83,16 +103,7 @@ def load_cast_weights(archive, names, device, dtype=None):
             continue
         if source.dtype not in (wp.float16, wp.bfloat16, wp.float32):
             raise TypeError(f"cannot cast non-floating weight '{name}'")
-        converted = wp.empty(source.shape, dtype=dtype, device=device)
-        wp.launch(
-            _cast_kernel_for_dtypes(source.dtype, dtype),
-            dim=source.size,
-            inputs=[source.flatten(), converted.flatten()],
-            device=device,
-        )
-        if device.is_cuda:
-            wp.synchronize_stream(wp.get_stream(device))
-        output[name] = converted
+        output[name] = cast_weight(source, dtype)
     return output
 
 

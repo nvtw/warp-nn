@@ -8,13 +8,14 @@ import warp as wp
 
 from tests.utilities import is_device_available
 from warp_nn.runtime._cublas import try_create_cublas
-from warp_nn.runtime.formats.gguf import BlockQuantizedTensor
+from warp_nn.runtime.formats.gguf import BlockQuantizedTensor, PackedQuantizedTensor
 from warp_nn.runtime.kernels import (
     _append_head_cache_kernel,
     _append_circular_head_cache_kernel,
     _causal_conv_rows_kernel,
     _get_gated_rms_norm_kernel,
     _get_gqa_attention_kernel,
+    _get_gather_q2_k_rows_kernel,
     _get_greedy_argmax_kernels,
     _get_grouped_decode_linear_kernel,
     _get_prefill_mma_linear_kernel,
@@ -359,7 +360,7 @@ def test_q8_linear_operations_share_quantized_activation():
             tensors,
             shapes,
             device,
-            q8_activation_cache=cache,
+            quantized_activation_cache=cache,
         )
 
     assert len(cache) == 1
@@ -452,6 +453,109 @@ def test_q8_grouped_outputs_match_single_output_kernel():
         device="cuda:0",
     )
     np.testing.assert_array_equal(grouped.numpy(), single.numpy())
+
+
+def _q2_k_reference(blocks):
+    rows, block_count, _ = blocks.shape
+    output = np.empty((rows, block_count * 256), dtype=np.float32)
+    for row in range(rows):
+        for block in range(block_count):
+            raw = blocks[row, block]
+            d = np.frombuffer(raw[80:82].tobytes(), dtype=np.float16)[0]
+            minimum = np.frombuffer(raw[82:84].tobytes(), dtype=np.float16)[0]
+            for column in range(256):
+                scale = int(raw[column // 16])
+                group = (column % 128) // 16
+                quant_index = 16 + (column // 128) * 32 + (group % 2) * 16 + column % 16
+                quant = (int(raw[quant_index]) >> ((group // 2) * 2)) & 3
+                output[row, block * 256 + column] = np.float32(d) * (
+                    scale & 15
+                ) * quant - np.float32(minimum) * (scale >> 4)
+    return output
+
+
+def _q3_k_scales(raw):
+    output = np.empty(16, dtype=np.int32)
+    for index in range(16):
+        group, lane = divmod(index, 4)
+        lower_index = 96 + lane + (4 if group in (1, 3) else 0)
+        lower = (int(raw[lower_index]) >> (4 if group >= 2 else 0)) & 15
+        upper = (int(raw[104 + lane]) >> (group * 2)) & 3
+        output[index] = (lower | (upper << 4)) - 32
+    return output
+
+
+def _q3_k_reference(blocks):
+    rows, block_count, _ = blocks.shape
+    output = np.empty((rows, block_count * 256), dtype=np.float32)
+    for row in range(rows):
+        for block in range(block_count):
+            raw = blocks[row, block]
+            d = np.float32(np.frombuffer(raw[108:110].tobytes(), dtype=np.float16)[0])
+            scales = _q3_k_scales(raw)
+            for group in range(16):
+                half = group // 8
+                local_group = group % 8
+                shift = (local_group // 2) * 2
+                mask = 1 << (half * 4 + local_group // 2)
+                for lane in range(16):
+                    quant_index = 32 + half * 32 + (local_group % 2) * 16 + lane
+                    quant = (int(raw[quant_index]) >> shift) & 3
+                    if int(raw[(local_group % 2) * 16 + lane]) & mask == 0:
+                        quant -= 4
+                    output[row, block * 256 + group * 16 + lane] = (
+                        d * scales[group] * quant
+                    )
+    return output
+
+
+def test_q2_k_embedding_gather_matches_scalar_reference():
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(71)
+    raw = rng.integers(0, 256, (3, 2, 84), dtype=np.uint8)
+    raw[:, :, 80:82] = np.frombuffer(np.float16(0.125).tobytes(), dtype=np.uint8)
+    raw[:, :, 82:84] = np.frombuffer(np.float16(0.0625).tobytes(), dtype=np.uint8)
+    indices_np = np.array([[2, 0]], dtype=np.int64)
+    output = wp.empty((1, 2, 512), dtype=wp.bfloat16, device="cuda:0")
+    wp.launch(
+        _get_gather_q2_k_rows_kernel(wp.bfloat16),
+        dim=output.shape,
+        inputs=[
+            wp.array(raw, device="cuda:0"),
+            wp.array(indices_np, device="cuda:0"),
+            output,
+        ],
+        device="cuda:0",
+    )
+    expected = _q2_k_reference(raw)[indices_np]
+    np.testing.assert_allclose(output.numpy(), expected, atol=0.5, rtol=0.01)
+
+
+@pytest.mark.parametrize("rows", [1, 3])
+def test_q3_k_linear_matches_scalar_reference_and_captures(rows):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(73)
+    columns, inner = 3, 512
+    raw = rng.integers(0, 256, (columns, inner // 256, 110), dtype=np.uint8)
+    raw[:, :, 108:110] = np.frombuffer(np.float16(0.03125).tobytes(), dtype=np.uint8)
+    x_np = rng.normal(0.0, 0.2, (rows, inner)).astype(np.float32)
+    packed = wp.array(raw, device="cuda:0")
+    weight = PackedQuantizedTensor(packed, (columns, inner), "Q3_K", 256, 110)
+    tensors = {
+        "x": wp.array(x_np, dtype=wp.bfloat16, device="cuda:0"),
+        "weight": weight,
+    }
+    shapes = {"x": (rows, inner), "weight": (columns, inner)}
+    operation = Operation("Linear", ["x", "weight"], ["output"])
+    device = wp.get_device("cuda:0")
+    plan_linear(operation, tensors, shapes, device)
+    with wp.ScopedCapture(device) as capture:
+        execute_operations([operation], tensors, shapes, device)
+    wp.capture_launch(capture.graph)
+    expected = tensors["x"].numpy().astype(np.float32) @ _q3_k_reference(raw).T
+    np.testing.assert_allclose(tensors["output"].numpy(), expected, atol=2.0, rtol=0.02)
 
 
 def test_gated_rms_norm_bfloat16():

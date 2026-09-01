@@ -14,7 +14,7 @@ import math
 import numpy as np
 import warp as wp
 
-from warp_nn.runtime.formats.gguf import BlockQuantizedTensor
+from warp_nn.runtime.formats.gguf import BlockQuantizedTensor, PackedQuantizedTensor
 
 from warp_nn.runtime.kernels import (
     _adaptive_layer_norm_kernel,
@@ -40,10 +40,14 @@ from warp_nn.runtime.kernels import (
     _get_prefill_mma_linear_kernel,
     _get_partitioned_gqa_attention_kernels,
     _get_linear_vector_kernel,
+    _get_nvfp4_mma_linear_kernel,
+    _get_nvfp4_row_scale_kernel,
     _get_q8_grouped_decode_linear_kernel,
     _get_q8_prefill_mma_linear_kernel,
+    _get_q3_k_linear_kernel,
     _get_matmul_int8_q8_kernel,
     _get_quantize_activation_int8_kernel,
+    _get_quantize_nvfp4_kernel,
     _get_rms_norm_kernels,
     _get_swiglu_kernel,
     _gqa_copy_past_fp16_kernel,
@@ -64,6 +68,7 @@ from warp_nn.runtime.kernels import (
     _true_cfg_kernel,
     _spatial_vae_kernels,
 )
+from warp_nn.runtime.quantization import enable_nvfp4_native, repack_gguf_nvfp4_weight
 from warp_nn.utils.ops import resolve_dim
 
 
@@ -238,6 +243,64 @@ def _exec_linear(op, tensors, shapes, device):
     x = tensors[op.inputs[0]].reshape((op.attrs["_rows"], op.attrs["_inner"]))
     weight = tensors[op.inputs[1]]
     output = tensors[op.outputs[0]].reshape((op.attrs["_rows"], op.attrs["_columns"]))
+    if "_q3_k_kernel" in op.attrs:
+        wp.launch(
+            op.attrs["_q3_k_kernel"],
+            dim=op.attrs["_rows"] * op.attrs["_columns"] * 32,
+            inputs=[x, weight.blocks, output, op.attrs["_inner"] // 256],
+            block_dim=128,
+            device=device,
+        )
+        return
+    if "_nvfp4_activations" in op.attrs:
+        quantize_kernel = op.attrs.get("_nvfp4_quantize_kernel")
+        if quantize_kernel is not None:
+            wp.launch_tiled(
+                op.attrs["_nvfp4_row_scale_kernel"],
+                dim=op.attrs["_rows"],
+                inputs=[x, op.attrs["_nvfp4_global_scales"]],
+                block_dim=128,
+                device=device,
+            )
+            wp.launch(
+                quantize_kernel,
+                dim=op.attrs["_rows"] * op.attrs["_inner"],
+                inputs=[
+                    x,
+                    op.attrs["_nvfp4_activations"],
+                    op.attrs["_nvfp4_scales"],
+                    op.attrs["_nvfp4_global_scales"],
+                ],
+                block_dim=256,
+                device=device,
+            )
+        wp.launch(
+            op.attrs["_nvfp4_mma_kernel"],
+            dim=(
+                op.attrs["_nvfp4_padded_rows"]
+                // 16
+                * (op.attrs["_columns"] // 8)
+                * 32
+            ),
+            inputs=[
+                op.attrs["_nvfp4_activations"],
+                op.attrs["_nvfp4_scales"],
+                op.attrs["_nvfp4_global_scales"],
+                weight.values.reshape(
+                    (op.attrs["_columns"], op.attrs["_inner"] // 2)
+                ),
+                weight.scales.reshape(
+                    (op.attrs["_columns"], op.attrs["_inner"] // 16)
+                ),
+                op.attrs["_nvfp4_output"],
+                op.attrs["_columns"],
+                op.attrs["_inner"] // 64,
+                float(op.attrs.get("_output_scale", 1.0)),
+            ],
+            block_dim=128,
+            device=device,
+        )
+        return
     if "_q8_activations" in op.attrs:
         quantize_kernel = op.attrs.get("_q8_quantize_kernel")
         if quantize_kernel is not None:
@@ -385,7 +448,7 @@ def plan_linear(
     shapes: dict[str, tuple[int, ...]],
     device,
     cublas=None,
-    q8_activation_cache=None,
+    quantized_activation_cache=None,
 ):
     """Allocate and specialize a dense projection operation."""
     rows, inner = shapes[op.inputs[0]]
@@ -397,7 +460,95 @@ def plan_linear(
     activation = tensors[op.inputs[0]]
     dtype = activation.dtype
     weight = tensors[op.inputs[1]]
+    if isinstance(weight, PackedQuantizedTensor):
+        if weight.format != "Q3_K":
+            raise TypeError(f"Linear does not support packed {weight.format} weights")
+        if not device.is_cuda or dtype not in (wp.float16, wp.bfloat16):
+            raise TypeError("Q3_K Linear requires CUDA FP16/BF16 activations")
+        if inner % 256:
+            raise ValueError("Q3_K Linear requires an inner width divisible by 256")
+        output = wp.empty((rows, columns), dtype=dtype, device=device)
+        tensors[op.outputs[0]] = output
+        shapes[op.outputs[0]] = output.shape
+        op.attrs.update(
+            {
+                "_rows": rows,
+                "_columns": columns,
+                "_inner": inner,
+                "_q3_k_kernel": _get_q3_k_linear_kernel(dtype),
+            }
+        )
+        return
     if isinstance(weight, BlockQuantizedTensor):
+        if weight.format in ("NVFP4", "NVFP4_MMA"):
+            enable_nvfp4_native(device)
+            if dtype not in (wp.float16, wp.bfloat16):
+                raise TypeError("NVFP4 Linear requires FP16/BF16 activations")
+            if inner % 64 or columns % 8:
+                raise ValueError("NVFP4 Linear requires K%64 == N%8 == 0")
+            if weight.format == "NVFP4":
+                weight = repack_gguf_nvfp4_weight(weight)
+                tensors[op.inputs[1]] = weight
+            padded_rows = (rows + 15) // 16 * 16
+            padded_output = wp.empty(
+                (padded_rows, columns), dtype=dtype, device=device
+            )
+            output = wp.array(
+                ptr=padded_output.ptr,
+                dtype=dtype,
+                shape=(rows, columns),
+                capacity=padded_output.capacity,
+                device=device,
+                copy=False,
+            )
+            tensors[op.outputs[0]] = output
+            shapes[op.outputs[0]] = output.shape
+            cache_key = (weight.format, op.inputs[0], padded_rows, inner, dtype)
+            cached_activation = (
+                quantized_activation_cache.get(cache_key)
+                if quantized_activation_cache is not None
+                else None
+            )
+            if cached_activation is None:
+                quantized = wp.zeros(
+                    (padded_rows, inner // 2), dtype=wp.uint8, device=device
+                )
+                activation_scales = wp.zeros(
+                    (padded_rows, inner // 16), dtype=wp.uint8, device=device
+                )
+                activation_global_scales = wp.zeros(
+                    padded_rows, dtype=wp.float32, device=device
+                )
+                cached_activation = (
+                    quantized,
+                    activation_scales,
+                    activation_global_scales,
+                )
+                if quantized_activation_cache is not None:
+                    quantized_activation_cache[cache_key] = cached_activation
+                op.attrs["_nvfp4_quantize_kernel"] = _get_quantize_nvfp4_kernel(
+                    dtype
+                )
+                op.attrs["_nvfp4_row_scale_kernel"] = (
+                    _get_nvfp4_row_scale_kernel(dtype)
+                )
+            quantized, activation_scales, activation_global_scales = cached_activation
+            op.attrs.update(
+                {
+                    "_rows": rows,
+                    "_columns": columns,
+                    "_inner": inner,
+                    "_nvfp4_padded_rows": padded_rows,
+                    "_nvfp4_activations": quantized,
+                    "_nvfp4_scales": activation_scales,
+                    "_nvfp4_global_scales": activation_global_scales,
+                    "_nvfp4_output": padded_output,
+                    "_nvfp4_mma_kernel": _get_nvfp4_mma_linear_kernel(dtype),
+                }
+            )
+            return
+        if weight.format != "Q8_0":
+            raise TypeError(f"Linear does not support block {weight.format} weights")
         if not device.is_cuda or dtype not in (wp.float16, wp.bfloat16):
             raise TypeError("Q8_0 Linear requires CUDA FP16/BF16 activations")
         if inner % 32:
@@ -407,10 +558,10 @@ def plan_linear(
         shapes[op.outputs[0]] = output.shape
         op.attrs.update({"_rows": rows, "_columns": columns, "_inner": inner})
         blocks = inner // 32
-        cache_key = (op.inputs[0], rows, inner, dtype)
+        cache_key = (weight.format, op.inputs[0], rows, inner, dtype)
         cached_activation = (
-            q8_activation_cache.get(cache_key)
-            if q8_activation_cache is not None
+            quantized_activation_cache.get(cache_key)
+            if quantized_activation_cache is not None
             else None
         )
         if cached_activation is None:
@@ -425,8 +576,8 @@ def plan_linear(
             activation_scales = wp.empty(
                 (rows, blocks), dtype=wp.float32, device=device
             )
-            if q8_activation_cache is not None:
-                q8_activation_cache[cache_key] = (
+            if quantized_activation_cache is not None:
+                quantized_activation_cache[cache_key] = (
                     quantized,
                     activation_words,
                     activation_scales,
@@ -1359,6 +1510,22 @@ def reuse_operation_outputs(
                     if output_index == 0 and "_output_2d" in value.attrs:
                         value.attrs["_output_2d"] = shared.reshape(
                             value.attrs["_output_2d"].shape
+                        )
+                    if (
+                        output_index == 0
+                        and shared is not output
+                        and "_nvfp4_output" in value.attrs
+                    ):
+                        padded = value.attrs["_nvfp4_output"]
+                        if shared.capacity < padded.capacity:
+                            raise ValueError("shared output cannot hold NVFP4 row padding")
+                        value.attrs["_nvfp4_output"] = wp.array(
+                            ptr=shared.ptr,
+                            dtype=shared.dtype,
+                            shape=padded.shape,
+                            capacity=shared.capacity,
+                            device=shared.device,
+                            copy=False,
                         )
                     if output_index == 3 and "_residual_2d" in value.attrs:
                         value.attrs["_residual_2d"] = shared.reshape(

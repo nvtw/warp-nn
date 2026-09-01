@@ -108,7 +108,11 @@ def _write_tiny_qwen35(path):
             values = np.zeros(shape, dtype=np.float32)
         else:
             values = rng.normal(0.0, 0.08, shape).astype(np.float32)
-        tensors[name] = ("BF16", shape, _bfloat16_bytes(values))
+        tensors[name] = (
+            ("F32", shape, values.tobytes())
+            if name.endswith("linear_attn.in_proj_a.weight")
+            else ("BF16", shape, _bfloat16_bytes(values))
+        )
     path.mkdir()
     (path / "config.json").write_text(
         json.dumps({"text_config": config}), encoding="utf-8"
@@ -182,6 +186,12 @@ def test_qwen35_native_prefill_decode_and_graph_replay(tmp_path, use_cublas):
         cache_capacity=8,
         prefill_chunk_size=4,
         use_cublas=use_cublas,
+    )
+    assert (
+        runner.weights[
+            "model.language_model.layers.0.linear_attn.in_proj_a.weight"
+        ].dtype
+        == wp.bfloat16
     )
     plan = runner._chunk_plan
     assert plan._owned_storage_bytes > 0

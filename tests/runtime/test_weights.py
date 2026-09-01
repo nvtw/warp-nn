@@ -9,9 +9,19 @@ import warp as wp
 from tests.utilities import write_safetensors
 from warp_nn.runtime.llama.encoder import merge_lora_adapter
 from warp_nn.runtime.weights import (
+    cast_weight,
     extract_temporal_conv2d_weight,
     merge_lora_weight,
 )
+
+
+def test_cast_weight_converts_once_and_preserves_same_dtype():
+    values = np.array([[1.25, -2.5], [3.75, 0.5]], dtype=np.float32)
+    source = wp.array(values, dtype=wp.float32, device="cpu")
+    converted = cast_weight(source, wp.bfloat16)
+    np.testing.assert_allclose(converted.numpy().astype(np.float32), values)
+    assert converted.dtype == wp.bfloat16
+    assert cast_weight(converted, wp.bfloat16).ptr == converted.ptr
 
 
 def test_merge_lora_weight_and_peft_adapter_cpu(tmp_path):

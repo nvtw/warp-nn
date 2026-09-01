@@ -24,15 +24,20 @@ import warp as wp
 
 from warp_nn.modules.layers._common import tile_transposed_gemm_2d
 from warp_nn.runtime._cuda import (
+    decode_ue4m3,
     dp4a,
+    encode_ue4m3,
     expand_int4x4_high,
     expand_int4x4_low,
     get_grouped_decode_projection,
+    get_nvfp4_mma_projection,
     get_small_batch_grouped_projection,
     get_prefill_mma_projection,
     get_q8_grouped_decode_projection,
     get_q8_prefill_mma_projection,
     subgroup_sum,
+    subgroup_max_broadcast,
+    quantize_e2m1_pair,
     warp_max_broadcast,
 )
 from warp_nn.utils.config import get_kernel_config
@@ -295,6 +300,45 @@ def _create_q8_prefill_mma_linear_kernel(dtype: type, tile_m: int):
 def _get_q8_prefill_mma_linear_kernel(dtype: type, tile_m: int):
     """Return a cached signed-INT8 tensor-core projection kernel."""
     return _create_q8_prefill_mma_linear_kernel(dtype, tile_m)
+
+
+def _create_nvfp4_mma_linear_kernel(dtype: type):
+    """Build the exact-SM120 native NVFP4 projection wrapper."""
+    DTYPE = dtype
+    project = get_nvfp4_mma_projection(dtype)
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(
+        activations: wp.array2d[wp.uint8],
+        activation_scales: wp.array2d[wp.uint8],
+        activation_global_scales: wp.array1d[wp.float32],
+        weights: wp.array2d[wp.uint8],
+        weight_scales: wp.array2d[wp.uint8],
+        output: wp.array2d(dtype=DTYPE),
+        columns: int,
+        blocks64: int,
+        global_scale: float,
+    ):
+        typed_zero = DTYPE(0.0)  # noqa: F841 - bind dtype in the Warp closure
+        wp.static(project)(
+            activations,
+            activation_scales,
+            activation_global_scales,
+            weights,
+            weight_scales,
+            output,
+            wp.tid(),
+            columns,
+            blocks64,
+            global_scale,
+        )
+
+    return kernel
+
+
+@lru_cache(maxsize=None)
+def _get_nvfp4_mma_linear_kernel(dtype: type):
+    return _create_nvfp4_mma_linear_kernel(dtype)
 
 
 def _create_linear_tiled_kernel(dtype: type, tile_m: int, tile_k: int):
@@ -1088,6 +1132,139 @@ def _get_append_head_cache_decode_batch_kernel(
     return kernel
 
 
+@wp.func
+def _float_from_fp16_bytes(low: wp.uint8, high: wp.uint8) -> wp.float32:
+    """Decode one little-endian IEEE FP16 value without an aligned typed view."""
+    bits = wp.int32(low) | (wp.int32(high) << 8)
+    sign = wp.float32(1.0)
+    if (bits & 0x8000) != 0:
+        sign = wp.float32(-1.0)
+    exponent = (bits >> 10) & 0x1F
+    fraction = bits & 0x3FF
+    if exponent == 0:
+        return sign * wp.float32(fraction) * wp.float32(5.960464477539063e-8)
+    return (
+        sign
+        * (wp.float32(1.0) + wp.float32(fraction) * wp.float32(0.0009765625))
+        * wp.pow(wp.float32(2.0), wp.float32(exponent - 15))
+    )
+
+
+@lru_cache(maxsize=None)
+def _get_gather_q2_k_rows_kernel(dtype: type):
+    """Gather GGML Q2_K rows while dequantizing only requested elements."""
+    if dtype not in (wp.float16, wp.bfloat16, wp.float32):
+        raise TypeError("Q2_K gather output must be FP16, BF16, or FP32")
+
+    @wp.kernel(enable_backward=False)
+    def kernel(
+        blocks: wp.array3d(dtype=wp.uint8),
+        indices: wp.array2d(dtype=wp.int64),
+        output: wp.array3d(dtype=dtype),
+    ):
+        batch, row, column = wp.tid()
+        source_row = indices[batch, row]
+        block = column >> 8
+        local = column & 255
+        scale_index = local >> 4
+        quant_group = (local & 127) >> 4
+        quant_index = 16 + ((local >> 7) << 5) + ((quant_group & 1) << 4) + (local & 15)
+        shift = (quant_group >> 1) << 1
+        scale = wp.int32(blocks[source_row, block, scale_index])
+        quant = (wp.int32(blocks[source_row, block, quant_index]) >> shift) & 3
+        d = _float_from_fp16_bytes(
+            blocks[source_row, block, 80], blocks[source_row, block, 81]
+        )
+        minimum = _float_from_fp16_bytes(
+            blocks[source_row, block, 82], blocks[source_row, block, 83]
+        )
+        output[batch, row, column] = dtype(
+            d * wp.float32(scale & 15) * wp.float32(quant)
+            - minimum * wp.float32(scale >> 4)
+        )
+
+    return kernel
+
+
+@wp.func
+def _q3_k_scale(
+    blocks: wp.array3d(dtype=wp.uint8), row: int, block: int, index: int
+) -> int:
+    """Unpack one signed six-bit Q3_K group scale."""
+    group = index >> 2
+    lane = index & 3
+    lower = wp.int32(0)
+    if group == 0:
+        lower = wp.int32(blocks[row, block, 96 + lane]) & 15
+    elif group == 1:
+        lower = wp.int32(blocks[row, block, 100 + lane]) & 15
+    elif group == 2:
+        lower = (wp.int32(blocks[row, block, 96 + lane]) >> 4) & 15
+    else:
+        lower = (wp.int32(blocks[row, block, 100 + lane]) >> 4) & 15
+    upper = (wp.int32(blocks[row, block, 104 + lane]) >> (group << 1)) & 3
+    return (lower | (upper << 4)) - 32
+
+
+@lru_cache(maxsize=None)
+def _get_q3_k_linear_kernel(dtype: type):
+    """Return a fused GGML Q3_K matrix-vector projection."""
+    if dtype not in (wp.float16, wp.bfloat16, wp.float32):
+        raise TypeError("Q3_K Linear output must be FP16, BF16, or FP32")
+
+    @wp.kernel(enable_backward=False)
+    def kernel(
+        x: wp.array2d(dtype=dtype),
+        blocks: wp.array3d(dtype=wp.uint8),
+        output: wp.array2d(dtype=dtype),
+        inner_blocks: int,
+    ):
+        thread = wp.tid()
+        lane = thread & 31
+        item = thread >> 5
+        column = item % blocks.shape[0]
+        row = item // blocks.shape[0]
+        total = wp.float32(0.0)
+        for block in range(inner_blocks):
+            d = _float_from_fp16_bytes(
+                blocks[column, block, 108], blocks[column, block, 109]
+            )
+            for part in range(8):
+                local = lane + part * 32
+                group = local >> 4
+                component = local & 15
+                group_scale = d * wp.float32(_q3_k_scale(blocks, column, block, group))
+                half = group >> 3
+                local_group = group & 7
+                shift = (local_group >> 1) << 1
+                mask = 1 << (half * 4 + (local_group >> 1))
+                quant_index = 32 + half * 32 + (local_group & 1) * 16 + component
+                quant = (wp.int32(blocks[column, block, quant_index]) >> shift) & 3
+                high = (
+                    wp.int32(
+                        blocks[
+                            column,
+                            block,
+                            component + (local_group & 1) * 16,
+                        ]
+                    )
+                    & mask
+                )
+                value = quant
+                if high == 0:
+                    value -= 4
+                total += (
+                    wp.float32(x[row, block * 256 + local])
+                    * group_scale
+                    * wp.float32(value)
+                )
+        total = subgroup_sum(total, 32)
+        if lane == 0:
+            output[row, column] = dtype(total)
+
+    return kernel
+
+
 @wp.kernel(enable_backward=False, module="unique")
 def _append_head_cache_kernel(
     x: wp.array2d[Any],
@@ -1208,6 +1385,101 @@ def _get_quantize_activation_int8_kernel(dtype: type):
 
 
 _quantize_activation_int8_kernel = _get_quantize_activation_int8_kernel(wp.float16)
+
+
+def _create_quantize_nvfp4_kernel(dtype: type):
+    """Build dynamic block-16 E2M1 quantization with E4M3 scales."""
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(
+        values: wp.array2d(dtype=DTYPE),
+        packed: wp.array2d[wp.uint8],
+        scales: wp.array2d[wp.uint8],
+        global_scales: wp.array1d[wp.float32],
+    ):
+        typed_zero = DTYPE(0.0)  # noqa: F841 - bind dtype in the Warp closure
+        thread = wp.tid()
+        lane = thread % 16
+        block = (thread / 16) % scales.shape[1]
+        row = (thread / 16) / scales.shape[1]
+        global_scale = global_scales[row]
+        value = wp.float32(values[row, block * 16 + lane])
+        value = value / global_scale if global_scale > 0.0 else 0.0
+        maximum = subgroup_max_broadcast(wp.abs(value), 16)
+        scale_code = encode_ue4m3(maximum / 6.0)
+        scale = decode_ue4m3(scale_code)
+        inverse_scale = 1.0 / scale if scale > 0.0 else 0.0
+        packed_code = quantize_e2m1_pair(value, inverse_scale)
+        if lane % 2 == 0:
+            packed[row, block * 8 + lane / 2] = wp.uint8(packed_code)
+        if lane == 0:
+            scales[row, block] = wp.uint8(scale_code)
+
+    return kernel
+
+
+@lru_cache(maxsize=None)
+def _get_quantize_nvfp4_kernel(dtype: type):
+    """Return block-16 dynamic NVFP4 quantization for a floating input."""
+    if dtype not in (wp.float16, wp.bfloat16, wp.float32):
+        raise TypeError("NVFP4 quantization requires FP16, BF16, or FP32 input")
+    return _create_quantize_nvfp4_kernel(dtype)
+
+
+def _create_nvfp4_row_scale_kernel(dtype: type):
+    """Build a deterministic tiled row-maximum reduction for NVFP4."""
+    DTYPE = dtype
+    TILE_WIDTH = 256
+
+    @wp.func
+    def absolute(value: DTYPE):
+        return wp.abs(wp.float32(DTYPE(value)))
+
+    @wp.func
+    def maximum(left: wp.float32, right: wp.float32):
+        return wp.max(left, right)
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(
+        values: wp.array2d(dtype=DTYPE),
+        global_scales: wp.array1d[wp.float32],
+    ):
+        typed_zero = DTYPE(0.0)  # noqa: F841 - bind dtype in the Warp closure
+        row = wp.tid()
+        maxima = wp.tile_zeros(shape=(TILE_WIDTH,), dtype=wp.float32)
+        for tile in range((values.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
+            loaded = wp.tile_load(
+                values[row], shape=(TILE_WIDTH,), offset=(tile * TILE_WIDTH,)
+            )
+            maxima = wp.tile_map(maximum, maxima, wp.tile_map(absolute, loaded))
+        row_maximum = wp.tile_extract(wp.tile_reduce(maximum, maxima), 0)
+        global_scales[row] = row_maximum / wp.float32(2688.0)
+
+    return kernel
+
+
+@lru_cache(maxsize=None)
+def _get_nvfp4_row_scale_kernel(dtype: type):
+    if dtype not in (wp.float16, wp.bfloat16, wp.float32):
+        raise TypeError("NVFP4 row scaling requires FP16, BF16, or FP32 input")
+    return _create_nvfp4_row_scale_kernel(dtype)
+
+
+@wp.kernel(enable_backward=False)
+def _repack_gguf_nvfp4_kernel(
+    source: wp.array3d[wp.uint8], output: wp.array3d[wp.uint8]
+):
+    """Convert GGUF's split-half nibbles to adjacent E2M1 pairs."""
+    row, block, output_byte = wp.tid()
+    first = output_byte * 2
+    subblock = first / 16
+    local = first % 16
+    shift = 0 if local < 8 else 4
+    source_byte = subblock * 8 + local % 8
+    low = (wp.int32(source[row, block, source_byte]) >> shift) & 15
+    high = (wp.int32(source[row, block, source_byte + 1]) >> shift) & 15
+    output[row, block, output_byte] = wp.uint8(low | (high << 4))
 
 
 @wp.func

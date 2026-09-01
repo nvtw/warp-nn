@@ -11,7 +11,18 @@ from collections.abc import Iterable
 import warp as wp
 
 from warp_nn.runtime.formats.gguf import BlockQuantizedTensor
-from warp_nn.runtime.kernels import _get_quantize_int8_kernel
+from warp_nn.runtime.kernels import (
+    _get_nvfp4_mma_linear_kernel,
+    _get_nvfp4_row_scale_kernel,
+    _get_quantize_int8_kernel,
+    _get_quantize_nvfp4_kernel,
+    _repack_gguf_nvfp4_kernel,
+)
+
+NVFP4_BLOCK_SIZE = 16
+NVFP4_MMA_K = 64
+NVFP4_MMA_M = 16
+NVFP4_MMA_N = 8
 
 _PROJECTION_SUFFIXES = (
     "self_attn.q_proj.weight",
@@ -90,6 +101,136 @@ def quantize_q8_0_weight(weight: wp.array) -> BlockQuantizedTensor:
     return BlockQuantizedTensor(values, words, scales, tuple(weight.shape), "Q8_0")
 
 
+def enable_nvfp4_native(device=None):
+    """Enable the exact SM120a target for an opt-in NVFP4 model."""
+    device = wp.get_device(device)
+    if not device.is_cuda or device.arch != 120:
+        name = getattr(device, "name", str(device))
+        raise RuntimeError(
+            f"native NVFP4 inference requires an SM120 GPU; selected device is {name}"
+        )
+    if wp.config.cuda_arch_suffix not in ("a", "f"):
+        wp.config.cuda_arch_suffix = "a"
+    return device
+
+
+def launch_quantize_nvfp4(
+    values,
+    packed,
+    scales,
+    global_scales,
+    *,
+    compute_global_scale: bool = True,
+    stream=None,
+) -> None:
+    """Quantize a dense matrix to adjacent E2M1 pairs and block-16 E4M3 scales."""
+    if values.shape[1] % NVFP4_BLOCK_SIZE:
+        raise ValueError("NVFP4 inner dimension must be divisible by 16")
+    expected_columns = values.shape[1] // 2
+    expected_scale_columns = values.shape[1] // NVFP4_BLOCK_SIZE
+    padded_rows = packed.shape[0]
+    if (
+        padded_rows < values.shape[0]
+        or packed.shape[1] != expected_columns
+        or scales.shape != (padded_rows, expected_scale_columns)
+        or global_scales.shape != (padded_rows,)
+    ):
+        raise ValueError(
+            "packed/scales must share a row count at least as large as input and "
+            "have K/2 and K/16 columns"
+        )
+    if compute_global_scale:
+        wp.launch_tiled(
+            _get_nvfp4_row_scale_kernel(values.dtype),
+            dim=values.shape[0],
+            inputs=[values, global_scales],
+            block_dim=128,
+            stream=stream,
+        )
+    wp.launch(
+        _get_quantize_nvfp4_kernel(values.dtype),
+        dim=values.size,
+        inputs=[values, packed, scales, global_scales],
+        block_dim=256,
+        stream=stream,
+    )
+
+
+def repack_gguf_nvfp4_weight(weight: BlockQuantizedTensor) -> BlockQuantizedTensor:
+    """Repack one GGUF NVFP4 weight once into tensor-core fragment order."""
+    if weight.format != "NVFP4":
+        raise TypeError("expected an NVFP4 block-quantized tensor")
+    if weight.values.ndim != 3 or weight.values.shape[2] != 32:
+        raise ValueError("NVFP4 GGUF values must have shape [rows, blocks, 32]")
+    output = wp.empty_like(weight.values)
+    wp.launch(
+        _repack_gguf_nvfp4_kernel,
+        dim=weight.values.shape,
+        inputs=[weight.values, output],
+        device=weight.values.device,
+    )
+    words = wp.array(
+        ptr=output.ptr,
+        dtype=wp.uint32,
+        shape=(output.shape[0], output.shape[1], 8),
+        capacity=output.capacity,
+        device=output.device,
+        copy=False,
+    )
+    return BlockQuantizedTensor(output, words, weight.scales, weight.shape, "NVFP4_MMA")
+
+
+def launch_nvfp4_linear(
+    activations,
+    activation_scales,
+    activation_global_scales,
+    weights,
+    weight_scales,
+    output,
+    *,
+    global_scale: float = 1.0,
+    stream=None,
+) -> None:
+    """Launch native NVFP4 output = activations @ weights.T.
+
+    Scales use natural [row, K / 16] order; the MMA intrinsic assembles scale
+    registers without a persistent 512-byte cuBLASLt swizzle. Operator planning
+    pads short decode batches to M=16 so they reuse this same native kernel.
+    """
+    enable_nvfp4_native(output.device)
+    rows, columns = output.shape
+    inner = activations.shape[1] * 2
+    if rows % NVFP4_MMA_M or columns % NVFP4_MMA_N or inner % NVFP4_MMA_K:
+        raise ValueError("native NVFP4 MMA requires M%16 == N%8 == K%64 == 0")
+    if weights.shape != (columns, inner // 2):
+        raise ValueError("NVFP4 weight shape does not match output and inner size")
+    expected_activation_scales = (rows, inner // NVFP4_BLOCK_SIZE)
+    expected_weight_scales = (columns, inner // NVFP4_BLOCK_SIZE)
+    if (
+        activation_scales.shape != expected_activation_scales
+        or activation_global_scales.shape != (rows,)
+        or weight_scales.shape != expected_weight_scales
+    ):
+        raise ValueError("NVFP4 scale shape does not match its packed matrix")
+    wp.launch(
+        _get_nvfp4_mma_linear_kernel(output.dtype),
+        dim=(rows // NVFP4_MMA_M) * (columns // NVFP4_MMA_N) * 32,
+        inputs=[
+            activations,
+            activation_scales,
+            activation_global_scales,
+            weights,
+            weight_scales,
+            output,
+            columns,
+            inner // NVFP4_MMA_K,
+            global_scale,
+        ],
+        block_dim=128,
+        stream=stream,
+    )
+
+
 def estimate_loaded_weight_bytes(archive, names: Iterable[str], mode: str | None):
     """Return final bytes and largest transient source for a load policy."""
     mode = normalize_weight_quantization(mode)
@@ -102,29 +243,43 @@ def estimate_loaded_weight_bytes(archive, names: Iterable[str], mode: str | None
             largest_source = max(largest_source, metadata.nbytes)
         else:
             final += metadata.nbytes
+            if metadata.format == "NVFP4":
+                largest_source = max(largest_source, metadata.nbytes)
     return final, largest_source
 
 
 def load_native_weights(archive, device, names: Iterable[str], mode: str | None):
-    """Load native weights, quantizing selected matrices one at a time."""
+    """Load weights, preparing selected block formats one matrix at a time."""
     mode = normalize_weight_quantization(mode)
     names = tuple(names)
-    if mode is None:
-        return archive.load(device, names)
     device = wp.get_device(device)
-    if not device.is_cuda:
+    nvfp4 = {
+        name for name in names if archive.metadata(name).format == "NVFP4"
+    }
+    if nvfp4:
+        enable_nvfp4_native(device)
+    if mode == "q8_0" and not device.is_cuda:
         raise TypeError("Q8_0 weight quantization requires CUDA")
+    q8 = {
+        name
+        for name in names
+        if mode == "q8_0" and is_q8_linear_weight(name, archive.metadata(name))
+    }
+    selected_set = nvfp4 | q8
     selected = sorted(
-        (name for name in names if is_q8_linear_weight(name, archive.metadata(name))),
+        selected_set,
         key=lambda name: archive.metadata(name).nbytes,
         reverse=True,
     )
-    selected_set = set(selected)
     output = archive.load(device, [name for name in names if name not in selected_set])
     for name in selected:
         loaded = archive.load(device, [name])
         source = loaded.pop(name)
-        output[name] = quantize_q8_0_weight(source)
+        output[name] = (
+            repack_gguf_nvfp4_weight(source)
+            if name in nvfp4
+            else quantize_q8_0_weight(source)
+        )
         wp.synchronize_stream(device)
         del source, loaded
     return output

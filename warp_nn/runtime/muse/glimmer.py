@@ -572,7 +572,7 @@ class _MusePlan:
         self.graphs = {}
 
     def _linear(
-        self, name: str, x: str, weight: str, q8_activation_cache=None
+        self, name: str, x: str, weight: str, quantized_activation_cache=None
     ) -> Operation:
         op = Operation("Linear", [x, weight], [name])
         if self.decode_batch:
@@ -583,7 +583,7 @@ class _MusePlan:
             self.shapes,
             self.device,
             cublas=self.runner.cublas,
-            q8_activation_cache=q8_activation_cache,
+            quantized_activation_cache=quantized_activation_cache,
         )
         op.attrs["_sequence"] = (op,)
         return op

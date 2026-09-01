@@ -33,11 +33,20 @@ _VALUE_FORMATS = {
 }
 _STRING = 8
 _ARRAY = 9
+_BLOCK_FORMATS = {
+    "Q8_0": (32, 34),
+    "Q2_K": (256, 84),
+    "Q3_K": (256, 110),
+    "NVFP4": (64, 36),
+}
 _TENSOR_TYPES = {
     0: (wp.float32, 1, 4, "F32"),
     1: (wp.float16, 1, 2, "F16"),
-    8: (wp.uint8, 32, 34, "Q8_0"),
+    8: (wp.uint8, *_BLOCK_FORMATS["Q8_0"], "Q8_0"),
+    10: (wp.uint8, *_BLOCK_FORMATS["Q2_K"], "Q2_K"),
+    11: (wp.uint8, *_BLOCK_FORMATS["Q3_K"], "Q3_K"),
     30: (wp.bfloat16, 1, 2, "BF16"),
+    40: (wp.uint8, *_BLOCK_FORMATS["NVFP4"], "NVFP4"),
 }
 
 
@@ -122,6 +131,17 @@ class BlockQuantizedTensor:
     scales: wp.array
     shape: tuple[int, ...]
     format: str
+
+
+@dataclass(frozen=True)
+class PackedQuantizedTensor:
+    """A block tensor retaining its format-specific packed byte layout."""
+
+    blocks: wp.array
+    shape: tuple[int, ...]
+    format: str
+    block_elements: int
+    block_bytes: int
 
 
 class _Reader:
@@ -379,10 +399,11 @@ class GGUFArchive:
                 (info.nbytes,), dtype=np.uint8, buffer=mapping, offset=info.offset
             )
             byte_views.append(raw)
-            if info.format == "Q8_0":
+            if info.format in _BLOCK_FORMATS:
                 rows = math.prod(info.shape[:-1])
-                blocks = info.shape[-1] // 32
-                row_stride = blocks * 34
+                block_elements, block_bytes = _BLOCK_FORMATS[info.format]
+                blocks = info.shape[-1] // block_elements
+                row_stride = blocks * block_bytes
                 host = wp.array(
                     ptr=raw.ctypes.data,
                     dtype=wp.uint8,
@@ -391,37 +412,59 @@ class GGUFArchive:
                     device="cpu",
                 )
                 packed = wp.clone(host, device=device)
-                packed_scales = wp.array(
-                    ptr=packed.ptr,
-                    dtype=wp.float16,
-                    shape=(rows, blocks),
-                    strides=(row_stride, 34),
-                    capacity=packed.capacity,
-                    device=device,
-                    copy=False,
-                )
-                packed_values = wp.array(
-                    ptr=packed.ptr + 2,
-                    dtype=wp.int8,
-                    shape=(rows, blocks, 32),
-                    strides=(row_stride, 34, 1),
-                    capacity=packed.capacity - 2,
-                    device=device,
-                    copy=False,
-                )
-                values = wp.clone(packed_values)
-                scales = wp.clone(packed_scales)
-                words = wp.array(
-                    ptr=values.ptr,
-                    dtype=wp.uint32,
-                    shape=(rows, blocks, 8),
-                    capacity=values.capacity,
-                    device=device,
-                    copy=False,
-                )
-                output[name] = BlockQuantizedTensor(
-                    values, words, scales, info.shape, info.format
-                )
+                if info.format in ("Q8_0", "NVFP4"):
+                    scale_bytes = 2 if info.format == "Q8_0" else 4
+                    value_bytes = 32
+                    scale_dtype = wp.float16 if info.format == "Q8_0" else wp.uint8
+                    scale_shape = (
+                        (rows, blocks)
+                        if info.format == "Q8_0"
+                        else (rows, blocks, scale_bytes)
+                    )
+                    scale_strides = (
+                        (row_stride, block_bytes)
+                        if info.format == "Q8_0"
+                        else (row_stride, block_bytes, 1)
+                    )
+                    packed_scales = wp.array(
+                        ptr=packed.ptr,
+                        dtype=scale_dtype,
+                        shape=scale_shape,
+                        strides=scale_strides,
+                        capacity=packed.capacity,
+                        device=device,
+                        copy=False,
+                    )
+                    packed_values = wp.array(
+                        ptr=packed.ptr + scale_bytes,
+                        dtype=wp.int8 if info.format == "Q8_0" else wp.uint8,
+                        shape=(rows, blocks, value_bytes),
+                        strides=(row_stride, block_bytes, 1),
+                        capacity=packed.capacity - scale_bytes,
+                        device=device,
+                        copy=False,
+                    )
+                    values = wp.clone(packed_values)
+                    scales = wp.clone(packed_scales)
+                    words = wp.array(
+                        ptr=values.ptr,
+                        dtype=wp.uint32,
+                        shape=(rows, blocks, value_bytes // 4),
+                        capacity=values.capacity,
+                        device=device,
+                        copy=False,
+                    )
+                    output[name] = BlockQuantizedTensor(
+                        values, words, scales, info.shape, info.format
+                    )
+                else:
+                    output[name] = PackedQuantizedTensor(
+                        packed.reshape((rows, blocks, block_bytes)),
+                        info.shape,
+                        info.format,
+                        block_elements,
+                        block_bytes,
+                    )
                 if device.is_cuda:
                     wp.synchronize_stream(device)
                 host_views.clear()

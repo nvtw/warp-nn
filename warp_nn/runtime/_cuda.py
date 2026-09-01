@@ -36,6 +36,67 @@ def warp_max_broadcast(value: float) -> float: ...
 @wp.func_native(
     """
 #if defined(__CUDA_ARCH__)
+    for (int offset = width / 2; offset > 0; offset >>= 1)
+        value = max(value, __shfl_down_sync(__activemask(), value, offset, width));
+    value = __shfl_sync(__activemask(), value, 0, width);
+#endif
+    return value;
+    """
+)
+def subgroup_max_broadcast(value: float, width: int) -> float: ...
+
+
+@wp.func_native(
+    """
+#if defined(__CUDA_ARCH__)
+    unsigned short storage;
+    asm volatile(
+        "{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}"
+        : "=h"(storage) : "f"(value), "f"(0.0f));
+    return static_cast<int>(storage & 0xffu);
+#else
+    return 0;
+#endif
+    """
+)
+def encode_ue4m3(value: float) -> int: ...
+
+
+@wp.func_native(
+    """
+    const unsigned bits = unsigned(encoded) & 0xffu;
+    const unsigned exponent = (bits >> 3) & 15u;
+    const float mantissa = static_cast<float>(bits & 7u);
+    if (exponent == 0u)
+        return ldexpf(mantissa, -9);
+    return ldexpf(1.0f + mantissa * 0.125f, static_cast<int>(exponent) - 7);
+    """
+)
+def decode_ue4m3(encoded: int) -> float: ...
+
+
+@wp.func_native(
+    """
+#if defined(__CUDA_ARCH__)
+    const float high = __shfl_down_sync(__activemask(), value, 1, 16);
+    unsigned short storage;
+    asm volatile(
+        "{.reg .b8 fp4; cvt.rn.satfinite.e2m1x2.f32 fp4, %2, %1; "
+        "mov.b16 %0, {fp4, 0};}"
+        : "=h"(storage) : "f"(value * inverse_scale),
+                            "f"(high * inverse_scale));
+    return static_cast<int>(storage & 0xffu);
+#else
+    return 0;
+#endif
+    """
+)
+def quantize_e2m1_pair(value: float, inverse_scale: float) -> int: ...
+
+
+@wp.func_native(
+    """
+#if defined(__CUDA_ARCH__)
     return __dp4a(a, b, total);
 #else
     for (int shift = 0; shift < 32; shift += 8)
@@ -924,6 +985,101 @@ def get_q8_prefill_mma_projection(dtype: type, tile_m: int):
         tid: int,
         columns: int,
         blocks: int,
+    ): ...
+
+    return project
+
+
+_NVFP4_MMA_PROJECTION = r"""
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int group = lane >> 2;
+    const int thread_in_group = lane & 3;
+    const int column_tiles = columns >> 3;
+    const int row_tile = warp / column_tiles;
+    const int row_base = row_tile << 4;
+    const int column_base = (warp - row_tile * column_tiles) << 3;
+    float total_0 = 0.0f, total_1 = 0.0f, total_2 = 0.0f, total_3 = 0.0f;
+
+    for (int block = 0; block < blocks64; ++block) {
+        const int packed_base = block << 5;
+        const int fragment = thread_in_group << 2;
+        const unsigned char* a_row_0 = activations.data +
+            (row_base + group) * activations.shape[1] + packed_base;
+        const unsigned char* a_row_1 = activations.data +
+            (row_base + group + 8) * activations.shape[1] + packed_base;
+        const unsigned a0 = *reinterpret_cast<const unsigned*>(a_row_0 + fragment);
+        const unsigned a1 = *reinterpret_cast<const unsigned*>(a_row_1 + fragment);
+        const unsigned a2 = *reinterpret_cast<const unsigned*>(a_row_0 + fragment + 16);
+        const unsigned a3 = *reinterpret_cast<const unsigned*>(a_row_1 + fragment + 16);
+        const unsigned char* b_row = weights.data +
+            (column_base + group) * weights.shape[1] + packed_base;
+        const unsigned b0 = *reinterpret_cast<const unsigned*>(b_row + fragment);
+        const unsigned b1 = *reinterpret_cast<const unsigned*>(b_row + fragment + 16);
+
+        const int scale_base = block << 2;
+        // CUTLASS SFALayout: thread strides <8,0,1>, value stride 16.
+        const int a_scale_row = row_base + group + ((lane & 1) << 3);
+        const unsigned char* as = activation_scales.data +
+            a_scale_row * activation_scales.shape[1] + scale_base;
+        // CUTLASS SFBLayout: thread strides <0,1>, value stride 8.
+        const unsigned char* bs = weight_scales.data +
+            (column_base + group) * weight_scales.shape[1] + scale_base;
+        const unsigned sfa = *reinterpret_cast<const unsigned*>(as);
+        const unsigned sfb = *reinterpret_cast<const unsigned*>(bs);
+        const unsigned short selector = 0;
+
+        float d0, d1, d2, d3;
+        const float zero = 0.0f;
+        asm volatile(
+            "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X."
+            "m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13}, "
+            "{%14}, {%15,%16}, {%17}, {%18,%19};"
+            : "=&f"(d0), "=&f"(d1), "=&f"(d2), "=&f"(d3)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+              "f"(zero), "f"(zero), "f"(zero), "f"(zero),
+              "r"(sfa), "h"(selector), "h"(selector), "r"(sfb),
+              "h"(selector), "h"(selector));
+        total_0 += d0; total_1 += d1; total_2 += d2; total_3 += d3;
+    }
+
+    const int row_0 = row_base + group;
+    const int row_1 = row_0 + 8;
+    const int column_0 = column_base + (thread_in_group << 1);
+    const float output_scale_0 = activation_global_scales.data[row_0] * weight_global_scale;
+    const float output_scale_1 = activation_global_scales.data[row_1] * weight_global_scale;
+    output.data[row_0 * columns + column_0] = NATIVE_TYPE(total_0 * output_scale_0);
+    output.data[row_0 * columns + column_0 + 1] = NATIVE_TYPE(total_1 * output_scale_0);
+    output.data[row_1 * columns + column_0] = NATIVE_TYPE(total_2 * output_scale_1);
+    output.data[row_1 * columns + column_0 + 1] = NATIVE_TYPE(total_3 * output_scale_1);
+#endif
+"""
+
+
+@lru_cache(maxsize=None)
+def get_nvfp4_mma_projection(dtype: type):
+    """Return the SM120a m16n8k64 block-scaled NVFP4 projection."""
+    if dtype == wp.float16:
+        native_type = "wp::float16"
+    elif dtype == wp.bfloat16:
+        native_type = "wp::bfloat16"
+    else:
+        raise TypeError("NVFP4 MMA output requires FP16 or BF16")
+
+    @wp.func_native(_NVFP4_MMA_PROJECTION.replace("NATIVE_TYPE", native_type))
+    def project(
+        activations: wp.array2d[wp.uint8],
+        activation_scales: wp.array2d[wp.uint8],
+        activation_global_scales: wp.array1d[wp.float32],
+        weights: wp.array2d[wp.uint8],
+        weight_scales: wp.array2d[wp.uint8],
+        output: wp.array2d[dtype],
+        tid: int,
+        columns: int,
+        blocks64: int,
+        weight_global_scale: float,
     ): ...
 
     return project
