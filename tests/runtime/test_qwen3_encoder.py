@@ -15,6 +15,7 @@ from warp_nn.runtime.qwen.encoder import (
     load_qwen3_encoder_config,
     qwen3_encoder_weight_names,
 )
+from warp_nn.runtime.qwen.causal import Qwen3CausalLM, qwen3_causal_weight_names
 from warp_nn.runtime.tokenizers import _BYTE_ENCODER
 
 
@@ -192,6 +193,39 @@ def test_qwen3_encoder_rejects_invalid_ids(tmp_path):
         runner.encode_ids([config["vocab_size"]])
     with pytest.raises(ValueError, match="one-dimensional"):
         runner.encode_ids([[1, 2]])
+
+
+def test_qwen3_causal_prefill_decode_matches_full_reference(tmp_path):
+    config, weights = _tiny_checkpoint(tmp_path / "qwen")
+    config["tie_word_embeddings"] = True
+    (tmp_path / "qwen" / "config.json").write_text(
+        json.dumps(config), encoding="utf-8"
+    )
+    runner = Qwen3CausalLM(
+        tmp_path / "qwen",
+        dtype=wp.float16,
+        device="cpu",
+        cache_capacity=16,
+        prefill_chunk_size=2,
+        use_cublas=False,
+    )
+    logits = runner.prefill([3, 9, 4]).numpy()[0, 0]
+    expected = _reference([3, 9, 4], config, weights)[-1]
+    np.testing.assert_allclose(
+        logits,
+        expected @ weights["model.embed_tokens.weight"].T,
+        rtol=4.0e-3,
+        atol=4.0e-3,
+    )
+    decoded = runner.decode(7).numpy()[0, 0]
+    expected = _reference([3, 9, 4, 7], config, weights)[-1]
+    np.testing.assert_allclose(
+        decoded,
+        expected @ weights["model.embed_tokens.weight"].T,
+        rtol=4.0e-3,
+        atol=4.0e-3,
+    )
+    assert "lm_head.weight" not in qwen3_causal_weight_names(config)
 
 
 def test_official_qwen3_embedding_checkpoint_contract():
