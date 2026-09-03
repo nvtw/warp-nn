@@ -110,6 +110,19 @@ def test_qwen25_language_encoder_matches_numpy_and_derives_head_dim(tmp_path):
     assert runner.attention_bias
 
 
+def test_qwen25_multimodal_config_selects_text_backbone(tmp_path):
+    config, _ = _tiny_qwen25(tmp_path / "qwen")
+    config["model_type"] = "qwen2_5_vl_text"
+    (tmp_path / "qwen" / "config.json").write_text(
+        json.dumps({"model_type": "qwen2_5_vl", "text_config": config}),
+        encoding="utf-8",
+    )
+    loaded = load_qwen_encoder_config(tmp_path / "qwen")
+    assert loaded["model_type"] == "qwen2_5_vl"
+    assert loaded["head_dim"] == 2
+    assert loaded["attention_bias"]
+
+
 @pytest.mark.skipif(not wp.is_cuda_available(), reason="CUDA is not available")
 def test_qwen25_language_encoder_cuda_graph_replay(tmp_path):
     config, weights = _tiny_qwen25(tmp_path / "qwen")

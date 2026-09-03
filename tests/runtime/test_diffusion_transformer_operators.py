@@ -27,8 +27,7 @@ def test_multi_axis_rotary_cache_matches_explicit_frequencies():
     expected_angles = np.concatenate(
         (
             coordinates[:, 0:1],
-            coordinates[:, 1:2]
-            * (1.0 / np.power(100.0, np.arange(0, 4, 2) / 4))[None],
+            coordinates[:, 1:2] * (1.0 / np.power(100.0, np.arange(0, 4, 2) / 4))[None],
             coordinates[:, 2:3],
         ),
         axis=1,
@@ -57,17 +56,23 @@ def test_transformer_layout_plans_match_reference_and_replay_graph():
     norm.execute()
     sliced.execute()
     projected = values @ weight.T + bias
-    expected = 0.5 * projected * (
-        1.0
-        + np.tanh(
-            np.sqrt(2.0 / np.pi)
-            * (projected + 0.044715 * projected * projected * projected)
+    expected = (
+        0.5
+        * projected
+        * (
+            1.0
+            + np.tanh(
+                np.sqrt(2.0 / np.pi)
+                * (projected + 0.044715 * projected * projected * projected)
+            )
         )
     )
     expected = (expected - expected.mean(axis=-1, keepdims=True)) / np.sqrt(
         expected.var(axis=-1, keepdims=True) + 1.0e-6
     )
-    np.testing.assert_allclose(sliced.output.numpy(), expected[:, 1:4], rtol=0.04, atol=0.025)
+    np.testing.assert_allclose(
+        sliced.output.numpy(), expected[:, 1:4], rtol=0.04, atol=0.025
+    )
 
     wp.synchronize()
     wp.capture_begin(device="cuda:0")
@@ -119,9 +124,7 @@ def test_adaptive_rope_joint_attention_and_sinusoidal_plans():
     )
     adaptive = AdaptiveLayerNormPlan(x, modulation, shift_index=0, scale_index=1)
     adaptive.execute()
-    residual = BroadcastGatedResidualPlan(
-        x, adaptive.output, modulation, gate_index=2
-    )
+    residual = BroadcastGatedResidualPlan(x, adaptive.output, modulation, gate_index=2)
     residual.execute()
     assert np.isfinite(residual.output.numpy()).all()
 
@@ -137,5 +140,24 @@ def test_adaptive_rope_joint_attention_and_sinusoidal_plans():
     actual = sinusoidal.execute().numpy()
     frequencies = np.exp(-np.log(10000.0) * np.arange(3) / 3)
     angles = 500.0 * frequencies
-    expected = np.concatenate((np.cos(angles), np.sin(angles)))[None]
-    np.testing.assert_allclose(actual, expected, rtol=0.01, atol=0.005)
+    expected_unquantized = np.concatenate((np.cos(angles), np.sin(angles)))[None]
+
+    timesteps.assign(np.array([0.7312345], dtype=np.float32))
+    quantized = (
+        SinusoidalEmbeddingPlan(
+            timesteps,
+            6,
+            dtype=wp.bfloat16,
+            scale=1000.0,
+            frequency_shift=0.0,
+            flip_sin_cos=True,
+            quantize_input=True,
+        )
+        .execute()
+        .numpy()
+    )
+    rounded = wp.array([0.7312345], dtype=wp.bfloat16, device="cuda:0").numpy()[0]
+    expected_angles = float(rounded) * 1000.0 * frequencies
+    expected = np.concatenate((np.cos(expected_angles), np.sin(expected_angles)))[None]
+    np.testing.assert_allclose(quantized, expected, rtol=0.01, atol=0.005)
+    np.testing.assert_allclose(actual, expected_unquantized, rtol=0.01, atol=0.005)

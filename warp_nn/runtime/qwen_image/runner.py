@@ -297,6 +297,15 @@ class QwenImage2512Bundle:
             missing.append(vae_weight)
         return tuple(missing)
 
+    def require_weight_files(self):
+        """Fail before execution when any indexed model shard is unavailable."""
+        missing = self.missing_weight_files()
+        if missing:
+            raise FileNotFoundError(
+                f"Qwen-Image bundle is missing {len(missing)} weight file(s): "
+                f"{missing[0]}"
+            )
+
     @classmethod
     def inspect(
         cls, path: str | Path, *, require_weights: bool = False
@@ -359,10 +368,6 @@ class QwenImage2512Bundle:
             text_hidden_size=text_hidden,
             text_layers=text_layers,
         )
-        missing = bundle.missing_weight_files()
-        if require_weights and missing:
-            raise FileNotFoundError(
-                f"Qwen-Image bundle is missing {len(missing)} weight file(s): "
-                f"{missing[0]}"
-            )
+        if require_weights:
+            bundle.require_weight_files()
         return bundle

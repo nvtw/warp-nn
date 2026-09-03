@@ -52,6 +52,8 @@ def qwen_image_to_rgb8(sample) -> np.ndarray:
     if values.ndim != 4 or values.shape[0] != 1 or values.shape[1] != 3:
         raise ValueError("Qwen-Image output must have shape [1, 3, height, width]")
     values = np.transpose(values[0], (1, 2, 0)).astype(np.float32, copy=False)
+    if not np.isfinite(values).all():
+        raise ValueError("Qwen-Image output contains non-finite values")
     return np.rint(np.clip((values + 1.0) * 127.5, 0.0, 255.0)).astype(np.uint8)
 
 
@@ -75,6 +77,8 @@ class QwenImage2512Pipeline:
             if isinstance(bundle, QwenImage2512Bundle)
             else QwenImage2512Bundle.inspect(bundle, require_weights=True)
         )
+        if isinstance(bundle, QwenImage2512Bundle):
+            self.bundle.require_weight_files()
         if dtype not in (wp.float16, wp.bfloat16):
             raise TypeError("Qwen-Image inference requires FP16 or BF16")
         self.dtype = dtype
@@ -97,12 +101,16 @@ class QwenImage2512Pipeline:
             use_cublas=self.use_cublas,
         )
         positive = encoder.encode(prompt, max_sequence_length=max_sequence_length)
+        # QwenEncoder reuses its fixed-length output. Own the positive result
+        # before encoding an equal-length negative prompt into that buffer.
+        owned_positive = wp.empty_like(positive)
+        owned_positive.assign(positive)
         negative = encoder.encode(
             negative_prompt, max_sequence_length=max_sequence_length
         )
-        conditioning = _padded_conditioning(positive, negative)
+        conditioning = _padded_conditioning(owned_positive, negative)
         self._finish_stage()
-        del encoder, positive, negative
+        del encoder, positive, owned_positive, negative
         self._collect_released_stage()
         return conditioning
 
@@ -122,8 +130,8 @@ class QwenImage2512Pipeline:
         latent_width, latent_height, sequence = self.bundle.latent_geometry(
             width, height
         )
-        if not 1 <= int(steps) <= 1000:
-            raise ValueError("Qwen-Image steps must be between 1 and 1000")
+        if not 2 <= int(steps) <= 1000:
+            raise ValueError("Qwen-Image steps must be between 2 and 1000")
         if not np.isfinite(true_cfg_scale) or true_cfg_scale < 0.0:
             raise ValueError("Qwen-Image true CFG scale must be finite and nonnegative")
         sample = seeded_normal(
@@ -160,18 +168,26 @@ class QwenImage2512Pipeline:
             latent_width // self.bundle.transformer.patch_size,
             cublas=cublas,
         )
-        positive_velocity = wp.empty_like(plan.output)
-        cfg = TrueCFGPlan(positive_velocity, plan.output, true_cfg_scale)
+        use_cfg = true_cfg_scale > 1.0
+        positive_velocity = wp.empty_like(plan.output) if use_cfg else None
+        cfg = (
+            TrueCFGPlan(positive_velocity, plan.output, true_cfg_scale)
+            if use_cfg
+            else None
+        )
         sigma = wp.zeros((1,), dtype=wp.float32, device=self.device)
         next_sigma = wp.zeros_like(sigma)
-        flow = FlowEulerPlan(sample, cfg.output, sigma, next_sigma)
+        flow = FlowEulerPlan(
+            sample, cfg.output if cfg is not None else plan.output, sigma, next_sigma
+        )
         schedule = self.bundle.scheduler.schedule(steps, sequence)
         for current, following in zip(schedule[:-1], schedule[1:]):
             timestep.assign(np.array([current], dtype=np.float32))
             plan.replay(text=positive, text_valid=positive_valid)
-            wp.copy(positive_velocity, plan.output)
-            plan.replay(text=negative, text_valid=negative_valid)
-            cfg.execute()
+            if cfg is not None:
+                wp.copy(positive_velocity, plan.output)
+                plan.replay(text=negative, text_valid=negative_valid)
+                cfg.execute()
             sigma.assign(np.array([current], dtype=np.float32))
             next_sigma.assign(np.array([following], dtype=np.float32))
             flow.execute()
@@ -188,13 +204,13 @@ class QwenImage2512Pipeline:
             weights,
             cublas,
             archive,
-            positive_velocity,
-            cfg,
             flow,
             unpack,
             transformer_text,
             transformer_text_valid,
         )
+        if cfg is not None:
+            del positive_velocity, cfg
         self._collect_released_stage()
         return latent
 
@@ -249,4 +265,9 @@ class QwenImage2512Pipeline:
         )
         del positive, positive_valid, negative, negative_valid
         self._collect_released_stage()
-        return self.decode(latent, vae_tiling=vae_tiling)
+        image = self.decode(latent, vae_tiling=vae_tiling)
+        if image.shape != (height, width, 3):
+            raise RuntimeError(
+                f"Qwen-Image produced {image.shape}, expected {(height, width, 3)}"
+            )
+        return image

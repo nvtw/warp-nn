@@ -494,6 +494,7 @@ class QwenImageMMDiTPlan:
             scale=1000.0,
             frequency_shift=0.0,
             flip_sin_cos=True,
+            quantize_input=True,
         )
         self.time_linear1 = BiasedLinearPlan(
             self.time_frequency.output,

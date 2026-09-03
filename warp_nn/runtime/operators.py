@@ -1785,8 +1785,14 @@ class BidirectionalGQAPlan:
         self.scale = float(head_size**-0.5 if scale is None else scale)
         if not math.isfinite(self.scale) or self.scale <= 0.0:
             raise ValueError("attention scale must be finite and positive")
+        self._tiled = (
+            query.device.is_cuda
+            and query.dtype in (wp.float16, wp.bfloat16)
+            and 16 <= head_size <= 128
+            and head_size % 16 == 0
+        )
         self._block_dim, self._kernel = _get_bidirectional_gqa_attention_kernel(
-            head_size, query.dtype
+            head_size, query.dtype, self._tiled
         )
 
     @staticmethod
@@ -1802,6 +1808,32 @@ class BidirectionalGQAPlan:
         return mask
 
     def execute(self):
+        if self._tiled:
+            batch, query_heads, query_length, head_size = self.query.shape
+            kv_heads, key_length = self.key.shape[1:3]
+            wp.launch_tiled(
+                self._kernel,
+                dim=batch * query_heads * ((query_length + 31) // 32),
+                inputs=[
+                    self.query.reshape((batch * query_heads * query_length, head_size)),
+                    self.key.reshape((batch * kv_heads * key_length, head_size)),
+                    self.value.reshape((batch * kv_heads * key_length, head_size)),
+                    self.query_valid,
+                    self.key_valid,
+                    self.output.reshape(
+                        (batch * query_heads * query_length, head_size)
+                    ),
+                    query_heads,
+                    kv_heads,
+                    query_length,
+                    key_length,
+                    wp.float32(self.scale),
+                    self.window,
+                ],
+                block_dim=self._block_dim,
+                device=self.query.device,
+            )
+            return self.output
         wp.launch_tiled(
             self._kernel,
             dim=(self.query.shape[0], self.query.shape[1], self.query.shape[2]),
@@ -3377,6 +3409,7 @@ class SinusoidalEmbeddingPlan:
         scale=1.0,
         frequency_shift=1.0,
         flip_sin_cos=False,
+        quantize_input=False,
     ):
         if values.ndim != 1 or values.dtype != wp.float32:
             raise TypeError("sinusoidal embedding values must be a rank-one FP32 array")
@@ -3387,6 +3420,7 @@ class SinusoidalEmbeddingPlan:
         self.scale = float(scale)
         self.frequency_shift = float(frequency_shift)
         self.flip_sin_cos = bool(flip_sin_cos)
+        self.quantize_input = bool(quantize_input)
         self.output = wp.empty(
             (values.shape[0], int(width)), dtype=dtype, device=values.device
         )
@@ -3402,6 +3436,7 @@ class SinusoidalEmbeddingPlan:
                 wp.float32(self.scale),
                 wp.float32(self.frequency_shift),
                 self.flip_sin_cos,
+                self.quantize_input,
             ],
             device=self.values.device,
         )

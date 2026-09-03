@@ -109,6 +109,27 @@ def test_attention_low_precision_matches_fp32_reference(dtype):
     np.testing.assert_allclose(plan.execute().numpy(), expected, rtol=0.02, atol=0.01)
 
 
+def test_tiled_attention_matches_reference_across_query_tiles():
+    """Exercise more than one query tile at production head width."""
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is unavailable")
+    rng = np.random.default_rng(109)
+    query = rng.normal(0.0, 0.2, size=(1, 4, 37, 128)).astype(np.float32)
+    key = rng.normal(0.0, 0.2, size=(1, 2, 43, 128)).astype(np.float32)
+    value = rng.normal(0.0, 0.2, size=(1, 2, 43, 128)).astype(np.float32)
+    query_valid = np.array([[True] * 35 + [False] * 2])
+    key_valid = np.array([[True] * 40 + [False] * 3])
+    plan = BidirectionalGQAPlan(
+        wp.array(query, dtype=wp.bfloat16, device="cuda:0"),
+        wp.array(key, dtype=wp.bfloat16, device="cuda:0"),
+        wp.array(value, dtype=wp.bfloat16, device="cuda:0"),
+        query_valid=wp.array(query_valid, device="cuda:0"),
+        key_valid=wp.array(key_valid, device="cuda:0"),
+    )
+    expected = _reference(query, key, value, query_valid, key_valid)
+    np.testing.assert_allclose(plan.execute().numpy(), expected, rtol=0.025, atol=0.012)
+
+
 def test_attention_rejects_incompatible_geometry():
     query = wp.zeros((1, 3, 4, 8), dtype=wp.float32, device="cpu")
     key = wp.zeros((1, 2, 4, 8), dtype=wp.float32, device="cpu")

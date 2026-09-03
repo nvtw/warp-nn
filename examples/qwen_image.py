@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 
 from warp_nn.runtime.formats.image import write_png_rgb8
 from warp_nn.runtime.qwen_image.checkpoint import QwenImageTransformerManifest
@@ -78,6 +79,12 @@ def main(argv=None):
     pipeline = QwenImage2512Pipeline(
         bundle, device=args.device, use_cublas=not args.no_cublas
     )
+    print(
+        f"Generating {width}x{height} image in {args.steps} steps on "
+        f"{pipeline.device}...",
+        flush=True,
+    )
+    started = time.perf_counter()
     image = pipeline.generate(
         args.prompt,
         negative_prompt=args.negative_prompt,
@@ -90,7 +97,7 @@ def main(argv=None):
     )
     write_png_rgb8(args.output, image)
     mode = "approximate overlap-tiled VAE" if args.vae_tiling else "exact untiled VAE"
-    print(f"Wrote {args.output} ({mode})")
+    print(f"Wrote {args.output} in {time.perf_counter() - started:.1f}s ({mode})")
     return 0
 
 

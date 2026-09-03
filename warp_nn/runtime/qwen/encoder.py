@@ -80,6 +80,11 @@ def load_qwen_encoder_config(path: str | Path) -> dict:
     config = json.loads(path.read_text(encoding="utf-8"))
     if "text_config" in config:
         config = dict(config["text_config"])
+    # Hugging Face uses a text-only model type inside multimodal Qwen2.5-VL
+    # configs. Its weights and execution contract are the same language
+    # backbone already handled below.
+    if config.get("model_type") == "qwen2_5_vl_text":
+        config["model_type"] = "qwen2_5_vl"
     required = (
         "hidden_size",
         "intermediate_size",

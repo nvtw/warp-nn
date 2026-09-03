@@ -955,6 +955,7 @@ def _sinusoidal_embedding_kernel(
     scale: wp.float32,
     frequency_shift: wp.float32,
     flip_sin_cos: bool,
+    quantize_input: bool,
 ):
     """Create a graph-safe diffusion-style sinusoidal embedding."""
     batch, column = wp.tid()
@@ -968,7 +969,10 @@ def _sinusoidal_embedding_kernel(
             * wp.float32(frequency_column)
             / (wp.float32(half) - frequency_shift)
         )
-        angle = values[batch] * scale * frequency
+        value = values[batch]
+        if quantize_input:
+            value = wp.float32(output.dtype(value))
+        angle = value * scale * frequency
         use_cos = (column >= half) != flip_sin_cos
         output[batch, column] = output.dtype(
             wp.cos(angle) if use_cos else wp.sin(angle)
@@ -3479,14 +3483,19 @@ def _get_gqa_attention_kernel(head_size: int, dtype: type = wp.float16):
     return block_dim, _gqa_attention_kernel_cache[key]
 
 
-def _get_bidirectional_gqa_attention_kernel(head_size: int, dtype: type = wp.float16):
+def _get_bidirectional_gqa_attention_kernel(
+    head_size: int, dtype: type = wp.float16, tiled: bool = False
+):
     """Return fixed-sequence bidirectional GQA and its tile block dimension."""
-    key = (head_size, dtype)
+    key = (head_size, dtype, bool(tiled))
     if key not in _bidirectional_gqa_attention_kernel_cache:
-        _bidirectional_gqa_attention_kernel_cache[key] = (
-            _create_bidirectional_gqa_attention_kernel(*key)
+        factory = (
+            _create_tiled_bidirectional_gqa_attention_kernel
+            if tiled
+            else _create_bidirectional_gqa_attention_kernel
         )
-    block_dim = min(1024, max(32, 1 << (head_size - 1).bit_length()))
+        _bidirectional_gqa_attention_kernel_cache[key] = factory(head_size, dtype)
+    block_dim = 128 if tiled else min(1024, max(32, 1 << (head_size - 1).bit_length()))
     return block_dim, _bidirectional_gqa_attention_kernel_cache[key]
 
 
@@ -4885,3 +4894,204 @@ def _conv_transpose1d_mma_kernels(
     for kernel in (pack_weight, pack_input, project, unpack):
         kernel.module.options["enable_backward"] = False
     return pack_weight, pack_input, project, unpack
+
+
+def _create_tiled_bidirectional_gqa_attention_kernel(head_size: int, dtype: type):
+    """Build exact tensor-core full/sliding GQA with online softmax."""
+    DTYPE = dtype
+    QUERY_TILE = 32
+    KEY_TILE = 32
+
+    @wp.func
+    def maximum(left: wp.float32, right: wp.float32):
+        return wp.max(left, right)
+
+    @wp.func
+    def add_offset(offset: wp.int32, base: wp.int32):
+        return offset + base
+
+    @wp.func
+    def valid_score(
+        score: wp.float32,
+        query_position: wp.int32,
+        key_position: wp.int32,
+        query_is_valid: wp.bool,
+        key_is_valid: wp.bool,
+        scale: wp.float32,
+        window: wp.int32,
+    ):
+        in_window = window <= 0 or wp.abs(query_position - key_position) <= window
+        return (
+            score * scale
+            if query_is_valid and key_is_valid and in_window
+            else wp.float32(-3.402823466e38)
+        )
+
+    @wp.func
+    def masked_exp(
+        score: wp.float32,
+        maximum_value: wp.float32,
+        query_position: wp.int32,
+        key_position: wp.int32,
+        query_is_valid: wp.bool,
+        key_is_valid: wp.bool,
+        window: wp.int32,
+    ):
+        in_window = window <= 0 or wp.abs(query_position - key_position) <= window
+        return (
+            wp.exp(score - maximum_value)
+            if query_is_valid and key_is_valid and in_window
+            else wp.float32(0.0)
+        )
+
+    @wp.func
+    def exp_difference(old: wp.float32, new: wp.float32):
+        return wp.exp(old - new)
+
+    @wp.func
+    def safe_inverse(value: wp.float32):
+        return wp.float32(1.0) / value if value > 0.0 else wp.float32(0.0)
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(
+        query: wp.array2d(dtype=DTYPE),
+        key: wp.array2d(dtype=DTYPE),
+        value: wp.array2d(dtype=DTYPE),
+        query_valid: wp.array2d(dtype=wp.bool),
+        key_valid: wp.array2d(dtype=wp.bool),
+        output: wp.array2d(dtype=DTYPE),
+        query_heads: wp.int32,
+        kv_heads: wp.int32,
+        query_length: wp.int32,
+        key_length: wp.int32,
+        scale: wp.float32,
+        window: wp.int32,
+    ):
+        item = wp.tid()
+        query_tiles = (query_length + QUERY_TILE - 1) / QUERY_TILE
+        tile_index = item % query_tiles
+        head = (item / query_tiles) % query_heads
+        batch = item / (query_tiles * query_heads)
+        query_start = tile_index * QUERY_TILE
+        kv_head = head / (query_heads / kv_heads)
+        query_base = (batch * query_heads + head) * query_length
+        key_base = (batch * kv_heads + kv_head) * key_length
+
+        queries = wp.tile_load(
+            query,
+            shape=(QUERY_TILE, head_size),
+            offset=(query_base + query_start, 0),
+        )
+        accumulator = wp.tile_zeros(shape=(QUERY_TILE, head_size), dtype=wp.float32)
+        maximum_values = wp.tile_full(
+            shape=(QUERY_TILE,),
+            value=wp.float32(-3.402823466e38),
+            dtype=wp.float32,
+        )
+        denominators = wp.tile_zeros(shape=(QUERY_TILE,), dtype=wp.float32)
+        query_offsets = wp.tile_arange(QUERY_TILE, dtype=wp.int32)
+        query_positions = wp.tile_map(add_offset, query_offsets, query_start)
+        query_positions_group = wp.tile_broadcast(
+            wp.tile_reshape(query_positions, shape=(QUERY_TILE, 1)),
+            shape=(QUERY_TILE, KEY_TILE),
+        )
+        query_mask = wp.tile_reshape(
+            wp.tile_load(
+                query_valid,
+                shape=(1, QUERY_TILE),
+                offset=(batch, query_start),
+            ),
+            shape=(QUERY_TILE,),
+        )
+        query_mask_group = wp.tile_broadcast(
+            wp.tile_reshape(query_mask, shape=(QUERY_TILE, 1)),
+            shape=(QUERY_TILE, KEY_TILE),
+        )
+        key_offsets = wp.tile_arange(KEY_TILE, dtype=wp.int32)
+
+        for key_start in range(0, key_length, KEY_TILE):
+            keys = wp.tile_load(
+                key,
+                shape=(KEY_TILE, head_size),
+                offset=(key_base + key_start, 0),
+            )
+            scores = wp.tile_zeros(shape=(QUERY_TILE, KEY_TILE), dtype=wp.float32)
+            wp.tile_matmul(queries, wp.tile_transpose(keys), scores)
+            key_positions = wp.tile_map(add_offset, key_offsets, key_start)
+            key_positions_group = wp.tile_broadcast(
+                wp.tile_reshape(key_positions, shape=(1, KEY_TILE)),
+                shape=(QUERY_TILE, KEY_TILE),
+            )
+            key_mask = wp.tile_load(
+                key_valid,
+                shape=(1, KEY_TILE),
+                offset=(batch, key_start),
+            )
+            key_mask_group = wp.tile_broadcast(key_mask, shape=(QUERY_TILE, KEY_TILE))
+            scores = wp.tile_map(
+                valid_score,
+                scores,
+                query_positions_group,
+                key_positions_group,
+                query_mask_group,
+                key_mask_group,
+                scale,
+                window,
+            )
+            block_maximum = wp.tile_reduce(maximum, scores, axis=1)
+            new_maximum = wp.tile_map(maximum, maximum_values, block_maximum)
+            old_scale = wp.tile_map(exp_difference, maximum_values, new_maximum)
+            maximum_group = wp.tile_broadcast(
+                wp.tile_reshape(new_maximum, shape=(QUERY_TILE, 1)),
+                shape=(QUERY_TILE, KEY_TILE),
+            )
+            probabilities = wp.tile_map(
+                masked_exp,
+                scores,
+                maximum_group,
+                query_positions_group,
+                key_positions_group,
+                query_mask_group,
+                key_mask_group,
+                window,
+            )
+            denominators = denominators * old_scale + wp.tile_sum(probabilities, axis=1)
+            old_scale_group = wp.tile_broadcast(
+                wp.tile_reshape(old_scale, shape=(QUERY_TILE, 1)),
+                shape=(QUERY_TILE, head_size),
+            )
+            values = wp.tile_load(
+                value,
+                shape=(KEY_TILE, head_size),
+                offset=(key_base + key_start, 0),
+            )
+            contribution = wp.tile_zeros(
+                shape=(QUERY_TILE, head_size), dtype=wp.float32
+            )
+            wp.tile_matmul(
+                wp.tile_astype(probabilities, dtype=DTYPE),
+                values,
+                contribution,
+            )
+            accumulator = accumulator * old_scale_group + contribution
+            maximum_values = new_maximum
+
+        inverse = wp.tile_map(safe_inverse, denominators)
+        normalized = accumulator * wp.tile_broadcast(
+            wp.tile_reshape(inverse, shape=(QUERY_TILE, 1)),
+            shape=(QUERY_TILE, head_size),
+        )
+        for row in range(QUERY_TILE):
+            token = query_start + row
+            if token < query_length:
+                normalized_row = wp.tile_view(
+                    normalized, offset=(row, 0), shape=(1, head_size)
+                )
+                wp.tile_store(
+                    output,
+                    wp.tile_astype(normalized_row, dtype=DTYPE),
+                    offset=(query_base + token, 0),
+                )
+
+    kernel.module.options["enable_backward"] = False
+    return kernel

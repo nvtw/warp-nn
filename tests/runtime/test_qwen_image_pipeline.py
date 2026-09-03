@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import numpy as np
+import pytest
 import warp as wp
 
 import warp_nn.runtime.qwen_image.pipeline as pipeline_module
@@ -27,6 +28,42 @@ def test_qwen_image_output_conversion_has_exact_endpoints_and_layout():
     image = qwen_image_to_rgb8(sample)
     assert image.dtype == np.uint8
     np.testing.assert_array_equal(image, [[[0, 128, 255], [255, 128, 0]]])
+    sample[0, 0, 0, 0] = np.nan
+    with pytest.raises(ValueError, match="non-finite"):
+        qwen_image_to_rgb8(sample)
+
+
+def test_prompt_encoding_owns_equal_length_positive_before_negative(monkeypatch):
+    shared = wp.zeros((1, 2, 3), dtype=wp.bfloat16)
+
+    class Encoder:
+        calls = 0
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return cls()
+
+        def encode(self, prompt, *, max_sequence_length):
+            self.calls += 1
+            shared.assign(np.full(shared.shape, self.calls, dtype=np.float32))
+            return shared
+
+    class Bundle:
+        root = None
+
+    monkeypatch.setattr(pipeline_module, "QwenImagePromptEncoder", Encoder)
+    pipeline = object.__new__(QwenImage2512Pipeline)
+    pipeline.bundle = Bundle()
+    pipeline.dtype = wp.bfloat16
+    pipeline.device = wp.get_device("cpu")
+    pipeline.use_cublas = False
+    positive, positive_valid, negative, negative_valid = pipeline.encode_prompts(
+        "positive", "negative"
+    )
+    np.testing.assert_allclose(positive.numpy(), 1.0)
+    np.testing.assert_allclose(negative.numpy(), 2.0)
+    np.testing.assert_array_equal(positive_valid.numpy(), [[True, True]])
+    np.testing.assert_array_equal(negative_valid.numpy(), [[True, True]])
 
 
 def test_denoise_does_not_overwrite_positive_conditioning(monkeypatch, tmp_path):
@@ -89,3 +126,29 @@ def test_denoise_does_not_overwrite_positive_conditioning(monkeypatch, tmp_path)
     assert latent.shape == (1, 1, 4, 4)
     assert calls == [1.0, 2.0, 1.0, 2.0]
     np.testing.assert_allclose(positive.numpy(), 1.0)
+
+    calls.clear()
+    pipeline.denoise(
+        positive,
+        valid,
+        negative,
+        valid,
+        width=8,
+        height=8,
+        steps=2,
+        true_cfg_scale=1.0,
+    )
+    assert calls == [1.0, 1.0]
+
+    calls.clear()
+    with pytest.raises(ValueError, match="between 2 and 1000"):
+        pipeline.denoise(
+            positive,
+            valid,
+            negative,
+            valid,
+            width=8,
+            height=8,
+            steps=1,
+        )
+    assert not calls
