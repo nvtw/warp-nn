@@ -118,7 +118,18 @@ def _condition_kernels(dtype):
         batch, frame, channel = wp.tid()
         output[batch, frame, channel] = source[batch % source_batch, frame, channel]
 
-    return add_bias, pack, fill_null, copy_reference
+    @wp.kernel(enable_backward=False, module="unique")
+    def prepend_special(
+        source: wp.array3d(dtype=DTYPE),
+        special: wp.array3d(dtype=DTYPE),
+        output: wp.array3d(dtype=DTYPE),
+    ):
+        batch, token, channel = wp.tid()
+        output[batch, token, channel] = (
+            special[0, 0, channel] if token == 0 else source[batch, token - 1, channel]
+        )
+
+    return add_bias, pack, fill_null, copy_reference, prepend_special
 
 
 class _EncoderLayerPlan:
@@ -386,14 +397,13 @@ class AceStepConditionPlan:
             self.lyric,
             lyric_valid,
             weights,
-            config,
+            config.condition_encoder,
             "encoder.lyric_encoder",
             config.num_lyric_encoder_hidden_layers,
             cublas,
         )
 
-        # Base/turbo ACE 1.5 does not prepend special_token. Encode a fixed
-        # reference prefix and pool position zero; crop/broadcast stays on-device.
+        # XL prepends its learned pooling token; turbo explicitly omits it.
         self.reference_input = reference_latents
         self.reference = wp.empty(
             (batch, config.timbre_fix_frame, config.timbre_hidden_dim),
@@ -420,19 +430,29 @@ class AceStepConditionPlan:
             self.device,
             cublas=cublas,
         )
+        timbre_tokens = config.timbre_fix_frame + int(not config.is_turbo)
         self.timbre_hidden = wp.empty(
-            (batch, config.timbre_fix_frame, config.encoder_hidden_size),
+            (batch, timbre_tokens, config.encoder_hidden_size),
             dtype=self.dtype,
             device=self.device,
         )
+        self.projected_timbre = (
+            self.timbre_hidden
+            if config.is_turbo
+            else wp.empty(
+                (batch, config.timbre_fix_frame, config.encoder_hidden_size),
+                dtype=self.dtype,
+                device=self.device,
+            )
+        )
         timbre_valid = wp.ones(
-            (batch, config.timbre_fix_frame), dtype=wp.bool, device=self.device
+            (batch, timbre_tokens), dtype=wp.bool, device=self.device
         )
         self.timbre_stack = _EncoderStackPlan(
             self.timbre_hidden,
             timbre_valid,
             weights,
-            config,
+            config.condition_encoder,
             "encoder.timbre_encoder",
             config.num_timbre_encoder_hidden_layers,
             cublas,
@@ -500,14 +520,25 @@ class AceStepConditionPlan:
         )
         wp.launch(
             self._kernels[0],
-            dim=self.timbre_hidden.shape,
+            dim=self.projected_timbre.shape,
             inputs=[
-                self._timbre_tensors["projected"].reshape(self.timbre_hidden.shape),
+                self._timbre_tensors["projected"].reshape(self.projected_timbre.shape),
                 self.weights["encoder.timbre_encoder.embed_tokens.bias"],
-                self.timbre_hidden,
+                self.projected_timbre,
             ],
             device=self.device,
         )
+        if not self.config.is_turbo:
+            wp.launch(
+                self._kernels[4],
+                dim=self.timbre_hidden.shape,
+                inputs=[
+                    self.projected_timbre,
+                    self.weights["encoder.timbre_encoder.special_token"],
+                    self.timbre_hidden,
+                ],
+                device=self.device,
+            )
         self.timbre_stack.execute()
         wp.launch(
             self._kernels[1],
@@ -537,7 +568,7 @@ class AceStepConditionPlan:
 
 
 class AceStepConditionEncoder:
-    """Load exact ACE 1.5 turbo condition weights and build fixed-shape plans."""
+    """Load ACE 1.5 condition weights and build fixed-shape execution plans."""
 
     def __init__(
         self,
@@ -551,14 +582,6 @@ class AceStepConditionEncoder:
         self.device = parse_device(device)
         self.dtype = dtype
         self.config = config
-        if config.model_version != "turbo" or not config.is_turbo:
-            raise ValueError(
-                "ACE condition execution currently supports only ACE-Step 1.5 turbo"
-            )
-        if config.encoder_hidden_size != config.hidden_size:
-            raise ValueError(
-                "ACE turbo condition execution requires encoder and decoder hidden widths to match"
-            )
         archive = SafeTensorArchive(Path(path))
         names = condition_weight_names(config)
         missing = set(names) - set(archive.names)

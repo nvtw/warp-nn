@@ -11,7 +11,7 @@ official AceStepDiTModel and covers both turbo and XL checkpoints.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 import json
 import math
@@ -85,6 +85,9 @@ class AceStepDiTConfig:
     audio_acoustic_hidden_dim: int
     patch_size: int
     encoder_hidden_size: int
+    encoder_intermediate_size: int
+    encoder_num_attention_heads: int
+    encoder_num_key_value_heads: int
     layer_types: tuple[str, ...]
     sliding_window: int | None
     rope_theta: float
@@ -128,8 +131,8 @@ class AceStepDiTConfig:
         head_dim = int(source["head_dim"])
         if min(hidden, heads, kv_heads, head_dim, layers) <= 0:
             raise ValueError("ACE-Step DiT dimensions must be positive")
-        if heads % kv_heads or hidden != heads * head_dim:
-            raise ValueError("ACE-Step attention head dimensions are inconsistent")
+        if heads % kv_heads:
+            raise ValueError("ACE-Step attention head groups are inconsistent")
         if str(source.get("hidden_act", "silu")) != "silu":
             raise ValueError("ACE-Step DiT requires the SiLU-gated Qwen MLP")
         patch_size = int(source["patch_size"])
@@ -137,6 +140,17 @@ class AceStepDiTConfig:
         audio_channels = int(source.get("audio_acoustic_hidden_dim", in_channels // 3))
         text_width = int(source.get("text_hidden_dim", 1024))
         timbre_width = int(source.get("timbre_hidden_dim", 64))
+        encoder_hidden = int(source.get("encoder_hidden_size", hidden))
+        encoder_intermediate = int(
+            source.get("encoder_intermediate_size", source["intermediate_size"])
+        )
+        encoder_heads = int(source.get("encoder_num_attention_heads", heads))
+        encoder_kv_heads = int(source.get("encoder_num_key_value_heads", kv_heads))
+        if (
+            encoder_heads % encoder_kv_heads
+            or encoder_hidden != encoder_heads * head_dim
+        ):
+            raise ValueError("ACE-Step condition encoder head geometry is inconsistent")
         lyric_layers = int(source.get("num_lyric_encoder_hidden_layers", 8))
         timbre_layers = int(source.get("num_timbre_encoder_hidden_layers", 4))
         audio_decoder_layers = int(
@@ -178,7 +192,10 @@ class AceStepDiTConfig:
             in_channels=in_channels,
             audio_acoustic_hidden_dim=audio_channels,
             patch_size=patch_size,
-            encoder_hidden_size=int(source.get("encoder_hidden_size", hidden)),
+            encoder_hidden_size=encoder_hidden,
+            encoder_intermediate_size=encoder_intermediate,
+            encoder_num_attention_heads=encoder_heads,
+            encoder_num_key_value_heads=encoder_kv_heads,
             layer_types=layer_types,
             sliding_window=window,
             rope_theta=float(source.get("rope_theta", 1_000_000.0)),
@@ -264,6 +281,17 @@ class AceStepDiTConfig:
     @property
     def audio_decoder_layers(self) -> int:
         return self.num_audio_decoder_hidden_layers
+
+    @property
+    def condition_encoder(self) -> "AceStepDiTConfig":
+        """Return the condition-transformer geometry used by XL and turbo."""
+        return replace(
+            self,
+            hidden_size=self.encoder_hidden_size,
+            intermediate_size=self.encoder_intermediate_size,
+            num_attention_heads=self.encoder_num_attention_heads,
+            num_key_value_heads=self.encoder_num_key_value_heads,
+        )
 
 
 @dataclass(frozen=True)
@@ -468,11 +496,14 @@ class AceStepAttentionPlan:
                 key_valid=key_valid,
                 window=window,
             )
+        attention_width = config.num_attention_heads * config.head_dim
         self.merged = wp.empty(
-            (batch, query_length, hidden_size), dtype=hidden.dtype, device=self.device
+            (batch, query_length, attention_width),
+            dtype=hidden.dtype,
+            device=self.device,
         )
         self.tensors["merged"] = self.merged.reshape(
-            (batch * query_length, hidden_size)
+            (batch * query_length, attention_width)
         )
         self.shapes["merged"] = self.tensors["merged"].shape
         self.output_projection = linear("output", "merged", prefix + ".o_proj.weight")
@@ -850,6 +881,84 @@ def _ace_dit_kernels(dtype):
     )
 
 
+@lru_cache(maxsize=None)
+def _apg_flow_kernels(dtype):
+    """Create deterministic APG guidance fused with the flow update."""
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def update_momentum(
+        prediction: wp.array3d(dtype=DTYPE),
+        momentum: wp.array3d(dtype=DTYPE),
+        active: wp.array1d(dtype=wp.int32),
+    ):
+        batch, frame, channel = wp.tid()
+        if active[0] != 0:
+            difference = wp.float32(prediction[batch, frame, channel]) - wp.float32(
+                prediction[batch + momentum.shape[0], frame, channel]
+            )
+            momentum[batch, frame, channel] = DTYPE(
+                difference
+                - wp.float32(0.75) * wp.float32(momentum[batch, frame, channel])
+            )
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def statistics(
+        prediction: wp.array3d(dtype=DTYPE),
+        momentum: wp.array3d(dtype=DTYPE),
+        output: wp.array3d(dtype=wp.float64),
+    ):
+        batch, channel = wp.tid()
+        difference_norm = wp.float64(0.0)
+        condition_norm = wp.float64(0.0)
+        typed_zero = DTYPE(0.0)
+        dot = wp.float64(0.0)
+        for frame in range(momentum.shape[1]):
+            difference = wp.float64(momentum[batch, frame, channel] + typed_zero)
+            condition = wp.float64(prediction[batch, frame, channel])
+            difference_norm += difference * difference
+            condition_norm += condition * condition
+            dot += difference * condition
+        output[batch, channel, 0] = difference_norm
+        output[batch, channel, 1] = condition_norm
+        output[batch, channel, 2] = dot
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def guide_and_step(
+        latent: wp.array3d(dtype=DTYPE),
+        prediction: wp.array3d(dtype=DTYPE),
+        momentum: wp.array3d(dtype=DTYPE),
+        stats: wp.array3d(dtype=wp.float64),
+        timestep: wp.array1d(dtype=DTYPE),
+        next_timestep: wp.array1d(dtype=DTYPE),
+        guidance: wp.array1d(dtype=wp.float32),
+    ):
+        batch, frame, channel = wp.tid()
+        scale = guidance[0]
+        condition = wp.float32(prediction[batch, frame, channel])
+        velocity = condition
+        if scale != wp.float32(1.0):
+            difference_norm = wp.sqrt(stats[batch, channel, 0])
+            clip = wp.min(
+                wp.float64(1.0),
+                wp.float64(2.5) / wp.max(difference_norm, wp.float64(1.0e-20)),
+            )
+            projection = (
+                clip
+                * stats[batch, channel, 2]
+                / wp.max(stats[batch, channel, 1], wp.float64(1.0e-20))
+            )
+            update = wp.float32(clip) * wp.float32(momentum[batch, frame, channel])
+            update -= wp.float32(projection) * condition
+            velocity += (scale - wp.float32(1.0)) * update
+        delta = wp.float32(timestep[batch]) - wp.float32(next_timestep[batch])
+        value = DTYPE(wp.float32(latent[batch, frame, channel]) - velocity * delta)
+        latent[batch, frame, channel] = value
+        latent[batch + momentum.shape[0], frame, channel] = value
+
+    return update_momentum, statistics, guide_and_step
+
+
 class _TimeEmbeddingPlan:
     def __init__(
         self, timestep, timestep_r, weights, prefix, hidden, difference, cublas
@@ -877,7 +986,10 @@ class _TimeEmbeddingPlan:
             return operation
 
         self.linear1 = linear("linear1", "frequency", ".linear_1")
-        self.linear2 = linear("temb", "linear1", ".linear_2")
+        self.first_activation = wp.empty_like(self.tensors["linear1"])
+        self.tensors["first_activation"] = self.first_activation
+        self.shapes["first_activation"] = self.first_activation.shape
+        self.linear2 = linear("temb", "first_activation", ".linear_2")
         self.activated = wp.empty(
             (batch, hidden), dtype=timestep.dtype, device=self.device
         )
@@ -908,8 +1020,8 @@ class _TimeEmbeddingPlan:
         )
         wp.launch(
             self._kernels[2],
-            dim=self.activated.shape,
-            inputs=[self.tensors["linear1"], self.activated],
+            dim=self.first_activation.shape,
+            inputs=[self.tensors["linear1"], self.first_activation],
             device=self.device,
         )
         execute_operations((self.linear2,), self.tensors, self.shapes, self.device)
@@ -1202,6 +1314,154 @@ class AceStepDiTPlan:
         return self.hidden
 
 
+class AceStepGuidedDiTPlan:
+    """Batch-two XL-SFT DiT with official deterministic APG guidance."""
+
+    def __init__(
+        self,
+        hidden,
+        context_latents,
+        condition,
+        null_condition,
+        weights,
+        config,
+        *,
+        condition_valid=None,
+        cublas=None,
+        guidance_scale=7.0,
+        guidance_start=0.0,
+        guidance_end=1.0,
+    ):
+        if condition.shape != null_condition.shape:
+            raise ValueError(
+                "ACE conditional and null embeddings must have equal shapes"
+            )
+        if not 0.0 <= guidance_start <= guidance_end <= 1.0:
+            raise ValueError("ACE guidance interval must be within [0, 1]")
+        self.batch = hidden.shape[0]
+        self.guidance_scale = float(guidance_scale)
+        self.guidance_start = float(guidance_start)
+        self.guidance_end = float(guidance_end)
+        self.device = hidden.device
+        self.dtype = hidden.dtype
+
+        def paired(source, second=None):
+            second = source if second is None else second
+            output = wp.empty(
+                (source.shape[0] * 2, *source.shape[1:]),
+                dtype=source.dtype,
+                device=source.device,
+            )
+            wp.copy(output.flatten(), source.flatten(), count=source.size)
+            wp.copy(
+                output.flatten(),
+                second.flatten(),
+                dest_offset=source.size,
+                count=source.size,
+            )
+            return output
+
+        model_hidden = paired(hidden)
+        model_context = paired(context_latents)
+        model_condition = paired(condition, null_condition)
+        model_valid = paired(condition_valid) if condition_valid is not None else None
+        self.plan = AceStepDiTPlan(
+            model_hidden,
+            model_context,
+            model_condition,
+            weights,
+            config,
+            condition_valid=model_valid,
+            cublas=cublas,
+        )
+        self.hidden = self.plan.hidden[: self.batch]
+        self.momentum = wp.zeros_like(hidden)
+        self.statistics = wp.empty(
+            (self.batch, hidden.shape[2], 3), dtype=wp.float64, device=self.device
+        )
+        self.active = wp.zeros(1, dtype=wp.int32, device=self.device)
+        self.guidance = wp.ones(1, dtype=wp.float32, device=self.device)
+        self._kernels = _apg_flow_kernels(self.dtype)
+        self.graph = None
+
+    def _execute(self):
+        self.plan.execute()
+        wp.launch(
+            self._kernels[0],
+            dim=self.momentum.shape,
+            inputs=[self.plan.output, self.momentum, self.active],
+            device=self.device,
+        )
+        wp.launch(
+            self._kernels[1],
+            dim=(self.batch, self.momentum.shape[2]),
+            inputs=[self.plan.output, self.momentum, self.statistics],
+            device=self.device,
+        )
+        wp.launch(
+            self._kernels[2],
+            dim=self.momentum.shape,
+            inputs=[
+                self.plan.hidden,
+                self.plan.output,
+                self.momentum,
+                self.statistics,
+                self.plan.timestep,
+                self.plan.next_timestep,
+                self.guidance,
+            ],
+            device=self.device,
+        )
+
+    def capture(self):
+        """Prepare fixed cross-attention state and capture one guided flow step."""
+        self.plan.prepare_fixed_condition()
+        ones = np.ones(self.plan.timestep.shape, dtype=np.float32)
+        self.plan.timestep.assign(ones)
+        self.plan.timestep_r.assign(ones)
+        self.plan.next_timestep.assign(ones)
+        self.active.zero_()
+        self.guidance.fill_(1.0)
+        self._execute()
+        wp.synchronize_stream(wp.get_stream(self.device))
+        wp.capture_begin(device=self.device)
+        self._execute()
+        self.graph = wp.capture_end(device=self.device)
+        return self.graph
+
+    def run_schedule(self, schedule):
+        """Run checkpoint-native APG through one captured GPU graph."""
+        values = tuple(float(value) for value in schedule)
+        if (
+            not values
+            or any(not 0.0 < value <= 1.0 for value in values)
+            or any(left <= right for left, right in zip(values, values[1:]))
+        ):
+            raise ValueError(
+                "ACE diffusion schedule must be strictly descending in (0, 1]"
+            )
+        if self.graph is None:
+            self.capture()
+        count = len(values)
+        for index, value in enumerate(values):
+            next_value = values[index + 1] if index + 1 < count else 0.0
+            active = (
+                self.guidance_start <= value <= self.guidance_end
+                and self.guidance_scale not in (0.0, 1.0)
+            )
+            scale = 1.0
+            if active:
+                scale = self.guidance_scale
+            shape = self.plan.timestep.shape
+            self.plan.timestep.assign(np.full(shape, value, dtype=np.float32))
+            self.plan.timestep_r.assign(np.full(shape, value, dtype=np.float32))
+            self.plan.next_timestep.assign(np.full(shape, next_value, dtype=np.float32))
+            self.active.assign(np.array([int(active)], dtype=np.int32))
+            self.guidance.assign(np.array([scale], dtype=np.float32))
+            wp.capture_launch(self.graph)
+        return self.hidden
+
+
 def load_ace_dit_weights(path, config, device, dtype=wp.bfloat16):
     """Load exactly the official ACE DiT tensors from sharded safetensors."""
     archive = SafeTensorArchive(path)
@@ -1296,17 +1556,21 @@ def turbo_schedule(
             for value in values[:20]
         )
     if steps is not None:
-        if steps <= 0:
-            raise ValueError("steps must be positive")
-        count = min(int(steps), 20)
-        raw = tuple(1.0 - index / count for index in range(count))
-        return (
-            raw
-            if shift == 1.0
-            else tuple(shift * value / (1.0 + (shift - 1.0) * value) for value in raw)
-        )
+        return flow_schedule(steps, shift=shift)
     nearest = min(TURBO_TIMESTEPS, key=lambda value: abs(value - shift))
     return TURBO_TIMESTEPS[nearest]
+
+
+def flow_schedule(steps: int, *, shift: float = 1.0) -> tuple[float, ...]:
+    """Build the official descending flow-matching schedule."""
+    if steps <= 0:
+        raise ValueError("steps must be positive")
+    if shift <= 0.0:
+        raise ValueError("shift must be positive")
+    raw = tuple(1.0 - index / int(steps) for index in range(int(steps)))
+    if shift == 1.0:
+        return raw
+    return tuple(shift * value / (1.0 + (shift - 1.0) * value) for value in raw)
 
 
 def flow_euler_step(

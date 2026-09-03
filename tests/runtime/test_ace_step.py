@@ -284,6 +284,7 @@ def test_pipeline_orchestrates_minimal_turbo_path_on_device(monkeypatch):
     bundle = SimpleNamespace(
         text_encoder_path=Path("."),
         dit_path=Path("."),
+        dit=SimpleNamespace(is_turbo=True),
     )
     monkeypatch.setattr(
         "warp_nn.runtime.ace_step.runner.Qwen3Tokenizer",
@@ -413,7 +414,7 @@ def test_ace_cli_writes_stereo_pcm16_only_after_ready_generation(tmp_path, monke
 
         def generate(self, *, conditioning, duration_seconds, seed, steps):
             assert conditioning == "conditioning"
-            assert (duration_seconds, seed, steps) == (30.0, 0, 8)
+            assert (duration_seconds, seed, steps) == (30.0, 0, None)
             return generated
 
     monkeypatch.setattr(cli, "AceStep15Pipeline", Pipeline)

@@ -248,14 +248,3 @@ def test_condition_encoder_executes_live_attention_and_mlp(tmp_path):
     assert np.any(layer.attention.output.numpy() != 0.0)
     assert np.any(layer._mlp_tensors["down"].numpy() != 0.0)
     assert np.isfinite(condition.numpy()).all()
-
-
-def test_condition_encoder_rejects_non_turbo_before_loading(tmp_path):
-    raw = {
-        **_config().__dict__,
-        "layer_types": list(_config().layer_types),
-        "is_turbo": False,
-    }
-    config = AceStepDiTConfig.from_dict(raw)
-    with pytest.raises(ValueError, match="only ACE-Step 1.5 turbo"):
-        AceStepConditionEncoder(tmp_path, config, device="cpu")

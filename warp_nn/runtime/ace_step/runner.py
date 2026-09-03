@@ -103,20 +103,42 @@ class AceStep15Bundle:
     ) -> AceStep15Bundle:
         """Discover the official multi-component layout without loading tensors."""
         root = Path(root).expanduser().resolve()
-        text_path = root / "Qwen3-Embedding-0.6B"
-        dit_path = root / variant
-        vae_path = root / "vae"
-        planner = root / "acestep-5Hz-lm-1.7B"
-        if require_planner and not planner.is_dir():
-            raise FileNotFoundError(f"ACE-Step 5 Hz planner not found: {planner}")
+        base = root / "Ace-Step1.5" if (root / "Ace-Step1.5").is_dir() else root
+        locations = tuple(dict.fromkeys((root, base, root.parent, base.parent)))
+
+        def component(name, *, required=True):
+            path = next(
+                (
+                    directory / name
+                    for directory in locations
+                    if (directory / name).is_dir()
+                ),
+                None,
+            )
+            if path is None and required:
+                raise FileNotFoundError(f"ACE-Step component not found: {name}")
+            return path
+
+        text_path = component("Qwen3-Embedding-0.6B")
+        dit_path = component(variant)
+        vae_path = component("vae")
+        planner = component("acestep-5Hz-lm-4B", required=False)
+        if planner is None:
+            planner = component("acestep-5Hz-lm-1.7B", required=False)
+        if require_planner and planner is None:
+            raise FileNotFoundError("ACE-Step 5 Hz planner not found")
         if validate_weights:
-            required = (
+            required = [
                 text_path / "model.safetensors",
                 text_path / "tokenizer.json",
-                dit_path / "model.safetensors",
                 dit_path / "silence_latent.pt",
                 vae_path / "diffusion_pytorch_model.safetensors",
-            )
+            ]
+            if not (
+                (dit_path / "model.safetensors").is_file()
+                or (dit_path / "model.safetensors.index.json").is_file()
+            ):
+                required.append(dit_path / "model.safetensors[.index.json]")
             missing = [str(path) for path in required if not path.is_file()]
             if missing:
                 raise FileNotFoundError(f"ACE-Step bundle is incomplete: {missing}")
@@ -130,12 +152,12 @@ class AceStep15Bundle:
                 "ACE-Step VAE latent channels do not match DiT input packing"
             )
         return cls(
-            root=root,
+            root=base,
             variant=variant,
             text_encoder_path=text_path,
             dit_path=dit_path,
             vae_path=vae_path,
-            planner_path=planner if planner.is_dir() else None,
+            planner_path=planner,
             text=text,
             dit=dit,
             vae=vae,
@@ -400,9 +422,13 @@ class AceStep15Pipeline:
         device=None,
         use_cublas: bool = True,
     ):
-        """Load all fixed weights needed by the minimal turbo generation path."""
+        """Load all fixed weights needed by ACE-Step generation."""
         from .conditioning import AceStepConditionEncoder
-        from .dit import AceStepDiTPlan, load_ace_dit_weights
+        from .dit import (
+            AceStepDiTPlan,
+            AceStepGuidedDiTPlan,
+            load_ace_dit_weights,
+        )
         from .vae import OobleckVAEDecoder
 
         encoder = self.load_text_encoder(
@@ -421,15 +447,34 @@ class AceStep15Pipeline:
         )
         cublas = try_create_cublas() if use_cublas and encoder.device.is_cuda else None
 
-        def dit_factory(hidden, context, packed_condition, valid):
-            return AceStepDiTPlan(
+        def dit_factory(
+            hidden,
+            context,
+            packed_condition,
+            valid,
+            null_condition=None,
+            guidance_scale=7.0,
+        ):
+            if config.is_turbo:
+                return AceStepDiTPlan(
+                    hidden,
+                    context,
+                    packed_condition,
+                    weights,
+                    config,
+                    condition_valid=valid,
+                    cublas=cublas,
+                )
+            return AceStepGuidedDiTPlan(
                 hidden,
                 context,
                 packed_condition,
+                null_condition,
                 weights,
                 config,
                 condition_valid=valid,
                 cublas=cublas,
+                guidance_scale=guidance_scale,
             )
 
         def vae_factory(frames, batch):
@@ -534,14 +579,18 @@ class AceStep15Pipeline:
         conditioning: AceStepConditioning,
         duration_seconds: float = 30.0,
         seed: int = 0,
-        steps: int = 8,
+        steps: int | None = None,
+        guidance_scale: float = 7.0,
     ):
         """Generate stereo audio through condition encoder, DiT, and VAE."""
         if not self.ready:
             missing = ", ".join(self.missing_components)
             raise RuntimeError(f"ACE-Step 1.5 pipeline is not ready; missing {missing}")
-        if not 1 <= steps <= 8:
-            raise ValueError("ACE-Step turbo steps must be between 1 and 8")
+        if steps is None:
+            steps = 8 if self.bundle.dit.is_turbo else 30
+        if steps <= 0 or (self.bundle.dit.is_turbo and steps > 8):
+            limit = " between 1 and 8" if self.bundle.dit.is_turbo else " positive"
+            raise ValueError(f"ACE-Step steps must be{limit}")
         from .dit import turbo_schedule
 
         batch = conditioning.text_hidden_states.shape[0]
@@ -564,8 +613,22 @@ class AceStep15Pipeline:
             inputs.source_latents.shape, seed=seed, dtype=dtype, device=device
         )
         context = wp.array(inputs.context_latents, dtype=dtype, device=device)
-        dit = self.dit_executor(hidden, context, packed_condition, condition_valid)
-        latent = dit.run_schedule(turbo_schedule(shift=3.0, steps=steps))
+        if self.bundle.dit.is_turbo:
+            dit = self.dit_executor(hidden, context, packed_condition, condition_valid)
+        else:
+            dit = self.dit_executor(
+                hidden,
+                context,
+                packed_condition,
+                condition_valid,
+                condition_plan.null_condition(),
+                guidance_scale,
+            )
+        schedule = turbo_schedule(
+            shift=3.0 if self.bundle.dit.is_turbo else 1.0,
+            steps=steps,
+        )
+        latent = dit.run_schedule(schedule)
         decoder = self.vae_decoder(latent.shape[1], batch)
         decoder.input.assign(latent)
         decoder.execute()

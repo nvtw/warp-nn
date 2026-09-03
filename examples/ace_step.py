@@ -4,8 +4,8 @@
 """Validate or run the dependency-free ACE-Step 1.5 pipeline.
 
 The ``--check`` path is useful while downloading: it validates the official
-multi-component bundle without loading tensors. Generation runs the native
-dependency-free turbo pipeline when the complete official bundle is present.
+multi-component bundle without loading tensors. Generation runs the native,
+dependency-free Turbo or XL-SFT pipeline when the complete bundle is present.
 """
 
 from __future__ import annotations
@@ -42,10 +42,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--steps",
         type=int,
-        default=8,
-        choices=range(1, 9),
-        metavar="[1-8]",
-        help="turbo diffusion steps (default: 8)",
+        default=None,
+        help="diffusion steps (default: 8 for Turbo, 30 for XL-SFT)",
     )
     parser.add_argument("--no-cublas", action="store_true")
     parser.add_argument(

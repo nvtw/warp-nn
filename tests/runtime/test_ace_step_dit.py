@@ -14,6 +14,7 @@ from warp_nn.runtime.ace_step.dit import (
     AceStepDiTLayerPlan,
     AceStepDiTPlan,
     TURBO_TIMESTEPS,
+    _apg_flow_kernels,
     bidirectional_attention_mask,
     dit_weight_names,
     flow_euler_step,
@@ -55,6 +56,8 @@ def test_config_supports_distinct_xl_encoder_dimensions():
         num_key_value_heads=1,
         head_dim=4,
         encoder_hidden_size=16,
+        encoder_num_attention_heads=4,
+        encoder_num_key_value_heads=1,
     )
     assert config.hidden_size == 20
     assert config.encoder_hidden_size == 16
@@ -62,8 +65,11 @@ def test_config_supports_distinct_xl_encoder_dimensions():
 
 
 def test_config_rejects_incompatible_attention_and_context_channels():
-    with pytest.raises(ValueError, match="head dimensions"):
-        _config(head_dim=8)
+    projected = _config(hidden_size=20, head_dim=8, encoder_hidden_size=32)
+    assert projected.num_attention_heads * projected.head_dim == 32
+    assert projected.hidden_size == 20
+    with pytest.raises(ValueError, match="head groups"):
+        _config(num_attention_heads=3)
     with pytest.raises(ValueError, match="three times"):
         _config(in_channels=16)
     with pytest.raises(ValueError, match="sliding layers"):
@@ -137,6 +143,65 @@ def test_bidirectional_masks_adaln_split_and_euler_update():
     velocity = np.full_like(latent, 0.25)
     np.testing.assert_allclose(flow_euler_step(latent, velocity, 0.8, 0.3), 0.875)
     np.testing.assert_allclose(flow_euler_step(latent, velocity, 0.8), 0.8)
+
+
+def test_apg_flow_kernels_match_official_equations():
+    condition = np.array([[[1.0, -2.0], [0.5, 3.0]]], dtype=np.float32)
+    unconditional = np.array([[[0.25, -1.0], [-0.5, 1.0]]], dtype=np.float32)
+    prediction = wp.array(
+        np.concatenate((condition, unconditional)),
+        dtype=wp.float32,
+        device="cpu",
+    )
+    initial_momentum = np.full_like(condition, 0.2)
+    momentum = wp.array(initial_momentum, dtype=wp.float32, device="cpu")
+    latent = wp.ones((2, 2, 2), dtype=wp.float32, device="cpu")
+    stats = wp.empty((1, 2, 3), dtype=wp.float64, device="cpu")
+    active = wp.ones(1, dtype=wp.int32, device="cpu")
+    guidance = wp.array([3.0], dtype=wp.float32, device="cpu")
+    timestep = wp.ones(2, dtype=wp.float32, device="cpu")
+    next_timestep = wp.array([0.5, 0.5], dtype=wp.float32, device="cpu")
+    kernels = _apg_flow_kernels(wp.float32)
+    wp.launch(
+        kernels[0],
+        dim=momentum.shape,
+        inputs=[prediction, momentum, active],
+        device="cpu",
+    )
+    wp.launch(
+        kernels[1],
+        dim=(1, 2),
+        inputs=[prediction, momentum, stats],
+        device="cpu",
+    )
+    wp.launch(
+        kernels[2],
+        dim=momentum.shape,
+        inputs=[
+            latent,
+            prediction,
+            momentum,
+            stats,
+            timestep,
+            next_timestep,
+            guidance,
+        ],
+        device="cpu",
+    )
+
+    difference = condition - unconditional - 0.75 * initial_momentum
+    clip = np.minimum(1.0, 2.5 / np.linalg.norm(difference, axis=1, keepdims=True))
+    projection = (
+        clip
+        * np.sum(difference * condition, axis=1, keepdims=True)
+        / np.sum(condition**2, axis=1, keepdims=True)
+    )
+    update = clip * difference - projection * condition
+    velocity = condition + 2.0 * update
+    expected = 1.0 - 0.5 * velocity
+    np.testing.assert_allclose(momentum.numpy(), difference, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(latent.numpy()[0], expected[0], rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(latent.numpy()[1], expected[0], rtol=1.0e-6, atol=1.0e-6)
 
 
 def _rms_norm(x, scale, epsilon):
@@ -522,6 +587,21 @@ def test_top_level_dit_graph_and_sampler_smoke():
         ),
         weights,
         config,
+    )
+    plan.timestep.assign(np.array([0.8], dtype=np.float32))
+    plan.timestep_r.assign(np.array([0.8], dtype=np.float32))
+    plan.time_t.execute()
+    frequency = plan.time_t.frequency.numpy().astype(np.float32)
+    linear1 = (
+        frequency @ arrays["decoder.time_embed.linear_1.weight"].T
+        + arrays["decoder.time_embed.linear_1.bias"]
+    )
+    expected_activation = linear1 / (1.0 + np.exp(-linear1))
+    np.testing.assert_allclose(
+        plan.time_t.first_activation.numpy(),
+        expected_activation,
+        rtol=0.03,
+        atol=0.01,
     )
     before = hidden.numpy().copy()
     graph = plan.capture()
