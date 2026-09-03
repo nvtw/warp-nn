@@ -1788,9 +1788,10 @@ class BidirectionalGQAPlan:
         self._tiled = (
             query.device.is_cuda
             and query.dtype in (wp.float16, wp.bfloat16)
-            and 16 <= head_size <= 128
+            and 16 <= head_size <= 512
             and head_size % 16 == 0
         )
+        self._query_tile = 32 if head_size <= 128 else 8
         self._block_dim, self._kernel = _get_bidirectional_gqa_attention_kernel(
             head_size, query.dtype, self._tiled
         )
@@ -1813,7 +1814,9 @@ class BidirectionalGQAPlan:
             kv_heads, key_length = self.key.shape[1:3]
             wp.launch_tiled(
                 self._kernel,
-                dim=batch * query_heads * ((query_length + 31) // 32),
+                dim=batch
+                * query_heads
+                * ((query_length + self._query_tile - 1) // self._query_tile),
                 inputs=[
                     self.query.reshape((batch * query_heads * query_length, head_size)),
                     self.key.reshape((batch * kv_heads * key_length, head_size)),

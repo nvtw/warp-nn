@@ -4899,8 +4899,8 @@ def _conv_transpose1d_mma_kernels(
 def _create_tiled_bidirectional_gqa_attention_kernel(head_size: int, dtype: type):
     """Build exact tensor-core full/sliding GQA with online softmax."""
     DTYPE = dtype
-    QUERY_TILE = 32
-    KEY_TILE = 32
+    QUERY_TILE = 32 if head_size <= 128 else 8
+    KEY_TILE = 32 if head_size <= 128 else 16
 
     @wp.func
     def maximum(left: wp.float32, right: wp.float32):

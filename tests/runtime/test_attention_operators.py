@@ -109,14 +109,15 @@ def test_attention_low_precision_matches_fp32_reference(dtype):
     np.testing.assert_allclose(plan.execute().numpy(), expected, rtol=0.02, atol=0.01)
 
 
-def test_tiled_attention_matches_reference_across_query_tiles():
+@pytest.mark.parametrize("head_size", [128, 512])
+def test_tiled_attention_matches_reference_across_query_tiles(head_size):
     """Exercise more than one query tile at production head width."""
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is unavailable")
     rng = np.random.default_rng(109)
-    query = rng.normal(0.0, 0.2, size=(1, 4, 37, 128)).astype(np.float32)
-    key = rng.normal(0.0, 0.2, size=(1, 2, 43, 128)).astype(np.float32)
-    value = rng.normal(0.0, 0.2, size=(1, 2, 43, 128)).astype(np.float32)
+    query = rng.normal(0.0, 0.2, size=(1, 4, 37, head_size)).astype(np.float32)
+    key = rng.normal(0.0, 0.2, size=(1, 2, 43, head_size)).astype(np.float32)
+    value = rng.normal(0.0, 0.2, size=(1, 2, 43, head_size)).astype(np.float32)
     query_valid = np.array([[True] * 35 + [False] * 2])
     key_valid = np.array([[True] * 40 + [False] * 3])
     plan = BidirectionalGQAPlan(
