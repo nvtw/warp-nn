@@ -29,6 +29,7 @@ from warp_nn.runtime._cuda import (
     encode_ue4m3,
     expand_int4x4_high,
     expand_int4x4_low,
+    get_bidirectional_attention_d128,
     get_grouped_decode_projection,
     get_nvfp4_mma_projection,
     get_small_batch_grouped_projection,
@@ -3752,19 +3753,28 @@ def _get_gqa_attention_kernel(head_size: int, dtype: type = wp.float16):
 
 
 def _get_bidirectional_gqa_attention_kernel(
-    head_size: int, dtype: type = wp.float16, tiled: bool = False
+    head_size: int,
+    dtype: type = wp.float16,
+    tiled: bool = False,
+    native: bool = False,
 ):
     """Return fixed-sequence bidirectional GQA and its tile block dimension."""
-    key = (head_size, dtype, bool(tiled))
+    if native and (not tiled or head_size != 128):
+        raise ValueError("native bidirectional attention requires tiled D128 input")
+    key = (head_size, dtype, bool(tiled), bool(native))
     if key not in _bidirectional_gqa_attention_kernel_cache:
         factory = (
-            _create_tiled_bidirectional_gqa_attention_kernel
+            _create_native_bidirectional_attention_d128_kernel
+            if native
+            else _create_tiled_bidirectional_gqa_attention_kernel
             if tiled
             else _create_bidirectional_gqa_attention_kernel
         )
-        _bidirectional_gqa_attention_kernel_cache[key] = factory(head_size, dtype)
+        _bidirectional_gqa_attention_kernel_cache[key] = (
+            factory(dtype) if native else factory(head_size, dtype)
+        )
     block_dim = (
-        (256 if head_size <= 128 else 128)
+        (256 if native or head_size <= 128 else 128)
         if tiled
         else min(1024, max(32, 1 << (head_size - 1).bit_length()))
     )
@@ -5381,5 +5391,52 @@ def _create_tiled_bidirectional_gqa_attention_kernel(head_size: int, dtype: type
                     wp.tile_astype(normalized_row, dtype=DTYPE),
                     offset=(query_base + token, 0),
                 )
+
+    return kernel
+
+
+@lru_cache(maxsize=None)
+def _create_native_bidirectional_attention_d128_kernel(dtype: type):
+    """Build the thin launch wrapper for dependency-free native exact attention."""
+    DTYPE = dtype
+    native_attention = get_bidirectional_attention_d128(dtype)
+
+    @wp.kernel(
+        enable_backward=False,
+        module="unique",
+        module_options={"enable_backward": False},
+        grid_stride=False,
+    )
+    def kernel(
+        query: wp.array2d(dtype=DTYPE),
+        key: wp.array2d(dtype=DTYPE),
+        value: wp.array2d(dtype=DTYPE),
+        query_valid: wp.array2d(dtype=wp.bool),
+        key_valid: wp.array2d(dtype=wp.bool),
+        output: wp.array2d(dtype=DTYPE),
+        query_heads: wp.int32,
+        kv_heads: wp.int32,
+        query_length: wp.int32,
+        key_length: wp.int32,
+        scale: wp.float32,
+        window: wp.int32,
+    ):
+        # Keep the closure type visible while Warp resolves postponed annotations.
+        if wp.static(DTYPE == wp.float16):
+            pass
+        native_attention(
+            query,
+            key,
+            value,
+            query_valid,
+            key_valid,
+            output,
+            query_heads,
+            kv_heads,
+            query_length,
+            key_length,
+            scale,
+            window,
+        )
 
     return kernel

@@ -46,6 +46,269 @@ def warp_max_broadcast(value: float) -> float: ...
 def subgroup_max_broadcast(value: float, width: int) -> float: ...
 
 
+_BIDIRECTIONAL_ATTENTION_D128 = r"""
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    // Eight warps own 16 query rows each while sharing one 16-row K/V tile.
+    // Scores are never materialized globally: online softmax and FP32 output
+    // accumulators preserve exact attention with 46.5 KiB of static shared memory.
+    constexpr int QUERY_ROWS = 128;
+    constexpr int WARP_ROWS = 16;
+    constexpr int HEAD_SIZE = 128;
+    constexpr int KEY_ROWS = 16;
+    constexpr int Q_LD = 136;
+    constexpr int KV_LD = 136;
+    constexpr int P_LD = 16;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int lane_group = lane & 3;
+    const int row = lane >> 2;
+    const int query_tiles = (query_length + QUERY_ROWS - 1) / QUERY_ROWS;
+    const int tile = blockIdx.x;
+    const int tile_index = tile % query_tiles;
+    const int head = (tile / query_tiles) % query_heads;
+    const int batch = tile / (query_tiles * query_heads);
+    const int kv_head = head / (query_heads / kv_heads);
+    const int query_start = tile_index * QUERY_ROWS;
+    const int warp_query_start = query_start + warp * WARP_ROWS;
+    const int query_base = (batch * query_heads + head) * query_length;
+    const int key_base = (batch * kv_heads + kv_head) * key_length;
+
+    __shared__ __align__(16) unsigned short q_shared[8 * WARP_ROWS * Q_LD];
+    __shared__ __align__(16) unsigned short k_shared[KEY_ROWS * KV_LD];
+    __shared__ __align__(16) unsigned short v_shared[KEY_ROWS * KV_LD];
+    __shared__ __align__(16) unsigned short p_shared[8 * WARP_ROWS * P_LD];
+
+    const NATIVE_TYPE* query_values = query.data;
+    const NATIVE_TYPE* key_values = key.data;
+    const NATIVE_TYPE* value_values = value.data;
+    NATIVE_TYPE* output_values = output.data;
+
+    for (int copy = threadIdx.x; copy < 8 * WARP_ROWS * (HEAD_SIZE / 8); copy += 256) {
+        const int query_row = copy / (HEAD_SIZE / 8);
+        const int segment = copy % (HEAD_SIZE / 8);
+        unsigned short* destination = q_shared + query_row * Q_LD + segment * 8;
+        const int source_row = query_start + query_row;
+        if (source_row < query_length) {
+            const NATIVE_TYPE* source = query_values + (query_base + source_row) * HEAD_SIZE + segment * 8;
+            *reinterpret_cast<uint4*>(destination) = *reinterpret_cast<const uint4*>(source);
+        } else {
+            *reinterpret_cast<uint4*>(destination) = make_uint4(0, 0, 0, 0);
+        }
+    }
+    __syncthreads();
+
+    float maximum_0 = -3.402823466e38f;
+    float maximum_1 = -3.402823466e38f;
+    float denominator_0 = 0.0f;
+    float denominator_1 = 0.0f;
+    float accumulators[8][8] = {};
+    const int query_0 = warp_query_start + row;
+    const int query_1 = query_0 + 8;
+    const bool query_valid_0 = query_0 < query_length && query_valid.data[batch * query_length + query_0];
+    const bool query_valid_1 = query_1 < query_length && query_valid.data[batch * query_length + query_1];
+    unsigned short* warp_q = q_shared + warp * WARP_ROWS * Q_LD;
+    unsigned short* warp_p = p_shared + warp * WARP_ROWS * P_LD;
+
+    for (int key_start = 0; key_start < key_length; key_start += KEY_ROWS) {
+        for (int copy = threadIdx.x; copy < KEY_ROWS * (HEAD_SIZE / 8); copy += 256) {
+            const int key_row = copy / (HEAD_SIZE / 8);
+            const int segment = copy % (HEAD_SIZE / 8);
+            const int source_row = key_start + key_row;
+            unsigned short* key_destination = k_shared + key_row * KV_LD + segment * 8;
+            unsigned short* value_destination = v_shared + key_row * KV_LD + segment * 8;
+            if (source_row < key_length) {
+                const NATIVE_TYPE* key_source = key_values + (key_base + source_row) * HEAD_SIZE + segment * 8;
+                const NATIVE_TYPE* value_source = value_values + (key_base + source_row) * HEAD_SIZE + segment * 8;
+                *reinterpret_cast<uint4*>(key_destination) = *reinterpret_cast<const uint4*>(key_source);
+                *reinterpret_cast<uint4*>(value_destination) = *reinterpret_cast<const uint4*>(value_source);
+            } else {
+                *reinterpret_cast<uint4*>(key_destination) = make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4*>(value_destination) = make_uint4(0, 0, 0, 0);
+            }
+        }
+        __syncthreads();
+
+        float scores[8] = {};
+        const int quadrant = lane >> 3;
+        const int local_row = lane & 7;
+        #pragma unroll
+        for (int part = 0; part < HEAD_SIZE / 16; ++part) {
+            unsigned a0, a1, a2, a3, b0, b1, b2, b3;
+            const unsigned pa = static_cast<unsigned>(__cvta_generic_to_shared(
+                warp_q + (local_row + ((quadrant & 1) * 8)) * Q_LD
+                + part * 16 + ((quadrant >> 1) * 8)));
+            const unsigned pb = static_cast<unsigned>(__cvta_generic_to_shared(
+                k_shared + (local_row + ((quadrant >> 1) * 8)) * KV_LD
+                + part * 16 + ((quadrant & 1) * 8)));
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(pa) : "memory");
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3) : "r"(pb) : "memory");
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.PTX_TYPE.PTX_TYPE.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+f"(scores[0]), "+f"(scores[1]), "+f"(scores[2]), "+f"(scores[3])
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.PTX_TYPE.PTX_TYPE.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+f"(scores[4]), "+f"(scores[5]), "+f"(scores[6]), "+f"(scores[7])
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b2), "r"(b3));
+        }
+
+        const int key_column_0 = key_start + lane_group * 2;
+        const int key_column_1 = key_column_0 + 1;
+        const int key_column_8 = key_column_0 + 8;
+        const int key_column_9 = key_column_0 + 9;
+        const bool key_valid_0 = key_column_0 < key_length && key_valid.data[batch * key_length + key_column_0];
+        const bool key_valid_1 = key_column_1 < key_length && key_valid.data[batch * key_length + key_column_1];
+        const bool key_valid_8 = key_column_8 < key_length && key_valid.data[batch * key_length + key_column_8];
+        const bool key_valid_9 = key_column_9 < key_length && key_valid.data[batch * key_length + key_column_9];
+        #define VALID_PAIR(Q, K, QVALID, KVALID) ((QVALID) && (KVALID) && (window <= 0 || abs((Q) - (K)) <= window))
+        const bool valid_00 = VALID_PAIR(query_0, key_column_0, query_valid_0, key_valid_0);
+        const bool valid_01 = VALID_PAIR(query_0, key_column_1, query_valid_0, key_valid_1);
+        const bool valid_08 = VALID_PAIR(query_0, key_column_8, query_valid_0, key_valid_8);
+        const bool valid_09 = VALID_PAIR(query_0, key_column_9, query_valid_0, key_valid_9);
+        const bool valid_10 = VALID_PAIR(query_1, key_column_0, query_valid_1, key_valid_0);
+        const bool valid_11 = VALID_PAIR(query_1, key_column_1, query_valid_1, key_valid_1);
+        const bool valid_18 = VALID_PAIR(query_1, key_column_8, query_valid_1, key_valid_8);
+        const bool valid_19 = VALID_PAIR(query_1, key_column_9, query_valid_1, key_valid_9);
+        #undef VALID_PAIR
+        scores[0] = valid_00 ? scores[0] * scale : -3.402823466e38f;
+        scores[1] = valid_01 ? scores[1] * scale : -3.402823466e38f;
+        scores[2] = valid_10 ? scores[2] * scale : -3.402823466e38f;
+        scores[3] = valid_11 ? scores[3] * scale : -3.402823466e38f;
+        scores[4] = valid_08 ? scores[4] * scale : -3.402823466e38f;
+        scores[5] = valid_09 ? scores[5] * scale : -3.402823466e38f;
+        scores[6] = valid_18 ? scores[6] * scale : -3.402823466e38f;
+        scores[7] = valid_19 ? scores[7] * scale : -3.402823466e38f;
+        float block_max_0 = max(max(scores[0], scores[1]), max(scores[4], scores[5]));
+        float block_max_1 = max(max(scores[2], scores[3]), max(scores[6], scores[7]));
+        block_max_0 = max(block_max_0, __shfl_xor_sync(0xffffffffu, block_max_0, 2, 4));
+        block_max_0 = max(block_max_0, __shfl_xor_sync(0xffffffffu, block_max_0, 1, 4));
+        block_max_1 = max(block_max_1, __shfl_xor_sync(0xffffffffu, block_max_1, 2, 4));
+        block_max_1 = max(block_max_1, __shfl_xor_sync(0xffffffffu, block_max_1, 1, 4));
+        const float new_maximum_0 = max(maximum_0, block_max_0);
+        const float new_maximum_1 = max(maximum_1, block_max_1);
+        const float old_scale_0 = expf(maximum_0 - new_maximum_0);
+        const float old_scale_1 = expf(maximum_1 - new_maximum_1);
+        float probabilities[8];
+        probabilities[0] = valid_00 ? expf(scores[0] - new_maximum_0) : 0.0f;
+        probabilities[1] = valid_01 ? expf(scores[1] - new_maximum_0) : 0.0f;
+        probabilities[2] = valid_10 ? expf(scores[2] - new_maximum_1) : 0.0f;
+        probabilities[3] = valid_11 ? expf(scores[3] - new_maximum_1) : 0.0f;
+        probabilities[4] = valid_08 ? expf(scores[4] - new_maximum_0) : 0.0f;
+        probabilities[5] = valid_09 ? expf(scores[5] - new_maximum_0) : 0.0f;
+        probabilities[6] = valid_18 ? expf(scores[6] - new_maximum_1) : 0.0f;
+        probabilities[7] = valid_19 ? expf(scores[7] - new_maximum_1) : 0.0f;
+        float probability_sum_0 = probabilities[0] + probabilities[1] + probabilities[4] + probabilities[5];
+        float probability_sum_1 = probabilities[2] + probabilities[3] + probabilities[6] + probabilities[7];
+        probability_sum_0 += __shfl_xor_sync(0xffffffffu, probability_sum_0, 2, 4);
+        probability_sum_0 += __shfl_xor_sync(0xffffffffu, probability_sum_0, 1, 4);
+        probability_sum_1 += __shfl_xor_sync(0xffffffffu, probability_sum_1, 2, 4);
+        probability_sum_1 += __shfl_xor_sync(0xffffffffu, probability_sum_1, 1, 4);
+        denominator_0 = denominator_0 * old_scale_0 + probability_sum_0;
+        denominator_1 = denominator_1 * old_scale_1 + probability_sum_1;
+        maximum_0 = new_maximum_0;
+        maximum_1 = new_maximum_1;
+        #pragma unroll
+        for (int output_part = 0; output_part < 8; ++output_part) {
+            accumulators[output_part][0] *= old_scale_0;
+            accumulators[output_part][1] *= old_scale_0;
+            accumulators[output_part][2] *= old_scale_1;
+            accumulators[output_part][3] *= old_scale_1;
+            accumulators[output_part][4] *= old_scale_0;
+            accumulators[output_part][5] *= old_scale_0;
+            accumulators[output_part][6] *= old_scale_1;
+            accumulators[output_part][7] *= old_scale_1;
+        }
+
+        NATIVE_TYPE* probability_values = reinterpret_cast<NATIVE_TYPE*>(warp_p);
+        const int probability_column = lane_group * 2;
+        probability_values[row * P_LD + probability_column] = NATIVE_TYPE(probabilities[0]);
+        probability_values[row * P_LD + probability_column + 1] = NATIVE_TYPE(probabilities[1]);
+        probability_values[(row + 8) * P_LD + probability_column] = NATIVE_TYPE(probabilities[2]);
+        probability_values[(row + 8) * P_LD + probability_column + 1] = NATIVE_TYPE(probabilities[3]);
+        probability_values[row * P_LD + probability_column + 8] = NATIVE_TYPE(probabilities[4]);
+        probability_values[row * P_LD + probability_column + 9] = NATIVE_TYPE(probabilities[5]);
+        probability_values[(row + 8) * P_LD + probability_column + 8] = NATIVE_TYPE(probabilities[6]);
+        probability_values[(row + 8) * P_LD + probability_column + 9] = NATIVE_TYPE(probabilities[7]);
+        __syncwarp();
+
+        unsigned probability_a0, probability_a1, probability_a2, probability_a3;
+        const unsigned probability_address = static_cast<unsigned>(__cvta_generic_to_shared(
+            warp_p + (local_row + ((quadrant & 1) * 8)) * P_LD + ((quadrant >> 1) * 8)));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+            : "=r"(probability_a0), "=r"(probability_a1), "=r"(probability_a2), "=r"(probability_a3)
+            : "r"(probability_address) : "memory");
+        #pragma unroll
+        for (int output_part = 0; output_part < 8; ++output_part) {
+            unsigned b0, b1, b2, b3;
+            const unsigned value_address = static_cast<unsigned>(__cvta_generic_to_shared(
+                v_shared + (lane & 15) * KV_LD + output_part * 16 + (lane >> 4) * 8));
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3) : "r"(value_address) : "memory");
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.PTX_TYPE.PTX_TYPE.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+f"(accumulators[output_part][0]), "+f"(accumulators[output_part][1]), "+f"(accumulators[output_part][2]), "+f"(accumulators[output_part][3])
+                : "r"(probability_a0), "r"(probability_a1), "r"(probability_a2), "r"(probability_a3), "r"(b0), "r"(b1));
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.PTX_TYPE.PTX_TYPE.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+f"(accumulators[output_part][4]), "+f"(accumulators[output_part][5]), "+f"(accumulators[output_part][6]), "+f"(accumulators[output_part][7])
+                : "r"(probability_a0), "r"(probability_a1), "r"(probability_a2), "r"(probability_a3), "r"(b2), "r"(b3));
+        }
+        __syncthreads();
+    }
+
+    const float inverse_0 = denominator_0 > 0.0f ? 1.0f / denominator_0 : 0.0f;
+    const float inverse_1 = denominator_1 > 0.0f ? 1.0f / denominator_1 : 0.0f;
+    const int output_column = lane_group * 2;
+    #pragma unroll
+    for (int output_part = 0; output_part < 8; ++output_part) {
+        const int column = output_part * 16 + output_column;
+        if (query_0 < query_length) {
+            output_values[(query_base + query_0) * HEAD_SIZE + column] = NATIVE_TYPE(accumulators[output_part][0] * inverse_0);
+            output_values[(query_base + query_0) * HEAD_SIZE + column + 1] = NATIVE_TYPE(accumulators[output_part][1] * inverse_0);
+            output_values[(query_base + query_0) * HEAD_SIZE + column + 8] = NATIVE_TYPE(accumulators[output_part][4] * inverse_0);
+            output_values[(query_base + query_0) * HEAD_SIZE + column + 9] = NATIVE_TYPE(accumulators[output_part][5] * inverse_0);
+        }
+        if (query_1 < query_length) {
+            output_values[(query_base + query_1) * HEAD_SIZE + column] = NATIVE_TYPE(accumulators[output_part][2] * inverse_1);
+            output_values[(query_base + query_1) * HEAD_SIZE + column + 1] = NATIVE_TYPE(accumulators[output_part][3] * inverse_1);
+            output_values[(query_base + query_1) * HEAD_SIZE + column + 8] = NATIVE_TYPE(accumulators[output_part][6] * inverse_1);
+            output_values[(query_base + query_1) * HEAD_SIZE + column + 9] = NATIVE_TYPE(accumulators[output_part][7] * inverse_1);
+        }
+    }
+#endif
+"""
+
+
+@lru_cache(maxsize=None)
+def get_bidirectional_attention_d128(dtype: type):
+    """Return dependency-free SM80+ exact attention for 128-wide heads."""
+    if dtype == wp.float16:
+        native_type, ptx_type = "wp::float16", "f16"
+    elif dtype == wp.bfloat16:
+        native_type, ptx_type = "wp::bfloat16", "bf16"
+    else:
+        raise TypeError("Native attention requires FP16 or BF16")
+    snippet = _BIDIRECTIONAL_ATTENTION_D128.replace("NATIVE_TYPE", native_type).replace(
+        "PTX_TYPE", ptx_type
+    )
+
+    @wp.func_native(snippet)
+    def attention(
+        query: wp.array2d[dtype],
+        key: wp.array2d[dtype],
+        value: wp.array2d[dtype],
+        query_valid: wp.array2d[wp.bool],
+        key_valid: wp.array2d[wp.bool],
+        output: wp.array2d[dtype],
+        query_heads: int,
+        kv_heads: int,
+        query_length: int,
+        key_length: int,
+        scale: float,
+        window: int,
+    ): ...
+
+    return attention
+
+
 @wp.func_native(
     """
 #if defined(__CUDA_ARCH__)

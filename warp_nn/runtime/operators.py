@@ -1794,9 +1794,10 @@ class BidirectionalGQAPlan:
             and 16 <= head_size <= 512
             and head_size % 16 == 0
         )
-        self._query_tile = 32 if head_size <= 128 else 8
+        self._native = self._tiled and head_size == 128 and query.device.arch >= 80
+        self._query_tile = 128 if self._native else 32 if head_size <= 128 else 8
         self._block_dim, self._kernel = _get_bidirectional_gqa_attention_kernel(
-            head_size, query.dtype, self._tiled
+            head_size, query.dtype, self._tiled, self._native
         )
 
     @staticmethod

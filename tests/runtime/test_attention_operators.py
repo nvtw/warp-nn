@@ -109,7 +109,7 @@ def test_attention_low_precision_matches_fp32_reference(dtype):
     np.testing.assert_allclose(plan.execute().numpy(), expected, rtol=0.02, atol=0.01)
 
 
-@pytest.mark.parametrize("head_size", [128, 512])
+@pytest.mark.parametrize("head_size", [80, 128, 512])
 def test_tiled_attention_matches_reference_across_query_tiles(head_size):
     """Exercise more than one query tile at production head width."""
     if not is_device_available("cuda:0"):
@@ -127,8 +127,38 @@ def test_tiled_attention_matches_reference_across_query_tiles(head_size):
         query_valid=wp.array(query_valid, device="cuda:0"),
         key_valid=wp.array(key_valid, device="cuda:0"),
     )
+    assert plan._native == (head_size == 128 and wp.get_device("cuda:0").arch >= 80)
     expected = _reference(query, key, value, query_valid, key_valid)
     np.testing.assert_allclose(plan.execute().numpy(), expected, rtol=0.025, atol=0.012)
+
+
+@pytest.mark.parametrize("dtype", [wp.float16, wp.bfloat16])
+def test_native_attention_batch_gqa_sliding_tail_and_cuda_graph(dtype):
+    """Cover native D128 batching, GQA, masks, tail tiles, and graph replay."""
+    if not is_device_available("cuda:0") or wp.get_device("cuda:0").arch < 80:
+        pytest.skip("native D128 attention requires SM80+")
+    rng = np.random.default_rng(113)
+    shape, kv_shape = (2, 8, 129, 128), (2, 2, 129, 128)
+    query = rng.normal(0.0, 0.2, size=shape).astype(np.float32)
+    key = rng.normal(0.0, 0.2, size=kv_shape).astype(np.float32)
+    value = rng.normal(0.0, 0.2, size=kv_shape).astype(np.float32)
+    query_valid = rng.random(shape[:1] + shape[2:3]) > 0.13
+    key_valid = rng.random(kv_shape[:1] + kv_shape[2:3]) > 0.17
+    plan = BidirectionalGQAPlan(
+        wp.array(query, dtype=dtype, device="cuda:0"),
+        wp.array(key, dtype=dtype, device="cuda:0"),
+        wp.array(value, dtype=dtype, device="cuda:0"),
+        query_valid=wp.array(query_valid, device="cuda:0"),
+        key_valid=wp.array(key_valid, device="cuda:0"),
+        window=17,
+    )
+    assert plan._native
+    wp.capture_begin(device="cuda:0")
+    plan.execute()
+    graph = wp.capture_end(device="cuda:0")
+    wp.capture_launch(graph)
+    expected = _reference(query, key, value, query_valid, key_valid, 17)
+    np.testing.assert_allclose(plan.output.numpy(), expected, rtol=0.025, atol=0.012)
 
 
 def test_attention_rejects_incompatible_geometry():
