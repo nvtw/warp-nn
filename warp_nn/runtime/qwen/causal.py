@@ -51,9 +51,7 @@ class _Qwen3CausalPlan(_Qwen3EncoderPlan):
         final = self.layers[-1]["next_norm"].outputs[0]
         self.tensors["final.last"] = self.tensors[final][rows - 1 : rows]
         self.shapes["final.last"] = (1, runner.hidden_size)
-        self.lm_head = Operation(
-            "Linear", ["final.last", "lm_head.weight"], ["logits"]
-        )
+        self.lm_head = Operation("Linear", ["final.last", "lm_head.weight"], ["logits"])
         plan_linear(
             self.lm_head,
             self.tensors,
@@ -70,7 +68,11 @@ class _Qwen3CausalPlan(_Qwen3EncoderPlan):
         wp.launch(
             _gather_rows_kernel,
             dim=self.embedding.shape,
-            inputs=[runner.weights["model.embed_tokens.weight"], self.input_ids, self.embedding],
+            inputs=[
+                runner.weights["model.embed_tokens.weight"],
+                self.input_ids,
+                self.embedding,
+            ],
             device=self.device,
         )
         self._execute(self.first_norm)
@@ -86,7 +88,11 @@ class _Qwen3CausalPlan(_Qwen3EncoderPlan):
                 wp.launch(
                     _reorder_heads_kernel,
                     dim=(self.rows, heads, runner.head_dim),
-                    inputs=[self.tensors[layer[name].outputs[0]], target, runner.head_dim],
+                    inputs=[
+                        self.tensors[layer[name].outputs[0]],
+                        target,
+                        runner.head_dim,
+                    ],
                     device=self.device,
                 )
             if runner.qk_norm:
@@ -161,9 +167,7 @@ class _Qwen3CausalPlan(_Qwen3EncoderPlan):
                 "next_norm",
             ):
                 self._execute(layer[name])
-        execute_operations(
-            (self.lm_head,), self.tensors, self.shapes, self.device
-        )
+        execute_operations((self.lm_head,), self.tensors, self.shapes, self.device)
         return self.logits
 
 
@@ -247,7 +251,9 @@ class Qwen3CausalLM(AutoregressiveRunner):
     def _validate_ids(self, token_ids: Sequence[int]) -> None:
         values = np.asarray(token_ids)
         if values.ndim != 1 or values.size == 0:
-            raise ValueError("Qwen3 token IDs must be a nonempty one-dimensional sequence")
+            raise ValueError(
+                "Qwen3 token IDs must be a nonempty one-dimensional sequence"
+            )
         if values.min() < 0 or values.max() >= int(self.config["vocab_size"]):
             raise ValueError("Qwen3 token ID is outside the vocabulary")
 
@@ -268,7 +274,11 @@ class Qwen3CausalLM(AutoregressiveRunner):
         vocabulary = int(self.config["vocab_size"])
         if not 0 <= start < stop <= vocabulary:
             raise ValueError("Qwen3 token interval is outside the vocabulary")
-        if logits.device != self.device or logits.dtype != self.dtype or logits.ndim != 3:
+        if (
+            logits.device != self.device
+            or logits.dtype != self.dtype
+            or logits.ndim != 3
+        ):
             raise TypeError("sample_greedy_range expects runner logits")
         values = logits.flatten()[start:stop].reshape((1, 1, stop - start))
         wp.launch_tiled(
@@ -293,3 +303,9 @@ class Qwen3CausalLM(AutoregressiveRunner):
         wp.copy(self._sampled_token_host, self._sampled_token, count=1)
         wp.synchronize_stream(self.device)
         return start + int(self._sampled_token_host_view[0])
+
+    def read_top_k_range(
+        self, logits: wp.array, start: int, stop: int, top_k: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Read bounded candidates from one contiguous token interval."""
+        return self.read_top_k(logits, top_k, token_start=start, token_stop=stop)

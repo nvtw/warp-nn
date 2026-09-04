@@ -367,7 +367,14 @@ class AutoregressiveRunner:
         wp.synchronize_stream(self.device)
         return int(self._sampled_token_host_view[0])
 
-    def read_top_k(self, logits: wp.array, top_k: int) -> tuple[np.ndarray, np.ndarray]:
+    def read_top_k(
+        self,
+        logits: wp.array,
+        top_k: int,
+        *,
+        token_start: int = 0,
+        token_stop: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Return exact top-k values and token IDs with a bounded host transfer."""
         if (
             logits.device != self.device
@@ -377,11 +384,18 @@ class AutoregressiveRunner:
             or logits.shape[1] == 0
         ):
             raise TypeError(f"{type(self).__name__}.read_top_k expects runner logits")
-        vocabulary = logits.shape[2]
-        if vocabulary != int(self.config["vocab_size"]):
+        full_vocabulary = logits.shape[2]
+        if full_vocabulary != int(self.config["vocab_size"]):
             raise ValueError(
                 f"{type(self).__name__}.read_top_k received an unexpected vocabulary"
             )
+        token_stop = full_vocabulary if token_stop is None else token_stop
+        if not 0 <= token_start < token_stop <= full_vocabulary:
+            raise ValueError("top-k token interval is outside the vocabulary")
+        logits = logits.flatten()[token_start:token_stop].reshape(
+            (1, 1, token_stop - token_start)
+        )
+        vocabulary = token_stop - token_start
         if not 1 <= top_k <= 32:
             raise ValueError("top_k must be between 1 and 32")
         top_k = min(top_k, vocabulary)
@@ -390,12 +404,15 @@ class AutoregressiveRunner:
                 -1, vocabulary
             )[-1]
             tokens = np.lexsort((np.arange(vocabulary), -values))[:top_k]
-            return values[tokens], tokens.astype(np.int32)
+            return values[tokens], tokens.astype(np.int32) + token_start
 
         tile_width = 512
         partial_count = (vocabulary + tile_width - 1) // tile_width
         maximum_k = min(32, vocabulary)
-        state = getattr(self, "_top_k_state", None)
+        states = getattr(self, "_top_k_states", None)
+        if states is None:
+            states = self._top_k_states = {}
+        state = states.get(vocabulary)
         if state is None:
             candidate_count = partial_count * maximum_k
             merge_count = (partial_count + 15) // 16
@@ -411,7 +428,7 @@ class AutoregressiveRunner:
                 maximum_k, dtype=wp.float32, device="cpu", pinned=True
             )
             host_tokens = wp.empty(maximum_k, dtype=wp.int32, device="cpu", pinned=True)
-            state = self._top_k_state = (
+            state = states[vocabulary] = (
                 _get_top_k_kernels(tile_width, maximum_k, self.dtype),
                 values,
                 tokens,
@@ -420,6 +437,9 @@ class AutoregressiveRunner:
                 host_values,
                 host_tokens,
             )
+        # Preserve the established inspection/debug handle while range-specific
+        # buffers live in the keyed cache above.
+        self._top_k_state = state
         (
             kernels,
             values,
@@ -462,5 +482,5 @@ class AutoregressiveRunner:
         wp.synchronize_stream(self.device)
         return (
             host_values.numpy()[:top_k].copy(),
-            host_tokens.numpy()[:top_k].copy(),
+            host_tokens.numpy()[:top_k].copy() + token_start,
         )

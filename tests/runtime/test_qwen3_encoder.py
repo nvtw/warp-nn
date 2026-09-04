@@ -198,9 +198,7 @@ def test_qwen3_encoder_rejects_invalid_ids(tmp_path):
 def test_qwen3_causal_prefill_decode_matches_full_reference(tmp_path):
     config, weights = _tiny_checkpoint(tmp_path / "qwen")
     config["tie_word_embeddings"] = True
-    (tmp_path / "qwen" / "config.json").write_text(
-        json.dumps(config), encoding="utf-8"
-    )
+    (tmp_path / "qwen" / "config.json").write_text(json.dumps(config), encoding="utf-8")
     runner = Qwen3CausalLM(
         tmp_path / "qwen",
         dtype=wp.float16,
@@ -225,6 +223,12 @@ def test_qwen3_causal_prefill_decode_matches_full_reference(tmp_path):
         rtol=4.0e-3,
         atol=4.0e-3,
     )
+    values, tokens = runner.read_top_k_range(runner.decode(8), 2, 12, 3)
+    expected_logits = _reference([3, 9, 4, 7, 8], config, weights)[-1]
+    expected_logits = expected_logits @ weights["model.embed_tokens.weight"].T
+    expected_tokens = np.lexsort((np.arange(2, 12), -expected_logits[2:12]))[:3] + 2
+    np.testing.assert_array_equal(tokens, expected_tokens)
+    np.testing.assert_allclose(values, expected_logits[tokens], atol=4.0e-3)
     assert "lm_head.weight" not in qwen3_causal_weight_names(config)
 
 

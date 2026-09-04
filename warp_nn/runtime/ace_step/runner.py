@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -39,6 +40,24 @@ SFT_GENERATION_PROMPT = """# Instruction
 # Metas
 {}<|endoftext|>
 """
+
+
+@lru_cache(maxsize=None)
+def _semantic_context_kernel(dtype):
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def pack(
+        hints: wp.array3d(dtype=DTYPE),
+        context: wp.array3d(dtype=DTYPE),
+    ):
+        batch, frame, channel = wp.tid()
+        if channel < 64:
+            context[batch, frame, channel] = hints[0, frame, channel]
+        else:
+            context[batch, frame, channel] = DTYPE(1.0)
+
+    return pack
 
 
 @dataclass(frozen=True)
@@ -390,6 +409,8 @@ class AceStep15Pipeline:
         condition_executor: Callable | None = None,
         dit_executor: Callable | None = None,
         vae_decoder: Callable | None = None,
+        planner_executor=None,
+        audio_code_decoder=None,
     ):
         self.bundle = bundle
         self.tokenizer = Qwen3Tokenizer(bundle.text_encoder_path)
@@ -397,6 +418,8 @@ class AceStep15Pipeline:
         self.condition_executor = condition_executor
         self.dit_executor = dit_executor
         self.vae_decoder = vae_decoder
+        self.planner_executor = planner_executor
+        self.audio_code_decoder = audio_code_decoder
 
     def load_text_encoder(
         self,
@@ -491,6 +514,53 @@ class AceStep15Pipeline:
         self.vae_decoder = vae_factory
         return self
 
+    def load_planner(
+        self,
+        *,
+        dtype=wp.bfloat16,
+        device=None,
+        cache_capacity: int = 4096,
+        prefill_chunk_size: int = 16,
+        use_cublas: bool = True,
+    ):
+        """Load the optional 5 Hz composition planner and semantic decoder."""
+        if self.bundle.planner_path is None:
+            raise FileNotFoundError("ACE-Step 5 Hz planner not found")
+        from ..qwen.causal import Qwen3CausalLM
+        from .planner import AceAudioCodeDecoder, AceStepPlanner
+
+        runner = Qwen3CausalLM(
+            self.bundle.planner_path,
+            dtype=dtype,
+            device=device,
+            cache_capacity=cache_capacity,
+            prefill_chunk_size=prefill_chunk_size,
+            use_cublas=use_cublas,
+        )
+        self.planner_executor = AceStepPlanner(runner)
+        self.audio_code_decoder = AceAudioCodeDecoder(
+            self.bundle.dit_path,
+            dtype=dtype,
+            device=runner.device,
+            use_cublas=use_cublas,
+        )
+        return self.planner_executor
+
+    def plan_music(
+        self,
+        caption: str,
+        lyrics: str,
+        *,
+        duration_seconds: float,
+        **sampling_options,
+    ):
+        """Generate the metadata and 5 Hz semantic plan used by LM-DiT."""
+        if self.planner_executor is None:
+            raise RuntimeError("ACE-Step 5 Hz planner is not loaded")
+        return self.planner_executor.generate(
+            caption, lyrics, duration_seconds=duration_seconds, **sampling_options
+        )
+
     def prepare_gpu_conditioning(
         self, tokens: AceStepTokenBatch
     ) -> AceStepConditioning:
@@ -581,6 +651,7 @@ class AceStep15Pipeline:
         seed: int = 0,
         steps: int | None = None,
         guidance_scale: float = 7.0,
+        audio_codes: Sequence[int] | None = None,
     ):
         """Generate stereo audio through condition encoder, DiT, and VAE."""
         if not self.ready:
@@ -612,7 +683,27 @@ class AceStep15Pipeline:
         hidden = seeded_normal(
             inputs.source_latents.shape, seed=seed, dtype=dtype, device=device
         )
-        context = wp.array(inputs.context_latents, dtype=dtype, device=device)
+        if audio_codes is None:
+            context = wp.array(inputs.context_latents, dtype=dtype, device=device)
+        else:
+            if self.audio_code_decoder is None:
+                raise RuntimeError("ACE-Step audio-code decoder is not loaded")
+            hints = self.audio_code_decoder.decode(audio_codes)
+            if hints.shape[1:] != inputs.source_latents.shape[1:]:
+                raise ValueError(
+                    "ACE-Step audio codes must provide exactly five codes per second"
+                )
+            context = wp.empty(
+                (batch, hints.shape[1], hints.shape[2] * 2),
+                dtype=dtype,
+                device=device,
+            )
+            wp.launch(
+                _semantic_context_kernel(dtype),
+                dim=context.shape,
+                inputs=[hints, context],
+                device=device,
+            )
         if self.bundle.dit.is_turbo:
             dit = self.dit_executor(hidden, context, packed_condition, condition_valid)
         else:

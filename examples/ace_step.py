@@ -52,6 +52,11 @@ def _parser() -> argparse.ArgumentParser:
         help="peak-normalize before PCM16 conversion (off by default)",
     )
     parser.add_argument(
+        "--no-planner",
+        action="store_true",
+        help="skip the optional 5 Hz LM plan (faster and lower-memory, but less structured)",
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="validate files/configs without loading tensors",
@@ -83,9 +88,27 @@ def main(argv=None) -> int:
         raise ValueError("--prompt is required for generation")
     pipeline = AceStep15Pipeline(bundle)
     pipeline.load_generation_stack(device=args.device, use_cublas=not args.no_cublas)
+    plan = None
+    if bundle.planner_path is not None and not args.no_planner:
+        pipeline.load_planner(device=args.device, use_cublas=not args.no_cublas)
+        plan = pipeline.plan_music(
+            args.prompt,
+            args.lyrics,
+            duration_seconds=args.duration_seconds,
+            seed=args.seed,
+        )
+        print(
+            f"Planner: {len(plan.audio_codes)} semantic codes; "
+            + ", ".join(f"{name}={value}" for name, value in plan.metadata.items())
+        )
+    metadata = args.metadata
+    if plan is not None and not metadata:
+        metadata = "\n".join(
+            f"{name}: {value}" for name, value in plan.metadata.items()
+        )
     token_options = {
         "languages": [args.language],
-        "metadata": [args.metadata],
+        "metadata": [metadata],
     }
     if args.instruction is not None:
         token_options["instructions"] = [args.instruction]
@@ -97,12 +120,15 @@ def main(argv=None) -> int:
         raise RuntimeError(
             f"ACE-Step bundle and Qwen conditioning are ready; generation still needs {missing}"
         )
-    audio = pipeline.generate(
-        conditioning=conditioning,
-        duration_seconds=args.duration_seconds,
-        seed=args.seed,
-        steps=args.steps,
-    )
+    generation_options = {
+        "conditioning": conditioning,
+        "duration_seconds": args.duration_seconds,
+        "seed": args.seed,
+        "steps": args.steps,
+    }
+    if plan is not None:
+        generation_options["audio_codes"] = plan.audio_codes
+    audio = pipeline.generate(**generation_options)
     if hasattr(audio, "numpy"):
         audio = audio.numpy()
     audio = np.asarray(audio)
