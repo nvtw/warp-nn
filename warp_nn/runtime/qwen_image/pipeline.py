@@ -58,8 +58,9 @@ def qwen_image_to_rgb8(sample) -> np.ndarray:
 
 
 class QwenImage2512Pipeline:
-    """Run official Qwen-Image-2512 while loading only one large stage at a time.
+    """Run official Qwen-Image-2512 with staged or resident large weights.
 
+    ``resident=True`` retains text and transformer weights between generations.
     The exact untiled VAE is the default. ``vae_tiling=True`` is an explicit,
     approximate memory-saving mode using the release's overlap-tile geometry.
     """
@@ -71,6 +72,7 @@ class QwenImage2512Pipeline:
         dtype=wp.bfloat16,
         device=None,
         use_cublas=True,
+        resident=False,
     ):
         self.bundle = (
             bundle
@@ -84,22 +86,30 @@ class QwenImage2512Pipeline:
         self.dtype = dtype
         self.device = parse_device(device)
         self.use_cublas = bool(use_cublas)
+        self.resident = bool(resident)
+        self._prompt_encoder = None
+        self._transformer_weights = None
+        self._cublas = None
 
     def _finish_stage(self):
         if self.device.is_cuda:
             wp.synchronize_stream(wp.get_stream(self.device))
 
-    @staticmethod
-    def _collect_released_stage():
-        gc.collect()
+    def _collect_released_stage(self):
+        if not self.resident:
+            gc.collect()
 
     def encode_prompts(self, prompt, negative_prompt="", *, max_sequence_length=512):
-        encoder = QwenImagePromptEncoder.from_pretrained(
-            self.bundle.root,
-            dtype=self.dtype,
-            device=self.device,
-            use_cublas=self.use_cublas,
-        )
+        encoder = self._prompt_encoder
+        if encoder is None:
+            encoder = QwenImagePromptEncoder.from_pretrained(
+                self.bundle.root,
+                dtype=self.dtype,
+                device=self.device,
+                use_cublas=self.use_cublas,
+            )
+            if self.resident:
+                self._prompt_encoder = encoder
         positive = encoder.encode(prompt, max_sequence_length=max_sequence_length)
         # QwenEncoder reuses its fixed-length output. Own the positive result
         # before encoding an equal-length negative prompt into that buffer.
@@ -110,7 +120,9 @@ class QwenImage2512Pipeline:
         )
         conditioning = _padded_conditioning(owned_positive, negative)
         self._finish_stage()
-        del encoder, positive, owned_positive, negative
+        del positive, owned_positive, negative
+        if not self.resident:
+            del encoder
         self._collect_released_stage()
         return conditioning
 
@@ -147,17 +159,23 @@ class QwenImage2512Pipeline:
             / "transformer"
             / "diffusion_pytorch_model.safetensors.index.json"
         )
-        archive = SafeTensorArchive(index_path)
-        weights = load_qwen_image_transformer_weights(
-            archive, self.bundle.transformer, self.device, self.dtype
-        )
+        weights = self._transformer_weights
+        if weights is None:
+            archive = SafeTensorArchive(index_path)
+            weights = load_qwen_image_transformer_weights(
+                archive, self.bundle.transformer, self.device, self.dtype
+            )
+            if self.resident:
+                self._transformer_weights = weights
         transformer_text = wp.empty_like(positive)
         transformer_text.assign(positive)
         transformer_text_valid = wp.empty_like(positive_valid)
         transformer_text_valid.assign(positive_valid)
-        cublas = (
-            try_create_cublas() if self.use_cublas and self.device.is_cuda else None
-        )
+        cublas = self._cublas
+        if cublas is None and self.use_cublas and self.device.is_cuda:
+            cublas = try_create_cublas()
+            if self.resident:
+                self._cublas = cublas
         plan = QwenImageMMDiTPlan(
             sample,
             transformer_text,
@@ -207,9 +225,7 @@ class QwenImage2512Pipeline:
         self._finish_stage()
         del (
             plan,
-            weights,
             cublas,
-            archive,
             flow,
             unpack,
             transformer_text,
@@ -217,6 +233,8 @@ class QwenImage2512Pipeline:
         )
         if cfg is not None:
             del positive_velocity, cfg
+        if not self.resident:
+            del weights
         self._collect_released_stage()
         return latent
 

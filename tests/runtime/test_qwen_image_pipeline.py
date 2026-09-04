@@ -57,6 +57,8 @@ def test_prompt_encoding_owns_equal_length_positive_before_negative(monkeypatch)
     pipeline.dtype = wp.bfloat16
     pipeline.device = wp.get_device("cpu")
     pipeline.use_cublas = False
+    pipeline.resident = False
+    pipeline._prompt_encoder = None
     positive, positive_valid, negative, negative_valid = pipeline.encode_prompts(
         "positive", "negative"
     )
@@ -66,8 +68,37 @@ def test_prompt_encoding_owns_equal_length_positive_before_negative(monkeypatch)
     np.testing.assert_array_equal(negative_valid.numpy(), [[True, True]])
 
 
+def test_resident_pipeline_reuses_prompt_encoder(monkeypatch):
+    constructions = []
+
+    class Encoder:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            constructions.append(None)
+            return cls()
+
+        def encode(self, prompt, *, max_sequence_length):
+            return wp.zeros((1, 1, 3), dtype=wp.bfloat16)
+
+    class Bundle:
+        root = None
+
+    monkeypatch.setattr(pipeline_module, "QwenImagePromptEncoder", Encoder)
+    pipeline = object.__new__(QwenImage2512Pipeline)
+    pipeline.bundle = Bundle()
+    pipeline.dtype = wp.bfloat16
+    pipeline.device = wp.get_device("cpu")
+    pipeline.use_cublas = False
+    pipeline.resident = True
+    pipeline._prompt_encoder = None
+    pipeline.encode_prompts("first")
+    pipeline.encode_prompts("second")
+    assert len(constructions) == 1
+
+
 def test_denoise_does_not_overwrite_positive_conditioning(monkeypatch, tmp_path):
     calls = []
+    loads = []
     progress = []
 
     class Config:
@@ -104,7 +135,9 @@ def test_denoise_does_not_overwrite_positive_conditioning(monkeypatch, tmp_path)
 
     monkeypatch.setattr(pipeline_module, "SafeTensorArchive", lambda path: object())
     monkeypatch.setattr(
-        pipeline_module, "load_qwen_image_transformer_weights", lambda *args: {}
+        pipeline_module,
+        "load_qwen_image_transformer_weights",
+        lambda *args: loads.append(None) or {},
     )
     monkeypatch.setattr(pipeline_module, "QwenImageMMDiTPlan", Plan)
     pipeline = object.__new__(QwenImage2512Pipeline)
@@ -112,6 +145,9 @@ def test_denoise_does_not_overwrite_positive_conditioning(monkeypatch, tmp_path)
     pipeline.dtype = wp.bfloat16
     pipeline.device = wp.get_device("cpu")
     pipeline.use_cublas = False
+    pipeline.resident = True
+    pipeline._transformer_weights = None
+    pipeline._cublas = None
     positive = wp.array(np.ones((1, 2, 3)), dtype=wp.bfloat16)
     negative = wp.array(np.full((1, 2, 3), 2.0), dtype=wp.bfloat16)
     valid = wp.array(np.ones((1, 2), dtype=bool), dtype=wp.bool)
@@ -155,3 +191,4 @@ def test_denoise_does_not_overwrite_positive_conditioning(monkeypatch, tmp_path)
             steps=1,
         )
     assert not calls
+    assert len(loads) == 1

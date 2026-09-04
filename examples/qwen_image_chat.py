@@ -40,6 +40,12 @@ def _parser():
     parser.add_argument("--device", default=None)
     parser.add_argument("--no-cublas", action="store_true")
     parser.add_argument(
+        "--resident",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="keep text and transformer weights on GPU between images (default: on)",
+    )
+    parser.add_argument(
         "--vae-tiling",
         action="store_true",
         help="opt in to approximate overlap-tiled VAE decoding",
@@ -93,12 +99,20 @@ def main(argv=None):
 
     print("Preparing Qwen-Image pipeline...", flush=True)
     pipeline = QwenImage2512Pipeline(
-        bundle, device=args.device, use_cublas=not args.no_cublas
+        bundle,
+        device=args.device,
+        use_cublas=not args.no_cublas,
+        resident=args.resident,
     )
     auto_open = args.auto_open
     show_progress = args.progress
     generation = 0
     print(f"Ready on {pipeline.device}; the pipeline stays alive between prompts.")
+    print(
+        "Large weights remain on GPU; use --no-resident if memory is limited."
+        if args.resident
+        else "Large stages are reloaded as needed to limit GPU memory."
+    )
     print(f"Images are written to {args.output_dir.expanduser().resolve()}.")
     _help()
 
