@@ -282,3 +282,26 @@ class SafeTensorArchive:
         # caller that immediately begins CUDA graph capture.
         _release_mappings(resources, event)
         return output
+
+
+class SafeTensorNamespace:
+    """Expose one checkpoint name prefix as a canonical archive view."""
+
+    def __init__(self, archive: SafeTensorArchive, prefix: str):
+        self.archive = archive
+        self.prefix = prefix
+        self.names = tuple(
+            name.removeprefix(prefix)
+            for name in archive.names
+            if name.startswith(prefix)
+        )
+
+    def metadata(self, name: str) -> SafeTensorMetadata:
+        return self.archive.metadata(self.prefix + name)
+
+    def load(self, device=None, names=None, **options) -> dict[str, wp.array]:
+        selected = self.names if names is None else tuple(names)
+        loaded = self.archive.load(
+            device, [self.prefix + name for name in selected], **options
+        )
+        return {name.removeprefix(self.prefix): value for name, value in loaded.items()}

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
 # SPDX-License-Identifier: Apache-2.0
 
-"""Dependency-free stereo PCM16 WAV input and output."""
+"""Dependency-free mono/stereo PCM16 WAV input and stereo output."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import numpy as np
 
 @dataclass(frozen=True)
 class WavAudio:
-    """Channels-last stereo samples in ``[-1, 1]`` and their sample rate."""
+    """Channels-last mono/stereo samples in ``[-1, 1]`` and their sample rate."""
 
     samples: np.ndarray
     sample_rate: int
@@ -71,19 +71,21 @@ def write_wav_pcm16(
 
 
 def read_wav_pcm16(path: str | Path) -> WavAudio:
-    """Read an uncompressed stereo PCM16 WAV into channels-last FP32 samples."""
+    """Read an uncompressed mono/stereo PCM16 WAV into channels-last FP32."""
     with wave.open(str(Path(path)), "rb") as stream:
         channels = stream.getnchannels()
         width = stream.getsampwidth()
         compression = stream.getcomptype()
         sample_rate = stream.getframerate()
         frames = stream.getnframes()
-        if channels != 2:
-            raise ValueError(f"WAV input must be stereo, found {channels} channels")
+        if channels not in (1, 2):
+            raise ValueError(
+                f"WAV input must be mono or stereo, found {channels} channels"
+            )
         if width != 2 or compression != "NONE":
             raise ValueError("WAV input must be uncompressed 16-bit PCM")
         raw = stream.readframes(frames)
-    pcm = np.frombuffer(raw, dtype="<i2").reshape((-1, 2))
+    pcm = np.frombuffer(raw, dtype="<i2").reshape((-1, channels))
     values = pcm.astype(np.float32)
     values = np.where(values < 0.0, values / 32768.0, values / 32767.0)
     return WavAudio(np.ascontiguousarray(values, dtype=np.float32), sample_rate)

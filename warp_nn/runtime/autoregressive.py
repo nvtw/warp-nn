@@ -187,7 +187,41 @@ class AutoregressiveRunner:
             return graph_entry[1]
         return plan.execute()
 
-    def _stage_one(self, token_id: int) -> wp.array:
+    def _stage_embedding_overrides(
+        self, plan, embeddings, positions, token_offset: int
+    ) -> None:
+        """Stage compact device embeddings into selected rows of a fixed plan."""
+        mask = getattr(plan, "embedding_override_mask", None)
+        if mask is None:
+            if embeddings is not None:
+                raise TypeError(
+                    f"{type(self).__name__} does not support embedding overrides"
+                )
+            return
+        mask.zero_()
+        if embeddings is None:
+            return
+        rows = plan.input_ids.shape[1]
+        host_mask = np.zeros((1, rows), dtype=np.bool_)
+        destination = plan.embedding_overrides.flatten()
+        source = embeddings.reshape((-1, embeddings.shape[-1])).flatten()
+        width = embeddings.shape[-1]
+        for source_row, position in enumerate(positions):
+            local_row = int(position) - token_offset
+            if 0 <= local_row < rows:
+                wp.copy(
+                    destination,
+                    source,
+                    dest_offset=local_row * width,
+                    src_offset=source_row * width,
+                    count=width,
+                )
+                host_mask[0, local_row] = True
+        mask.assign(host_mask)
+
+    def _stage_one(
+        self, token_id: int, embeddings=None, positions=(), token_offset=0
+    ) -> wp.array:
         position = self.sequence_length
         if hasattr(self._decode_plan, "rope_position_ids"):
             wp.launch(
@@ -217,6 +251,9 @@ class AutoregressiveRunner:
                 ],
                 device=self.device,
             )
+        self._stage_embedding_overrides(
+            self._decode_plan, embeddings, positions, token_offset
+        )
         partitions = getattr(self._decode_plan, "attention_partitions", 256)
         logits = self._run(self._decode_plan, partitions)
         self.sequence_length += 1
@@ -234,7 +271,9 @@ class AutoregressiveRunner:
             self._record_plan_storage(plan)
         return plan
 
-    def _stage_many(self, token_ids: Sequence[int]) -> wp.array:
+    def _stage_many(
+        self, token_ids: Sequence[int], embeddings=None, positions=(), token_offset=0
+    ) -> wp.array:
         rows = len(token_ids)
         plan = self._plan_for_rows(rows)
         end = self.sequence_length + rows
@@ -259,17 +298,43 @@ class AutoregressiveRunner:
             inputs=[self.sequence_end, end - 1],
             device=self.device,
         )
+        self._stage_embedding_overrides(plan, embeddings, positions, token_offset)
         logits = self._run(plan)
         self.sequence_length = end
         return logits
 
-    def _append(self, token_ids: Sequence[int]) -> wp.array:
+    def _append(
+        self, token_ids: Sequence[int], embeddings=None, positions=()
+    ) -> wp.array:
         if not token_ids:
             raise ValueError(f"{type(self).__name__} requires at least one token")
         if self.sequence_length + len(token_ids) > self.cache_capacity:
             raise ValueError(
                 f"{type(self).__name__} token sequence exceeds cache_capacity"
             )
+        if embeddings is not None:
+            positions = tuple(int(position) for position in positions)
+            target = getattr(self._decode_plan, "embedding_overrides", None)
+            if (
+                target is None
+                or embeddings.ndim != 2
+                or embeddings.shape[1] != target.shape[2]
+                or embeddings.dtype != target.dtype
+                or embeddings.device != target.device
+            ):
+                raise TypeError(
+                    "embedding overrides must match the runner width, dtype, and device"
+                )
+            if len(positions) != embeddings.shape[0]:
+                raise ValueError("each embedding override requires one token position")
+            if len(set(positions)) != len(positions) or any(
+                position < 0 or position >= len(token_ids) for position in positions
+            ):
+                raise ValueError(
+                    "embedding override positions must be unique prompt indices"
+                )
+        elif positions:
+            raise ValueError("embedding override positions require embeddings")
         logits = None
         denied_rows = set()
         start = 0
@@ -286,10 +351,14 @@ class AutoregressiveRunner:
                     default=1,
                 )
             if rows == 1:
-                logits = self._stage_one(int(token_ids[start]))
+                logits = self._stage_one(
+                    int(token_ids[start]), embeddings, positions, start
+                )
             else:
                 try:
-                    logits = self._stage_many(token_ids[start : start + rows])
+                    logits = self._stage_many(
+                        token_ids[start : start + rows], embeddings, positions, start
+                    )
                 except _PlanMemoryError:
                     denied_rows.add(rows)
                     rows = max(
@@ -301,9 +370,16 @@ class AutoregressiveRunner:
                         default=1,
                     )
                     if rows == 1:
-                        logits = self._stage_one(int(token_ids[start]))
+                        logits = self._stage_one(
+                            int(token_ids[start]), embeddings, positions, start
+                        )
                     else:
-                        logits = self._stage_many(token_ids[start : start + rows])
+                        logits = self._stage_many(
+                            token_ids[start : start + rows],
+                            embeddings,
+                            positions,
+                            start,
+                        )
             start += rows
         return logits
 
@@ -316,6 +392,17 @@ class AutoregressiveRunner:
             )
         return self._append(token_ids)
 
+    def prefill_with_embeddings(
+        self, token_ids: Sequence[int], embeddings: wp.array, positions: Sequence[int]
+    ) -> wp.array:
+        """Prefill while replacing selected token rows with device embeddings."""
+        self.reset()
+        if len(token_ids) >= self.cache_capacity:
+            raise ValueError(
+                f"{type(self).__name__} prompt must leave room for one decoded token"
+            )
+        return self._append(token_ids, embeddings, positions)
+
     def append(self, token_ids: Sequence[int]) -> wp.array:
         """Append prompt tokens while retaining the current conversation state."""
         if self.sequence_length == 0:
@@ -323,6 +410,16 @@ class AutoregressiveRunner:
                 f"{type(self).__name__}.append requires a preceding prefill"
             )
         return self._append(token_ids)
+
+    def append_with_embeddings(
+        self, token_ids: Sequence[int], embeddings: wp.array, positions: Sequence[int]
+    ) -> wp.array:
+        """Append tokens with selected device embeddings, retaining model state."""
+        if self.sequence_length == 0:
+            raise RuntimeError(
+                f"{type(self).__name__}.append_with_embeddings requires a preceding prefill"
+            )
+        return self._append(token_ids, embeddings, positions)
 
     def decode(self, token_id: int) -> wp.array:
         """Append one generated token and return its logits."""

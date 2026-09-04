@@ -53,6 +53,11 @@ Changelog = "https://github.com/NVIDIA/warp-nn/blob/main/CHANGELOG.md"
 onnx = [
   "onnx>=1.16.0",
 ]
+# Optional compressed audio/video decoding. Text, images, and PCM16 WAV stay
+# dependency-free; binary PyAV wheels bundle the required FFmpeg libraries.
+media = [
+  "av>=17,<19",
+]
 tests = [
   "hypothesis",
   "onnx>=1.16.0",

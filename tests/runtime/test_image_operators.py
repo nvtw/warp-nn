@@ -193,3 +193,31 @@ def test_clamp_plan_preserves_shape_and_values():
     plan = ClampPlan(wp.array(values, device="cpu"), -1.0, 1.0)
     assert plan.output.shape == values.shape
     np.testing.assert_array_equal(plan.execute().numpy(), np.clip(values, -1.0, 1.0))
+
+
+def test_depthwise_conv2d_matches_reference():
+    rng = np.random.default_rng(915)
+    x = rng.normal(size=(1, 5, 4, 3)).astype(np.float32)
+    weight = rng.normal(size=(3, 1, 3, 3)).astype(np.float32)
+    bias = rng.normal(size=3).astype(np.float32)
+    plan = Conv2dPlan(
+        wp.array(x, device="cpu"),
+        wp.array(weight, device="cpu"),
+        wp.array(bias, device="cpu"),
+        padding=1,
+        groups=3,
+    )
+    expected = np.empty_like(x)
+    for row in range(x.shape[1]):
+        for column in range(x.shape[2]):
+            for channel in range(x.shape[3]):
+                total = bias[channel]
+                for ky in range(3):
+                    for kx in range(3):
+                        sy, sx = row - 1 + ky, column - 1 + kx
+                        if 0 <= sy < x.shape[1] and 0 <= sx < x.shape[2]:
+                            total += x[0, sy, sx, channel] * weight[channel, 0, ky, kx]
+                expected[0, row, column, channel] = total
+    np.testing.assert_allclose(
+        plan.execute().numpy(), expected, rtol=2.0e-5, atol=2.0e-5
+    )

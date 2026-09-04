@@ -36,6 +36,7 @@ from warp_nn.runtime.kernels import (
     _get_grouped_decode_linear_kernel,
     _get_small_batch_grouped_linear_kernel,
     _get_bidirectional_gqa_attention_kernel,
+    _get_relative_bidirectional_attention_kernel,
     _get_linear_tiled_kernel,
     _get_prefill_mma_linear_kernel,
     _get_partitioned_gqa_attention_kernels,
@@ -49,8 +50,10 @@ from warp_nn.runtime.kernels import (
     _get_quantize_activation_int8_kernel,
     _get_quantize_nvfp4_kernel,
     _get_rms_norm_kernels,
+    _get_sparse_expert_kernels,
     _get_swiglu_kernel,
     _gqa_copy_past_fp16_kernel,
+    _relu2_kernel,
     _gqa_prepare_fp16_kernel,
     _linear_kernel,
     _channels_last_1d_kernels,
@@ -1856,6 +1859,71 @@ class BidirectionalGQAPlan:
         return self.output
 
 
+class RelativeBidirectionalAttentionPlan:
+    """Exact Transformer-XL relative-position attention for fixed Q/K/V."""
+
+    def __init__(
+        self,
+        query,
+        key,
+        value,
+        relative_key,
+        bias_u,
+        bias_v,
+        *,
+        valid=None,
+        scale=None,
+    ):
+        if query.ndim != 4 or query.shape != key.shape or query.shape != value.shape:
+            raise ValueError("relative attention Q/K/V shapes must match")
+        batch, heads, sequence, head_size = query.shape
+        if relative_key.shape not in (
+            (1, heads, 2 * sequence - 1, head_size),
+            (batch, heads, 2 * sequence - 1, head_size),
+        ):
+            raise ValueError("relative key geometry is incompatible")
+        if bias_u.shape != (heads, head_size) or bias_v.shape != bias_u.shape:
+            raise ValueError("relative attention bias geometry is incompatible")
+        tensors = (key, value, relative_key, bias_u, bias_v)
+        if any(
+            item.dtype != query.dtype or item.device != query.device for item in tensors
+        ):
+            raise ValueError("relative attention tensors must share dtype and device")
+        if query.dtype not in (wp.float16, wp.bfloat16, wp.float32):
+            raise TypeError("relative attention requires FP16, BF16, or FP32 tensors")
+        self.query, self.key, self.value = query, key, value
+        self.relative_key = relative_key
+        self.bias_u, self.bias_v = bias_u, bias_v
+        self.valid = BidirectionalGQAPlan._mask(valid, batch, sequence, query)
+        self.output = wp.empty_like(query)
+        self.scale = float(head_size**-0.5 if scale is None else scale)
+        if not math.isfinite(self.scale) or self.scale <= 0.0:
+            raise ValueError("relative attention scale must be finite and positive")
+        self._block_dim, self._kernel = _get_relative_bidirectional_attention_kernel(
+            head_size, query.dtype
+        )
+
+    def execute(self):
+        wp.launch_tiled(
+            self._kernel,
+            dim=(self.query.shape[0], self.query.shape[1], self.query.shape[2]),
+            inputs=[
+                self.query,
+                self.key,
+                self.value,
+                self.relative_key,
+                self.bias_u,
+                self.bias_v,
+                self.valid,
+                self.output,
+                wp.float32(self.scale),
+            ],
+            block_dim=self._block_dim,
+            device=self.query.device,
+        )
+        return self.output
+
+
 class FixedKVAttentionPlan(BidirectionalGQAPlan):
     """Graph-safe cross-attention whose projected condition K/V stay fixed."""
 
@@ -2468,6 +2536,7 @@ class Conv2dPlan:
         stride=1,
         padding=0,
         dilation=1,
+        groups=1,
         tensor_cores=True,
     ):
         if not isinstance(tensor_cores, bool):
@@ -2479,8 +2548,11 @@ class Conv2dPlan:
         if x.dtype not in (wp.float16, wp.bfloat16, wp.float32):
             raise TypeError("Conv2D requires FP16, BF16, or FP32 tensors")
         out_channels, in_channels, kernel_y, kernel_x = weight.shape
-        if x.shape[3] != in_channels:
-            raise ValueError("Conv2D OIHW weight channels do not match NHWC input")
+        groups = int(groups)
+        if groups <= 0 or x.shape[3] != in_channels * groups or out_channels % groups:
+            raise ValueError(
+                "Conv2D OIHW weight channels do not match NHWC input groups"
+            )
         if bias is not None and (
             bias.shape != (out_channels,)
             or bias.dtype != x.dtype
@@ -2493,6 +2565,7 @@ class Conv2dPlan:
         self.stride = _spatial_pair(stride, "stride")
         self.padding = _spatial_padding(padding)
         self.dilation = _spatial_pair(dilation, "dilation")
+        self.groups = groups
         output_y, output_x = conv2d_output_shape(
             x.shape[1],
             x.shape[2],
@@ -2516,6 +2589,7 @@ class Conv2dPlan:
         self._use_mma = False
         if (
             tensor_cores
+            and groups == 1
             and x.device.is_cuda
             and self.stride == (1, 1)
             and self.dilation == (1, 1)
@@ -2631,6 +2705,7 @@ class Conv2dPlan:
                 self.dilation[0],
                 self.dilation[1],
                 self._use_bias,
+                self.groups,
             ],
             device=self.input.device,
         )
@@ -2958,6 +3033,7 @@ class Conv1dPlan:
         stride=1,
         padding=0,
         dilation=1,
+        groups=1,
         transposed=False,
         output_padding=0,
     ):
@@ -2967,10 +3043,13 @@ class Conv1dPlan:
             raise ValueError("Conv1D input and weight must share dtype and device")
         if x.dtype not in (wp.float16, wp.bfloat16, wp.float32):
             raise TypeError("Conv1D requires FP16, BF16, or FP32 tensors")
+        groups = int(groups)
+        if groups <= 0 or transposed and groups != 1:
+            raise ValueError("grouped ConvTranspose1D is not supported")
         in_channels = weight.shape[0] if transposed else weight.shape[1]
         out_channels = weight.shape[1] if transposed else weight.shape[0]
-        if x.shape[2] != in_channels:
-            raise ValueError("Conv1D weight channels do not match the input")
+        if x.shape[2] != in_channels * groups or out_channels % groups:
+            raise ValueError("Conv1D weight channels do not match the input groups")
         if bias is not None and (
             bias.shape != (out_channels,)
             or bias.dtype != x.dtype
@@ -2984,6 +3063,7 @@ class Conv1dPlan:
         self.padding = int(padding)
         self.dilation = int(dilation)
         self.transposed = bool(transposed)
+        self.groups = groups
         output_length = conv1d_output_length(
             x.shape[1],
             weight.shape[2],
@@ -3013,6 +3093,7 @@ class Conv1dPlan:
             x.device.is_cuda
             and not self.transposed
             and self.stride == 1
+            and groups == 1
             and x.dtype in (wp.float16, wp.bfloat16)
             and x.shape[2] % 16 == 0
             and out_channels % 32 == 0
@@ -3184,6 +3265,7 @@ class Conv1dPlan:
                 self.padding,
                 self.dilation,
                 self._use_bias,
+                self.groups,
             ],
             device=self.input.device,
         )
@@ -3667,6 +3749,198 @@ class ElementwiseActivationPlan:
                 self.bias,
                 self.output.reshape((self.rows, self.width)),
                 self.activation,
+            ],
+            device=self.input.device,
+        )
+        return self.output
+
+
+class SparseExpertPlan:
+    """Sigmoid-routed ReLU-squared sparse MoE with one shared expert."""
+
+    def __init__(
+        self,
+        x,
+        gate_weight,
+        correction_bias,
+        expert_up_3d,
+        expert_down_3d,
+        shared_up,
+        shared_down,
+        *,
+        top_k,
+        scale,
+        groups=1,
+        topk_groups=1,
+        cublas=None,
+    ):
+        if x.ndim < 2:
+            raise ValueError("sparse-expert input must have a channel axis")
+        hidden = x.shape[-1]
+        if gate_weight.ndim != 2 or gate_weight.shape[1] != hidden:
+            raise ValueError("sparse-expert gate geometry is incompatible")
+        experts = gate_weight.shape[0]
+        if (
+            expert_up_3d.ndim != 3
+            or expert_down_3d.ndim != 3
+            or expert_up_3d.shape[0] != experts
+            or expert_down_3d.shape[0] != experts
+            or expert_up_3d.shape[2] != hidden
+            or expert_down_3d.shape[1] != hidden
+            or expert_down_3d.shape[2] != expert_up_3d.shape[1]
+        ):
+            raise ValueError("sparse-expert routed weight geometry is incompatible")
+        if (
+            shared_up.ndim != 2
+            or shared_down.ndim != 2
+            or shared_up.shape[1] != hidden
+            or shared_down.shape != (hidden, shared_up.shape[0])
+        ):
+            raise ValueError("sparse-expert shared weight geometry is incompatible")
+        top_k, groups, topk_groups = int(top_k), int(groups), int(topk_groups)
+        if not 0 < top_k <= experts:
+            raise ValueError("top_k must be within the expert count")
+        if groups <= 0 or experts % groups or experts // groups < 2:
+            raise ValueError(
+                "groups must divide experts with at least two experts per group"
+            )
+        if not 0 < topk_groups <= groups or top_k > topk_groups * (experts // groups):
+            raise ValueError(
+                "selected groups cannot contain the requested top_k experts"
+            )
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError("sparse-expert scale must be finite and positive")
+        parameters = (gate_weight, expert_up_3d, expert_down_3d, shared_up, shared_down)
+        if any(
+            value.dtype != x.dtype or value.device != x.device for value in parameters
+        ):
+            raise ValueError("sparse-expert weights must share input dtype and device")
+        if (
+            correction_bias.shape != (experts,)
+            or correction_bias.dtype != wp.float32
+            or correction_bias.device != x.device
+        ):
+            raise ValueError(
+                "sparse-expert correction bias must be device-local float32"
+            )
+
+        self.input, self.gate_weight = x, gate_weight
+        self.correction_bias = correction_bias
+        self.expert_up, self.expert_down = expert_up_3d, expert_down_3d
+        self.scale = float(scale)
+        self.rows, self.hidden = int(np.prod(x.shape[:-1])), hidden
+        self._input_2d = x.reshape((self.rows, hidden))
+        self.routing_logits = wp.empty(
+            (self.rows, experts), dtype=wp.float32, device=x.device
+        )
+        self._group_scores = wp.empty(
+            (self.rows, groups), dtype=wp.float32, device=x.device
+        )
+        self._selected_groups = wp.empty(
+            (self.rows, topk_groups), dtype=wp.int32, device=x.device
+        )
+        self.routing_indices = wp.empty(
+            (self.rows, top_k), dtype=wp.int32, device=x.device
+        )
+        self.routing_weights = wp.empty(
+            (self.rows, top_k), dtype=wp.float32, device=x.device
+        )
+        self._expert_hidden = wp.empty(
+            (self.rows, top_k, expert_up_3d.shape[1]), dtype=x.dtype, device=x.device
+        )
+        self._output_2d = wp.empty((self.rows, hidden), dtype=x.dtype, device=x.device)
+        self.output = self._output_2d.reshape(x.shape)
+        self._kernels = _get_sparse_expert_kernels(
+            x.dtype, experts, top_k, groups, topk_groups
+        )
+
+        self._tensors = {
+            "x": self._input_2d,
+            "shared_up_weight": shared_up,
+            "shared_down_weight": shared_down,
+        }
+        self._shapes = {name: value.shape for name, value in self._tensors.items()}
+        self._shared_up = Operation(
+            "Linear", ["x", "shared_up_weight"], ["shared_hidden"]
+        )
+        plan_linear(
+            self._shared_up, self._tensors, self._shapes, x.device, cublas=cublas
+        )
+        self._shared_down = Operation(
+            "Linear", ["shared_hidden", "shared_down_weight"], ["shared_output"]
+        )
+        plan_linear(
+            self._shared_down, self._tensors, self._shapes, x.device, cublas=cublas
+        )
+
+    def execute(self):
+        router, group_scores, select_groups, select_experts, expert_up, expert_down = (
+            self._kernels
+        )
+        wp.launch(
+            router,
+            dim=self.routing_logits.shape,
+            inputs=[self._input_2d, self.gate_weight, self.routing_logits],
+            device=self.input.device,
+        )
+        wp.launch(
+            group_scores,
+            dim=self._group_scores.shape,
+            inputs=[self.routing_logits, self.correction_bias, self._group_scores],
+            device=self.input.device,
+        )
+        wp.launch(
+            select_groups,
+            dim=self.rows,
+            inputs=[self._group_scores, self._selected_groups],
+            device=self.input.device,
+        )
+        wp.launch(
+            select_experts,
+            dim=self.rows,
+            inputs=[
+                self.routing_logits,
+                self.correction_bias,
+                self._selected_groups,
+                self.routing_indices,
+                self.routing_weights,
+                wp.float32(self.scale),
+            ],
+            device=self.input.device,
+        )
+        wp.launch(
+            expert_up,
+            dim=self._expert_hidden.shape,
+            inputs=[
+                self._input_2d,
+                self.routing_indices,
+                self.expert_up,
+                self._expert_hidden,
+            ],
+            device=self.input.device,
+        )
+        execute_operations(
+            (self._shared_up,), self._tensors, self._shapes, self.input.device
+        )
+        wp.launch(
+            _relu2_kernel,
+            dim=self._tensors["shared_hidden"].shape,
+            inputs=[self._tensors["shared_hidden"], self._tensors["shared_hidden"]],
+            device=self.input.device,
+        )
+        execute_operations(
+            (self._shared_down,), self._tensors, self._shapes, self.input.device
+        )
+        wp.launch(
+            expert_down,
+            dim=self._output_2d.shape,
+            inputs=[
+                self._expert_hidden,
+                self.routing_indices,
+                self.routing_weights,
+                self.expert_down,
+                self._tensors["shared_output"],
+                self._output_2d,
             ],
             device=self.input.device,
         )

@@ -37,6 +37,11 @@ from warp_nn.runtime.muse.glimmer import (
     parse_atem_tool_calls,
 )
 from warp_nn.runtime.nemotron.runner import NemotronHRunner
+from warp_nn.runtime.nemotron.audio import NemotronAudioConfig
+from warp_nn.runtime.nemotron.omni import (
+    NemotronMultimodalProcessor,
+    NemotronMultimodalPrompt,
+)
 from warp_nn.runtime.qwen.qwen3 import Qwen3OnnxRunner, sample_token
 from warp_nn.runtime.tokenizers import Qwen3Tokenizer, parse_qwen_tool_calls
 from warp_nn.runtime.qwen.qwen35 import Qwen35Runner
@@ -67,7 +72,10 @@ def create_text_runner(path, **kwargs):
         return runner_type(path, **kwargs)
     config = json.loads(config_path.read_text(encoding="utf-8"))
     runner_types = {"muse_glimmer": MuseGlimmerRunner, "nemotron_h": NemotronHRunner}
-    runner_type = runner_types.get(config.get("model_type"), Qwen35Runner)
+    model_type = config.get("model_type")
+    if config.get("llm_config", {}).get("model_type") == "nemotron_h":
+        model_type = "nemotron_h"
+    runner_type = runner_types.get(model_type, Qwen35Runner)
     return runner_type(path, **kwargs)
 
 
@@ -101,7 +109,25 @@ def create_tokenizer(path):
 
 
 def create_multimodal_processor(path):
-    """Create the dependency-free Qwen multimodal chat processor."""
+    """Create the matching dependency-free multimodal chat processor."""
+    path = Path(path)
+    directory = path if path.is_dir() else path.parent
+    config_path = directory / "config.json"
+    if config_path.is_file():
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if config.get("llm_config", {}).get("model_type") == "nemotron_h":
+            return NemotronMultimodalProcessor(
+                create_tokenizer(directory),
+                NemotronAudioConfig.from_document(config),
+                video_temporal_patch_size=int(
+                    config.get("video_temporal_patch_size", 2)
+                ),
+                video_target_patches=int(
+                    config.get("vision_config", {}).get(
+                        "video_target_num_patches", 1024
+                    )
+                ),
+            )
     return QwenMultimodalProcessor(create_tokenizer(path))
 
 
@@ -115,6 +141,8 @@ __all__ = [
     "ChatCompletions",
     "OpenAIHTTPServer",
     "NemotronHRunner",
+    "NemotronMultimodalProcessor",
+    "NemotronMultimodalPrompt",
     "MuseGlimmerRunner",
     "MuseGlimmerTokenizer",
     "Qwen3OnnxRunner",

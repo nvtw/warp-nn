@@ -6,7 +6,12 @@ import pytest
 import warp as wp
 
 from tests.utilities import is_device_available
-from warp_nn.runtime.operators import Conv1dPlan, Snake1dPlan, conv1d_output_length
+from warp_nn.runtime.operators import (
+    Conv1dPlan,
+    RelativeBidirectionalAttentionPlan,
+    Snake1dPlan,
+    conv1d_output_length,
+)
 
 
 def _conv_reference(
@@ -158,3 +163,88 @@ def test_conv_transpose1d_mma_matches_reference(stride):
         True,
     )
     np.testing.assert_allclose(actual, expected, rtol=2.0e-3, atol=2.0e-3)
+
+
+def test_depthwise_conv1d_matches_reference():
+    rng = np.random.default_rng(49)
+    x = rng.normal(size=(1, 7, 3)).astype(np.float32)
+    weight = rng.normal(size=(3, 1, 3)).astype(np.float32)
+    bias = rng.normal(size=3).astype(np.float32)
+    plan = Conv1dPlan(
+        wp.array(x, device="cpu"),
+        wp.array(weight, device="cpu"),
+        wp.array(bias, device="cpu"),
+        padding=1,
+        groups=3,
+    )
+    expected = np.empty_like(x)
+    for position in range(x.shape[1]):
+        for channel in range(x.shape[2]):
+            total = bias[channel]
+            for kernel in range(3):
+                source = position - 1 + kernel
+                if 0 <= source < x.shape[1]:
+                    total += x[0, source, channel] * weight[channel, 0, kernel]
+            expected[0, position, channel] = total
+    np.testing.assert_allclose(
+        plan.execute().numpy(), expected, rtol=2.0e-5, atol=2.0e-5
+    )
+
+
+def test_relative_bidirectional_attention_matches_reference():
+    rng = np.random.default_rng(71)
+    batch, heads, sequence, head_size = 1, 2, 4, 4
+    shape = (batch, heads, sequence, head_size)
+    query = rng.normal(size=shape).astype(np.float32)
+    key = rng.normal(size=shape).astype(np.float32)
+    value = rng.normal(size=shape).astype(np.float32)
+    relative = rng.normal(size=(batch, heads, 2 * sequence - 1, head_size)).astype(
+        np.float32
+    )
+    bias_u = rng.normal(size=(heads, head_size)).astype(np.float32)
+    bias_v = rng.normal(size=(heads, head_size)).astype(np.float32)
+    valid = np.array([[True, True, True, False]])
+
+    plan = RelativeBidirectionalAttentionPlan(
+        wp.array(query, device="cpu"),
+        wp.array(key, device="cpu"),
+        wp.array(value, device="cpu"),
+        wp.array(relative, device="cpu"),
+        wp.array(bias_u, device="cpu"),
+        wp.array(bias_v, device="cpu"),
+        valid=wp.array(valid, device="cpu"),
+    )
+    actual = plan.execute().numpy()
+
+    expected = np.zeros_like(query)
+    scale = head_size**-0.5
+    for head in range(heads):
+        for query_token in range(sequence):
+            if not valid[0, query_token]:
+                continue
+            scores = []
+            values = []
+            for key_token in range(sequence):
+                if not valid[0, key_token]:
+                    continue
+                relative_index = sequence - 1 - query_token + key_token
+                scores.append(
+                    (
+                        np.dot(
+                            query[0, head, query_token] + bias_u[head],
+                            key[0, head, key_token],
+                        )
+                        + np.dot(
+                            query[0, head, query_token] + bias_v[head],
+                            relative[0, head, relative_index],
+                        )
+                    )
+                    * scale
+                )
+                values.append(value[0, head, key_token])
+            scores = np.asarray(scores, dtype=np.float32)
+            probabilities = np.exp(scores - np.max(scores))
+            probabilities /= np.sum(probabilities)
+            expected[0, head, query_token] = probabilities @ np.asarray(values)
+
+    np.testing.assert_allclose(actual, expected, rtol=2.0e-5, atol=2.0e-5)

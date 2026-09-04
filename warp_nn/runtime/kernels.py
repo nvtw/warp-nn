@@ -817,6 +817,18 @@ def _gather_rows_kernel(
 
 
 @wp.kernel(enable_backward=False, module="unique")
+def _apply_embedding_overrides_kernel(
+    embedding: wp.array3d[Any],
+    overrides: wp.array3d[Any],
+    mask: wp.array2d[wp.bool],
+):
+    """Replace selected gathered token embeddings without a host round trip."""
+    batch, sequence, column = wp.tid()
+    if mask[batch, sequence]:
+        embedding[batch, sequence, column] = overrides[batch, sequence, column]
+
+
+@wp.kernel(enable_backward=False, module="unique")
 def _reorder_heads_kernel(x: wp.array2d[Any], output: wp.array2d[Any], head_size: int):
     """Reorder row-major packed heads into head-major rows."""
     row, head, column = wp.tid()
@@ -2270,6 +2282,159 @@ def _relu2_kernel(x: wp.array2d[Any], output: wp.array2d[Any]):
     output[row, column] = x.dtype(value * value)
 
 
+def _create_sparse_expert_kernels(dtype, experts, top_k, groups, topk_groups):
+    """Build deterministic sigmoid-routing and selected-expert kernels."""
+    DTYPE, EXPERTS, TOP_K = dtype, experts, top_k
+    GROUPS, TOPK_GROUPS, GROUP_WIDTH = groups, topk_groups, experts // groups
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def router_logits(
+        x: wp.array2d(dtype=DTYPE),
+        gate: wp.array2d(dtype=DTYPE),
+        logits: wp.array2d(dtype=wp.float32),
+    ):
+        row, expert = wp.tid()
+        typed_zero = DTYPE(0.0)  # noqa: F841 - retain dtype in the Warp closure
+        total = wp.float32(0.0)
+        for column in range(x.shape[1]):
+            total += wp.float32(x[row, column]) * wp.float32(gate[expert, column])
+        logits[row, expert] = total
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def group_scores(
+        logits: wp.array2d(dtype=wp.float32),
+        correction: wp.array1d(dtype=wp.float32),
+        scores: wp.array2d(dtype=wp.float32),
+    ):
+        row, group = wp.tid()
+        first, second = wp.float32(-1.0e30), wp.float32(-1.0e30)
+        for local in range(GROUP_WIDTH):
+            expert = group * GROUP_WIDTH + local
+            probability = wp.float32(1.0) / (
+                wp.float32(1.0) + wp.exp(-logits[row, expert])
+            )
+            value = probability + correction[expert]
+            if value > first:
+                second, first = first, value
+            elif value > second:
+                second = value
+        scores[row, group] = first + second
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def select_groups(
+        scores: wp.array2d(dtype=wp.float32), selected: wp.array2d(dtype=wp.int32)
+    ):
+        row = wp.tid()
+        for slot in range(TOPK_GROUPS):
+            best_value, best_group = wp.float32(-1.0e30), wp.int32(-1)
+            for group in range(GROUPS):
+                available = True
+                for previous in range(slot):
+                    if selected[row, previous] == group:
+                        available = False
+                if available and scores[row, group] > best_value:
+                    best_value, best_group = (
+                        wp.float32(scores[row, group]),
+                        wp.int32(group),
+                    )
+            selected[row, slot] = best_group
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def select_experts(
+        logits: wp.array2d(dtype=wp.float32),
+        correction: wp.array1d(dtype=wp.float32),
+        selected_groups: wp.array2d(dtype=wp.int32),
+        indices: wp.array2d(dtype=wp.int32),
+        weights: wp.array2d(dtype=wp.float32),
+        scale: wp.float32,
+    ):
+        row = wp.tid()
+        denominator = wp.float32(0.0)
+        for slot in range(TOP_K):
+            best_value, best_probability, best_expert = (
+                wp.float32(-1.0e30),
+                wp.float32(0.0),
+                wp.int32(-1),
+            )
+            for expert in range(EXPERTS):
+                allowed = False
+                group = expert / GROUP_WIDTH
+                for group_slot in range(TOPK_GROUPS):
+                    if selected_groups[row, group_slot] == group:
+                        allowed = True
+                for previous in range(slot):
+                    if indices[row, previous] == expert:
+                        allowed = False
+                probability = wp.float32(1.0) / (
+                    wp.float32(1.0) + wp.exp(-logits[row, expert])
+                )
+                value = probability + correction[expert]
+                if allowed and value > best_value:
+                    best_value, best_probability, best_expert = (
+                        value,
+                        probability,
+                        wp.int32(expert),
+                    )
+            indices[row, slot] = best_expert
+            weights[row, slot] = best_probability
+            denominator += best_probability
+        for slot in range(TOP_K):
+            weights[row, slot] = weights[row, slot] * scale / denominator
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def expert_up(
+        x: wp.array2d(dtype=DTYPE),
+        indices: wp.array2d(dtype=wp.int32),
+        weight: wp.array3d(dtype=DTYPE),
+        output: wp.array3d(dtype=DTYPE),
+    ):
+        row, slot, column = wp.tid()
+        expert = indices[row, slot]
+        total = wp.float32(0.0)
+        for inner in range(x.shape[1]):
+            total += wp.float32(x[row, inner]) * wp.float32(
+                weight[expert, column, inner]
+            )
+        total = wp.max(total, wp.float32(0.0))
+        output[row, slot, column] = DTYPE(total * total)
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def expert_down(
+        hidden: wp.array3d(dtype=DTYPE),
+        indices: wp.array2d(dtype=wp.int32),
+        routing_weights: wp.array2d(dtype=wp.float32),
+        weight: wp.array3d(dtype=DTYPE),
+        shared: wp.array2d(dtype=DTYPE),
+        output: wp.array2d(dtype=DTYPE),
+    ):
+        row, column = wp.tid()
+        total = wp.float32(shared[row, column])
+        for slot in range(TOP_K):
+            expert = wp.int32(indices[row, slot])
+            expert_total = wp.float32(0.0)
+            for inner in range(hidden.shape[2]):
+                expert_total += wp.float32(hidden[row, slot, inner]) * wp.float32(
+                    weight[expert, column, inner]
+                )
+            total += routing_weights[row, slot] * expert_total
+        output[row, column] = DTYPE(total)
+
+    return (
+        router_logits,
+        group_scores,
+        select_groups,
+        select_experts,
+        expert_up,
+        expert_down,
+    )
+
+
+@lru_cache(maxsize=None)
+def _get_sparse_expert_kernels(dtype, experts, top_k, groups=1, topk_groups=1):
+    """Return kernels for a fixed sparse-expert routing geometry."""
+    return _create_sparse_expert_kernels(dtype, experts, top_k, groups, topk_groups)
+
+
 def _create_lp_normalization_kernel(tile_width: int, dtype: type):
     """Build row-wise L2 normalization using ``tile_width`` lanes."""
     TILE_WIDTH = tile_width
@@ -3474,6 +3639,109 @@ _bidirectional_gqa_attention_kernel_cache = {}
 _partitioned_gqa_attention_kernel_cache = {}
 
 
+def _create_relative_bidirectional_attention_kernel(head_size: int, dtype: type):
+    """Build Transformer-XL relative-position attention with streaming softmax."""
+    DTYPE = dtype
+    HEAD_SIZE = head_size
+
+    @wp.func
+    def dot_bias(left: DTYPE, bias: DTYPE, right: DTYPE):
+        return (wp.float32(DTYPE(left)) + wp.float32(DTYPE(bias))) * wp.float32(
+            DTYPE(right)
+        )
+
+    @wp.func
+    def accumulate(
+        total: wp.float32, value: DTYPE, old_scale: wp.float32, weight: wp.float32
+    ):
+        return total * old_scale + wp.float32(DTYPE(value)) * weight
+
+    @wp.func
+    def normalize(total: wp.float32, denominator: wp.float32):
+        return DTYPE(total / denominator)
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def kernel(
+        query: wp.array4d(dtype=DTYPE),
+        key: wp.array4d(dtype=DTYPE),
+        value: wp.array4d(dtype=DTYPE),
+        relative_key: wp.array4d(dtype=DTYPE),
+        bias_u: wp.array2d(dtype=DTYPE),
+        bias_v: wp.array2d(dtype=DTYPE),
+        valid: wp.array2d[wp.bool],
+        output: wp.array4d(dtype=DTYPE),
+        scale: wp.float32,
+    ):
+        batch, head, query_token = wp.tid()
+        accumulator = wp.tile_zeros(shape=(HEAD_SIZE,), dtype=wp.float32)
+        maximum = wp.float32(-3.402823466e38) + wp.float32(DTYPE(0.0))
+        denominator = wp.float32(0.0)
+        if valid[batch, query_token]:
+            query_values = wp.tile_load(
+                query[batch, head, query_token], shape=(HEAD_SIZE,)
+            )
+            content_bias = wp.tile_load(bias_u[head], shape=(HEAD_SIZE,))
+            position_bias = wp.tile_load(bias_v[head], shape=(HEAD_SIZE,))
+            for key_token in range(key.shape[2]):
+                if valid[batch, key_token]:
+                    key_values = wp.tile_load(
+                        key[batch, head, key_token], shape=(HEAD_SIZE,)
+                    )
+                    relative_index = key.shape[2] - 1 - query_token + key_token
+                    relative_batch = wp.where(relative_key.shape[0] == 1, 0, batch)
+                    relative_values = wp.tile_load(
+                        relative_key[relative_batch, head, relative_index],
+                        shape=(HEAD_SIZE,),
+                    )
+                    content_score = wp.tile_extract(
+                        wp.tile_sum(
+                            wp.tile_map(
+                                dot_bias, query_values, content_bias, key_values
+                            )
+                        ),
+                        0,
+                    )
+                    position_score = wp.tile_extract(
+                        wp.tile_sum(
+                            wp.tile_map(
+                                dot_bias, query_values, position_bias, relative_values
+                            )
+                        ),
+                        0,
+                    )
+                    score = (content_score + position_score) * scale
+                    new_maximum = wp.max(maximum, score)
+                    old_scale = wp.exp(maximum - new_maximum)
+                    weight = wp.exp(score - new_maximum)
+                    denominator = denominator * old_scale + weight
+                    value_values = wp.tile_load(
+                        value[batch, head, key_token], shape=(HEAD_SIZE,)
+                    )
+                    accumulator = wp.tile_map(
+                        accumulate, accumulator, value_values, old_scale, weight
+                    )
+                    maximum = new_maximum
+        denominator = wp.max(denominator, wp.float32(1.0e-20))
+        wp.tile_store(
+            output[batch, head, query_token],
+            wp.tile_map(normalize, accumulator, denominator),
+        )
+
+    kernel.module.options["enable_backward"] = False
+    return kernel
+
+
+@lru_cache(maxsize=None)
+def _get_relative_bidirectional_attention_kernel(
+    head_size: int, dtype: type = wp.float16
+):
+    """Return exact relative-position attention and its reduction block size."""
+    if head_size <= 0:
+        raise ValueError("relative attention head size must be positive")
+    block_dim = min(1024, max(32, 1 << (head_size - 1).bit_length()))
+    return block_dim, _create_relative_bidirectional_attention_kernel(head_size, dtype)
+
+
 def _get_gqa_attention_kernel(head_size: int, dtype: type = wp.float16):
     """Return cached GQA kernel and a head-sized CUDA block dimension."""
     key = (head_size, dtype)
@@ -4392,18 +4660,21 @@ def _channels_last_1d_kernels(dtype: type):
         padding: int,
         dilation: int,
         use_bias: bool,
+        groups: int,
     ):
         batch, position, out_channel = wp.tid()
         total = wp.float32(0.0)
         if use_bias:
             total = wp.float32(bias[out_channel])
+        outputs_per_group = output.shape[2] / groups
+        input_begin = (out_channel / outputs_per_group) * weight.shape[1]
         for kernel_index in range(weight.shape[2]):
             source = position * stride - padding + kernel_index * dilation
             if source >= 0 and source < x.shape[1]:
-                for in_channel in range(x.shape[2]):
-                    total += wp.float32(x[batch, source, in_channel]) * wp.float32(
-                        weight[out_channel, in_channel, kernel_index]
-                    )
+                for local_channel in range(weight.shape[1]):
+                    total += wp.float32(
+                        x[batch, source, input_begin + local_channel]
+                    ) * wp.float32(weight[out_channel, local_channel, kernel_index])
         output[batch, position, out_channel] = DTYPE(total)
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -4416,6 +4687,7 @@ def _channels_last_1d_kernels(dtype: type):
         padding: int,
         dilation: int,
         use_bias: bool,
+        groups: int,
     ):
         batch, position, out_channel = wp.tid()
         total = wp.float32(0.0)
@@ -4567,22 +4839,30 @@ def _channels_last_2d_kernels(dtype: type):
         dilation_y: int,
         dilation_x: int,
         use_bias: bool,
+        groups: int,
     ):
         batch, row, column, out_channel = wp.tid()
         total = wp.float32(0.0)
         if use_bias:
             total = wp.float32(bias[out_channel])
+        outputs_per_group = output.shape[3] / groups
+        input_begin = (out_channel / outputs_per_group) * weight.shape[1]
         for kernel_y in range(weight.shape[2]):
             source_y = row * stride_y - padding_top + kernel_y * dilation_y
             if source_y >= 0 and source_y < x.shape[1]:
                 for kernel_x in range(weight.shape[3]):
                     source_x = column * stride_x - padding_left + kernel_x * dilation_x
                     if source_x >= 0 and source_x < x.shape[2]:
-                        for in_channel in range(x.shape[3]):
+                        for local_channel in range(weight.shape[1]):
                             total += wp.float32(
-                                x[batch, source_y, source_x, in_channel]
+                                x[
+                                    batch,
+                                    source_y,
+                                    source_x,
+                                    input_begin + local_channel,
+                                ]
                             ) * wp.float32(
-                                weight[out_channel, in_channel, kernel_y, kernel_x]
+                                weight[out_channel, local_channel, kernel_y, kernel_x]
                             )
         output[batch, row, column, out_channel] = DTYPE(total)
 

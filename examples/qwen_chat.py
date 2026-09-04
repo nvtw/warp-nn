@@ -173,6 +173,27 @@ def _image_message(text, paths):
     ]
 
 
+def _parse_media_command(command, kind):
+    """Return a media path and optional same-turn question."""
+    try:
+        parts = shlex.split(command)
+    except ValueError as error:
+        raise ValueError(f"invalid /{kind} command: {error}") from error
+    if not parts or parts[0] != f"/{kind}" or len(parts) < 2:
+        raise ValueError(
+            f"usage: /{kind} PATH [question] (quote paths containing spaces)"
+        )
+    return Path(parts[1]).expanduser(), " ".join(parts[2:])
+
+
+def _media_message(text, media):
+    content = []
+    for kind, path in media:
+        content.append({"type": kind, kind: str(path)})
+    content.append({"type": "text", "text": text})
+    return content
+
+
 def _resume_session(store, command):
     """Resolve ``/resume [ID]``, prompting from recent chats when needed."""
     requested = command.partition(" ")[2].strip()
@@ -358,7 +379,7 @@ def main():
         return path
 
     atexit.register(save_session)
-    pending_images = []
+    pending_media = []
     cached_ids = []
     cached_media_count = 0
     chat_encoder = ChatEncodingCache(tokenizer)
@@ -378,7 +399,9 @@ def main():
             "Use /image PATH to queue an image, or /image PATH QUESTION to ask "
             "about it immediately."
         )
-        print("Use /images to list queued images or /clear-images to remove them.")
+        if hasattr(processor, "audio_config"):
+            print("Nemotron Omni also accepts /audio PATH and /video PATH.")
+        print("Use /media to list queued attachments or /clear-media to remove them.")
     print("Press Esc to stop a response and return to user input.")
     if os.name == "nt":
         print("Press Ctrl-Z then Enter at an empty prompt to save and close the chat.")
@@ -414,7 +437,7 @@ def main():
                 continue
             messages = _portable_history(document)
             session_id = str(document["id"])
-            pending_images.clear()
+            pending_media.clear()
             cached_ids.clear()
             cached_media_count = 0
             chat_encoder.reset()
@@ -430,48 +453,69 @@ def main():
             save_session()
             session_id = session_store.new_id()
             messages = [] if system is None else [{"role": "system", "content": system}]
-            pending_images.clear()
+            pending_media.clear()
             cached_ids.clear()
             cached_media_count = 0
             chat_encoder.reset()
             print("Started a new chat. The previous chat remains saved.")
             continue
 
-        if prompt == "/images":
-            if pending_images:
-                print("Images queued for the next message:")
-                for path in pending_images:
-                    print(f"  {path}")
+        if prompt in ("/images", "/media"):
+            selected = (
+                [item for item in pending_media if item[0] == "image"]
+                if prompt == "/images"
+                else pending_media
+            )
+            if selected:
+                print("Attachments queued for the next message:")
+                for kind, path in selected:
+                    print(f"  {kind}: {path}")
             else:
-                print("No images are queued.")
+                print("No matching attachments are queued.")
             continue
-        if prompt == "/clear-images":
-            pending_images.clear()
-            print("Queued images cleared.")
+        if prompt in ("/clear-images", "/clear-media"):
+            if prompt == "/clear-images":
+                pending_media[:] = [
+                    item for item in pending_media if item[0] != "image"
+                ]
+            else:
+                pending_media.clear()
+            print("Queued attachments cleared.")
             continue
-        if prompt == "/image" or prompt.startswith("/image "):
+        media_kind = next(
+            (
+                kind
+                for kind in ("image", "audio", "video")
+                if prompt == f"/{kind}" or prompt.startswith(f"/{kind} ")
+            ),
+            None,
+        )
+        if media_kind is not None:
             if processor is None:
                 print(
-                    "Image input is disabled; restart with --vision-path "
+                    "Media input is disabled; restart with --vision-path "
                     "MMPROJ.gguf or --multimodal."
                 )
                 continue
+            if media_kind != "image" and not hasattr(processor, "audio_config"):
+                print(f"/{media_kind} is supported by Nemotron Omni only.")
+                continue
             try:
-                image_path, question = _parse_image_command(prompt)
+                media_path, question = _parse_media_command(prompt, media_kind)
             except ValueError as error:
                 print(error)
                 continue
-            if not image_path.is_file():
-                print(f"Image not found: {image_path}")
+            if not media_path.is_file():
+                print(f"Media file not found: {media_path}")
                 continue
-            pending_images.append(image_path.resolve())
+            pending_media.append((media_kind, media_path.resolve()))
             if not question:
-                print(f"Queued image: {pending_images[-1]}")
+                print(f"Queued {media_kind}: {pending_media[-1][1]}")
                 continue
             prompt = question
 
-        content = _image_message(prompt, pending_images) if pending_images else prompt
-        pending_images.clear()
+        content = _media_message(prompt, pending_media) if pending_media else prompt
+        pending_media.clear()
         messages.append({"role": "user", "content": content})
         save_session()
         with _EscapeMonitor() as cancel:
