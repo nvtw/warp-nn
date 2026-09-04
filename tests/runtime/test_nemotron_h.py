@@ -91,12 +91,7 @@ def _write_tiny_nemotron(path):
         if name == fp8_name:
             tensors[name] = ("F8_E4M3", shape, bytes(np.prod(shape)))
             tensors[name + "_scale"] = ("F32", (1,), np.float32(0.5).tobytes())
-        elif (
-            name.endswith("norm.weight")
-            or name.endswith("A_log")
-            or name.endswith("dt_bias")
-            or name.endswith(".D")
-        ):
+        elif name.endswith("norm.weight"):
             tensors[name] = ("F32", shape, values.tobytes())
         else:
             tensors[name] = ("BF16", shape, _bfloat16_bytes(values))
@@ -312,6 +307,9 @@ def test_nemotron_h_fp8_prefill_decode_and_graph_replay(tmp_path, use_cublas):
         runner.weights["backbone.layers.1.mixer.up_proj.weight"].dtype.__name__
         == "bfloat16"
     )
+    assert runner.weights["backbone.layers.0.mixer.A_log"].dtype == wp.float32
+    assert runner.weights["backbone.layers.0.mixer.dt_bias"].dtype == wp.float32
+    assert runner.weights["backbone.layers.0.mixer.D"].dtype == wp.float32
     first = runner.prefill([1, 2, 3]).numpy()
     assert set(runner._chunk_plans) == {2, 4}
     assert first.shape == (1, 1, 16)

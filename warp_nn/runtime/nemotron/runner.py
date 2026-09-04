@@ -37,6 +37,7 @@ from warp_nn.runtime.operators import (
 )
 from warp_nn.runtime.autoregressive import AutoregressiveRunner
 from warp_nn.runtime.formats.safetensors import SafeTensorArchive, SafeTensorNamespace
+from warp_nn.runtime.weights import cast_weight
 from warp_nn.utils.device import parse_device
 
 
@@ -196,6 +197,9 @@ def _load_weights(
     weights = _load_unpacked_weights(
         archive, [name for name in names if name not in expert_names], device, dtype
     )
+    for name in tuple(weights):
+        if name.endswith((".A_log", ".dt_bias", ".D")):
+            weights[name] = cast_weight(weights[name], wp.float32)
     prefixes = sorted({name.split("experts.", 1)[0] for name in expert_names})
     for prefix in prefixes:
         experts = sorted(
