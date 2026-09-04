@@ -1297,7 +1297,7 @@ class AceStepDiTPlan:
         wp.capture_launch(self.graph)
         return self.hidden
 
-    def run_schedule(self, schedule):
+    def run_schedule(self, schedule, progress=None):
         """Run a descending turbo/base flow schedule through one captured graph."""
         values = tuple(float(value) for value in schedule)
         if (
@@ -1308,9 +1308,13 @@ class AceStepDiTPlan:
             raise ValueError(
                 "ACE diffusion schedule must be strictly descending in (0, 1]"
             )
+        if progress is not None:
+            progress(0, len(values))
         for index, value in enumerate(values):
             next_value = values[index + 1] if index + 1 < len(values) else 0.0
             self.diffusion_step(value, next_value)
+            if progress is not None:
+                progress(index + 1, len(values))
         return self.hidden
 
 
@@ -1470,7 +1474,7 @@ class AceStepGuidedDiTPlan:
         self.graph = wp.capture_end(device=self.device)
         return self.graph
 
-    def run_schedule(self, schedule):
+    def run_schedule(self, schedule, progress=None):
         """Run checkpoint-native APG through one captured GPU graph."""
         values = tuple(float(value) for value in schedule)
         if (
@@ -1485,6 +1489,8 @@ class AceStepGuidedDiTPlan:
             self.capture()
         count = len(values)
         cover_steps = int(count * self.audio_cover_strength)
+        if progress is not None:
+            progress(0, count)
         for index, value in enumerate(values):
             if self.non_cover_context is not None and index == cover_steps:
                 self._switch_to_non_cover()
@@ -1503,6 +1509,8 @@ class AceStepGuidedDiTPlan:
             self.active.assign(np.array([int(active)], dtype=np.int32))
             self.guidance.assign(np.array([scale], dtype=np.float32))
             wp.capture_launch(self.graph)
+            if progress is not None:
+                progress(index + 1, count)
         return self.hidden
 
 

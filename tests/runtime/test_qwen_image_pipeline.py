@@ -68,6 +68,7 @@ def test_prompt_encoding_owns_equal_length_positive_before_negative(monkeypatch)
 
 def test_denoise_does_not_overwrite_positive_conditioning(monkeypatch, tmp_path):
     calls = []
+    progress = []
 
     class Config:
         input_channels = 4
@@ -122,9 +123,11 @@ def test_denoise_does_not_overwrite_positive_conditioning(monkeypatch, tmp_path)
         width=8,
         height=8,
         steps=2,
+        progress=lambda completed, total: progress.append((completed, total)),
     )
     assert latent.shape == (1, 1, 4, 4)
     assert calls == [1.0, 2.0, 1.0, 2.0]
+    assert progress == [(0, 2), (1, 2), (2, 2)]
     np.testing.assert_allclose(positive.numpy(), 1.0)
 
     calls.clear()

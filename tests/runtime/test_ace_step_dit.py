@@ -655,12 +655,17 @@ def test_guided_schedule_switches_to_non_cover_at_official_step(monkeypatch):
     plan.non_cover_condition = non_cover_condition
     plan.non_cover_valid = non_cover_valid
     contexts = []
+    progress = []
     monkeypatch.setattr(
         wp,
         "capture_launch",
         lambda _graph: contexts.append(float(cover_context.numpy()[0, 0, 0])),
     )
-    plan.run_schedule((1.0, 0.8, 0.6, 0.4, 0.2))
+    plan.run_schedule(
+        (1.0, 0.8, 0.6, 0.4, 0.2),
+        progress=lambda completed, total: progress.append((completed, total)),
+    )
     assert contexts == [0.0, 0.0, 0.0, 1.0, 1.0]
+    assert progress == [(index, 5) for index in range(6)]
     assert len(switches) == 1
     np.testing.assert_array_equal(key_valid.numpy(), True)

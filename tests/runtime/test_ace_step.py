@@ -302,8 +302,10 @@ def test_pipeline_orchestrates_minimal_turbo_path_on_device(monkeypatch):
         def __init__(self, hidden):
             self.hidden = hidden
 
-        def run_schedule(self, schedule):
+        def run_schedule(self, schedule, progress=None):
             assert len(schedule) == 4
+            if progress is not None:
+                progress(4, 4)
             return self.hidden
 
     class Decoder:
@@ -417,6 +419,46 @@ def test_pipeline_prepares_exact_gpu_conditioning_boundary(tmp_path):
     )
 
 
+def test_generate_music_prepares_text_and_forwards_progress():
+    from types import SimpleNamespace
+
+    calls = []
+
+    def progress(completed, total):
+        pass
+
+    pipeline = SimpleNamespace(
+        planner_executor=None,
+        prepare_conditioning=lambda captions, lyrics, **options: calls.append(
+            (captions, lyrics, options)
+        )
+        or "conditioning",
+        generate=lambda **options: calls.append(options) or "audio",
+    )
+    audio, plan = AceStep15Pipeline.generate_music(
+        pipeline,
+        "summer anthem",
+        "[Instrumental]",
+        duration_seconds=12.0,
+        seed=7,
+        steps=8,
+        progress=progress,
+    )
+    assert (audio, plan) == ("audio", None)
+    assert calls[0] == (
+        ["summer anthem"],
+        ["[Instrumental]"],
+        {"languages": ["en"], "metadata": [""]},
+    )
+    assert calls[1] == {
+        "conditioning": "conditioning",
+        "duration_seconds": 12.0,
+        "seed": 7,
+        "steps": 8,
+        "progress": progress,
+    }
+
+
 def test_ace_cli_check_validates_without_loading_weights(tmp_path, capsys):
     from examples.ace_step import main
 
@@ -445,13 +487,18 @@ def test_ace_cli_writes_stereo_pcm16_only_after_ready_generation(tmp_path, monke
         def load_generation_stack(self, **kwargs):
             return self
 
-        def prepare_conditioning(self, *args, **kwargs):
-            return "conditioning"
-
-        def generate(self, *, conditioning, duration_seconds, seed, steps):
-            assert conditioning == "conditioning"
-            assert (duration_seconds, seed, steps) == (30.0, 0, None)
-            return generated
+        def generate_music(self, prompt, lyrics, **options):
+            assert (prompt, lyrics) == ("music", "")
+            assert options == {
+                "language": "en",
+                "metadata": "",
+                "instruction": None,
+                "duration_seconds": 30.0,
+                "seed": 0,
+                "steps": None,
+                "lm_codes_strength": 0.6,
+            }
+            return generated, None
 
     monkeypatch.setattr(cli, "AceStep15Pipeline", Pipeline)
     output = tmp_path / "result.wav"

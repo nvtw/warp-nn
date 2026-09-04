@@ -541,14 +541,20 @@ class AceStep15Pipeline:
                 audio_cover_strength=audio_cover_strength,
             )
 
+        vae_cache = {}
+
         def vae_factory(frames, batch):
-            return OobleckVAEDecoder.from_pretrained(
-                self.bundle.vae_path,
-                frames,
-                batch_size=batch,
-                device=encoder.device,
-                dtype=dtype,
-            )
+            key = (frames, batch)
+            if key not in vae_cache:
+                vae_cache.clear()
+                vae_cache[key] = OobleckVAEDecoder.from_pretrained(
+                    self.bundle.vae_path,
+                    frames,
+                    batch_size=batch,
+                    device=encoder.device,
+                    dtype=dtype,
+                )
+            return vae_cache[key]
 
         self.condition_executor = condition
         self.dit_executor = dit_factory
@@ -684,6 +690,64 @@ class AceStep15Pipeline:
     def ready(self) -> bool:
         return not self.missing_components
 
+    def generate_music(
+        self,
+        caption: str,
+        lyrics: str = "",
+        *,
+        language: str = "en",
+        metadata: str = "",
+        instruction: str | None = None,
+        duration_seconds: float = 30.0,
+        seed: int = 0,
+        steps: int | None = None,
+        lm_codes_strength: float = 0.6,
+        progress: Callable[[int, int], None] | None = None,
+    ):
+        """Plan, condition, and generate one song from user-facing text."""
+        plan = None
+        if self.planner_executor is not None:
+            plan = self.plan_music(
+                caption, lyrics, duration_seconds=duration_seconds, seed=seed
+            )
+            caption = plan.metadata.get("caption", caption)
+            if not metadata:
+                metadata = format_dit_metadata(plan.metadata, duration_seconds)
+
+        non_cover_conditioning = None
+        token_options = {"languages": [language], "metadata": [metadata]}
+        if instruction is not None:
+            token_options["instructions"] = [instruction]
+        if plan is None or instruction is None:
+            conditioning = self.prepare_conditioning(
+                [caption], [lyrics], **token_options
+            )
+        else:
+            paired = self.prepare_conditioning(
+                [caption, caption],
+                [lyrics, lyrics],
+                languages=[language, language],
+                metadata=[metadata, metadata],
+                instructions=[instruction, DEFAULT_DIT_INSTRUCTION],
+            )
+            conditioning = paired.row(0)
+            non_cover_conditioning = paired.row(1)
+
+        options = {
+            "conditioning": conditioning,
+            "duration_seconds": duration_seconds,
+            "seed": seed,
+            "steps": steps,
+            "progress": progress,
+        }
+        if plan is not None:
+            options.update(
+                audio_codes=plan.audio_codes,
+                audio_cover_strength=lm_codes_strength,
+                non_cover_conditioning=non_cover_conditioning,
+            )
+        return self.generate(**options), plan
+
     def generate(
         self,
         *,
@@ -695,6 +759,7 @@ class AceStep15Pipeline:
         audio_codes: Sequence[int] | None = None,
         audio_cover_strength: float = 1.0,
         non_cover_conditioning: AceStepConditioning | None = None,
+        progress: Callable[[int, int], None] | None = None,
     ):
         """Generate stereo audio through condition encoder, DiT, and VAE."""
         if not self.ready:
@@ -792,7 +857,7 @@ class AceStep15Pipeline:
             shift=3.0 if self.bundle.dit.is_turbo else 1.0,
             steps=steps,
         )
-        latent = dit.run_schedule(schedule)
+        latent = dit.run_schedule(schedule, progress=progress)
         decoder = self.vae_decoder(latent.shape[1], batch)
         decoder.input.assign(latent)
         decoder.execute()

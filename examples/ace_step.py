@@ -18,7 +18,6 @@ import numpy as np
 from warp_nn.runtime.ace_step.runner import (
     AceStep15Bundle,
     AceStep15Pipeline,
-    format_dit_metadata,
 )
 from warp_nn.runtime.formats.wav import write_wav_pcm16
 
@@ -74,6 +73,19 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def write_audio(path, audio, sample_rate: int, *, normalize: bool = False) -> None:
+    """Copy generated audio once and write stereo PCM16."""
+    if hasattr(audio, "numpy"):
+        audio = audio.numpy()
+    audio = np.asarray(audio)
+    if audio.ndim == 3 and audio.shape[0] == 1:
+        audio = audio[0]
+    peak = float(np.max(np.abs(audio)))
+    if peak > 1.0:
+        audio = audio / peak
+    write_wav_pcm16(path, audio, sample_rate, normalize=normalize)
+
+
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
     bundle = AceStep15Bundle.discover(
@@ -98,73 +110,25 @@ def main(argv=None) -> int:
         raise ValueError("--prompt is required for generation")
     pipeline = AceStep15Pipeline(bundle)
     pipeline.load_generation_stack(device=args.device, use_cublas=not args.no_cublas)
-    plan = None
     if bundle.planner_path is not None and not args.no_planner:
         pipeline.load_planner(device=args.device, use_cublas=not args.no_cublas)
-        plan = pipeline.plan_music(
-            args.prompt,
-            args.lyrics,
-            duration_seconds=args.duration_seconds,
-            seed=args.seed,
-        )
+    audio, plan = pipeline.generate_music(
+        args.prompt,
+        args.lyrics,
+        language=args.language,
+        metadata=args.metadata,
+        instruction=args.instruction,
+        duration_seconds=args.duration_seconds,
+        seed=args.seed,
+        steps=args.steps,
+        lm_codes_strength=args.lm_codes_strength,
+    )
+    if plan is not None:
         print(
             f"Planner: {len(plan.audio_codes)} semantic codes; "
             + ", ".join(f"{name}={value}" for name, value in plan.metadata.items())
         )
-    metadata = args.metadata
-    caption = (
-        plan.metadata.get("caption", args.prompt) if plan is not None else args.prompt
-    )
-    if plan is not None and not metadata:
-        metadata = format_dit_metadata(plan.metadata, args.duration_seconds)
-    non_cover_conditioning = None
-    if plan is None or args.instruction is None:
-        token_options = {"languages": [args.language], "metadata": [metadata]}
-        if args.instruction is not None:
-            token_options["instructions"] = [args.instruction]
-        conditioning = pipeline.prepare_conditioning(
-            [caption], [args.lyrics], **token_options
-        )
-    else:
-        # The official fallback retains caption, lyrics, and metadata while
-        # replacing only an explicitly customized instruction.
-        paired = pipeline.prepare_conditioning(
-            [caption, caption],
-            [args.lyrics, args.lyrics],
-            languages=[args.language, args.language],
-            metadata=[metadata, metadata],
-            instructions=[
-                args.instruction,
-                "Fill the audio semantic mask based on the given conditions:",
-            ],
-        )
-        conditioning = paired.row(0)
-        non_cover_conditioning = paired.row(1)
-    if not pipeline.ready:
-        missing = ", ".join(pipeline.missing_components)
-        raise RuntimeError(
-            f"ACE-Step bundle and Qwen conditioning are ready; generation still needs {missing}"
-        )
-    generation_options = {
-        "conditioning": conditioning,
-        "duration_seconds": args.duration_seconds,
-        "seed": args.seed,
-        "steps": args.steps,
-    }
-    if plan is not None:
-        generation_options["audio_codes"] = plan.audio_codes
-        generation_options["audio_cover_strength"] = args.lm_codes_strength
-        generation_options["non_cover_conditioning"] = non_cover_conditioning
-    audio = pipeline.generate(**generation_options)
-    if hasattr(audio, "numpy"):
-        audio = audio.numpy()
-    audio = np.asarray(audio)
-    if audio.ndim == 3 and audio.shape[0] == 1:
-        audio = audio[0]
-    peak = float(np.max(np.abs(audio)))
-    if peak > 1.0:
-        audio = audio / peak
-    write_wav_pcm16(
+    write_audio(
         args.output,
         audio,
         bundle.vae.sampling_rate,

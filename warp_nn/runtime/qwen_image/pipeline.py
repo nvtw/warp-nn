@@ -126,6 +126,7 @@ class QwenImage2512Pipeline:
         steps=50,
         true_cfg_scale=4.0,
         seed=0,
+        progress=None,
     ):
         latent_width, latent_height, sequence = self.bundle.latent_geometry(
             width, height
@@ -181,7 +182,10 @@ class QwenImage2512Pipeline:
             sample, cfg.output if cfg is not None else plan.output, sigma, next_sigma
         )
         schedule = self.bundle.scheduler.schedule(steps, sequence)
-        for current, following in zip(schedule[:-1], schedule[1:]):
+        total = len(schedule) - 1
+        if progress is not None:
+            progress(0, total)
+        for index, (current, following) in enumerate(zip(schedule[:-1], schedule[1:])):
             timestep.assign(np.array([current], dtype=np.float32))
             plan.replay(text=positive, text_valid=positive_valid)
             if cfg is not None:
@@ -191,6 +195,8 @@ class QwenImage2512Pipeline:
             sigma.assign(np.array([current], dtype=np.float32))
             next_sigma.assign(np.array([following], dtype=np.float32))
             flow.execute()
+            if progress is not None:
+                progress(index + 1, total)
         unpack = SpatialPatchUnpackPlan(
             sample,
             latent_height,
@@ -245,6 +251,7 @@ class QwenImage2512Pipeline:
         seed=0,
         max_sequence_length=512,
         vae_tiling=False,
+        progress=None,
     ) -> np.ndarray:
         """Generate one HWC RGB8 image using exact weights and staged loading."""
         positive, positive_valid, negative, negative_valid = self.encode_prompts(
@@ -262,6 +269,7 @@ class QwenImage2512Pipeline:
             steps=steps,
             true_cfg_scale=true_cfg_scale,
             seed=seed,
+            progress=progress,
         )
         del positive, positive_valid, negative, negative_valid
         self._collect_released_stage()
