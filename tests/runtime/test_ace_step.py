@@ -13,7 +13,9 @@ from warp_nn.runtime.ace_step.runner import (
     AceStep15Pipeline,
     AceStepDiTConfig,
     OobleckVAEConfig,
+    _semantic_context_kernel,
     Qwen3EmbeddingConfig,
+    format_dit_metadata,
     format_lyrics,
     format_text_prompt,
     load_silence_latent,
@@ -191,14 +193,48 @@ def test_prompt_format_and_token_batch(tmp_path):
     assert "# Languages\nde" in batch.lyric_prompts[1]
 
 
+def test_dit_metadata_matches_official_checkpoint_format():
+    assert format_dit_metadata(
+        {"bpm": "143", "keyscale": "G minor", "timesignature": "4"},
+        45.0,
+    ) == (
+        "- bpm: 143\n- timesignature: 4\n- keyscale: G minor\n- duration: 45 seconds\n"
+    )
+
+
 def test_pack_conditioning_sequences_is_stable():
     first = np.array([[[1.0], [99.0], [2.0]]])
     second = np.array([[[3.0], [98.0]]])
     first_mask = np.array([[True, False, True]])
     second_mask = np.array([[True, False]])
+
     packed, mask = pack_conditioning_sequences(first, second, first_mask, second_mask)
     np.testing.assert_array_equal(packed[0, :, 0], [1.0, 2.0, 3.0, 99.0, 98.0])
     np.testing.assert_array_equal(mask, [[True, True, True, False, False]])
+
+
+def test_semantic_context_crops_and_silence_pads_like_official_runtime():
+    hints = wp.array(
+        np.full((1, 2, 64), 3.0, dtype=np.float32),
+        dtype=wp.float32,
+        device="cpu",
+    )
+    fallback = wp.array(
+        np.full((2, 3, 64), 7.0, dtype=np.float32),
+        dtype=wp.float32,
+        device="cpu",
+    )
+    context = wp.empty((2, 3, 128), dtype=wp.float32, device="cpu")
+    wp.launch(
+        _semantic_context_kernel(wp.float32),
+        dim=context.shape,
+        inputs=[hints, fallback, context],
+        device="cpu",
+    )
+    actual = context.numpy()
+    np.testing.assert_array_equal(actual[:, :2, :64], 3.0)
+    np.testing.assert_array_equal(actual[:, 2:, :64], 7.0)
+    np.testing.assert_array_equal(actual[:, :, 64:], 1.0)
 
 
 def test_silence_latent_slicing_and_tiling():

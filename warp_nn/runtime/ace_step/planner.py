@@ -99,17 +99,56 @@ def format_planner_unconditional_prompt() -> str:
 
 
 def parse_planner_metadata(cot: str) -> dict[str, str]:
-    """Extract the official small metadata vocabulary from planner reasoning."""
+    """Parse the planner's YAML-like metadata, including wrapped captions."""
     result = {}
     aliases = {"key": "keyscale", "time_signature": "timesignature"}
     pattern = re.compile(
-        r"^\s*(bpm|duration|keyscale|key|timesignature|time_signature|language)\s*:\s*(.*?)\s*$",
-        re.IGNORECASE | re.MULTILINE,
+        r"^(bpm|caption|duration|genres|keyscale|key|timesignature|"
+        r"time_signature|language)\s*:\s*(.*?)"
+        r"(?=^[A-Za-z_]+\s*:|\Z)",
+        re.IGNORECASE | re.MULTILINE | re.DOTALL,
     )
     for name, value in pattern.findall(cot):
-        if value:
-            result[aliases.get(name.lower(), name.lower())] = value
+        lines = value.strip().splitlines()
+        if lines and lines[0].strip() in ("|", "|-", ">", ">-"):
+            lines.pop(0)
+        normalized = " ".join(line.strip() for line in lines).strip()
+        if (
+            len(normalized) >= 2
+            and normalized[0] == normalized[-1]
+            and normalized[0] in ("'", '"')
+        ):
+            normalized = normalized[1:-1]
+        if normalized:
+            result[aliases.get(name.lower(), name.lower())] = normalized
     return result
+
+
+def _canonical_planner_cot(
+    cot: str, duration_seconds: float
+) -> tuple[str, dict[str, str]]:
+    """Validate and canonicalize the compact official Phase-1 schema."""
+    metadata = parse_planner_metadata(cot)
+    metadata["duration"] = _duration_text(duration_seconds)
+    required = ("bpm", "caption", "duration", "keyscale", "language", "timesignature")
+    missing = [name for name in required if not metadata.get(name)]
+    if missing:
+        raise ValueError(f"ACE planner metadata is missing {', '.join(missing)}")
+    try:
+        bpm = int(metadata["bpm"])
+    except ValueError as error:
+        raise ValueError("ACE planner BPM must be an integer") from error
+    if not 30 <= bpm <= 300:
+        raise ValueError("ACE planner BPM must be within [30, 300]")
+    timesignature = metadata["timesignature"]
+    if timesignature.endswith("/4"):
+        timesignature = timesignature[:-2]
+    if timesignature not in ("2", "3", "4", "6"):
+        raise ValueError("ACE planner time signature must be 2, 3, 4, or 6")
+    metadata["bpm"] = str(bpm)
+    metadata["timesignature"] = timesignature
+    canonical = "\n".join(f"{name}: {metadata[name]}" for name in required)
+    return canonical, metadata
 
 
 @dataclass(frozen=True)
@@ -117,15 +156,6 @@ class AcePlannerResult:
     cot: str
     metadata: dict[str, str]
     audio_codes: tuple[int, ...]
-
-
-def _set_planner_metadata(cot: str, name: str, value: str) -> str:
-    """Replace or append one constrained phase-one metadata value."""
-    pattern = re.compile(rf"^(\s*{re.escape(name)}\s*:)\s*.*$", re.MULTILINE)
-    if pattern.search(cot):
-        return pattern.sub(rf"\1 {value}", cot, count=1)
-    suffix = "" if cot.endswith("\n") else "\n"
-    return f"{cot}{suffix}{name}: {value}"
 
 
 def _duration_text(duration_seconds: float) -> str:
@@ -150,7 +180,7 @@ class AceStepPlanner:
         caption: str,
         lyrics: str,
         *,
-        max_tokens: int = 256,
+        max_tokens: int = 512,
         temperature: float = 0.85,
         top_k: int = 0,
         top_p: float = 0.9,
@@ -279,15 +309,25 @@ class AceStepPlanner:
         seed: int | None = None,
     ) -> AcePlannerResult:
         rng = np.random.default_rng(seed)
-        cot = self.generate_cot(
-            caption,
-            lyrics,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            rng=rng,
-        )
-        cot = _set_planner_metadata(cot, "duration", _duration_text(duration_seconds))
+        error = None
+        for _ in range(2):
+            try:
+                cot = self.generate_cot(
+                    caption,
+                    lyrics,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    rng=rng,
+                )
+                cot, metadata = _canonical_planner_cot(cot, duration_seconds)
+                break
+            except (RuntimeError, ValueError) as caught:
+                error = caught
+        else:
+            raise RuntimeError(
+                "ACE planner failed to produce valid metadata after two attempts"
+            ) from error
         codes = self.generate_codes(
             caption,
             lyrics,
@@ -299,7 +339,7 @@ class AceStepPlanner:
             cfg_scale=cfg_scale,
             rng=rng,
         )
-        return AcePlannerResult(cot, parse_planner_metadata(cot), codes)
+        return AcePlannerResult(cot, metadata, codes)
 
 
 def audio_code_decoder_weight_names(layers: int = 2) -> tuple[str, ...]:

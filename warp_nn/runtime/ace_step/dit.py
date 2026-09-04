@@ -1331,6 +1331,10 @@ class AceStepGuidedDiTPlan:
         guidance_scale=7.0,
         guidance_start=0.0,
         guidance_end=1.0,
+        non_cover_context=None,
+        non_cover_condition=None,
+        non_cover_valid=None,
+        audio_cover_strength=1.0,
     ):
         if condition.shape != null_condition.shape:
             raise ValueError(
@@ -1338,10 +1342,20 @@ class AceStepGuidedDiTPlan:
             )
         if not 0.0 <= guidance_start <= guidance_end <= 1.0:
             raise ValueError("ACE guidance interval must be within [0, 1]")
+        if not 0.0 <= audio_cover_strength <= 1.0:
+            raise ValueError("ACE audio-cover strength must be within [0, 1]")
+        alternates = (non_cover_context, non_cover_condition, non_cover_valid)
+        if any(value is not None for value in alternates) and any(
+            value is None for value in alternates
+        ):
+            raise ValueError(
+                "ACE non-cover context, condition, and mask are required together"
+            )
         self.batch = hidden.shape[0]
         self.guidance_scale = float(guidance_scale)
         self.guidance_start = float(guidance_start)
         self.guidance_end = float(guidance_end)
+        self.audio_cover_strength = float(audio_cover_strength)
         self.device = hidden.device
         self.dtype = hidden.dtype
 
@@ -1365,6 +1379,25 @@ class AceStepGuidedDiTPlan:
         model_context = paired(context_latents)
         model_condition = paired(condition, null_condition)
         model_valid = paired(condition_valid) if condition_valid is not None else None
+        self.non_cover_context = (
+            paired(non_cover_context) if non_cover_context is not None else None
+        )
+        self.non_cover_condition = (
+            paired(non_cover_condition, null_condition)
+            if non_cover_condition is not None
+            else None
+        )
+        self.non_cover_valid = (
+            paired(non_cover_valid) if non_cover_valid is not None else None
+        )
+        if self.non_cover_context is not None and (
+            self.non_cover_context.shape != model_context.shape
+            or self.non_cover_condition.shape != model_condition.shape
+            or self.non_cover_valid.shape != model_valid.shape
+        ):
+            raise ValueError(
+                "ACE cover and non-cover conditions must have equal shapes"
+            )
         self.plan = AceStepDiTPlan(
             model_hidden,
             model_context,
@@ -1383,6 +1416,14 @@ class AceStepGuidedDiTPlan:
         self.guidance = wp.ones(1, dtype=wp.float32, device=self.device)
         self._kernels = _apg_flow_kernels(self.dtype)
         self.graph = None
+
+    def _switch_to_non_cover(self):
+        wp.copy(self.plan.context_latents, self.non_cover_context)
+        target = self.plan._condition_tensors["condition"]
+        wp.copy(target, self.non_cover_condition.reshape(target.shape))
+        for layer in self.plan.layers:
+            wp.copy(layer.cross_attention.attention.key_valid, self.non_cover_valid)
+        self.plan.prepare_fixed_condition()
 
     def _execute(self):
         self.plan.execute()
@@ -1443,7 +1484,10 @@ class AceStepGuidedDiTPlan:
         if self.graph is None:
             self.capture()
         count = len(values)
+        cover_steps = int(count * self.audio_cover_strength)
         for index, value in enumerate(values):
+            if self.non_cover_context is not None and index == cover_steps:
+                self._switch_to_non_cover()
             next_value = values[index + 1] if index + 1 < count else 0.0
             active = (
                 self.guidance_start <= value <= self.guidance_end

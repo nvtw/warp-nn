@@ -15,7 +15,11 @@ import json
 
 import numpy as np
 
-from warp_nn.runtime.ace_step.runner import AceStep15Bundle, AceStep15Pipeline
+from warp_nn.runtime.ace_step.runner import (
+    AceStep15Bundle,
+    AceStep15Pipeline,
+    format_dit_metadata,
+)
 from warp_nn.runtime.formats.wav import write_wav_pcm16
 
 
@@ -43,7 +47,7 @@ def _parser() -> argparse.ArgumentParser:
         "--steps",
         type=int,
         default=None,
-        help="diffusion steps (default: 8 for Turbo, 30 for XL-SFT)",
+        help="diffusion steps (default: 8 for Turbo, 50 for XL-SFT)",
     )
     parser.add_argument("--no-cublas", action="store_true")
     parser.add_argument(
@@ -55,6 +59,12 @@ def _parser() -> argparse.ArgumentParser:
         "--no-planner",
         action="store_true",
         help="skip the optional 5 Hz LM plan (faster and lower-memory, but less structured)",
+    )
+    parser.add_argument(
+        "--lm-codes-strength",
+        type=float,
+        default=0.6,
+        help="fraction of diffusion steps guided by LM codes (default: 0.6)",
     )
     parser.add_argument(
         "--check",
@@ -102,19 +112,34 @@ def main(argv=None) -> int:
             + ", ".join(f"{name}={value}" for name, value in plan.metadata.items())
         )
     metadata = args.metadata
-    if plan is not None and not metadata:
-        metadata = "\n".join(
-            f"{name}: {value}" for name, value in plan.metadata.items()
-        )
-    token_options = {
-        "languages": [args.language],
-        "metadata": [metadata],
-    }
-    if args.instruction is not None:
-        token_options["instructions"] = [args.instruction]
-    conditioning = pipeline.prepare_conditioning(
-        [args.prompt], [args.lyrics], **token_options
+    caption = (
+        plan.metadata.get("caption", args.prompt) if plan is not None else args.prompt
     )
+    if plan is not None and not metadata:
+        metadata = format_dit_metadata(plan.metadata, args.duration_seconds)
+    non_cover_conditioning = None
+    if plan is None or args.instruction is None:
+        token_options = {"languages": [args.language], "metadata": [metadata]}
+        if args.instruction is not None:
+            token_options["instructions"] = [args.instruction]
+        conditioning = pipeline.prepare_conditioning(
+            [caption], [args.lyrics], **token_options
+        )
+    else:
+        # The official fallback retains caption, lyrics, and metadata while
+        # replacing only an explicitly customized instruction.
+        paired = pipeline.prepare_conditioning(
+            [caption, caption],
+            [args.lyrics, args.lyrics],
+            languages=[args.language, args.language],
+            metadata=[metadata, metadata],
+            instructions=[
+                args.instruction,
+                "Fill the audio semantic mask based on the given conditions:",
+            ],
+        )
+        conditioning = paired.row(0)
+        non_cover_conditioning = paired.row(1)
     if not pipeline.ready:
         missing = ", ".join(pipeline.missing_components)
         raise RuntimeError(
@@ -128,12 +153,17 @@ def main(argv=None) -> int:
     }
     if plan is not None:
         generation_options["audio_codes"] = plan.audio_codes
+        generation_options["audio_cover_strength"] = args.lm_codes_strength
+        generation_options["non_cover_conditioning"] = non_cover_conditioning
     audio = pipeline.generate(**generation_options)
     if hasattr(audio, "numpy"):
         audio = audio.numpy()
     audio = np.asarray(audio)
     if audio.ndim == 3 and audio.shape[0] == 1:
         audio = audio[0]
+    peak = float(np.max(np.abs(audio)))
+    if peak > 1.0:
+        audio = audio / peak
     write_wav_pcm16(
         args.output,
         audio,

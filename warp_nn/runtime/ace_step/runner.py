@@ -49,11 +49,15 @@ def _semantic_context_kernel(dtype):
     @wp.kernel(enable_backward=False, module="unique")
     def pack(
         hints: wp.array3d(dtype=DTYPE),
+        fallback: wp.array3d(dtype=DTYPE),
         context: wp.array3d(dtype=DTYPE),
     ):
         batch, frame, channel = wp.tid()
         if channel < 64:
-            context[batch, frame, channel] = hints[0, frame, channel]
+            if frame < hints.shape[1]:
+                context[batch, frame, channel] = hints[0, frame, channel]
+            else:
+                context[batch, frame, channel] = fallback[batch, frame, channel]
         else:
             context[batch, frame, channel] = DTYPE(1.0)
 
@@ -212,6 +216,21 @@ def format_lyrics(lyrics: str, language: str = "en") -> str:
     return f"# Languages\n{language}\n\n# Lyric\n{lyrics}<|endoftext|>"
 
 
+def format_dit_metadata(metadata: dict[str, str], duration_seconds: float) -> str:
+    """Format the four checkpoint-native ACE DiT metadata fields."""
+    duration = metadata.get("duration", f"{duration_seconds:g}")
+    try:
+        duration = f"{int(float(duration))} seconds"
+    except (TypeError, ValueError):
+        pass
+    return (
+        f"- bpm: {metadata.get('bpm', 'N/A')}\n"
+        f"- timesignature: {metadata.get('timesignature', 'N/A')}\n"
+        f"- keyscale: {metadata.get('keyscale', 'N/A')}\n"
+        f"- duration: {duration}\n"
+    )
+
+
 def _padded_tokens(
     tokenizer: Qwen3Tokenizer, texts: Sequence[str], maximum: int
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -345,6 +364,19 @@ class AceStepConditioning:
     prompts: tuple[str, ...]
     lyric_prompts: tuple[str, ...]
 
+    def row(self, index: int) -> "AceStepConditioning":
+        """Return one batch row while preserving its fixed padded shape."""
+        if not 0 <= index < self.text_hidden_states.shape[0]:
+            raise IndexError("ACE-Step conditioning row is out of range")
+        return AceStepConditioning(
+            text_hidden_states=self.text_hidden_states[index : index + 1],
+            text_attention_mask=self.text_attention_mask[index : index + 1],
+            lyric_hidden_states=self.lyric_hidden_states[index : index + 1],
+            lyric_attention_mask=self.lyric_attention_mask[index : index + 1],
+            prompts=(self.prompts[index],),
+            lyric_prompts=(self.lyric_prompts[index],),
+        )
+
 
 @dataclass(frozen=True)
 class AceStepTextToMusicInputs:
@@ -477,6 +509,11 @@ class AceStep15Pipeline:
             valid,
             null_condition=None,
             guidance_scale=7.0,
+            *,
+            non_cover_context=None,
+            non_cover_condition=None,
+            non_cover_valid=None,
+            audio_cover_strength=1.0,
         ):
             if config.is_turbo:
                 return AceStepDiTPlan(
@@ -498,6 +535,10 @@ class AceStep15Pipeline:
                 condition_valid=valid,
                 cublas=cublas,
                 guidance_scale=guidance_scale,
+                non_cover_context=non_cover_context,
+                non_cover_condition=non_cover_condition,
+                non_cover_valid=non_cover_valid,
+                audio_cover_strength=audio_cover_strength,
             )
 
         def vae_factory(frames, batch):
@@ -652,16 +693,20 @@ class AceStep15Pipeline:
         steps: int | None = None,
         guidance_scale: float = 7.0,
         audio_codes: Sequence[int] | None = None,
+        audio_cover_strength: float = 1.0,
+        non_cover_conditioning: AceStepConditioning | None = None,
     ):
         """Generate stereo audio through condition encoder, DiT, and VAE."""
         if not self.ready:
             missing = ", ".join(self.missing_components)
             raise RuntimeError(f"ACE-Step 1.5 pipeline is not ready; missing {missing}")
         if steps is None:
-            steps = 8 if self.bundle.dit.is_turbo else 30
+            steps = 8 if self.bundle.dit.is_turbo else 50
         if steps <= 0 or (self.bundle.dit.is_turbo and steps > 8):
             limit = " between 1 and 8" if self.bundle.dit.is_turbo else " positive"
             raise ValueError(f"ACE-Step steps must be{limit}")
+        if not 0.0 <= audio_cover_strength <= 1.0:
+            raise ValueError("ACE-Step audio-cover strength must be within [0, 1]")
         from .dit import turbo_schedule
 
         batch = conditioning.text_hidden_states.shape[0]
@@ -680,6 +725,25 @@ class AceStep15Pipeline:
             reference,
         )
         packed_condition, condition_valid = condition_plan.execute()
+        non_cover_packed = non_cover_valid = None
+        if audio_codes is not None and audio_cover_strength < 1.0:
+            if non_cover_conditioning is None:
+                non_cover_packed, non_cover_valid = packed_condition, condition_valid
+            else:
+                if non_cover_conditioning.text_hidden_states.shape[0] != batch:
+                    raise ValueError("ACE-Step non-cover condition batch must match")
+                non_cover_plan = self.condition_executor.plan(
+                    non_cover_conditioning.text_hidden_states,
+                    non_cover_conditioning.text_attention_mask,
+                    non_cover_conditioning.lyric_hidden_states,
+                    non_cover_conditioning.lyric_attention_mask,
+                    reference,
+                )
+                non_cover_packed, non_cover_valid = non_cover_plan.execute()
+                if non_cover_packed.shape != packed_condition.shape:
+                    raise ValueError(
+                        "ACE-Step cover and non-cover conditions must share a padded shape"
+                    )
         hidden = seeded_normal(
             inputs.source_latents.shape, seed=seed, dtype=dtype, device=device
         )
@@ -689,19 +753,20 @@ class AceStep15Pipeline:
             if self.audio_code_decoder is None:
                 raise RuntimeError("ACE-Step audio-code decoder is not loaded")
             hints = self.audio_code_decoder.decode(audio_codes)
-            if hints.shape[1:] != inputs.source_latents.shape[1:]:
+            if hints.shape[2] != inputs.source_latents.shape[2]:
                 raise ValueError(
-                    "ACE-Step audio codes must provide exactly five codes per second"
+                    "ACE-Step audio-code hints must have 64 latent channels"
                 )
+            source = wp.array(inputs.source_latents, dtype=dtype, device=device)
             context = wp.empty(
-                (batch, hints.shape[1], hints.shape[2] * 2),
+                (batch, source.shape[1], source.shape[2] * 2),
                 dtype=dtype,
                 device=device,
             )
             wp.launch(
                 _semantic_context_kernel(dtype),
                 dim=context.shape,
-                inputs=[hints, context],
+                inputs=[hints, source, context],
                 device=device,
             )
         if self.bundle.dit.is_turbo:
@@ -714,6 +779,14 @@ class AceStep15Pipeline:
                 condition_valid,
                 condition_plan.null_condition(),
                 guidance_scale,
+                non_cover_context=wp.array(
+                    inputs.context_latents, dtype=dtype, device=device
+                )
+                if non_cover_packed is not None
+                else None,
+                non_cover_condition=non_cover_packed,
+                non_cover_valid=non_cover_valid,
+                audio_cover_strength=audio_cover_strength,
             )
         schedule = turbo_schedule(
             shift=3.0 if self.bundle.dit.is_turbo else 1.0,

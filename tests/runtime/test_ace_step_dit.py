@@ -13,6 +13,7 @@ from warp_nn.runtime.ace_step.dit import (
     AceStepAttentionPlan,
     AceStepDiTLayerPlan,
     AceStepDiTPlan,
+    AceStepGuidedDiTPlan,
     TURBO_TIMESTEPS,
     _apg_flow_kernels,
     bidirectional_attention_mask,
@@ -612,3 +613,54 @@ def test_top_level_dit_graph_and_sampler_smoke():
     assert not np.array_equal(output, before)
     with pytest.raises(ValueError, match="strictly descending"):
         plan.run_schedule((0.5, 0.8))
+
+
+def test_guided_schedule_switches_to_non_cover_at_official_step(monkeypatch):
+    from types import SimpleNamespace
+
+    plan = object.__new__(AceStepGuidedDiTPlan)
+    plan.audio_cover_strength = 0.6
+    plan.guidance_start = 0.0
+    plan.guidance_end = 1.0
+    plan.guidance_scale = 7.0
+    plan.graph = object()
+    plan.hidden = wp.zeros((1, 1, 1), dtype=wp.float32, device="cpu")
+    plan.active = wp.zeros(1, dtype=wp.int32, device="cpu")
+    plan.guidance = wp.ones(1, dtype=wp.float32, device="cpu")
+    cover_context = wp.zeros((2, 1, 2), dtype=wp.float32, device="cpu")
+    non_cover_context = wp.ones((2, 1, 2), dtype=wp.float32, device="cpu")
+    cover_condition = wp.zeros((2, 2, 3), dtype=wp.float32, device="cpu")
+    non_cover_condition = wp.ones((2, 2, 3), dtype=wp.float32, device="cpu")
+    cover_valid = wp.zeros((2, 2), dtype=wp.bool, device="cpu")
+    non_cover_valid = wp.ones((2, 2), dtype=wp.bool, device="cpu")
+    key_valid = wp.empty_like(cover_valid)
+    key_valid.assign(cover_valid)
+    switches = []
+    plan.plan = SimpleNamespace(
+        context_latents=cover_context,
+        _condition_tensors={"condition": cover_condition.reshape((4, 3))},
+        layers=[
+            SimpleNamespace(
+                cross_attention=SimpleNamespace(
+                    attention=SimpleNamespace(key_valid=key_valid)
+                )
+            )
+        ],
+        prepare_fixed_condition=lambda: switches.append(True),
+        timestep=wp.ones(2, dtype=wp.float32, device="cpu"),
+        timestep_r=wp.ones(2, dtype=wp.float32, device="cpu"),
+        next_timestep=wp.zeros(2, dtype=wp.float32, device="cpu"),
+    )
+    plan.non_cover_context = non_cover_context
+    plan.non_cover_condition = non_cover_condition
+    plan.non_cover_valid = non_cover_valid
+    contexts = []
+    monkeypatch.setattr(
+        wp,
+        "capture_launch",
+        lambda _graph: contexts.append(float(cover_context.numpy()[0, 0, 0])),
+    )
+    plan.run_schedule((1.0, 0.8, 0.6, 0.4, 0.2))
+    assert contexts == [0.0, 0.0, 0.0, 1.0, 1.0]
+    assert len(switches) == 1
+    np.testing.assert_array_equal(key_valid.numpy(), True)

@@ -63,9 +63,15 @@ def test_planner_prompt_and_metadata_contract():
     )
     assert "\nNO USER INPUT<|im_end|>\n" in format_planner_unconditional_prompt()
     assert parse_planner_metadata(
-        "bpm: 84\nduration: 12\nkey: C major\ntime_signature: 4"
+        "bpm: 84\ncaption: A warm piano theme that develops slowly.\n"
+        "  A quiet countermelody enters later.\nduration: 12\n"
+        "key: C major\ntime_signature: 4"
     ) == {
         "bpm": "84",
+        "caption": (
+            "A warm piano theme that develops slowly. "
+            "A quiet countermelody enters later."
+        ),
         "duration": "12",
         "keyscale": "C major",
         "timesignature": "4",
@@ -78,7 +84,14 @@ class _FakeTokenizer:
 
     def decode(self, token_ids):
         assert token_ids == [10]
-        return "bpm: 120\nduration: 0.4"
+        return (
+            "bpm: 120\n"
+            "caption: A developing piano miniature.\n"
+            "duration: 99\n"
+            "keyscale: C major\n"
+            "language: en\n"
+            "timesignature: 4/4"
+        )
 
 
 class _FakeRunner:
@@ -114,8 +127,18 @@ def test_two_phase_planner_enforces_audio_vocabulary_and_rate():
         temperature=0.0,
         cfg_scale=1.0,
     )
-    assert result.cot == "bpm: 120\nduration: 0.4"
-    assert result.metadata == {"bpm": "120", "duration": "0.4"}
+    assert result.cot == (
+        "bpm: 120\n"
+        "caption: A developing piano miniature.\n"
+        "duration: 0.4\n"
+        "keyscale: C major\n"
+        "language: en\n"
+        "timesignature: 4"
+    )
+    assert result.metadata == {
+        name: value
+        for name, value in (line.split(": ", 1) for line in result.cot.splitlines())
+    }
     assert result.audio_codes == (7, 9)
     assert runner.ranges == [
         (AUDIO_CODE_TOKEN_BASE, AUDIO_CODE_TOKEN_STOP),
