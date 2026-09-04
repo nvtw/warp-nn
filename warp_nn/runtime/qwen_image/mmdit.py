@@ -131,6 +131,9 @@ def _bind_linear_output(plan, scratch, name):
 def _bind_rms_output(plan, scratch, name):
     plan.output = scratch.bind(name, plan.output)
     plan._tensors["normalized"] = plan.output
+    plan._operation.attrs["_output_2d"] = plan.output.reshape(
+        plan._operation.attrs["_output_2d"].shape
+    )
     return plan.output
 
 

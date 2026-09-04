@@ -269,6 +269,10 @@ def test_two_layers_alias_scratch_and_replay():
 
     first, second = plan.layers
     assert first.image_qkv.q.output.ptr == second.image_qkv.q.output.ptr
+    for layer in plan.layers:
+        for qkv in (layer.image_qkv, layer.text_qkv):
+            for norm in (qkv.q_norm, qkv.k_norm):
+                assert norm._operation.attrs["_output_2d"].ptr == norm.output.ptr
     assert first.image_mlp_up.output.ptr == second.image_mlp_up.output.ptr
     assert first.image_output.ptr == plan.image_input.output.ptr
     assert second.image_output.ptr == plan.image_input.output.ptr
