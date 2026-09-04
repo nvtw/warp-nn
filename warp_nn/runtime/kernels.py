@@ -3763,7 +3763,11 @@ def _get_bidirectional_gqa_attention_kernel(
             else _create_bidirectional_gqa_attention_kernel
         )
         _bidirectional_gqa_attention_kernel_cache[key] = factory(head_size, dtype)
-    block_dim = 128 if tiled else min(1024, max(32, 1 << (head_size - 1).bit_length()))
+    block_dim = (
+        (256 if head_size <= 128 else 128)
+        if tiled
+        else min(1024, max(32, 1 << (head_size - 1).bit_length()))
+    )
     return block_dim, _bidirectional_gqa_attention_kernel_cache[key]
 
 
@@ -5232,7 +5236,12 @@ def _create_tiled_bidirectional_gqa_attention_kernel(head_size: int, dtype: type
     def safe_inverse(value: wp.float32):
         return wp.float32(1.0) / value if value > 0.0 else wp.float32(0.0)
 
-    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    @wp.kernel(
+        enable_backward=False,
+        module="unique",
+        module_options={"enable_backward": False},
+        grid_stride=False,
+    )
     def kernel(
         query: wp.array2d(dtype=DTYPE),
         key: wp.array2d(dtype=DTYPE),
@@ -5373,5 +5382,4 @@ def _create_tiled_bidirectional_gqa_attention_kernel(head_size: int, dtype: type
                     offset=(query_base + token, 0),
                 )
 
-    kernel.module.options["enable_backward"] = False
     return kernel
