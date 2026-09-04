@@ -28,6 +28,16 @@ import warp as wp
 from warp_nn.utils import logger
 
 
+def local_model_root() -> Path:
+    """Return the optional permanent root for locally downloaded test models."""
+    configured = os.environ.get("WARP_NN_MODEL_ROOT")
+    return (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / "Models" / "warp-nn"
+    )
+
+
 def write_safetensors(path: Path, tensors: dict[str, tuple[str, tuple[int, ...], bytes]]) -> None:
     """Write the small safetensors fixtures used by runtime tests."""
     header = {}

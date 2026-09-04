@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import warp as wp
 
-from tests.utilities import write_safetensors
+from tests.utilities import local_model_root, write_safetensors
 from warp_nn.runtime.ace_step.planner import (
     AUDIO_CODE_TOKEN_BASE,
     AUDIO_CODE_TOKEN_STOP,
@@ -293,7 +293,7 @@ def test_audio_code_decoder_matches_numpy_oracle(tmp_path):
 
 
 def test_local_ace_planner_and_decoder_manifests():
-    root = Path("/home/twidmer/.cache/warp-nn/models/ACE-Step")
+    root = local_model_root() / "ACE-Step"
     planner = root / "acestep-5Hz-lm-4B"
     decoder = root / "acestep-v15-xl-sft"
     if not planner.is_dir() or not decoder.is_dir():

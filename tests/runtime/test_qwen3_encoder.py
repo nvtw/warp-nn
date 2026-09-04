@@ -17,6 +17,7 @@ from warp_nn.runtime.qwen.encoder import (
 )
 from warp_nn.runtime.qwen.causal import Qwen3CausalLM, qwen3_causal_weight_names
 from warp_nn.runtime.tokenizers import _BYTE_ENCODER
+from tests.utilities import local_model_root
 
 
 def _write_safetensors(path: Path, tensors: dict[str, np.ndarray]) -> None:
@@ -238,9 +239,7 @@ def test_qwen3_causal_prefill_decode_matches_full_reference(tmp_path):
 
 
 def test_official_qwen3_embedding_checkpoint_contract():
-    path = Path(
-        "/home/twidmer/.cache/warp-nn/models/ACE-Step/Ace-Step1.5/Qwen3-Embedding-0.6B"
-    )
+    path = local_model_root() / "ACE-Step" / "Ace-Step1.5" / "Qwen3-Embedding-0.6B"
     model = path / "model.safetensors"
     if not model.is_file():
         pytest.skip("official ACE-Step Qwen3 embedding tensors are still downloading")
@@ -274,9 +273,7 @@ def test_qwen3_encoder_cuda_graph_replay(tmp_path):
 
 
 def test_official_qwen3_embedding_finite_bf16_cuda():
-    path = Path(
-        "/home/twidmer/.cache/warp-nn/models/ACE-Step/Ace-Step1.5/Qwen3-Embedding-0.6B"
-    )
+    path = local_model_root() / "ACE-Step" / "Ace-Step1.5" / "Qwen3-Embedding-0.6B"
     if not (path / "model.safetensors").is_file():
         pytest.skip("official ACE-Step Qwen3 embedding tensors are still downloading")
     if not wp.is_cuda_available():

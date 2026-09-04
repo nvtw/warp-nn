@@ -2,14 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
-from pathlib import Path
 
 import numpy as np
 import pytest
 import warp as wp
 
 from tests.runtime.test_qwen3_encoder import _write_safetensors
-from tests.utilities import is_device_available
+from tests.utilities import is_device_available, local_model_root
 from warp_nn.runtime.ace_step.conditioning import (
     AceStepConditionEncoder,
     condition_weight_names,
@@ -169,7 +168,7 @@ def test_condition_encoder_exact_timbre_pool_and_stable_pack(tmp_path):
 
 @pytest.mark.skipif(not is_device_available("cuda:0"), reason="CUDA unavailable")
 def test_official_condition_encoder_bf16_finite_cuda():
-    root = Path("/home/twidmer/.cache/warp-nn/models/ACE-Step/Ace-Step1.5")
+    root = local_model_root() / "ACE-Step" / "Ace-Step1.5"
     path = root / "acestep-v15-turbo"
     silence_path = path / "silence_latent.pt"
     if not (path / "model.safetensors").is_file() or not silence_path.is_file():
