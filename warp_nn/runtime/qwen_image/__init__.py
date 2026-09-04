@@ -22,7 +22,11 @@ from .prompt import (
     format_qwen_image_prompt,
     tokenize_qwen_image_prompt,
 )
-from .pipeline import QwenImage2512Pipeline, qwen_image_to_rgb8
+from .pipeline import (
+    QwenImage2512Pipeline,
+    qwen_image_batch_to_rgb8,
+    qwen_image_to_rgb8,
+)
 from .runner import (
     QWEN_IMAGE_2512_RESOLUTIONS,
     FlowMatchEulerConfig,
@@ -66,6 +70,7 @@ __all__ = [
     "prepare_qwen_image_vae_decoder_weights",
     "qwen_image_mmdit_workspace_bytes",
     "qwen_image_rotary_coordinates",
+    "qwen_image_batch_to_rgb8",
     "qwen_image_to_rgb8",
     "qwen_image_2512_vae_decoder_weight_specs",
 ]

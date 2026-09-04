@@ -183,3 +183,9 @@ def test_seeded_normal_is_device_deterministic():
     third = seeded_normal((2, 7), seed=42, dtype=wp.float32, device="cpu")
     np.testing.assert_array_equal(first.numpy(), second.numpy())
     assert not np.array_equal(first.numpy(), third.numpy())
+
+    batched = seeded_normal((2, 7), seed=[41, 42], dtype=wp.float32, device="cpu")
+    np.testing.assert_array_equal(batched.numpy()[0], first.numpy()[0])
+    np.testing.assert_array_equal(batched.numpy()[1], third.numpy()[0])
+    with pytest.raises(ValueError, match="one integer seed"):
+        seeded_normal((2, 7), seed=[41], dtype=wp.float32, device="cpu")

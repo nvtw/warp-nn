@@ -230,6 +230,39 @@ def test_tiny_mmdit_matches_numpy_and_replays_captured_graph():
     np.testing.assert_allclose(plan.output.numpy(), expected, rtol=0.08, atol=0.04)
 
 
+@pytest.mark.skipif(not is_device_available("cuda:0"), reason="CUDA is unavailable")
+def test_tiny_mmdit_batch_matches_numpy():
+    config = _config()
+    rng = np.random.default_rng(403)
+    weights = _weights(config, rng)
+    arrays = {name: value.numpy() for name, value in weights.items()}
+    image_values = rng.normal(0.0, 0.2, (2, 4, 4)).astype(np.float32)
+    text_values = rng.normal(0.0, 0.2, (2, 3, 8)).astype(np.float32)
+    valid_values = np.array([[True, True, False], [True, False, False]])
+    timestep_values = np.array([0.6, 0.25], dtype=np.float32)
+    plan = QwenImageMMDiTPlan(
+        wp.array(image_values, dtype=wp.bfloat16, device="cuda:0"),
+        wp.array(text_values, dtype=wp.bfloat16, device="cuda:0"),
+        wp.array(valid_values, dtype=wp.bool, device="cuda:0"),
+        wp.array(timestep_values, dtype=wp.float32, device="cuda:0"),
+        weights,
+        config,
+        2,
+        2,
+    )
+    expected = _reference(
+        image_values,
+        text_values,
+        valid_values,
+        timestep_values,
+        arrays,
+        config,
+        2,
+        2,
+    )
+    np.testing.assert_allclose(plan.execute().numpy(), expected, rtol=0.08, atol=0.04)
+
+
 def test_official_workspace_is_bounded_independent_of_layer_count():
     official = QwenImageTransformerConfig(
         patch_size=2,

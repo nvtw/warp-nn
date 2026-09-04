@@ -10,7 +10,9 @@ def test_generation_examples_share_interactive_defaults(tmp_path, capsys):
     assert ace_parser().parse_args(["model"]).auto_open
     assert ace_parser().parse_args(["model"]).progress
     assert image_parser().parse_args(["model"]).auto_open
-    assert image_parser().parse_args(["model"]).progress
+    image_args = image_parser().parse_args(["model"])
+    assert image_args.progress
+    assert image_args.num_images == 4
     assert parse_toggle("", True) is False
     assert parse_toggle("on", False) is True
     assert parse_toggle("off", True) is False

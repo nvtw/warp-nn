@@ -9,6 +9,7 @@ import warp_nn.runtime.qwen_image.pipeline as pipeline_module
 from warp_nn.runtime.qwen_image.pipeline import (
     QwenImage2512Pipeline,
     _padded_conditioning,
+    qwen_image_batch_to_rgb8,
     qwen_image_to_rgb8,
 )
 
@@ -22,6 +23,15 @@ def test_padded_conditioning_stays_on_device_and_marks_valid_tokens():
     np.testing.assert_array_equal(neg_valid.numpy(), [[True, False]])
     np.testing.assert_allclose(neg.numpy()[:, 1], 0.0)
 
+    pos, pos_valid, neg, neg_valid = _padded_conditioning(
+        positive, negative, batch_size=3
+    )
+    assert pos.shape == neg.shape == (3, 2, 3)
+    np.testing.assert_allclose(pos.numpy(), 1.0)
+    np.testing.assert_allclose(neg.numpy()[:, 0], 2.0)
+    np.testing.assert_array_equal(pos_valid.numpy(), [[True, True]] * 3)
+    np.testing.assert_array_equal(neg_valid.numpy(), [[True, False]] * 3)
+
 
 def test_qwen_image_output_conversion_has_exact_endpoints_and_layout():
     sample = np.array([[[[-1.0, 1.0]], [[0.0, 0.0]], [[1.0, -1.0]]]])
@@ -31,6 +41,52 @@ def test_qwen_image_output_conversion_has_exact_endpoints_and_layout():
     sample[0, 0, 0, 0] = np.nan
     with pytest.raises(ValueError, match="non-finite"):
         qwen_image_to_rgb8(sample)
+
+    batch = qwen_image_batch_to_rgb8(np.zeros((3, 3, 1, 2), dtype=np.float32))
+    assert batch.shape == (3, 1, 2, 3)
+    with pytest.raises(ValueError, match="batch size one"):
+        qwen_image_to_rgb8(np.zeros((2, 3, 1, 2), dtype=np.float32))
+
+
+def test_decode_batch_reuses_one_bounded_decoder(monkeypatch, tmp_path):
+    constructions = []
+
+    class Decoder:
+        def __init__(self):
+            self.input = wp.empty((1, 3, 1, 2), dtype=wp.float32)
+            self.output = wp.empty_like(self.input)
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            constructions.append(kwargs["batch_size"])
+            return cls()
+
+        def execute(self):
+            self.output.assign(self.input)
+            return self.output
+
+    class Bundle:
+        root = tmp_path
+
+    monkeypatch.setattr(pipeline_module, "QwenImage2512VAEDecoder", Decoder)
+    pipeline = object.__new__(QwenImage2512Pipeline)
+    pipeline.bundle = Bundle()
+    pipeline.device = wp.get_device("cpu")
+    pipeline.resident = True
+    latent = wp.array(
+        np.array(
+            [
+                [[[-1.0, 1.0]], [[0.0, 0.0]], [[1.0, -1.0]]],
+                [[[1.0, -1.0]], [[0.0, 0.0]], [[-1.0, 1.0]]],
+            ],
+            dtype=np.float32,
+        )
+    )
+    images = pipeline.decode_batch(latent)
+    assert constructions == [1]
+    assert images.shape == (2, 1, 2, 3)
+    np.testing.assert_array_equal(images[0, 0, 0], [0, 128, 255])
+    np.testing.assert_array_equal(images[1, 0, 0], [255, 128, 0])
 
 
 def test_prompt_encoding_owns_equal_length_positive_before_negative(monkeypatch):
@@ -192,3 +248,21 @@ def test_denoise_does_not_overwrite_positive_conditioning(monkeypatch, tmp_path)
         )
     assert not calls
     assert len(loads) == 1
+
+    calls.clear()
+    positive_batch = wp.array(np.ones((2, 2, 3)), dtype=wp.bfloat16)
+    negative_batch = wp.array(np.full((2, 2, 3), 2.0), dtype=wp.bfloat16)
+    valid_batch = wp.array(np.ones((2, 2), dtype=bool), dtype=wp.bool)
+    latent = pipeline.denoise(
+        positive_batch,
+        valid_batch,
+        negative_batch,
+        valid_batch,
+        width=8,
+        height=8,
+        steps=2,
+        true_cfg_scale=1.0,
+        seed=[71, 72],
+    )
+    assert latent.shape == (2, 1, 4, 4)
+    assert calls == [1.0, 1.0]

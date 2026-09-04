@@ -26,6 +26,7 @@ from warp_nn.runtime.kernels import (
     _merge_attention_heads_kernel,
     _rotary_cache_kernel,
     _sequence_slice_kernel,
+    _seeded_normal_batch_kernel,
     _seeded_normal_kernel,
     _sinusoidal_embedding_kernel,
     _split_attention_heads_kernel,
@@ -2184,6 +2185,22 @@ def seeded_normal(shape, *, seed=0, dtype=wp.bfloat16, device=None):
     if dtype not in (wp.float16, wp.bfloat16, wp.float32):
         raise TypeError("normal noise requires FP16, BF16, or FP32 output")
     output = wp.empty(shape, dtype=dtype, device=device)
+    if not np.isscalar(seed):
+        seeds = np.asarray(seed)
+        if seeds.shape != (shape[0],) or not np.issubdtype(seeds.dtype, np.integer):
+            raise ValueError("normal noise requires one integer seed per batch row")
+        if np.any(seeds < np.iinfo(np.int32).min) or np.any(
+            seeds > np.iinfo(np.int32).max
+        ):
+            raise ValueError("normal noise seeds must fit in signed 32-bit integers")
+        device_seeds = wp.array(seeds.astype(np.int32), device=output.device)
+        wp.launch(
+            _seeded_normal_batch_kernel(dtype),
+            dim=output.size,
+            inputs=[output.flatten(), device_seeds, output.size // shape[0]],
+            device=output.device,
+        )
+        return output
     wp.launch(
         _seeded_normal_kernel(dtype),
         dim=output.size,

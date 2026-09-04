@@ -4204,6 +4204,25 @@ def _seeded_normal_kernel(dtype: type):
 
 
 @lru_cache(maxsize=None)
+def _seeded_normal_batch_kernel(dtype: type):
+    """Return independently seeded standard-normal filling by batch row."""
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def fill(
+        output: wp.array1d(dtype=DTYPE),
+        seeds: wp.array1d(dtype=wp.int32),
+        values_per_batch: int,
+    ):
+        index = wp.tid()
+        batch = index / values_per_batch
+        state = wp.rand_init(seeds[batch], index - batch * values_per_batch)
+        output[index] = DTYPE(wp.randn(state))
+
+    return fill
+
+
+@lru_cache(maxsize=None)
 def _temporal_conv2d_slice_kernel(dtype: type):
     """Extract one OITHW temporal plane into a contiguous OIHW weight."""
     DTYPE = dtype

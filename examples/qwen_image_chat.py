@@ -37,6 +37,12 @@ def _parser():
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--true-cfg-scale", type=float, default=4.0)
     parser.add_argument("--seed", type=int, default=0, help="seed for the first image")
+    parser.add_argument(
+        "--num-images",
+        type=int,
+        default=4,
+        help="candidates generated together per prompt (default: 4; maximum: 8)",
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument("--no-cublas", action="store_true")
     parser.add_argument(
@@ -74,6 +80,7 @@ def _parser():
 def _help():
     print("Commands:")
     print("  /open [on|off]      toggle or set automatic opening")
+    print("  /num-images [1-8]   show or set candidates per prompt")
     print("  /progress [on|off]  toggle or set the progress bar")
     print("  /help               show this help")
     print("  /quit (/exit)       close the session")
@@ -96,6 +103,8 @@ def main(argv=None):
     width = preset_width if args.width is None else args.width
     height = preset_height if args.height is None else args.height
     bundle.latent_geometry(width, height)
+    if not 1 <= args.num_images <= 8:
+        raise ValueError("--num-images must be between 1 and 8")
 
     print("Preparing Qwen-Image pipeline...", flush=True)
     pipeline = QwenImage2512Pipeline(
@@ -106,7 +115,8 @@ def main(argv=None):
     )
     auto_open = args.auto_open
     show_progress = args.progress
-    generation = 0
+    next_seed = args.seed
+    num_images = args.num_images
     print(f"Ready on {pipeline.device}; the pipeline stays alive between prompts.")
     print(
         "Large weights remain on GPU; use --no-resident if memory is limited."
@@ -131,6 +141,20 @@ def main(argv=None):
         if command == "/help" and not value:
             _help()
             continue
+        if command == "/num-images":
+            if not value:
+                print(f"Candidates per prompt: {num_images}")
+                continue
+            try:
+                requested = int(value)
+            except ValueError:
+                requested = 0
+            if not 1 <= requested <= 8:
+                print("Usage: /num-images N, where N is between 1 and 8")
+                continue
+            num_images = requested
+            print(f"Candidates per prompt: {num_images}")
+            continue
         if command in ("/open", "/progress"):
             current = auto_open if command == "/open" else show_progress
             try:
@@ -150,35 +174,44 @@ def main(argv=None):
             print(f"Unknown command: {command}. Use /help for available commands.")
             continue
 
-        seed = args.seed + generation
+        seeds = list(range(next_seed, next_seed + num_images))
         progress = TerminalProgress("Denoising", enabled=show_progress)
         print(
-            f"Generating {width}x{height} image ({args.steps} steps, seed {seed})...",
+            f"Generating {num_images} × {width}x{height} candidates "
+            f"({args.steps} steps, seeds {seeds[0]}-{seeds[-1]})...",
             flush=True,
         )
         started = time.perf_counter()
         try:
-            image = pipeline.generate(
+            images = pipeline.generate_batch(
                 prompt,
+                num_images=num_images,
                 negative_prompt=args.negative_prompt,
                 width=width,
                 height=height,
                 steps=args.steps,
                 true_cfg_scale=args.true_cfg_scale,
-                seed=seed,
+                seed=seeds,
                 vae_tiling=args.vae_tiling,
                 progress=progress,
             )
-            destination = output_path(args.output_dir, prompt, ".png")
-            write_png_rgb8(destination, image)
+            destinations = []
+            for image, seed in zip(images, seeds):
+                destination = output_path(
+                    args.output_dir, f"{prompt} seed {seed}", ".png"
+                ).resolve()
+                write_png_rgb8(destination, image)
+                destinations.append(destination)
         except Exception as error:
             print(f"Generation failed: {error}")
             continue
-        generation += 1
-        destination = destination.resolve()
-        print(f"Output: {destination} ({time.perf_counter() - started:.1f}s)")
-        if auto_open:
-            _try_open(destination)
+        next_seed += num_images
+        elapsed = time.perf_counter() - started
+        print(f"Generated {num_images} candidates in {elapsed:.1f}s:")
+        for seed, destination in zip(seeds, destinations):
+            print(f"  seed {seed}: {destination}")
+            if auto_open:
+                _try_open(destination)
     return 0
 
 
