@@ -18,6 +18,7 @@ from warp_nn.runtime.ace_step.planner import (
     audio_code_from_token_id,
     audio_code_token_id,
     format_planner_prompt,
+    format_planner_unconditional_prompt,
     fsq_indices_to_codes,
     parse_planner_metadata,
 )
@@ -57,6 +58,10 @@ def test_planner_prompt_and_metadata_contract():
         "warm piano", "[Instrumental]", cot="bpm: 84\nkeyscale: C major"
     )
     assert phase_two.endswith("</think>\n\n")
+    assert format_planner_unconditional_prompt().endswith(
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    )
+    assert "\nNO USER INPUT<|im_end|>\n" in format_planner_unconditional_prompt()
     assert parse_planner_metadata(
         "bpm: 84\nduration: 12\nkey: C major\ntime_signature: 4"
     ) == {
@@ -103,7 +108,11 @@ def test_two_phase_planner_enforces_audio_vocabulary_and_rate():
     runner = _FakeRunner()
     planner = AceStepPlanner(runner)
     result = planner.generate(
-        "piano", "[Instrumental]", duration_seconds=0.4, temperature=0.0
+        "piano",
+        "[Instrumental]",
+        duration_seconds=0.4,
+        temperature=0.0,
+        cfg_scale=1.0,
     )
     assert result.cot == "bpm: 120\nduration: 0.4"
     assert result.metadata == {"bpm": "120", "duration": "0.4"}

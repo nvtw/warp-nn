@@ -218,27 +218,34 @@ class Qwen3CausalLM(AutoregressiveRunner):
         self.cublas = (
             try_create_cublas() if use_cublas and self.device.is_cuda else None
         )
+        self._initialize_execution_state()
+
+    def _initialize_execution_state(self, rotary=None) -> None:
+        """Allocate one independent KV/sampling state over shared immutable weights."""
         self.sequence_end = wp.zeros(1, dtype=wp.int32, device=self.device)
         self.conv_states = {}
         self.recurrent_states = {}
         cache_shape = (self.kv_heads * self.cache_capacity, self.head_dim)
         self.kv_caches = {
             index: (
-                wp.empty(cache_shape, dtype=dtype, device=self.device),
-                wp.empty(cache_shape, dtype=dtype, device=self.device),
+                wp.empty(cache_shape, dtype=self.dtype, device=self.device),
+                wp.empty(cache_shape, dtype=self.dtype, device=self.device),
             )
             for index in range(self.layers)
         }
-        cos, sin = rotary_cache_values(
-            self.cache_capacity,
-            self.head_dim,
-            {
-                "rope_theta": float(self.config.get("rope_theta", 1_000_000.0)),
-                "rope_type": "default",
-            },
-        )
-        self.cos_cache = wp.array(cos, dtype=dtype, device=self.device)
-        self.sin_cache = wp.array(sin, dtype=dtype, device=self.device)
+        if rotary is None:
+            cos, sin = rotary_cache_values(
+                self.cache_capacity,
+                self.head_dim,
+                {
+                    "rope_theta": float(self.config.get("rope_theta", 1_000_000.0)),
+                    "rope_type": "default",
+                },
+            )
+            self.cos_cache = wp.array(cos, dtype=self.dtype, device=self.device)
+            self.sin_cache = wp.array(sin, dtype=self.dtype, device=self.device)
+        else:
+            self.cos_cache, self.sin_cache = rotary
         self._decode_plan = _Qwen3CausalPlan(self, 1)
         self._chunk_plan = _Qwen3CausalPlan(self, self.prefill_chunk_size)
         self._chunk_plan._capture_ready = False
@@ -247,6 +254,32 @@ class Qwen3CausalLM(AutoregressiveRunner):
         self._initialize_sampling()
         self.sequence_length = 0
         self.rope_delta = 0
+
+    def fork_state(self) -> Qwen3CausalLM:
+        """Create an independent causal state without duplicating model weights."""
+        other = object.__new__(type(self))
+        for name in (
+            "config",
+            "model_path",
+            "device",
+            "dtype",
+            "cache_capacity",
+            "prefill_chunk_size",
+            "hidden_size",
+            "layers",
+            "query_heads",
+            "kv_heads",
+            "head_dim",
+            "epsilon",
+            "qk_norm",
+            "attention_bias",
+            "weights",
+            "tokenizer",
+            "cublas",
+        ):
+            setattr(other, name, getattr(self, name))
+        other._initialize_execution_state((self.cos_cache, self.sin_cache))
+        return other
 
     def _validate_ids(self, token_ids: Sequence[int]) -> None:
         values = np.asarray(token_ids)

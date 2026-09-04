@@ -207,7 +207,11 @@ def test_qwen3_causal_prefill_decode_matches_full_reference(tmp_path):
         prefill_chunk_size=2,
         use_cublas=False,
     )
+    fork = runner.fork_state()
+    assert fork.weights is runner.weights
     logits = runner.prefill([3, 9, 4]).numpy()[0, 0]
+    fork_logits = fork.prefill([3, 9, 4]).numpy()[0, 0]
+    np.testing.assert_array_equal(fork_logits, logits)
     expected = _reference([3, 9, 4], config, weights)[-1]
     np.testing.assert_allclose(
         logits,
@@ -216,6 +220,7 @@ def test_qwen3_causal_prefill_decode_matches_full_reference(tmp_path):
         atol=4.0e-3,
     )
     decoded = runner.decode(7).numpy()[0, 0]
+    assert fork.sequence_length == 3
     expected = _reference([3, 9, 4, 7], config, weights)[-1]
     np.testing.assert_allclose(
         decoded,

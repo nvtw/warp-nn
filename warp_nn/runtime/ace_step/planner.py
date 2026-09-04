@@ -88,6 +88,16 @@ def format_planner_prompt(caption: str, lyrics: str, *, cot: str | None = None) 
     return prefix + f"<think>\n{body.strip()}\n</think>\n\n"
 
 
+def format_planner_unconditional_prompt() -> str:
+    """Format the checkpoint's training-aligned empty phase-two CFG branch."""
+    return (
+        "<|im_start|>system\n# Instruction\n"
+        f"{DEFAULT_PLANNER_INSTRUCTION}\n\n<|im_end|>\n"
+        "<|im_start|>user\nNO USER INPUT<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    )
+
+
 def parse_planner_metadata(cot: str) -> dict[str, str]:
     """Extract the official small metadata vocabulary from planner reasoning."""
     result = {}
@@ -133,6 +143,7 @@ class AceStepPlanner:
         if len(encoded) != 1:
             raise ValueError("planner tokenizer must encode </think> as one token")
         self.think_end_token = encoded[0]
+        self._unconditional_runner = None
 
     def generate_cot(
         self,
@@ -141,7 +152,7 @@ class AceStepPlanner:
         *,
         max_tokens: int = 256,
         temperature: float = 0.85,
-        top_k: int = 32,
+        top_k: int = 0,
         top_p: float = 0.9,
         rng: np.random.Generator | None = None,
     ) -> str:
@@ -177,24 +188,52 @@ class AceStepPlanner:
         *,
         duration_seconds: float,
         temperature: float = 0.85,
-        top_k: int = 32,
+        top_k: int = 0,
         top_p: float = 0.9,
+        cfg_scale: float = 2.0,
         rng: np.random.Generator | None = None,
     ) -> tuple[int, ...]:
         """Generate exactly five grammar-constrained semantic codes per second."""
         if not math.isfinite(duration_seconds) or duration_seconds <= 0.0:
             raise ValueError("planner duration must be a positive finite value")
+        if not math.isfinite(cfg_scale) or cfg_scale < 0.0:
+            raise ValueError("planner CFG scale must be finite and nonnegative")
         count = max(1, int(duration_seconds * 5.0))
         prompt = format_planner_prompt(caption, lyrics, cot=cot)
         logits = self.runner.prefill(self.runner.tokenizer.encode(prompt))
+        unconditional = None
+        unconditional_logits = None
+        if cfg_scale != 1.0:
+            if self._unconditional_runner is None:
+                self._unconditional_runner = self.runner.fork_state()
+            unconditional = self._unconditional_runner
+            unconditional_logits = unconditional.prefill(
+                unconditional.tokenizer.encode(format_planner_unconditional_prompt())
+            )
         result = []
         rng = rng or np.random.default_rng()
         for index in range(count):
-            if temperature <= 0.0 or top_k == 1:
+            if unconditional is not None:
+                positive = logits.flatten()[
+                    AUDIO_CODE_TOKEN_BASE:AUDIO_CODE_TOKEN_STOP
+                ].numpy()
+                negative = unconditional_logits.flatten()[
+                    AUDIO_CODE_TOKEN_BASE:AUDIO_CODE_TOKEN_STOP
+                ].numpy()
+                values = negative + cfg_scale * (positive - negative)
+                selected = sample_token(
+                    values,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    rng=rng,
+                )
+                token = AUDIO_CODE_TOKEN_BASE + selected
+            elif temperature <= 0.0 or top_k == 1:
                 token = self.runner.sample_greedy_range(
                     logits, AUDIO_CODE_TOKEN_BASE, AUDIO_CODE_TOKEN_STOP
                 )
-            else:
+            elif 1 < top_k <= 32:
                 values, candidates = self.runner.read_top_k_range(
                     logits,
                     AUDIO_CODE_TOKEN_BASE,
@@ -208,9 +247,23 @@ class AceStepPlanner:
                     rng=rng,
                 )
                 token = int(candidates[selected])
+            else:
+                values = logits.flatten()[
+                    AUDIO_CODE_TOKEN_BASE:AUDIO_CODE_TOKEN_STOP
+                ].reshape((1, 1, AUDIO_CODE_COUNT))
+                selected = sample_token(
+                    values,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    rng=rng,
+                )
+                token = AUDIO_CODE_TOKEN_BASE + selected
             result.append(audio_code_from_token_id(token))
             if index + 1 < count:
                 logits = self.runner.decode(token)
+                if unconditional is not None:
+                    unconditional_logits = unconditional.decode(token)
         return tuple(result)
 
     def generate(
@@ -220,8 +273,9 @@ class AceStepPlanner:
         *,
         duration_seconds: float,
         temperature: float = 0.85,
-        top_k: int = 32,
+        top_k: int = 0,
         top_p: float = 0.9,
+        cfg_scale: float = 2.0,
         seed: int | None = None,
     ) -> AcePlannerResult:
         rng = np.random.default_rng(seed)
@@ -242,6 +296,7 @@ class AceStepPlanner:
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
+            cfg_scale=cfg_scale,
             rng=rng,
         )
         return AcePlannerResult(cot, parse_planner_metadata(cot), codes)
