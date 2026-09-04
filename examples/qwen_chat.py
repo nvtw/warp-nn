@@ -264,10 +264,7 @@ def main():
     parser.add_argument(
         "--multimodal",
         action="store_true",
-        help=(
-            "Enable /image commands when vision weights are embedded in the "
-            "model directory"
-        ),
+        help="Enable embedded image/audio/video encoders supported by the model",
     )
     parser.add_argument(
         "--yarn",
