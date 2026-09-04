@@ -14,6 +14,9 @@ from warp_nn.runtime.nemotron.runner import (
     _validate_config,
     _weight_names,
 )
+from warp_nn.runtime.nemotron.omni import NemotronMultimodalPrompt
+from warp_nn.runtime.nemotron.video import NemotronVideo
+from warp_nn.runtime.nemotron.vision import NemotronImage
 from warp_nn.runtime.formats.safetensors import SafeTensorArchive, SafeTensorNamespace
 
 from warp_nn.runtime.operators import SparseExpertPlan
@@ -204,6 +207,55 @@ def test_nested_bf16_moe_prefill_and_embedding_override(tmp_path):
     assert ordinary.shape == overridden.shape == (1, 2, 8)
     assert np.isfinite(overridden).all()
     assert not np.allclose(ordinary, overridden)
+
+
+def test_video_pruning_remaps_prompt_positions_without_host_embeddings():
+    runner = object.__new__(NemotronHRunner)
+    runner.hidden_size = 4
+    runner.dtype = wp.float32
+    runner.device = wp.get_device("cpu")
+    runner.video_pruning_rate = 0.5
+    frames = tuple(
+        NemotronImage(np.zeros((3, 4, 8), dtype=np.float32), (2, 4)) for _ in range(4)
+    )
+    video = NemotronVideo(frames, 2.0, (0, 1, 2, 3))
+    embeddings = wp.array(
+        np.array(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [-1.0, 0.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        device="cpu",
+    )
+    runner._vision_encoder_instance = type(
+        "FakeVision", (), {"encode_video": lambda self, media: embeddings}
+    )()
+    captured = {}
+
+    def prefill(token_ids, values, positions):
+        captured.update(
+            token_ids=tuple(token_ids),
+            values=values.numpy(),
+            positions=tuple(positions),
+        )
+        return values
+
+    runner.prefill_with_embeddings = prefill
+    prompt = NemotronMultimodalPrompt(
+        tuple(range(10)),
+        (),
+        (),
+        videos=(video,),
+        video_starts=((1, 6),),
+    )
+    runner.prefill_multimodal(prompt)
+    assert captured["token_ids"] == (0, 1, 2, 3, 4, 5, 8, 9)
+    assert captured["positions"] == (1, 2)
+    np.testing.assert_array_equal(captured["values"], embeddings.numpy()[:2])
 
 
 def test_nemotron_omni_bf16_language_manifest():
