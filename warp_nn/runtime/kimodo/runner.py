@@ -1475,8 +1475,15 @@ def save_motion_npz(path, motion, *, fps):
     missing = [name for name in required if name not in motion]
     if missing:
         raise ValueError(f"decoded motion is missing: {', '.join(missing)}")
+    posed = np.asarray(motion["posed_joints"])
+    batched = posed.ndim == 4
+    if batched and posed.shape[0] != 1:
+        raise ValueError("save_motion_npz expects one motion, not a batch")
     np.savez_compressed(
         path,
         fps=np.float32(fps),
-        **{name: np.asarray(value) for name, value in motion.items()},
+        **{
+            name: np.asarray(value)[0] if batched else np.asarray(value)
+            for name, value in motion.items()
+        },
     )

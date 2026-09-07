@@ -78,16 +78,17 @@ input_first_heading_angle: true
         np.save(folder / "mean.npy", np.zeros(width, dtype=np.float32))
         np.save(folder / "std.npy", np.ones(width, dtype=np.float32))
     stats = KimodoStats.load(tmp_path / "stats")
-    features = np.zeros((2, config.motion_dim), dtype=np.float32)
+    features = np.zeros((1, 2, config.motion_dim), dtype=np.float32)
     decoded = decode_motion_features(features, stats, config.joints)
-    assert decoded["posed_joints"].shape == (2, config.joints, 3)
-    assert decoded["posed_joints_from_positions"].shape == (2, config.joints, 3)
-    assert decoded["local_rot_mats"].shape == (2, config.joints, 3, 3)
-    assert decoded["global_rot_mats"].shape == (2, config.joints, 3, 3)
+    assert decoded["posed_joints"].shape == (1, 2, config.joints, 3)
+    assert decoded["posed_joints_from_positions"].shape == (1, 2, config.joints, 3)
+    assert decoded["local_rot_mats"].shape == (1, 2, config.joints, 3, 3)
+    assert decoded["global_rot_mats"].shape == (1, 2, config.joints, 3, 3)
     output = tmp_path / "motion.npz"
     save_motion_npz(output, decoded, fps=config.fps)
     with np.load(output) as saved:
         assert saved["fps"] == 30 and "root_positions" in saved
+        assert saved["posed_joints"].shape == (2, config.joints, 3)
 
 
 def test_motion_condition_root_and_ddim_cpu():
