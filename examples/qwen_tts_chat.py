@@ -1,7 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generate successive Qwen3-TTS utterances in a resident terminal session."""
+"""Generate successive Qwen3-TTS utterances in a resident terminal session.
+
+Model: ``Qwen/Qwen3-TTS-12Hz-1.7B-Base`` from Hugging Face. Download it with::
+
+    hf download Qwen/Qwen3-TTS-12Hz-1.7B-Base --local-dir ~/Models/warp-nn/Qwen/Qwen3-TTS-12Hz-1.7B-Base
+"""
 
 from __future__ import annotations
 

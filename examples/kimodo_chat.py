@@ -3,12 +3,15 @@
 
 """Generate and preview Kimodo motions in a resident terminal session.
 
-Models: ``nvidia/Kimodo-SOMA-RP-v1.1``, ``meta-llama/Meta-Llama-3-8B-Instruct``,
-and the MNTP plus supervised adapters under ``McGill-NLP`` on Hugging Face.
-Download those repositories with ``huggingface-cli download REPOSITORY --local-dir PATH``.
-The Meta checkpoint requires accepting its Hugging Face license first.
+Models: ``nvidia/Kimodo-SOMA-RP-v1.1``, gated
+``meta-llama/Meta-Llama-3-8B-Instruct``,
+``McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp``, and its
+``-mntp-supervised`` adapter on Hugging Face. Download each with::
+
+    hf download REPOSITORY --local-dir ~/Models/warp-nn/OWNER/NAME
+
 Skinned mode additionally needs ``VAST-AI/SkinTokens`` and a CC0 MakeHuman
-male OBJ exported with its joint vertex groups.
+male OBJ exported with its joint vertex groups; see ``kimodo_skinned_chat.py``.
 """
 
 from __future__ import annotations
@@ -67,7 +70,7 @@ def _parser(*, quadruped=False, skinned=False, description=None):
         parser.add_argument(
             "mesh",
             type=Path,
-            help="MakeHuman base.obj containing body and joint groups",
+            help="MakeHuman male OBJ containing body and joint vertex groups",
         )
         parser.add_argument(
             "--rig-cache",

@@ -1,7 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Dependency-free interactive client for the warp-nn OpenAI endpoint."""
+"""Dependency-free interactive client for the warp-nn OpenAI endpoint.
+
+No local model is needed. Start ``examples/openai_server.py`` with one of the
+models documented by that command's ``--help``, then connect to its printed URL.
+"""
 
 import argparse
 import json
@@ -49,6 +53,7 @@ def main():
         models = _json_request(url + "/models", args.api_key)
         model = args.model or models["data"][0]["id"]
         print(f"Connected to {url} · model {model} · /quit to exit")
+        print("Use /help to show client commands.")
         messages = []
         while True:
             prompt = input("You: ").strip()
@@ -56,6 +61,13 @@ def main():
                 continue
             if prompt in ("/quit", "/exit"):
                 break
+            if prompt == "/help":
+                print("Commands: /help, /clear, /quit (/exit)")
+                continue
+            if prompt == "/clear":
+                messages.clear()
+                print("Started a new conversation.")
+                continue
             messages.append({"role": "user", "content": prompt})
             response = _json_request(
                 url + "/chat/completions",

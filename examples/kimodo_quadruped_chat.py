@@ -4,11 +4,17 @@
 """Generate dog motions from text in a resident interactive session.
 
 This combines ``nvidia/Kimodo-SOMA-RP-v1.1`` with PAN's released LAFAN-to-dog
-retargeter. Kimodo, ``meta-llama/Meta-Llama-3-8B-Instruct``, and both McGill-NLP
-LLM2Vec adapters can be downloaded from Hugging Face with
-``huggingface-cli download REPOSITORY --local-dir PATH``. Obtain PAN's compact
-``lafan1dog`` model archive from its official repository:
-https://github.com/hlcdyy/pan-motion-retargeting
+retargeter. It also needs gated ``meta-llama/Meta-Llama-3-8B-Instruct`` and the
+``McGill-NLP`` adapters ``LLM2Vec-Meta-Llama-3-8B-Instruct-mntp`` and
+``LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised``. Download each Hugging
+Face repository with::
+
+    hf download REPOSITORY --local-dir ~/Models/warp-nn/OWNER/NAME
+
+Clone PAN's official repository, then download ``pretrained_lafan1dog.zip``
+from the checkpoint link in its README and pass the extracted directory::
+
+    git clone --depth 1 https://github.com/hlcdyy/pan-motion-retargeting.git
 
 Run this file with ``--help`` for the positional model paths and all options.
 The generated result is a standalone HTML motion viewer; only Three.js is

@@ -1,7 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Chat with a supported local model in a terminal."""
+"""Chat with a tested Qwen3.8, Muse-Glimmer, or Nemotron Omni checkpoint.
+
+Download the wanted Hugging Face repository to the standard local model root::
+
+    hf download unsloth/Qwen3.8-27B-GGUF --include '*BF16*.gguf' mmproj-F16.gguf --local-dir ~/Models/warp-nn/Qwen/Qwen3.8-27B-GGUF
+    hf download esatapedico/Qwen3.8-27B-NVFP4-MTP-GGUF --local-dir ~/Models/warp-nn/Qwen/Qwen3.8-27B-NVFP4-MTP-GGUF
+    hf download unsloth/Muse-Glimmer-30B-GGUF --local-dir ~/Models/warp-nn/unsloth/Muse-Glimmer-30B-GGUF
+    hf download nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 --local-dir ~/Models/warp-nn/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+    hf download nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4 --local-dir ~/Models/warp-nn/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4
+
+Qwen vision uses ``mmproj-F16.gguf`` via ``--vision-path``; Nemotron Omni's
+image/audio/video encoders are included and enabled with ``--multimodal``.
+"""
 
 import argparse
 import atexit
@@ -240,8 +252,25 @@ def _portable_history(document):
     return messages
 
 
+def _help(multimodal: bool, omni: bool, coding_tools: bool) -> None:
+    print("Commands:")
+    print("  /clear              start a new chat (the current chat stays saved)")
+    print("  /resume [NUMBER|ID] list or resume an automatically saved chat")
+    if multimodal:
+        print("  /image PATH [TEXT]  queue an image or ask about it immediately")
+        if omni:
+            print("  /audio PATH [TEXT]  queue audio or ask about it immediately")
+            print("  /video PATH [TEXT]  queue video or ask about it immediately")
+        print("  /media              list queued attachments")
+        print("  /clear-media        discard queued attachments")
+    if coding_tools:
+        print("  coding tools are requested naturally in the prompt")
+    print("  /help               show this help")
+    print("  /quit (/exit)       save and close the chat")
+
+
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "model_dir",
         type=Path,
@@ -425,8 +454,15 @@ def main():
             break
         if not prompt:
             continue
-        if prompt == "/exit":
+        if prompt in ("/quit", "/exit"):
             break
+        if prompt == "/help":
+            _help(
+                processor is not None,
+                hasattr(processor, "audio_config"),
+                coding_tools is not None,
+            )
+            continue
         if prompt == "/resume" or prompt.startswith("/resume "):
             save_session()
             document = _resume_session(session_store, prompt)

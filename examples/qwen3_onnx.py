@@ -1,7 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run dependency-free greedy generation with a Qwen3 ONNX model."""
+"""Run dependency-free greedy generation with Qwen3-8B ONNX.
+
+Model: ``onnx-community/Qwen3-8B-ONNX`` on Hugging Face. Download its CUDA
+INT4 variant, then pass the resulting ``cuda-int4-kld-block-128`` directory::
+
+    hf download onnx-community/Qwen3-8B-ONNX --include 'onnxruntime/cuda/cuda-int4-kld-block-128/*' --local-dir ~/Models/warp-nn/Qwen/Qwen3-8B-ONNX
+"""
 
 import argparse
 from pathlib import Path
@@ -10,8 +16,12 @@ from warp_nn.runtime import Qwen3OnnxRunner, Qwen3Tokenizer
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("model_dir", type=Path, help="Directory containing model.onnx and tokenizer.json")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "model_dir",
+        type=Path,
+        help="Directory containing model.onnx and tokenizer.json",
+    )
     parser.add_argument("prompt")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--cache-capacity", type=int, default=4096)
@@ -25,7 +35,9 @@ def main():
         device=args.device,
         cache_capacity=args.cache_capacity,
     )
-    generated = runner.generate_greedy(token_ids, args.max_new_tokens, tokenizer.eos_token_id)
+    generated = runner.generate_greedy(
+        token_ids, args.max_new_tokens, tokenizer.eos_token_id
+    )
     print(tokenizer.decode(generated, skip_special_tokens=True))
 
 

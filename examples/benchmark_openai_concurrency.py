@@ -3,7 +3,8 @@
 
 """Measure concurrent OpenAI chat throughput and latency without dependencies.
 
-Start ``examples/openai_server.py`` first, then run for example::
+No local model is loaded here. Start ``examples/openai_server.py`` with one of
+the models listed by its ``--help`` first, then run for example::
 
     python examples/benchmark_openai_concurrency.py --concurrency 1,2,4
 

@@ -1,7 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Describe a local image with Qwen3.8 Vision and no Python media framework."""
+"""Describe a local image with Qwen3.8 Vision without a media framework.
+
+Model: ``Qwen/Qwen3.8-27B`` or ``unsloth/Qwen3.8-27B-GGUF`` on Hugging Face.
+For the tested BF16 GGUF plus vision projector, run::
+
+    hf download unsloth/Qwen3.8-27B-GGUF --include '*BF16*.gguf' mmproj-F16.gguf --local-dir ~/Models/warp-nn/Qwen/Qwen3.8-27B-GGUF
+"""
 
 import argparse
 import codecs
@@ -11,7 +17,7 @@ from warp_nn.runtime.chat import is_eos_token, sample_runner_token
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", help="Qwen3.8 model directory or text GGUF")
     parser.add_argument("image", help="PNG, PPM, NPY, or NPZ RGB image")
     parser.add_argument("--prompt", default="Describe this image in detail.")

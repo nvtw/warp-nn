@@ -1,7 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Serve a supported local checkpoint through OpenAI Chat Completions."""
+"""Serve a local Qwen3.8, Muse-Glimmer, or Nemotron-3-Nano checkpoint.
+
+Use ``unsloth/Qwen3.8-27B-GGUF``,
+``esatapedico/Qwen3.8-27B-NVFP4-MTP-GGUF``,
+``unsloth/Muse-Glimmer-30B-GGUF``,
+``nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16``, or
+``nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4`` on Hugging Face.
+Download one with::
+
+    hf download REPOSITORY --local-dir ~/Models/warp-nn/OWNER/NAME
+"""
 
 import argparse
 import socket
@@ -72,7 +82,7 @@ def _print_connection_info(server, model_id: str, host: str, api_key: str | None
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "model_dir",
         type=Path,

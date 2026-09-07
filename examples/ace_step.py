@@ -3,6 +3,10 @@
 
 """Validate or run the dependency-free ACE-Step 1.5 pipeline.
 
+Model bundle: ``ACE-Step/Ace-Step1.5`` from Hugging Face. Download it with::
+
+    hf download ACE-Step/Ace-Step1.5 --local-dir ~/Models/warp-nn/ACE-Step/Ace-Step1.5
+
 The ``--check`` path is useful while downloading: it validates the official
 multi-component bundle without loading tensors. Generation runs the native,
 dependency-free Turbo or XL-SFT pipeline when the complete bundle is present.

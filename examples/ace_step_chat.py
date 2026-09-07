@@ -1,7 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generate successive ACE-Step 1.5 songs in a resident terminal session."""
+"""Generate successive ACE-Step 1.5 songs in a resident terminal session.
+
+Model bundle: ``ACE-Step/Ace-Step1.5`` from Hugging Face. Download it with::
+
+    hf download ACE-Step/Ace-Step1.5 --local-dir ~/Models/warp-nn/ACE-Step/Ace-Step1.5
+"""
 
 from __future__ import annotations
 

@@ -1,7 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compare packed-INT4 Warp and cuBLAS MatMulNBits execution."""
+"""Compare packed-INT4 Warp and cuBLAS MatMulNBits execution.
+
+No model or download is needed; this benchmark creates a synthetic ONNX graph.
+"""
 
 import argparse
 import tempfile
@@ -37,20 +40,33 @@ def make_model(path: Path, rows: int, columns: int, inner: int) -> None:
                 )
             ],
             "q4_matmul_benchmark",
-            [helper.make_tensor_value_info("activations", TensorProto.FLOAT16, [rows, inner])],
-            [helper.make_tensor_value_info("output", TensorProto.FLOAT16, [rows, columns])],
+            [
+                helper.make_tensor_value_info(
+                    "activations", TensorProto.FLOAT16, [rows, inner]
+                )
+            ],
+            [
+                helper.make_tensor_value_info(
+                    "output", TensorProto.FLOAT16, [rows, columns]
+                )
+            ],
             [
                 numpy_helper.from_array(weights, name="weights"),
                 numpy_helper.from_array(scales, name="scales"),
             ],
         ),
-        opset_imports=[helper.make_opsetid("", 21), helper.make_opsetid("com.microsoft", 1)],
+        opset_imports=[
+            helper.make_opsetid("", 21),
+            helper.make_opsetid("com.microsoft", 1),
+        ],
     )
     model.ir_version = 10
     onnx.save(model, path)
 
 
-def measure(runtime: OnnxRuntime, activations: wp.array, iterations: int) -> tuple[float, np.ndarray]:
+def measure(
+    runtime: OnnxRuntime, activations: wp.array, iterations: int
+) -> tuple[float, np.ndarray]:
     inputs = {"activations": activations}
     for _ in range(5):
         output = runtime(inputs)["output"]
@@ -69,7 +85,7 @@ def measure(runtime: OnnxRuntime, activations: wp.array, iterations: int) -> tup
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rows", type=int, default=64)
     parser.add_argument("--columns", type=int, default=4096)
     parser.add_argument("--inner", type=int, default=4096)
@@ -77,12 +93,16 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
     if args.rows < 1 or args.inner % 32 or min(args.columns, args.iterations) < 1:
-        parser.error("rows must be positive, inner must be divisible by 32, and other sizes must be positive")
+        parser.error(
+            "rows must be positive, inner must be divisible by 32, and other sizes must be positive"
+        )
 
     wp.init()
     device = wp.get_device(args.device)
     activations = wp.array(
-        np.random.default_rng(23).standard_normal((args.rows, args.inner)).astype(np.float16),
+        np.random.default_rng(23)
+        .standard_normal((args.rows, args.inner))
+        .astype(np.float16),
         device=device,
     )
     with tempfile.TemporaryDirectory() as directory:
@@ -100,14 +120,18 @@ def main() -> None:
                     op.attrs["_dequantized_weights"] = wp.empty(
                         (args.columns, args.inner), dtype=wp.float16, device=device
                     )
-                    op.attrs["_dequantize_kernel"] = _get_dequantize_nbits_kernel(4, 32, wp.float16)
+                    op.attrs["_dequantize_kernel"] = _get_dequantize_nbits_kernel(
+                        4, 32, wp.float16
+                    )
         warp_ms, warp_output = measure(warp_runtime, activations, args.iterations)
         if cublas_runtime._cublas is None:
             print(f"Warp packed INT4: {warp_ms:.3f} ms (cuBLAS unavailable)")
             return
         cublas_ms, cublas_output = measure(cublas_runtime, activations, args.iterations)
 
-    difference = np.abs(warp_output.astype(np.float32) - cublas_output.astype(np.float32))
+    difference = np.abs(
+        warp_output.astype(np.float32) - cublas_output.astype(np.float32)
+    )
     np.testing.assert_allclose(
         warp_output,
         cublas_output,
@@ -115,10 +139,14 @@ def main() -> None:
         atol=7.5e-2 if args.rows == 1 else 2.0e-2,
     )
     print(f"Shape: ({args.rows}, {args.inner}) @ ({args.columns}, {args.inner}).T")
-    print(f"Warp {'INT4/Q8 DP4A' if args.rows == 1 else 'packed INT4'}: {warp_ms:.3f} ms")
+    print(
+        f"Warp {'INT4/Q8 DP4A' if args.rows == 1 else 'packed INT4'}: {warp_ms:.3f} ms"
+    )
     print(f"cuBLAS + dequant: {cublas_ms:.3f} ms")
     faster = "Warp" if warp_ms < cublas_ms else "cuBLAS"
-    print(f"Faster path:      {faster} {max(warp_ms, cublas_ms) / min(warp_ms, cublas_ms):.2f}x")
+    print(
+        f"Faster path:      {faster} {max(warp_ms, cublas_ms) / min(warp_ms, cublas_ms):.2f}x"
+    )
     print(f"Difference:       mean {difference.mean():.5f}, max {difference.max():.5f}")
 
 

@@ -1,7 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
 # SPDX-License-Identifier: Apache-2.0
 
-"""Validate or run the dependency-free official Qwen-Image-2512 pipeline."""
+"""Validate or run the dependency-free Qwen-Image-2512 pipeline.
+
+Model: ``Qwen/Qwen-Image-2512`` from Hugging Face. Download it with::
+
+    hf download Qwen/Qwen-Image-2512 --local-dir ~/Models/warp-nn/Qwen/Qwen-Image-2512
+"""
 
 from __future__ import annotations
 

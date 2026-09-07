@@ -1,7 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generate a Kimodo skeletal motion without PyTorch or Transformers."""
+"""Generate a Kimodo skeletal motion without PyTorch or Transformers.
+
+Models: ``nvidia/Kimodo-SOMA-RP-v1.1``, gated
+``meta-llama/Meta-Llama-3-8B-Instruct``, and the two ``McGill-NLP`` LLM2Vec
+adapters ``LLM2Vec-Meta-Llama-3-8B-Instruct-mntp`` and
+``LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised``. Download each Hugging
+Face repository with::
+
+    hf download REPOSITORY --local-dir ~/Models/warp-nn/OWNER/NAME
+"""
 
 import argparse
 from pathlib import Path

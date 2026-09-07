@@ -1,7 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generate successive Qwen-Image-2512 images in a resident terminal session."""
+"""Generate successive Qwen-Image-2512 images in a resident terminal session.
+
+Model: ``Qwen/Qwen-Image-2512`` from Hugging Face. Download it with::
+
+    hf download Qwen/Qwen-Image-2512 --local-dir ~/Models/warp-nn/Qwen/Qwen-Image-2512
+"""
 
 from __future__ import annotations
 
