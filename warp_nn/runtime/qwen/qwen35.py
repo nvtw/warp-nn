@@ -1313,7 +1313,9 @@ class Qwen35Runner(AutoregressiveRunner):
                 name = (
                     f"model.language_model.layers.{index}.linear_attn.in_proj_a.weight"
                 )
-                self.weights[name] = cast_weight(self.weights[name], self.dtype)
+                weight = self.weights[name]
+                if not isinstance(weight, BlockQuantizedTensor):
+                    self.weights[name] = cast_weight(weight, self.dtype)
         self.zero_bias = wp.zeros(1, dtype=self.dtype, device=self.device)
         self.cublas = (
             try_create_cublas() if use_cublas and self.device.is_cuda else None

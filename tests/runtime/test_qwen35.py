@@ -337,7 +337,10 @@ def test_qwen35_independent_batch_decode_matches_sequential_and_captures(
         recurrent_after[recurrent_rows:], recurrent_before[recurrent_rows:]
     )
     np.testing.assert_array_equal(conv_after[1:], conv_before[1:])
-    np.testing.assert_array_equal(key_after[cache_rows:], key_before[cache_rows:])
+    np.testing.assert_array_equal(
+        key_after[cache_rows:].view(np.uint16),
+        key_before[cache_rows:].view(np.uint16),
+    )
     assert len(batch.plan.graphs) == 1
 
 
