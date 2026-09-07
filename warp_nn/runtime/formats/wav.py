@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
 # SPDX-License-Identifier: Apache-2.0
 
-"""Dependency-free mono/stereo PCM16 WAV input and stereo output."""
+"""Dependency-free mono/stereo PCM16 WAV input and output."""
 
 from __future__ import annotations
 
@@ -20,13 +20,19 @@ class WavAudio:
     sample_rate: int
 
 
-def _stereo_float_samples(samples) -> np.ndarray:
+def _audio_float_samples(samples) -> np.ndarray:
     values = np.asarray(samples)
-    if values.ndim != 2 or values.shape[1] != 2:
-        raise ValueError("WAV audio must have channels-last shape [samples, 2]")
+    if values.ndim == 1:
+        values = values[:, None]
+    if values.ndim != 2 or values.shape[1] not in (1, 2):
+        raise ValueError(
+            "WAV audio shape must be [samples] or channels-last mono/stereo"
+        )
     if values.shape[0] == 0:
         raise ValueError("WAV audio must contain at least one sample")
-    if not np.issubdtype(values.dtype, np.floating):
+    if not (
+        np.issubdtype(values.dtype, np.floating) or values.dtype.name == "bfloat16"
+    ):
         raise TypeError("WAV input samples must use a floating dtype")
     values = np.asarray(values, dtype=np.float32)
     if not np.isfinite(values).all():
@@ -35,13 +41,12 @@ def _stereo_float_samples(samples) -> np.ndarray:
 
 
 def float_to_pcm16(samples, *, normalize: bool = False) -> np.ndarray:
-    """Quantize stereo floats to PCM16 with explicit clipping or normalization.
+    """Quantize mono/stereo floats to PCM16 with explicit clipping or normalization.
 
     With ``normalize=False`` (the default), values outside ``[-1, 1]`` are
-    clipped and in-range loudness is unchanged. With ``normalize=True``, both
-    channels are scaled together so their absolute peak is one before clipping.
+    clipped and in-range loudness is unchanged. With ``normalize=True``, both channels are scaled together so their absolute peak is one before clipping.
     """
-    values = _stereo_float_samples(samples)
+    values = _audio_float_samples(samples)
     if normalize:
         peak = float(np.max(np.abs(values)))
         if peak > 0.0:
@@ -58,13 +63,13 @@ def write_wav_pcm16(
     *,
     normalize: bool = False,
 ) -> None:
-    """Write channels-last stereo floats as an uncompressed PCM16 WAV file."""
+    """Write mono or channels-last mono/stereo floats as an uncompressed PCM16 WAV file."""
     sample_rate = int(sample_rate)
     if sample_rate <= 0:
         raise ValueError("WAV sample_rate must be positive")
     pcm = float_to_pcm16(samples, normalize=normalize)
     with wave.open(str(Path(path)), "wb") as stream:
-        stream.setnchannels(2)
+        stream.setnchannels(pcm.shape[1])
         stream.setsampwidth(2)
         stream.setframerate(sample_rate)
         stream.writeframes(pcm.tobytes(order="C"))

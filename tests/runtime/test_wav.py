@@ -70,5 +70,8 @@ def test_wav_boundary_rejects_ambiguous_or_invalid_audio(tmp_path):
         stream.setsampwidth(2)
         stream.setframerate(48_000)
         stream.writeframes(np.zeros(4, dtype="<i2").tobytes())
-    with pytest.raises(ValueError, match="stereo"):
-        read_wav_pcm16(mono)
+    decoded = read_wav_pcm16(mono)
+    assert decoded.samples.shape == (4, 1)
+    write_wav_pcm16(tmp_path / "mono-output.wav", decoded.samples, 48_000)
+    with wave.open(str(tmp_path / "mono-output.wav"), "rb") as stream:
+        assert stream.getnchannels() == 1

@@ -51,6 +51,7 @@ class _Qwen3CausalPlan(_Qwen3EncoderPlan):
         final = self.layers[-1]["next_norm"].outputs[0]
         self.tensors["final.last"] = self.tensors[final][rows - 1 : rows]
         self.shapes["final.last"] = (1, runner.hidden_size)
+        self.final_hidden = self.tensors["final.last"]
         self.lm_head = Operation("Linear", ["final.last", "lm_head.weight"], ["logits"])
         plan_linear(
             self.lm_head,
@@ -63,18 +64,21 @@ class _Qwen3CausalPlan(_Qwen3EncoderPlan):
             (1, 1, int(runner.config["vocab_size"]))
         )
 
-    def execute(self) -> wp.array:
-        runner = self.runner
+    def _stage_embeddings(self) -> None:
         wp.launch(
             _gather_rows_kernel,
             dim=self.embedding.shape,
             inputs=[
-                runner.weights["model.embed_tokens.weight"],
+                self.runner.weights["model.embed_tokens.weight"],
                 self.input_ids,
                 self.embedding,
             ],
             device=self.device,
         )
+
+    def execute(self) -> wp.array:
+        runner = self.runner
+        self._stage_embeddings()
         self._execute(self.first_norm)
         rotary = _rotary_embedding_kernel_for_dtype(self.dtype)
         for index, layer in enumerate(self.layers):
@@ -174,6 +178,8 @@ class _Qwen3CausalPlan(_Qwen3EncoderPlan):
 class Qwen3CausalLM(AutoregressiveRunner):
     """Dependency-free dense Qwen3 prefill/decode with a persistent KV cache."""
 
+    plan_type = _Qwen3CausalPlan
+
     def __init__(
         self,
         path: str | Path,
@@ -246,8 +252,8 @@ class Qwen3CausalLM(AutoregressiveRunner):
             self.sin_cache = wp.array(sin, dtype=self.dtype, device=self.device)
         else:
             self.cos_cache, self.sin_cache = rotary
-        self._decode_plan = _Qwen3CausalPlan(self, 1)
-        self._chunk_plan = _Qwen3CausalPlan(self, self.prefill_chunk_size)
+        self._decode_plan = self.plan_type(self, 1)
+        self._chunk_plan = self.plan_type(self, self.prefill_chunk_size)
         self._chunk_plan._capture_ready = False
         self._record_plan_storage(self._decode_plan)
         self._record_plan_storage(self._chunk_plan)

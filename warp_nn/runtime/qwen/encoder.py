@@ -367,7 +367,8 @@ class _Qwen3EncoderPlan:
                 device=self.device,
             )
 
-    def execute(self) -> wp.array:
+    def _stage_embeddings(self) -> None:
+        """Populate the fixed embedding buffer before transformer execution."""
         wp.launch(
             _gather_rows_kernel,
             dim=self.embedding.shape,
@@ -378,6 +379,9 @@ class _Qwen3EncoderPlan:
             ],
             device=self.device,
         )
+
+    def execute(self) -> wp.array:
+        self._stage_embeddings()
         self._execute(self.first_norm)
         rotary = _rotary_embedding_kernel_for_dtype(self.dtype)
         for layer in self.layers:
@@ -439,7 +443,7 @@ class _Qwen3EncoderPlan:
                     self.sequence,
                     self.sequence,
                     self.runner.head_dim**-0.5,
-                    0,
+                    int(getattr(self.runner, "sliding_window", 0)),
                 ],
                 block_dim=self.attention_block,
                 device=self.device,

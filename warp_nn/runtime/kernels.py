@@ -818,6 +818,29 @@ def _gather_rows_kernel(
 
 
 @wp.kernel(enable_backward=False, module="unique")
+def _gather_sum_embeddings_kernel(
+    tables: wp.array3d[Any],
+    indices: wp.array2d[wp.int32],
+    output: wp.array2d[Any],
+):
+    """Sum one embedding-table lookup per group for every output row."""
+    row, column = wp.tid()
+    total = wp.float32(0.0)
+    for group in range(indices.shape[1]):
+        total += wp.float32(tables[group, indices[row, group], column])
+    output[row, column] = output.dtype(total)
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _add_arrays_kernel(
+    left: wp.array1d[Any], right: wp.array1d[Any], output: wp.array1d[Any]
+):
+    """Add equal flat arrays with FP32 accumulation."""
+    index = wp.tid()
+    output[index] = output.dtype(wp.float32(left[index]) + wp.float32(right[index]))
+
+
+@wp.kernel(enable_backward=False, module="unique")
 def _apply_embedding_overrides_kernel(
     embedding: wp.array3d[Any],
     overrides: wp.array3d[Any],
