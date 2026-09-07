@@ -137,7 +137,7 @@ def check_arrays(
             f"limits: [{np.min(abs_diff)}, {np.max(abs_diff)}], sum: {np.sum(abs_diff)}"
         )
         if test == "all-close":
-            assert np.allclose(diff, 0.0, rtol=rtol, atol=atol), f"[all-close] Failed (at index {i}): {msg}: {stats}"
+            assert np.allclose(a, b, rtol=rtol, atol=atol), f"[all-close] Failed (at index {i}): {msg}: {stats}"
         elif test == "equal":
             assert np.array_equiv(diff, 0.0), f"[equal] Failed (at index {i}): {msg}: {stats}"
         elif test == "not-equal":

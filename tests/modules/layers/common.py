@@ -42,8 +42,8 @@ def _loss_3d(a: wp.array3d[Any], loss: wp.array1d[wp.float32]):
 
 @wp.kernel
 def _loss_4d(a: wp.array4d[Any], loss: wp.array1d[wp.float32]):
-    i, j, k, l = wp.tid()
-    wp.atomic_add(loss, 0, loss.dtype(a[i, j, k, l]))
+    i, j, k, m = wp.tid()
+    wp.atomic_add(loss, 0, loss.dtype(a[i, j, k, m]))
 
 
 def check_forward(*, warp_module, torch_module, device, dtype, shape, rtol: float = 1e-02, atol: float = 1e-03):
@@ -59,7 +59,8 @@ def check_forward(*, warp_module, torch_module, device, dtype, shape, rtol: floa
     warp_input = wp.array(array, device=device)
     # forward pass
     warp_output = warp_module(warp_input)
-    torch_output = torch_module(torch_input)
+    with torch.backends.cudnn.flags(allow_tf32=False):
+        torch_output = torch_module(torch_input)
     # check outputs
     utilities.check_arrays(torch_output, warp_output, rtol=rtol, atol=atol)
 
@@ -99,18 +100,19 @@ def check_forward_rnn_cell(
     # forward pass
     torch_outputs = []
     warp_outputs = []
-    for i in range(shape[0]):  # sequence length
-        if cell_shape is None:
-            torch_hidden = torch_module(torch_input[i], torch_hidden)
-            torch_outputs.append(torch_hidden)
-            warp_hidden = wp.clone(warp_module(warp_input[i], warp_hidden))
-            warp_outputs.append(warp_hidden)
-        else:
-            torch_hidden, torch_cell = torch_module(torch_input[i], (torch_hidden, torch_cell))
-            torch_outputs.append((torch_hidden, torch_cell))
-            warp_output = warp_module(warp_input[i], (warp_hidden, warp_cell))
-            warp_hidden, warp_cell = wp.clone(warp_output[0]), wp.clone(warp_output[1])
-            warp_outputs.append((warp_hidden, warp_cell))
+    with torch.backends.cudnn.flags(allow_tf32=False):
+        for i in range(shape[0]):  # sequence length
+            if cell_shape is None:
+                torch_hidden = torch_module(torch_input[i], torch_hidden)
+                torch_outputs.append(torch_hidden)
+                warp_hidden = wp.clone(warp_module(warp_input[i], warp_hidden))
+                warp_outputs.append(warp_hidden)
+            else:
+                torch_hidden, torch_cell = torch_module(torch_input[i], (torch_hidden, torch_cell))
+                torch_outputs.append((torch_hidden, torch_cell))
+                warp_output = warp_module(warp_input[i], (warp_hidden, warp_cell))
+                warp_hidden, warp_cell = wp.clone(warp_output[0]), wp.clone(warp_output[1])
+                warp_outputs.append((warp_hidden, warp_cell))
     # check outputs
     for warp_output, torch_output in zip(warp_outputs, torch_outputs):
         if cell_shape is None:
@@ -133,9 +135,10 @@ def check_gradients(*, warp_module, torch_module, device, dtype, shape, rtol: fl
     warp_input = wp.array(array, device=device, requires_grad=True)
     # compute loss
     # - torch
-    torch_output = torch_module(torch_input)
-    torch_loss = torch_output.sum()
-    torch_loss.backward()
+    with torch.backends.cudnn.flags(allow_tf32=False):
+        torch_output = torch_module(torch_input)
+        torch_loss = torch_output.sum()
+        torch_loss.backward()
     # - warp
     tape = wp.Tape()
     loss = wp.zeros((1,), dtype=wp.float32, requires_grad=True, device=device)
