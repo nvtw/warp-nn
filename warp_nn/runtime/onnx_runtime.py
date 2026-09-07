@@ -83,16 +83,21 @@ from warp_nn.runtime.kernels import (
     _batch_normalization_kernel,
     _binary_broadcast_kernel,
     _cast_kernel_for_dtypes,
+    _comparison_broadcast_kernel,
+    _concat_axis_kernel,
     _causal_conv_1d_kernel,
     _causal_conv_state_inplace_kernel,
     _causal_conv_state_kernel,
     _create_rms_normalization_kernel,
     _elu_kernel,
     _gather_rows_kernel,
+    _gather_axis_kernel,
     _gather_single_index_kernel,
     _gemm_transb_kernel,
+    _argmax_1d_kernel,
     _get_dequantize_nbits_kernel,
     _get_gqa_attention_kernel,
+    _get_layer_norm_kernel,
     _get_linear_attention_kernel,
     _linear_attention_value_blocks,
     _get_lp_normalization_kernel,
@@ -100,9 +105,11 @@ from warp_nn.runtime.kernels import (
     _get_matmul_int8_q8_kernel,
     _get_matmul_nbits_kernel,
     _get_reduce_sum_rows_kernel,
+    _get_softmax_rows_kernel,
     _kernel_for_dtype,
     _lstm_cell_update_kernel,
     _lstm_gates_kernel,
+    _matmul_batched_kernel,
     _matmul_int4_q8_kernel,
     _reduce_max_1d_kernel,
     _reduce_mean_rows_kernel,
@@ -111,8 +118,11 @@ from warp_nn.runtime.kernels import (
     _tile_3d_kernel,
     _transpose_021_kernel,
     _transpose_0213_kernel,
+    _transpose_0132_kernel,
+    _transpose_0231_kernel,
     _unary_kernel,
     _where_kernel_for_dtype,
+    _where_scalar_kernel,
 )
 from warp_nn.runtime.operators import (
     _OP_DISPATCH,
@@ -585,7 +595,7 @@ class OnnxRuntime:
         self._ops: list[_Op] = []
         for node in graph.node:
             decoded, all_names = _decode_attrs(node)
-            if node.op_type == "Constant" and "value" in decoded:
+            if node.op_type in ("Constant", "ConstantOfShape") and "value" in decoded:
                 decoded["_value"] = _np_to_warp(
                     numpy_helper.to_array(decoded["value"]),
                     self._device,
@@ -875,9 +885,13 @@ def _shape_elementwise_binary(op, shapes, dtypes, tensors, device, requires_grad
             "Sub": np.subtract,
             "Mul": np.multiply,
             "Div": np.divide,
+            "Min": np.minimum,
+            "Pow": np.power,
+            "Mod": np.remainder,
         }[op.op_type]
         result = operation(
-            tensors[op.inputs[0]].numpy(), tensors[op.inputs[1]].numpy()
+            tensors[op.inputs[0]].numpy().reshape(lhs_shape),
+            tensors[op.inputs[1]].numpy().reshape(rhs_shape),
         ).astype(wp.dtype_to_numpy(dtype))
         tensors[op.outputs[0]] = _np_to_warp(result, device)
         shapes[op.outputs[0]] = result.shape
@@ -921,16 +935,49 @@ def _shape_elementwise_binary(op, shapes, dtypes, tensors, device, requires_grad
     )
 
 
+def _shape_comparison(op, shapes, dtypes, tensors, device, requires_grad=False):
+    if all(op.attrs["_static_inputs"]):
+        operation = np.less_equal if op.op_type == "LessOrEqual" else np.equal
+        result = operation(
+            tensors[op.inputs[0]].numpy().reshape(shapes[op.inputs[0]]),
+            tensors[op.inputs[1]].numpy().reshape(shapes[op.inputs[1]]),
+        )
+        tensors[op.outputs[0]] = _np_to_warp(result, device)
+        shapes[op.outputs[0]] = result.shape
+        dtypes[op.outputs[0]] = wp.bool
+        op.attrs["_static_output"] = True
+        return
+    _shape_elementwise_binary(op, shapes, dtypes, tensors, device, requires_grad)
+    out_shape = shapes[op.outputs[0]]
+    dtype = dtypes[op.inputs[0]]
+    tensors[op.outputs[0]] = wp.zeros(out_shape, dtype=wp.bool, device=device)
+    dtypes[op.outputs[0]] = wp.bool
+    op.attrs["_kernel"] = _kernel_for_dtype(
+        _comparison_broadcast_kernel,
+        dtype,
+        (2,),
+        (2,),
+        int,
+        _array_type(wp.bool, 2),
+    )
+
+
 def _shape_reduce_mean(op, shapes, dtypes, tensors, device, requires_grad=False):
     in_shape = shapes[op.inputs[0]]
-    axes = tuple(int(axis) for axis in op.attrs.get("axes", []))
+    if len(op.inputs) > 1 and op.inputs[1]:
+        if op.inputs[1] not in tensors:
+            raise NotImplementedError("OnnxRuntime ReduceMean: axes must be constant")
+        axes = tuple(int(axis) for axis in tensors[op.inputs[1]].numpy().reshape(-1))
+    else:
+        axes = tuple(int(axis) for axis in op.attrs.get("axes", []))
+    axes = tuple(axis if axis >= 0 else axis + len(in_shape) for axis in axes)
     keepdims = int(op.attrs.get("keepdims", 1))
-    if len(in_shape) != 2 or axes not in ((1,), (-1,)) or keepdims != 1:
+    if axes != (len(in_shape) - 1,) or keepdims != 1:
         raise NotImplementedError(
-            "OnnxRuntime ReduceMean: only 2-D row reductions with keepdims=1 are supported"
+            "OnnxRuntime ReduceMean: only last-axis reductions with keepdims=1 are supported"
         )
     dtype = _require_matching_float_dtypes(op, dtypes, [op.inputs[0]])
-    out_shape = (in_shape[0], 1)
+    out_shape = (*in_shape[:-1], 1)
     out_name = op.outputs[0]
     if out_name not in tensors:
         tensors[out_name] = wp.zeros(
@@ -938,6 +985,8 @@ def _shape_reduce_mean(op, shapes, dtypes, tensors, device, requires_grad=False)
         )
     shapes[out_name] = out_shape
     dtypes[out_name] = dtype
+    op.attrs["_rows"] = int(np.prod(in_shape[:-1]))
+    op.attrs["_width"] = in_shape[-1]
     op.attrs["_kernel"] = _kernel_for_dtype(_reduce_mean_rows_kernel, dtype, (2,), (2,))
 
 
@@ -964,21 +1013,30 @@ def _shape_lp_normalization(op, shapes, dtypes, tensors, device, requires_grad=F
 
 
 def _shape_reduce_sum(op, shapes, dtypes, tensors, device, requires_grad=False):
+    if len(op.inputs) < 2 or op.inputs[1] not in tensors:
+        raise NotImplementedError("OnnxRuntime ReduceSum: axes must be constant")
     axes = tuple(int(value) for value in tensors[op.inputs[1]].numpy().reshape(-1))
     in_shape = shapes[op.inputs[0]]
-    if len(in_shape) != 2 or axes != (1,) or int(op.attrs.get("keepdims", 1)) != 0:
+    normalized_axes = tuple(
+        axis if axis >= 0 else axis + len(in_shape) for axis in axes
+    )
+    if normalized_axes != (len(in_shape) - 1,) or int(op.attrs.get("keepdims", 1)) != 0:
         raise NotImplementedError(
-            "OnnxRuntime ReduceSum: only Qwen's 2-D integer row reduction is supported"
+            "OnnxRuntime ReduceSum: only last-axis reductions with keepdims=0 are supported"
         )
     dtype = dtypes[op.inputs[0]]
-    if dtype not in (wp.int32, wp.int64):
-        raise TypeError("OnnxRuntime ReduceSum: expected an INT32 or INT64 input")
-    out_shape = (in_shape[0],)
-    tensors[op.outputs[0]] = wp.zeros(out_shape, dtype=dtype, device=device)
+    if dtype not in _FLOAT_DTYPES and dtype not in (wp.int32, wp.int64):
+        raise TypeError("OnnxRuntime ReduceSum: unsupported input dtype")
+    if requires_grad and dtype in _FLOAT_DTYPES:
+        raise NotImplementedError("OnnxRuntime ReduceSum: gradients are not supported")
+    out_shape = in_shape[:-1]
+    tensors[op.outputs[0]] = wp.zeros(out_shape or (1,), dtype=dtype, device=device)
     shapes[op.outputs[0]] = out_shape
     dtypes[op.outputs[0]] = dtype
+    op.attrs["_rows"] = int(np.prod(out_shape)) if out_shape else 1
+    op.attrs["_width"] = in_shape[-1]
     op.attrs["_tile_width"], op.attrs["_kernel"] = _get_reduce_sum_rows_kernel(
-        in_shape[1], dtype
+        in_shape[-1], dtype
     )
 
 
@@ -1007,6 +1065,68 @@ def _shape_shape(op, shapes, dtypes, tensors, device, requires_grad=False):
     op.attrs["_static_output"] = True
 
 
+def _shape_identity(op, shapes, dtypes, tensors, device, requires_grad=False):
+    """Plan ONNX Identity as a zero-copy alias."""
+    input_name = op.inputs[0]
+    output_name = op.outputs[0]
+    shapes[output_name] = shapes[input_name]
+    dtypes[output_name] = dtypes[input_name]
+    if input_name in tensors:
+        tensors[output_name] = tensors[input_name]
+    if op.attrs["_static_inputs"][0]:
+        op.attrs["_static_output"] = True
+
+
+def _shape_concat(op, shapes, dtypes, tensors, device, requires_grad=False):
+    input_shapes = [shapes[name] for name in op.inputs]
+    if not input_shapes or any(
+        len(shape) != len(input_shapes[0]) for shape in input_shapes
+    ):
+        raise ValueError(
+            f"OnnxRuntime Concat: inputs must have one matching rank, got "
+            f"{list(zip(op.inputs, input_shapes))}"
+        )
+    rank = len(input_shapes[0])
+    axis = int(op.attrs.get("axis", 0))
+    if axis < 0:
+        axis += rank
+    if axis < 0 or axis >= rank:
+        raise ValueError("OnnxRuntime Concat: axis is out of range")
+    reference = input_shapes[0]
+    if any(
+        any(
+            a != b
+            for index, (a, b) in enumerate(zip(reference, shape))
+            if index != axis
+        )
+        for shape in input_shapes[1:]
+    ):
+        raise ValueError("OnnxRuntime Concat: non-concatenated dimensions must match")
+    dtype = dtypes[op.inputs[0]]
+    if any(dtypes[name] != dtype for name in op.inputs):
+        raise TypeError("OnnxRuntime Concat: input dtypes must match")
+    out_shape = list(reference)
+    out_shape[axis] = sum(shape[axis] for shape in input_shapes)
+    out_shape = tuple(out_shape)
+    if all(op.attrs["_static_inputs"]):
+        result = np.concatenate(
+            [tensors[name].numpy() for name in op.inputs], axis=axis
+        )
+        tensors[op.outputs[0]] = _np_to_warp(result, device)
+        op.attrs["_static_output"] = True
+    else:
+        tensors[op.outputs[0]] = wp.zeros(
+            out_shape, dtype=dtype, device=device, requires_grad=requires_grad
+        )
+        op.attrs["_kernel"] = _kernel_for_dtype(
+            _concat_axis_kernel, dtype, (1,), (1,), int, int, int, int
+        )
+        op.attrs["_axis"] = axis
+        op.attrs["_suffix"] = int(np.prod(out_shape[axis + 1 :]))
+    shapes[op.outputs[0]] = out_shape
+    dtypes[op.outputs[0]] = dtype
+
+
 def _shape_gather(op, shapes, dtypes, tensors, device, requires_grad=False):
     data_shape = shapes[op.inputs[0]]
     axis = int(op.attrs.get("axis", 0))
@@ -1017,8 +1137,11 @@ def _shape_gather(op, shapes, dtypes, tensors, device, requires_grad=False):
     data_static, indices_static = op.attrs["_static_inputs"]
     if data_static and indices_static:
         value = np.take(
-            tensors[op.inputs[0]].numpy(),
-            tensors[op.inputs[1]].numpy().astype(np.int64),
+            tensors[op.inputs[0]].numpy().reshape(data_shape),
+            tensors[op.inputs[1]]
+            .numpy()
+            .reshape(shapes[op.inputs[1]])
+            .astype(np.int64),
             axis=axis,
         )
         tensors[op.outputs[0]] = _np_to_warp(value, device)
@@ -1073,13 +1196,168 @@ def _shape_gather(op, shapes, dtypes, tensors, device, requires_grad=False):
             _gather_single_index_kernel, dtypes[op.inputs[0]], (1,), (1,), int, int, int
         )
         return
-    raise NotImplementedError("OnnxRuntime Gather: unsupported dynamic gather")
+    if requires_grad:
+        raise NotImplementedError(
+            "OnnxRuntime Gather: generic gather gradients are not supported"
+        )
+    indices_shape = shapes[op.inputs[1]]
+    if dtypes[op.inputs[1]] != wp.int64:
+        raise TypeError("OnnxRuntime Gather: generic indices must be INT64")
+    out_shape = data_shape[:axis] + indices_shape + data_shape[axis + 1 :]
+    dtype = dtypes[op.inputs[0]]
+    tensors[op.outputs[0]] = wp.zeros(out_shape or (1,), dtype=dtype, device=device)
+    shapes[op.outputs[0]] = out_shape
+    dtypes[op.outputs[0]] = dtype
+    op.attrs["_generic"] = True
+    op.attrs["_axis_size"] = data_shape[axis]
+    op.attrs["_indices_size"] = int(np.prod(indices_shape)) if indices_shape else 1
+    op.attrs["_inner_size"] = int(np.prod(data_shape[axis + 1 :]))
+    op.attrs["_kernel"] = _kernel_for_dtype(
+        _gather_axis_kernel,
+        dtype,
+        (1,),
+        _array_type(wp.int64, 1),
+        (1,),
+        int,
+        int,
+        int,
+    )
+
+
+def _shape_argmax(op, shapes, dtypes, tensors, device, requires_grad=False):
+    in_shape = shapes[op.inputs[0]]
+    axis = int(op.attrs.get("axis", 0))
+    if axis < 0:
+        axis += len(in_shape)
+    if len(in_shape) != 1 or axis != 0 or int(op.attrs.get("keepdims", 1)) != 0:
+        raise NotImplementedError(
+            "OnnxRuntime ArgMax: only a full 1-D reduction with keepdims=0 is supported"
+        )
+    if int(op.attrs.get("select_last_index", 0)) != 0:
+        raise NotImplementedError(
+            "OnnxRuntime ArgMax: select_last_index=1 is unsupported"
+        )
+    tensors[op.outputs[0]] = wp.zeros(1, dtype=wp.int64, device=device)
+    shapes[op.outputs[0]] = ()
+    dtypes[op.outputs[0]] = wp.int64
+    op.attrs["_kernel"] = _kernel_for_dtype(
+        _argmax_1d_kernel, dtypes[op.inputs[0]], (1,), _array_type(wp.int64, 1)
+    )
+
+
+def _shape_matmul(op, shapes, dtypes, tensors, device, requires_grad=False):
+    lhs_shape, rhs_shape = (shapes[name] for name in op.inputs)
+    if len(lhs_shape) < 2 or len(rhs_shape) < 2:
+        raise NotImplementedError("OnnxRuntime MatMul: rank-one inputs are unsupported")
+    if lhs_shape[-1] != rhs_shape[-2]:
+        raise ValueError(
+            f"OnnxRuntime MatMul: incompatible shapes {lhs_shape} and {rhs_shape}"
+        )
+    lhs_batch, rhs_batch = lhs_shape[:-2], rhs_shape[:-2]
+    if lhs_batch != rhs_batch and lhs_batch and rhs_batch:
+        raise NotImplementedError(
+            "OnnxRuntime MatMul: only equal batch dimensions or a rank-two broadcast input are supported"
+        )
+    batch_shape = lhs_batch or rhs_batch
+    batches = int(np.prod(batch_shape)) if batch_shape else 1
+    rows, inner, columns = lhs_shape[-2], lhs_shape[-1], rhs_shape[-1]
+    dtype = _require_matching_float_dtypes(op, dtypes, op.inputs)
+    if requires_grad:
+        raise NotImplementedError("OnnxRuntime MatMul: gradients are not supported")
+    out_shape = (*batch_shape, rows, columns)
+    tensors[op.outputs[0]] = wp.zeros(out_shape, dtype=dtype, device=device)
+    shapes[op.outputs[0]] = out_shape
+    dtypes[op.outputs[0]] = dtype
+    op.attrs.update(
+        {
+            "_batches": batches,
+            "_rows": rows,
+            "_columns": columns,
+            "_inner": inner,
+            "_lhs_batches": int(np.prod(lhs_batch)) if lhs_batch else 1,
+            "_rhs_batches": int(np.prod(rhs_batch)) if rhs_batch else 1,
+            "_kernel": _kernel_for_dtype(
+                _matmul_batched_kernel,
+                dtype,
+                (1,),
+                (1,),
+                (1,),
+                int,
+                int,
+                int,
+                int,
+                int,
+            ),
+        }
+    )
+
+
+def _shape_layer_normalization(
+    op, shapes, dtypes, tensors, device, requires_grad=False
+):
+    in_shape = shapes[op.inputs[0]]
+    axis = int(op.attrs.get("axis", -1))
+    if axis < 0:
+        axis += len(in_shape)
+    if axis != len(in_shape) - 1 or len(op.inputs) != 3 or len(op.outputs) != 1:
+        raise NotImplementedError(
+            "OnnxRuntime LayerNormalization: only affine last-axis normalization with one output is supported"
+        )
+    width = in_shape[-1]
+    if shapes[op.inputs[1]] != (width,) or shapes[op.inputs[2]] != (width,):
+        raise ValueError(
+            "OnnxRuntime LayerNormalization: scale and bias must match the last axis"
+        )
+    dtype = _require_matching_float_dtypes(op, dtypes, op.inputs)
+    if requires_grad:
+        raise NotImplementedError(
+            "OnnxRuntime LayerNormalization: gradients are not supported"
+        )
+    tensors[op.outputs[0]] = wp.zeros(in_shape, dtype=dtype, device=device)
+    shapes[op.outputs[0]] = in_shape
+    dtypes[op.outputs[0]] = dtype
+    rows = int(np.prod(in_shape[:-1]))
+    tile_width, kernel = _get_layer_norm_kernel(width, dtype)
+    op.attrs.update(
+        {
+            "_rows": rows,
+            "_width": width,
+            "_tile_width": tile_width,
+            "_kernel": kernel,
+            "_affine_kernel": _kernel_for_dtype(
+                _binary_broadcast_kernel, dtype, (2,), (2,), int, (2,)
+            ),
+        }
+    )
+
+
+def _shape_softmax(op, shapes, dtypes, tensors, device, requires_grad=False):
+    in_shape = shapes[op.inputs[0]]
+    axis = int(op.attrs.get("axis", -1))
+    if axis < 0:
+        axis += len(in_shape)
+    if axis != len(in_shape) - 1:
+        raise NotImplementedError(
+            "OnnxRuntime Softmax: only the last axis is supported"
+        )
+    dtype = _require_matching_float_dtypes(op, dtypes, op.inputs)
+    if requires_grad:
+        raise NotImplementedError("OnnxRuntime Softmax: gradients are not supported")
+    tensors[op.outputs[0]] = wp.zeros(in_shape, dtype=dtype, device=device)
+    shapes[op.outputs[0]] = in_shape
+    dtypes[op.outputs[0]] = dtype
+    rows, width = int(np.prod(in_shape[:-1])), in_shape[-1]
+    tile_width, kernel = _get_softmax_rows_kernel(width, dtype)
+    op.attrs.update(
+        {"_rows": rows, "_width": width, "_tile_width": tile_width, "_kernel": kernel}
+    )
 
 
 def _shape_cast(op, shapes, dtypes, tensors, device, requires_grad=False):
     target_dtype = {
         1: wp.float32,
         6: wp.int32,
+        7: wp.int64,
         10: wp.float16,
         16: wp.bfloat16,
     }.get(int(op.attrs.get("to", 0)))
@@ -1189,6 +1467,31 @@ def _shape_constant(op, shapes, dtypes, tensors, device, requires_grad=False):
     op.attrs["_static_output"] = True
 
 
+def _shape_constant_of_shape(op, shapes, dtypes, tensors, device, requires_grad=False):
+    if len(op.inputs) != 1 or not op.attrs["_static_inputs"][0]:
+        raise NotImplementedError(
+            "OnnxRuntime ConstantOfShape: shape input must be construction-time constant"
+        )
+    shape = tuple(int(value) for value in tensors[op.inputs[0]].numpy().reshape(-1))
+    if any(size < 0 for size in shape):
+        raise ValueError("OnnxRuntime ConstantOfShape: dimensions must be nonnegative")
+    if "_value" in op.attrs:
+        scalar = op.attrs["_value"].numpy().reshape(-1)
+        if scalar.size != 1:
+            raise ValueError(
+                "OnnxRuntime ConstantOfShape: value must contain one element"
+            )
+        dtype = op.attrs["_value"].dtype
+        value = scalar[0]
+    else:
+        dtype, value = wp.float32, 0.0
+    result = np.full(shape, value, dtype=wp.dtype_to_numpy(dtype))
+    tensors[op.outputs[0]] = _np_to_warp(result, device)
+    shapes[op.outputs[0]] = shape
+    dtypes[op.outputs[0]] = dtype
+    op.attrs["_static_output"] = True
+
+
 def _shape_range(op, shapes, dtypes, tensors, device, requires_grad=False):
     if len(op.inputs) != 3 or not all(op.attrs["_static_inputs"]):
         raise NotImplementedError(
@@ -1209,11 +1512,10 @@ def _shape_range(op, shapes, dtypes, tensors, device, requires_grad=False):
 
 
 def _shape_slice(op, shapes, dtypes, tensors, device, requires_grad=False):
-    if not all(op.attrs["_static_inputs"]):
+    if not all(op.attrs["_static_inputs"][1:]):
         raise NotImplementedError(
-            "OnnxRuntime Slice: inputs must be construction-time constants"
+            "OnnxRuntime Slice: starts, ends, axes, and steps must be construction-time constants"
         )
-    data = tensors[op.inputs[0]].numpy()
     starts = tensors[op.inputs[1]].numpy().reshape(-1)
     ends = tensors[op.inputs[2]].numpy().reshape(-1)
     axes = (
@@ -1226,21 +1528,90 @@ def _shape_slice(op, shapes, dtypes, tensors, device, requires_grad=False):
         if len(op.inputs) > 4 and op.inputs[4]
         else np.ones(len(starts), dtype=np.int64)
     )
-    slices = [slice(None)] * data.ndim
+    in_shape = shapes[op.inputs[0]]
+    slices = [slice(None)] * len(in_shape)
     for start, end, axis, step in zip(starts, ends, axes, steps):
         slices[int(axis)] = slice(int(start), int(end), int(step))
-    result = np.ascontiguousarray(data[tuple(slices)])
-    tensors[op.outputs[0]] = _np_to_warp(result, device)
-    shapes[op.outputs[0]] = result.shape
+    normalized = tuple(value.indices(size) for value, size in zip(slices, in_shape))
+    out_shape = tuple(
+        max(0, (stop - start + step - 1) // step) for (start, stop, step) in normalized
+    )
+    if op.attrs["_static_inputs"][0]:
+        data = tensors[op.inputs[0]].numpy()
+        result = np.ascontiguousarray(data[tuple(slices)])
+        tensors[op.outputs[0]] = _np_to_warp(result, device)
+        shapes[op.outputs[0]] = result.shape
+        dtypes[op.outputs[0]] = dtypes[op.inputs[0]]
+        op.attrs["_static_output"] = True
+        return
+    changed_axes = [
+        axis
+        for axis, ((start, stop, step), size) in enumerate(zip(normalized, in_shape))
+        if (start, stop, step) != (0, size, 1)
+    ]
+    if not changed_axes:
+        shapes[op.outputs[0]] = in_shape
+        dtypes[op.outputs[0]] = dtypes[op.inputs[0]]
+        op.attrs["_view_only"] = True
+        if op.inputs[0] in tensors:
+            tensors[op.outputs[0]] = tensors[op.inputs[0]]
+        return
+    if changed_axes != [len(in_shape) - 1] or normalized[-1][2] != 1:
+        raise NotImplementedError(
+            "OnnxRuntime Slice: dynamic tensors support only a contiguous last-axis slice"
+        )
+    dtype = dtypes[op.inputs[0]]
+    tensors[op.outputs[0]] = wp.zeros(
+        out_shape, dtype=dtype, device=device, requires_grad=requires_grad
+    )
+    shapes[op.outputs[0]] = out_shape
     dtypes[op.outputs[0]] = dtypes[op.inputs[0]]
-    op.attrs["_static_output"] = True
+    op.attrs["_rows"] = int(np.prod(in_shape[:-1]))
+    op.attrs["_offset"] = normalized[-1][0]
+    op.attrs["_kernel"] = _kernel_for_dtype(
+        _split_last_axis_kernel, dtype, (2,), (2,), int
+    )
 
 
 def _shape_where(op, shapes, dtypes, tensors, device, requires_grad=False):
     condition_shape, x_shape, y_shape = (shapes[name] for name in op.inputs)
+    if all(op.attrs["_static_inputs"]):
+        result = np.where(
+            tensors[op.inputs[0]].numpy().reshape(condition_shape),
+            tensors[op.inputs[1]].numpy().reshape(x_shape),
+            tensors[op.inputs[2]].numpy().reshape(y_shape),
+        )
+        tensors[op.outputs[0]] = _np_to_warp(result, device)
+        shapes[op.outputs[0]] = result.shape
+        dtypes[op.outputs[0]] = dtypes[op.inputs[1]]
+        op.attrs["_static_output"] = True
+        return
+    if x_shape == () and y_shape == () and len(condition_shape) > 0:
+        if (
+            dtypes[op.inputs[0]] != wp.bool
+            or dtypes[op.inputs[1]] != dtypes[op.inputs[2]]
+        ):
+            raise TypeError(
+                "OnnxRuntime Where: expected a boolean condition and matching data dtypes"
+            )
+        dtype = dtypes[op.inputs[1]]
+        tensors[op.outputs[0]] = wp.zeros(condition_shape, dtype=dtype, device=device)
+        shapes[op.outputs[0]] = condition_shape
+        dtypes[op.outputs[0]] = dtype
+        op.attrs["_scalar_data"] = True
+        op.attrs["_kernel"] = _kernel_for_dtype(
+            _where_scalar_kernel,
+            dtype,
+            _array_type(wp.bool, 1),
+            (1,),
+            (1,),
+            (1,),
+        )
+        return
     if x_shape != y_shape or len(x_shape) < 1:
         raise NotImplementedError(
-            "OnnxRuntime Where: data inputs must have the same non-scalar shape"
+            f"OnnxRuntime Where: data inputs must have the same non-scalar shape, "
+            f"got condition={condition_shape}, x={x_shape}, y={y_shape}"
         )
     if condition_shape not in (x_shape, (x_shape[-1],)):
         raise NotImplementedError(
@@ -2010,6 +2381,10 @@ def _shape_transpose(op, shapes, dtypes, tensors, device, requires_grad=False):
         kernel = _transpose_021_kernel
     elif perm == (0, 2, 1, 3):
         kernel = _transpose_0213_kernel
+    elif perm == (0, 1, 3, 2):
+        kernel = _transpose_0132_kernel
+    elif perm == (0, 2, 3, 1):
+        kernel = _transpose_0231_kernel
     else:
         raise NotImplementedError(
             f"OnnxRuntime Transpose: permutation {perm} is not supported"
@@ -2269,21 +2644,34 @@ _SHAPE_DISPATCH: dict[str, Any] = {
     "_RmsNormalization": _shape_rms_normalization,
     "_SwiGLU": _shape_swiglu,
     "Add": _shape_elementwise_binary,
+    "ArgMax": _shape_argmax,
     "BatchNormalization": _shape_batch_normalization,
     "Cast": _shape_cast,
     "CausalConvWithState": _shape_causal_conv_with_state,
     "Constant": _shape_constant,
+    "ConstantOfShape": _shape_constant_of_shape,
+    "Concat": _shape_concat,
     "Div": _shape_elementwise_binary,
     "Elu": _shape_elementwise_unary,
+    "Equal": _shape_comparison,
+    "Erf": _shape_elementwise_unary,
     "Gemm": _shape_gemm,
     "Gather": _shape_gather,
     "GatherBlockQuantized": _shape_gather_block_quantized,
     "GroupQueryAttention": _shape_group_query_attention,
+    "Identity": _shape_identity,
     "LSTM": _shape_lstm,
     "LinearAttention": _shape_linear_attention,
+    "LayerNormalization": _shape_layer_normalization,
+    "LessOrEqual": _shape_comparison,
     "LpNormalization": _shape_lp_normalization,
     "MatMulNBits": _shape_matmul_nbits,
+    "MatMul": _shape_matmul,
+    "Min": _shape_elementwise_binary,
+    "Mod": _shape_elementwise_binary,
     "Mul": _shape_elementwise_binary,
+    "Neg": _shape_elementwise_unary,
+    "Pow": _shape_elementwise_binary,
     "ReduceMean": _shape_reduce_mean,
     "ReduceMax": _shape_reduce_max,
     "ReduceSum": _shape_reduce_sum,
@@ -2293,8 +2681,11 @@ _SHAPE_DISPATCH: dict[str, Any] = {
     "RotaryEmbedding": _shape_rotary_embedding,
     "Shape": _shape_shape,
     "Sigmoid": _shape_elementwise_unary,
+    "Sin": _shape_elementwise_unary,
     "Sqrt": _shape_elementwise_unary,
+    "Cos": _shape_elementwise_unary,
     "Softplus": _shape_elementwise_unary,
+    "Softmax": _shape_softmax,
     "SimplifiedLayerNormalization": _shape_simplified_layer_normalization,
     "Squeeze": _shape_squeeze,
     "Sub": _shape_elementwise_binary,

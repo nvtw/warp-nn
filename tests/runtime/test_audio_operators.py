@@ -8,6 +8,8 @@ import warp as wp
 from tests.utilities import is_device_available
 from warp_nn.runtime.operators import (
     Conv1dPlan,
+    LinearUpsample1dPlan,
+    ReflectPad1dPlan,
     RelativeBidirectionalAttentionPlan,
     Snake1dPlan,
     conv1d_output_length,
@@ -73,6 +75,26 @@ def test_conv1d_plan_matches_reference(device, transposed):
         x, weight, bias, 2, 2, 2, transposed, 1 if transposed else 0
     )
     np.testing.assert_allclose(actual, expected, rtol=2.0e-5, atol=2.0e-5)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda:0"])
+def test_reflect_padding_and_linear_upsampling_match_reference(device):
+    if not is_device_available(device):
+        pytest.skip(f"{device} is unavailable")
+    values = np.arange(2 * 5 * 3, dtype=np.float32).reshape(2, 5, 3) / 7.0
+    padding = ReflectPad1dPlan(wp.array(values, device=device), 2, 1)
+    np.testing.assert_array_equal(
+        padding.execute().numpy(),
+        np.pad(values, ((0, 0), (2, 1), (0, 0)), mode="reflect"),
+    )
+
+    upsampling = LinearUpsample1dPlan(wp.array(values, device=device), 2)
+    coordinates = (np.arange(10, dtype=np.float32) + 0.5) / 2.0 - 0.5
+    lower = np.maximum(np.floor(coordinates).astype(int), 0)
+    upper = np.minimum(lower + 1, values.shape[1] - 1)
+    fraction = np.maximum(coordinates - lower, 0.0)[None, :, None]
+    expected = values[:, lower] * (1.0 - fraction) + values[:, upper] * fraction
+    np.testing.assert_allclose(upsampling.execute().numpy(), expected, rtol=1e-6)
 
 
 def test_snake1d_matches_reference_and_cuda_graph():

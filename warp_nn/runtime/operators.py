@@ -882,9 +882,17 @@ def _exec_elu(op, tensors, shapes, device):
 
 
 def _exec_unary(op, tensors, shapes, device):
-    operation = {"Relu": 0, "Tanh": 1, "Sqrt": 2, "Sigmoid": 3, "Softplus": 4}[
-        op.op_type
-    ]
+    operation = {
+        "Relu": 0,
+        "Tanh": 1,
+        "Sqrt": 2,
+        "Sigmoid": 3,
+        "Softplus": 4,
+        "Sin": 5,
+        "Cos": 6,
+        "Erf": 7,
+        "Neg": 8,
+    }[op.op_type]
     shape_2d = op.attrs["_shape_2d"]
     wp.launch(
         op.attrs["_kernel"],
@@ -900,7 +908,9 @@ def _exec_binary(op, tensors, shapes, device):
         return
     lhs = tensors[op.inputs[0]].reshape(op.attrs["_lhs_shape_2d"])
     rhs = tensors[op.inputs[1]].reshape(op.attrs["_rhs_shape_2d"])
-    operation = {"Add": 0, "Sub": 1, "Mul": 2, "Div": 3}[op.op_type]
+    operation = {"Add": 0, "Sub": 1, "Mul": 2, "Div": 3, "Min": 4, "Pow": 5, "Mod": 6}[
+        op.op_type
+    ]
     wp.launch(
         op.attrs["_kernel"],
         dim=op.attrs["_out_shape_2d"],
@@ -910,12 +920,26 @@ def _exec_binary(op, tensors, shapes, device):
     )
 
 
+def _exec_comparison(op, tensors, shapes, device):
+    if op.attrs.get("_static_output"):
+        return
+    lhs = tensors[op.inputs[0]].reshape(op.attrs["_lhs_shape_2d"])
+    rhs = tensors[op.inputs[1]].reshape(op.attrs["_rhs_shape_2d"])
+    wp.launch(
+        op.attrs["_kernel"],
+        dim=op.attrs["_out_shape_2d"],
+        inputs=[lhs, rhs, 0 if op.op_type == "LessOrEqual" else 1],
+        outputs=[tensors[op.outputs[0]].reshape(op.attrs["_out_shape_2d"])],
+        device=device,
+    )
+
+
 def _exec_reduce_mean(op, tensors, shapes, device):
     wp.launch(
         op.attrs["_kernel"],
-        dim=shapes[op.inputs[0]][0],
-        inputs=[tensors[op.inputs[0]]],
-        outputs=[tensors[op.outputs[0]]],
+        dim=op.attrs["_rows"],
+        inputs=[tensors[op.inputs[0]].reshape((op.attrs["_rows"], op.attrs["_width"]))],
+        outputs=[tensors[op.outputs[0]].reshape((op.attrs["_rows"], 1))],
         device=device,
     )
 
@@ -923,8 +947,11 @@ def _exec_reduce_mean(op, tensors, shapes, device):
 def _exec_reduce_sum(op, tensors, shapes, device):
     wp.launch_tiled(
         op.attrs["_kernel"],
-        dim=shapes[op.inputs[0]][0],
-        inputs=[tensors[op.inputs[0]], tensors[op.outputs[0]]],
+        dim=op.attrs["_rows"],
+        inputs=[
+            tensors[op.inputs[0]].reshape((op.attrs["_rows"], op.attrs["_width"])),
+            tensors[op.outputs[0]].flatten(),
+        ],
         block_dim=op.attrs["_tile_width"],
         device=device,
     )
@@ -934,8 +961,71 @@ def _exec_static(op, tensors, shapes, device):
     pass
 
 
+def _exec_identity(op, tensors, shapes, device):
+    tensors[op.outputs[0]] = tensors[op.inputs[0]]
+
+
+def _exec_concat(op, tensors, shapes, device):
+    if op.attrs.get("_static_output"):
+        return
+    output = tensors[op.outputs[0]].flatten()
+    axis = op.attrs["_axis"]
+    output_axis_width = shapes[op.outputs[0]][axis]
+    axis_offset = 0
+    for name in op.inputs:
+        source = tensors[name].flatten()
+        axis_width = shapes[name][axis]
+        wp.launch(
+            op.attrs["_kernel"],
+            dim=source.size,
+            inputs=[
+                source,
+                output,
+                axis_width,
+                output_axis_width,
+                op.attrs["_suffix"],
+                axis_offset,
+            ],
+            device=device,
+        )
+        axis_offset += axis_width
+
+
+def _exec_slice(op, tensors, shapes, device):
+    if op.attrs.get("_static_output"):
+        return
+    if op.attrs.get("_view_only"):
+        tensors[op.outputs[0]] = tensors[op.inputs[0]]
+        return
+    rows = op.attrs["_rows"]
+    source = tensors[op.inputs[0]].reshape((rows, shapes[op.inputs[0]][-1]))
+    output = tensors[op.outputs[0]].reshape((rows, shapes[op.outputs[0]][-1]))
+    wp.launch(
+        op.attrs["_kernel"],
+        dim=output.shape,
+        inputs=[source, output, op.attrs["_offset"]],
+        device=device,
+    )
+
+
 def _exec_gather(op, tensors, shapes, device):
     if op.attrs.get("_static_output"):
+        return
+    if op.attrs.get("_generic"):
+        output = tensors[op.outputs[0]]
+        wp.launch(
+            op.attrs["_kernel"],
+            dim=output.size,
+            inputs=[
+                tensors[op.inputs[0]].flatten(),
+                tensors[op.inputs[1]].flatten(),
+                output.flatten(),
+                op.attrs["_axis_size"],
+                op.attrs["_indices_size"],
+                op.attrs["_inner_size"],
+            ],
+            device=device,
+        )
         return
     if "_single_index" in op.attrs:
         data = tensors[op.inputs[0]]
@@ -1000,6 +1090,68 @@ def _exec_reduce_max(op, tensors, shapes, device):
         op.attrs["_kernel"],
         dim=1,
         inputs=[tensors[op.inputs[0]], tensors[op.outputs[0]]],
+        device=device,
+    )
+
+
+def _exec_argmax(op, tensors, shapes, device):
+    wp.launch(
+        op.attrs["_kernel"],
+        dim=1,
+        inputs=[tensors[op.inputs[0]].flatten(), tensors[op.outputs[0]].flatten()],
+        device=device,
+    )
+
+
+def _exec_matmul(op, tensors, shapes, device):
+    wp.launch(
+        op.attrs["_kernel"],
+        dim=(op.attrs["_batches"], op.attrs["_rows"], op.attrs["_columns"]),
+        inputs=[
+            tensors[op.inputs[0]].flatten(),
+            tensors[op.inputs[1]].flatten(),
+            tensors[op.outputs[0]].flatten(),
+            op.attrs["_rows"],
+            op.attrs["_columns"],
+            op.attrs["_inner"],
+            op.attrs["_lhs_batches"],
+            op.attrs["_rhs_batches"],
+        ],
+        device=device,
+    )
+
+
+def _exec_layer_normalization(op, tensors, shapes, device):
+    rows, width = op.attrs["_rows"], op.attrs["_width"]
+    source = tensors[op.inputs[0]].reshape((rows, width))
+    output = tensors[op.outputs[0]].reshape((rows, width))
+    wp.launch_tiled(
+        op.attrs["_kernel"],
+        dim=rows,
+        inputs=[source, output, wp.float32(op.attrs.get("epsilon", 1.0e-5))],
+        block_dim=op.attrs["_tile_width"],
+        device=device,
+    )
+    for parameter, operation in ((op.inputs[1], 2), (op.inputs[2], 0)):
+        wp.launch(
+            op.attrs["_affine_kernel"],
+            dim=(rows, width),
+            inputs=[output, tensors[parameter].reshape((1, width)), operation],
+            outputs=[output],
+            device=device,
+        )
+
+
+def _exec_softmax(op, tensors, shapes, device):
+    rows, width = op.attrs["_rows"], op.attrs["_width"]
+    wp.launch_tiled(
+        op.attrs["_kernel"],
+        dim=rows,
+        inputs=[
+            tensors[op.inputs[0]].reshape((rows, width)),
+            tensors[op.outputs[0]].reshape((rows, width)),
+        ],
+        block_dim=op.attrs["_tile_width"],
         device=device,
     )
 
@@ -1078,6 +1230,22 @@ def _exec_tile(op, tensors, shapes, device):
 
 
 def _exec_where(op, tensors, shapes, device):
+    if op.attrs.get("_static_output"):
+        return
+    if op.attrs.get("_scalar_data"):
+        output = tensors[op.outputs[0]]
+        wp.launch(
+            op.attrs["_kernel"],
+            dim=output.size,
+            inputs=[
+                tensors[op.inputs[0]].flatten(),
+                tensors[op.inputs[1]].flatten(),
+                tensors[op.inputs[2]].flatten(),
+                output.flatten(),
+            ],
+            device=device,
+        )
+        return
     shape_2d = op.attrs["_shape_2d"]
     wp.launch(
         op.attrs["_kernel"],
@@ -2455,22 +2623,35 @@ _OP_DISPATCH: dict[str, Any] = {
     "_RmsNormalization": _exec_rms_normalization,
     "_SwiGLU": _exec_swiglu,
     "Add": _exec_binary,
+    "ArgMax": _exec_argmax,
     "BatchNormalization": _exec_batch_normalization,
     "Cast": _exec_cast,
     "CausalConvWithState": _exec_causal_conv_with_state,
     "Constant": _exec_constant,
+    "ConstantOfShape": _exec_static,
+    "Concat": _exec_concat,
     "Div": _exec_binary,
     "Elu": _exec_elu,
+    "Equal": _exec_comparison,
+    "Erf": _exec_unary,
     "Gemm": _exec_gemm,
     "Gather": _exec_gather,
     "GatherBlockQuantized": _exec_gather_block_quantized,
     "GroupQueryAttention": _exec_group_query_attention,
+    "Identity": _exec_identity,
     "LSTM": _exec_lstm,
     "Linear": _exec_linear,
     "LinearAttention": _exec_linear_attention,
+    "LayerNormalization": _exec_layer_normalization,
+    "LessOrEqual": _exec_comparison,
     "LpNormalization": _exec_lp_normalization,
     "MatMulNBits": _exec_matmul_nbits,
+    "MatMul": _exec_matmul,
+    "Min": _exec_binary,
+    "Mod": _exec_binary,
     "Mul": _exec_binary,
+    "Neg": _exec_unary,
+    "Pow": _exec_binary,
     "ReduceMean": _exec_reduce_mean,
     "ReduceMax": _exec_reduce_max,
     "ReduceSum": _exec_reduce_sum,
@@ -2480,13 +2661,16 @@ _OP_DISPATCH: dict[str, Any] = {
     "RotaryEmbedding": _exec_rotary_embedding,
     "Shape": _exec_static,
     "Sigmoid": _exec_unary,
+    "Sin": _exec_unary,
     "Sqrt": _exec_unary,
+    "Cos": _exec_unary,
     "Softplus": _exec_unary,
+    "Softmax": _exec_softmax,
     "SimplifiedLayerNormalization": _exec_simplified_layer_normalization,
     "Squeeze": _exec_squeeze,
     "Sub": _exec_binary,
     "SkipSimplifiedLayerNormalization": _exec_skip_simplified_layer_normalization,
-    "Slice": _exec_static,
+    "Slice": _exec_slice,
     "Split": _exec_split,
     "Tanh": _exec_unary,
     "Tile": _exec_tile,
@@ -3290,6 +3474,61 @@ class Conv1dPlan:
         return self.output
 
 
+class ReflectPad1dPlan:
+    """Fixed-buffer channels-last reflection padding along a sequence axis."""
+
+    def __init__(self, x, left, right=None):
+        if x.ndim != 3 or x.dtype not in (wp.float16, wp.bfloat16, wp.float32):
+            raise TypeError("reflection padding requires a rank-three floating tensor")
+        self.input = x
+        self.left = int(left)
+        self.right = self.left if right is None else int(right)
+        if min(self.left, self.right) < 0 or max(self.left, self.right) >= x.shape[1]:
+            raise ValueError("reflection padding must be smaller than the input length")
+        self.output = wp.empty(
+            (x.shape[0], x.shape[1] + self.left + self.right, x.shape[2]),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        self._kernel = _channels_last_1d_kernels(x.dtype)[3]
+
+    def execute(self):
+        wp.launch(
+            self._kernel,
+            dim=self.output.shape,
+            inputs=[self.input, self.output, self.left],
+            device=self.input.device,
+        )
+        return self.output
+
+
+class LinearUpsample1dPlan:
+    """Graph-safe channels-last linear interpolation with unaligned corners."""
+
+    def __init__(self, x, scale):
+        if x.ndim != 3 or x.dtype not in (wp.float16, wp.bfloat16, wp.float32):
+            raise TypeError("linear upsampling requires a rank-three floating tensor")
+        self.input = x
+        self.scale = int(scale)
+        if self.scale <= 0:
+            raise ValueError("linear upsampling scale must be positive")
+        self.output = wp.empty(
+            (x.shape[0], x.shape[1] * self.scale, x.shape[2]),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        self._kernel = _channels_last_1d_kernels(x.dtype)[4]
+
+    def execute(self):
+        wp.launch(
+            self._kernel,
+            dim=self.output.shape,
+            inputs=[self.input, self.output, self.scale],
+            device=self.input.device,
+        )
+        return self.output
+
+
 class Snake1dPlan:
     """Fixed-shape Oobleck Snake activation with channel parameters."""
 
@@ -3337,9 +3576,16 @@ class BiasedLinearPlan:
             for value in (weight, bias)
         ):
             raise ValueError("biased linear tensors must share dtype and device")
-        activations = {None: 0, "silu": 1, "gelu_tanh": 2}
+        activations = {
+            None: 0,
+            "silu": 1,
+            "gelu_tanh": 2,
+            "relu": 3,
+            "gelu": 4,
+            "leaky_relu": 5,
+        }
         if activation not in activations:
-            raise ValueError("activation must be None, 'silu', or 'gelu_tanh'")
+            raise ValueError(f"unknown fused linear activation {activation!r}")
         self.input = x
         self.bias = bias
         self.activation = activations[activation]
@@ -3743,10 +3989,16 @@ def multi_axis_rotary_cache_values(coordinates, axes, theta=10000.0):
 
 
 class ElementwiseActivationPlan:
-    """Fixed-buffer SiLU or tanh-approximate GELU activation."""
+    """Fixed-buffer common pointwise activation."""
 
     def __init__(self, x, activation):
-        activations = {"silu": 1, "gelu_tanh": 2}
+        activations = {
+            "silu": 1,
+            "gelu_tanh": 2,
+            "relu": 3,
+            "gelu": 4,
+            "leaky_relu": 5,
+        }
         if x.ndim < 2 or activation not in activations:
             raise ValueError(
                 "activation requires a rank-two-or-higher tensor and known kind"

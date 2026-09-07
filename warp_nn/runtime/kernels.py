@@ -420,12 +420,20 @@ def _unary_kernel(x: wp.array2d[Any], operation: int, y: wp.array2d[Any]):
     elif operation == 3:
         value_fp32 = wp.float32(value)
         y[i, j] = x.dtype(wp.float32(1.0) / (wp.float32(1.0) + wp.exp(-value_fp32)))
-    else:
+    elif operation == 4:
         value_fp32 = wp.float32(value)
         y[i, j] = x.dtype(
             wp.max(value_fp32, wp.float32(0.0))
             + wp.log(wp.float32(1.0) + wp.exp(-wp.abs(value_fp32)))
         )
+    elif operation == 5:
+        y[i, j] = x.dtype(wp.sin(wp.float32(value)))
+    elif operation == 6:
+        y[i, j] = x.dtype(wp.cos(wp.float32(value)))
+    elif operation == 7:
+        y[i, j] = x.dtype(wp.erf(wp.float32(value)))
+    else:
+        y[i, j] = -value
 
 
 @wp.kernel
@@ -445,8 +453,40 @@ def _binary_broadcast_kernel(
         out[i, j] = left - right
     elif operation == 2:
         out[i, j] = left * right
-    else:
+    elif operation == 3:
         out[i, j] = left / right
+    elif operation == 4:
+        out[i, j] = wp.min(left, right)
+    elif operation == 5:
+        out[i, j] = lhs.dtype(wp.pow(wp.float32(left), wp.float32(right)))
+    else:
+        out[i, j] = left % right
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _comparison_broadcast_kernel(
+    lhs: wp.array2d[Any],
+    rhs: wp.array2d[Any],
+    operation: int,
+    output: wp.array2d[wp.bool],
+):
+    """Apply an ONNX comparison with modulo broadcasting."""
+    row, column = wp.tid()
+    left = lhs[row % lhs.shape[0], column % lhs.shape[1]]
+    right = rhs[row % rhs.shape[0], column % rhs.shape[1]]
+    output[row, column] = left <= right if operation == 0 else left == right
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _where_scalar_kernel(
+    condition: wp.array1d[wp.bool],
+    x: wp.array1d[Any],
+    y: wp.array1d[Any],
+    output: wp.array1d[Any],
+):
+    """Select between scalar values using an arbitrary-shaped condition."""
+    index = wp.tid()
+    output[index] = wp.where(condition[index], x[0], y[0])
 
 
 @wp.kernel
@@ -551,6 +591,20 @@ def _transpose_0213_kernel(x: wp.array4d[Any], output: wp.array4d[Any]):
     output[i, j, k, column] = x[i, k, j, column]
 
 
+@wp.kernel(enable_backward=False)
+def _transpose_0132_kernel(x: wp.array4d[Any], output: wp.array4d[Any]):
+    """Transpose a rank-4 tensor from axes 0-1-2-3 to 0-1-3-2."""
+    i, j, k, column = wp.tid()
+    output[i, j, k, column] = x[i, j, column, k]
+
+
+@wp.kernel(enable_backward=False)
+def _transpose_0231_kernel(x: wp.array4d[Any], output: wp.array4d[Any]):
+    """Transpose a rank-4 tensor from axes 0-1-2-3 to 0-2-3-1."""
+    i, j, k, column = wp.tid()
+    output[i, j, k, column] = x[i, column, j, k]
+
+
 @wp.kernel(enable_backward=False, module="unique")
 def _split_last_axis_kernel(
     x: wp.array2d[Any],
@@ -560,6 +614,82 @@ def _split_last_axis_kernel(
     """Copy a last-axis slice starting at ``input_offset``."""
     row, column = wp.tid()
     output[row, column] = x[row, input_offset + column]
+
+
+@wp.kernel
+def _concat_axis_kernel(
+    x: wp.array1d[Any],
+    output: wp.array1d[Any],
+    axis_width: int,
+    output_axis_width: int,
+    suffix: int,
+    axis_offset: int,
+):
+    """Copy one contiguous tensor into a flattened concatenation output."""
+    index = wp.tid()
+    axis_span = axis_width * suffix
+    prefix = index / axis_span
+    within = index - prefix * axis_span
+    output_index = prefix * output_axis_width * suffix + axis_offset * suffix + within
+    output[output_index] = x[index]
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _gather_axis_kernel(
+    data: wp.array1d[Any],
+    indices: wp.array1d[wp.int64],
+    output: wp.array1d[Any],
+    axis_size: int,
+    indices_size: int,
+    inner_size: int,
+):
+    """Gather an arbitrary-rank tensor along one flattened axis."""
+    output_index = wp.tid()
+    outer = output_index / (indices_size * inner_size)
+    remainder = output_index - outer * indices_size * inner_size
+    index_offset = remainder / inner_size
+    inner = remainder - index_offset * inner_size
+    source_axis = indices[index_offset]
+    if source_axis < 0:
+        source_axis += wp.int64(axis_size)
+    source = (outer * axis_size + wp.int32(source_axis)) * inner_size + inner
+    output[output_index] = data[source]
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _argmax_1d_kernel(x: wp.array1d[Any], output: wp.array1d[wp.int64]):
+    """Deterministic first-index argmax for a 1-D tensor."""
+    maximum = x[0]
+    maximum_index = wp.int64(0)
+    for index in range(1, x.shape[0]):
+        if x[index] > maximum:
+            maximum = x[index]
+            maximum_index = wp.int64(index)
+    output[0] = maximum_index
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _matmul_batched_kernel(
+    lhs: wp.array1d[Any],
+    rhs: wp.array1d[Any],
+    output: wp.array1d[Any],
+    rows: int,
+    columns: int,
+    inner: int,
+    lhs_batches: int,
+    rhs_batches: int,
+):
+    """Reference batched matrix multiplication with rank-2 broadcasting."""
+    batch, row, column = wp.tid()
+    lhs_batch = wp.where(lhs_batches == 1, 0, batch)
+    rhs_batch = wp.where(rhs_batches == 1, 0, batch)
+    total = lhs.dtype(0.0)
+    for index in range(inner):
+        total += (
+            lhs[(lhs_batch * rows + row) * inner + index]
+            * rhs[(rhs_batch * inner + index) * columns + column]
+        )
+    output[(batch * rows + row) * columns + column] = total
 
 
 @wp.kernel(enable_backward=False)
@@ -927,7 +1057,7 @@ def _modulated_residual_kernel(
 def _bias_activation_kernel(
     x: wp.array2d[Any], bias: wp.array1d[Any], output: wp.array2d[Any], activation: int
 ):
-    """Add a vector bias and optionally apply SiLU or tanh-approximate GELU."""
+    """Add a vector bias and optionally apply a common pointwise activation."""
     row, column = wp.tid()
     value = wp.float32(x[row, column]) + wp.float32(bias[column])
     if activation == 1:
@@ -945,6 +1075,16 @@ def _bias_activation_kernel(
                 )
             )
         )
+    elif activation == 3:
+        value = wp.max(value, wp.float32(0.0))
+    elif activation == 4:
+        value = (
+            wp.float32(0.5)
+            * value
+            * (wp.float32(1.0) + wp.erf(value * wp.float32(0.7071067811865476)))
+        )
+    elif activation == 5:
+        value = wp.where(value >= wp.float32(0.0), value, value * wp.float32(0.2))
     output[row, column] = x.dtype(value)
 
 
@@ -2532,6 +2672,85 @@ def _get_reduce_sum_rows_kernel(width: int, dtype: type):
             offset = tile_index * TILE_WIDTH
             values += wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
         wp.tile_store(out, wp.tile_sum(values), offset=row)
+
+    return tile_width, kernel
+
+
+@lru_cache(maxsize=None)
+def _get_softmax_rows_kernel(width: int, dtype: type):
+    """Build a stable deterministic last-axis softmax kernel."""
+    tile_width = min(512, max(32, 1 << (width - 1).bit_length()))
+    TILE_WIDTH = tile_width
+    DTYPE = dtype
+
+    @wp.func
+    def masked_value(value: dtype, index: wp.int32, width: wp.int32):
+        return (
+            wp.float32(dtype(value)) if index < width else wp.float32(-3.402823466e38)
+        )
+
+    @wp.func
+    def shifted_exp(
+        value: dtype, index: wp.int32, width: wp.int32, maximum: wp.float32
+    ):
+        return (
+            wp.exp(wp.float32(dtype(value)) - maximum)
+            if index < width
+            else wp.float32(0.0)
+        )
+
+    @wp.func
+    def normalize(value: dtype, maximum: wp.float32, inverse_sum: wp.float32):
+        return dtype(wp.exp(wp.float32(dtype(value)) - maximum) * inverse_sum)
+
+    @wp.func
+    def add_offset(index: wp.int32, offset: wp.int32):
+        return index + offset
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def kernel(x: wp.array2d(dtype=DTYPE), output: wp.array2d(dtype=DTYPE)):
+        row = wp.tid()
+        typed_zero = DTYPE(0.0)  # noqa: F841 - retain dtype in the Warp closure
+        maximum = wp.float32(-3.402823466e38)
+        for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
+            offset = tile_index * TILE_WIDTH
+            values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
+            indices = wp.tile_map(
+                add_offset,
+                wp.tile_arange(TILE_WIDTH, dtype=wp.int32),
+                offset,
+            )
+            maximum = wp.max(
+                maximum,
+                wp.tile_extract(
+                    wp.tile_max(wp.tile_map(masked_value, values, indices, x.shape[1])),
+                    0,
+                ),
+            )
+        total = wp.float32(0.0)
+        for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
+            offset = tile_index * TILE_WIDTH
+            values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
+            indices = wp.tile_map(
+                add_offset,
+                wp.tile_arange(TILE_WIDTH, dtype=wp.int32),
+                offset,
+            )
+            total += wp.tile_extract(
+                wp.tile_sum(
+                    wp.tile_map(shifted_exp, values, indices, x.shape[1], maximum)
+                ),
+                0,
+            )
+        inverse_sum = wp.float32(1.0) / total
+        for tile_index in range((x.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
+            offset = tile_index * TILE_WIDTH
+            values = wp.tile_load(x[row], shape=(TILE_WIDTH,), offset=(offset,))
+            wp.tile_store(
+                output[row],
+                wp.tile_map(normalize, values, maximum, inverse_sum),
+                offset=(offset,),
+            )
 
     return tile_width, kernel
 
@@ -4780,7 +4999,41 @@ def _channels_last_1d_kernels(dtype: type):
             value + periodic * periodic / (beta_value + wp.float32(1.0e-9))
         )
 
-    return conv1d_nlc, conv_transpose1d_nlc, snake1d
+    @wp.kernel(enable_backward=False, module="unique")
+    def reflect_pad1d(
+        x: wp.array3d(dtype=DTYPE),
+        output: wp.array3d(dtype=DTYPE),
+        left: int,
+    ):
+        batch, position, channel = wp.tid()
+        source = position - left
+        if source < 0:
+            source = -source
+        elif source >= x.shape[1]:
+            source = 2 * x.shape[1] - source - 2
+        output[batch, position, channel] = DTYPE(x[batch, source, channel])
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def linear_upsample1d(
+        x: wp.array3d(dtype=DTYPE), output: wp.array3d(dtype=DTYPE), scale: int
+    ):
+        batch, position, channel = wp.tid()
+        # PyTorch interpolate(..., mode="linear", align_corners=False).
+        source = (wp.float32(position) + 0.5) / wp.float32(scale) - 0.5
+        lower = wp.max(0, wp.int32(wp.floor(source)))
+        upper = wp.min(x.shape[1] - 1, lower + 1)
+        fraction = wp.max(0.0, source - wp.float32(lower))
+        value = (1.0 - fraction) * wp.float32(x[batch, lower, channel])
+        value += fraction * wp.float32(x[batch, upper, channel])
+        output[batch, position, channel] = DTYPE(value)
+
+    return (
+        conv1d_nlc,
+        conv_transpose1d_nlc,
+        snake1d,
+        reflect_pad1d,
+        linear_upsample1d,
+    )
 
 
 @lru_cache(maxsize=None)
