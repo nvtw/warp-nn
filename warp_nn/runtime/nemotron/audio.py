@@ -719,12 +719,18 @@ class _ConformerBlock:
         p, w = self.prefix, self.weights
         self.norm_ff1.execute(affine)
         self.ff1_up.execute()
-        wp.launch(silu, dim=self.ff1_up.output.shape, inputs=[self.ff1_up.output])
+        wp.launch(
+            silu,
+            dim=self.ff1_up.output.shape,
+            inputs=[self.ff1_up.output],
+            device=self.x.device,
+        )
         self.ff1_down.execute()
         wp.launch(
             residual,
             dim=self.after_ff1.shape,
             inputs=[self.x, self.ff1_down.output, self.after_ff1, wp.float32(0.5)],
+            device=self.x.device,
         )
 
         self.norm_attention.execute(affine)
@@ -746,6 +752,7 @@ class _ConformerBlock:
                 self.after_attention,
                 wp.float32(1.0),
             ],
+            device=self.x.device,
         )
 
         self.norm_conv.execute(affine)
@@ -754,6 +761,7 @@ class _ConformerBlock:
             glu,
             dim=self.glu.shape,
             inputs=[self.conv_pointwise1.output, self.valid, self.glu],
+            device=self.x.device,
         )
         self.conv_depthwise.execute()
         wp.launch(
@@ -768,12 +776,14 @@ class _ConformerBlock:
                 self.valid,
                 wp.float32(epsilon),
             ],
+            device=self.x.device,
         )
         self.conv_pointwise2.execute()
         wp.launch(
             mask,
             dim=self.conv_pointwise2.output.shape,
             inputs=[self.conv_pointwise2.output, self.valid],
+            device=self.x.device,
         )
         wp.launch(
             residual,
@@ -784,11 +794,17 @@ class _ConformerBlock:
                 self.after_conv,
                 wp.float32(1.0),
             ],
+            device=self.x.device,
         )
 
         self.norm_ff2.execute(affine)
         self.ff2_up.execute()
-        wp.launch(silu, dim=self.ff2_up.output.shape, inputs=[self.ff2_up.output])
+        wp.launch(
+            silu,
+            dim=self.ff2_up.output.shape,
+            inputs=[self.ff2_up.output],
+            device=self.x.device,
+        )
         self.ff2_down.execute()
         wp.launch(
             residual,
@@ -799,6 +815,7 @@ class _ConformerBlock:
                 self.after_ff2,
                 wp.float32(0.5),
             ],
+            device=self.x.device,
         )
         self.norm_out.execute(affine)
         return self.output
@@ -916,6 +933,7 @@ class _AudioPlan:
             relu4,
             dim=self.conv0.output.shape,
             inputs=[self.conv0.output, self.masks[1]],
+            device=self.encoder.device,
         )
         self.conv1_depthwise.execute()
         self.conv1_pointwise.execute()
@@ -923,6 +941,7 @@ class _AudioPlan:
             relu4,
             dim=self.conv1_pointwise.output.shape,
             inputs=[self.conv1_pointwise.output, self.masks[2]],
+            device=self.encoder.device,
         )
         self.conv2_depthwise.execute()
         self.conv2_pointwise.execute()
@@ -930,11 +949,13 @@ class _AudioPlan:
             relu4,
             dim=self.conv2_pointwise.output.shape,
             inputs=[self.conv2_pointwise.output, self.masks[3]],
+            device=self.encoder.device,
         )
         wp.launch(
             flatten,
             dim=self.flattened.shape,
             inputs=[self.conv2_pointwise.output, self.flattened],
+            device=self.encoder.device,
         )
         self.subsampling_linear.execute()
         wp.launch(
@@ -945,6 +966,7 @@ class _AudioPlan:
                 self.encoder.weights["sound_encoder.encoder.subsampling.linear.bias"],
                 self.masks[-1],
             ],
+            device=self.encoder.device,
         )
         for block in self.blocks:
             block.execute(kernels, self.encoder.config.layer_norm_epsilon)
