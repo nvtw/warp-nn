@@ -78,6 +78,7 @@ import numpy as np
 import warp as wp
 
 from warp_nn.runtime._cublas import try_create_cublas
+from warp_nn.runtime.formats.onnx import onnx_array_to_warp
 from warp_nn.runtime.kernels import (
     _array_type,
     _batch_normalization_kernel,
@@ -494,8 +495,11 @@ class OnnxRuntime:
                     arr_np = numpy_helper.to_array(
                         init, base_dir=str(model_path.parent)
                     )
-                tensor = _np_to_warp(
-                    arr_np, self._device, requires_grad=self._requires_grad
+                tensor = onnx_array_to_warp(
+                    arr_np,
+                    init.data_type,
+                    self._device,
+                    requires_grad=self._requires_grad,
                 )
             finally:
                 if external:
@@ -597,8 +601,9 @@ class OnnxRuntime:
         for node in graph.node:
             decoded, all_names = _decode_attrs(node)
             if node.op_type in ("Constant", "ConstantOfShape") and "value" in decoded:
-                decoded["_value"] = _np_to_warp(
+                decoded["_value"] = onnx_array_to_warp(
                     numpy_helper.to_array(decoded["value"]),
+                    decoded["value"].data_type,
                     self._device,
                     requires_grad=self._requires_grad,
                 )
@@ -1366,8 +1371,16 @@ def _shape_cast(op, shapes, dtypes, tensors, device, requires_grad=False):
         raise NotImplementedError("OnnxRuntime Cast: unsupported target dtype")
     shape = shapes[op.inputs[0]]
     if op.attrs["_static_inputs"][0]:
-        result = tensors[op.inputs[0]].numpy().astype(wp.dtype_to_numpy(target_dtype))
-        tensors[op.outputs[0]] = _np_to_warp(result, device)
+        host = tensors[op.inputs[0]].numpy()
+        if target_dtype == wp.bfloat16:
+            # Warp exposes BF16's storage dtype as uint16 to NumPy.  Casting
+            # through that dtype would reinterpret numeric values as bits.
+            host = host.astype(np.float32)
+        else:
+            host = host.astype(wp.dtype_to_numpy(target_dtype))
+        tensors[op.outputs[0]] = wp.array(
+            host, dtype=target_dtype, device=device, requires_grad=False
+        )
         shapes[op.outputs[0]] = shape
         dtypes[op.outputs[0]] = target_dtype
         op.attrs["_static_output"] = True

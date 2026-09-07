@@ -253,7 +253,7 @@ def split_reasoning(text: str, enable_thinking: bool) -> tuple[str, str | None]:
     return (answer.lstrip(), reasoning.strip()) if marker else ("", reasoning.strip())
 
 
-def _sample_candidates(
+def sample_candidates(
     values: np.ndarray,
     candidates: np.ndarray,
     temperature: float,
@@ -300,7 +300,7 @@ def sample_token(
     if 0 < top_k < values.size:
         candidates = np.argpartition(values, -top_k)[-top_k:]
         values = values[candidates]
-    return _sample_candidates(
+    return sample_candidates(
         values, candidates, temperature, top_p, rng or np.random.default_rng()
     )
 
@@ -325,7 +325,7 @@ def sample_runner_token(
     read_top_k = getattr(runner, "read_top_k", None)
     if callable(read_top_k) and presence_penalty == 0.0 and 1 < top_k <= 32:
         values, candidates = read_top_k(logits, top_k)
-        return _sample_candidates(
+        return sample_candidates(
             values,
             candidates,
             temperature,

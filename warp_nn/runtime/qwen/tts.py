@@ -16,19 +16,19 @@ from typing import Sequence
 import numpy as np
 import warp as wp
 
-from ...utils.device import parse_device
-from .._cublas import try_create_cublas
 from ..chat import sample_token
 from ..formats.safetensors import SafeTensorArchive
 from ..kernels import (
     _add_arrays_kernel,
-    _apply_embedding_overrides_kernel,
     _gather_rows_kernel,
 )
 from ..operators import BiasedLinearPlan, Operation, plan_linear
 from ..tokenizers import Qwen3Tokenizer
-from ..weights import MappedWeightArchive, load_cast_weights
-from .causal import Qwen3CausalLM, _Qwen3CausalPlan
+from ..weights import load_cast_weights
+from .causal import (
+    ExternalEmbeddingQwen3CausalLM,
+    _ExternalEmbeddingQwen3CausalPlan,
+)
 from .encoder import qwen3_encoder_weight_names
 from .tts_codec import Qwen3TTSCodecDecoder
 from .tts_speaker import (
@@ -115,33 +115,10 @@ def _backbone_mapping(config: dict, prefix: str, head: str) -> dict[str, str]:
     return mapping
 
 
-class _TTSCausalPlan(_Qwen3CausalPlan):
-    """Dense Qwen plan whose complete input is supplied as embeddings."""
-
-    def __init__(self, runner, rows: int):
-        super().__init__(runner, rows)
-        self.embedding_overrides = wp.empty_like(self.embedding)
-        self.embedding_override_mask = wp.ones(
-            (1, rows), dtype=wp.bool, device=self.device
-        )
-
-    def _stage_embeddings(self) -> None:
-        wp.launch(
-            _apply_embedding_overrides_kernel,
-            dim=self.embedding.shape,
-            inputs=[
-                self.embedding,
-                self.embedding_overrides,
-                self.embedding_override_mask,
-            ],
-            device=self.device,
-        )
-
-
-class _TTSQwenRunner(Qwen3CausalLM):
+class _TTSQwenRunner(ExternalEmbeddingQwen3CausalLM):
     """Qwen causal state initialized from names nested in a TTS checkpoint."""
 
-    plan_type = _TTSCausalPlan
+    plan_type = _ExternalEmbeddingQwen3CausalPlan
 
     def __init__(
         self,
@@ -155,70 +132,17 @@ class _TTSQwenRunner(Qwen3CausalLM):
         dtype,
         use_cublas: bool,
     ):
-        self.config = _qwen_config(config)
-        self.model_path = path
-        self.device = parse_device(device)
-        self.dtype = dtype
-        self.cache_capacity = int(cache_capacity)
-        self.prefill_chunk_size = int(prefill_chunk_size)
-        self.hidden_size = int(config["hidden_size"])
-        self.layers = int(config["num_hidden_layers"])
-        self.query_heads = int(config["num_attention_heads"])
-        self.kv_heads = int(config["num_key_value_heads"])
-        self.head_dim = int(config["head_dim"])
-        self.epsilon = float(config.get("rms_norm_eps", 1.0e-6))
-        self.qk_norm = True
-        self.attention_bias = False
-        if dtype not in (wp.float16, wp.bfloat16):
-            raise TypeError("Qwen3-TTS activations require FP16 or BF16")
-        if not 1 <= self.prefill_chunk_size <= self.cache_capacity:
-            raise ValueError("Qwen3-TTS prefill chunk must fit in its cache")
-        archive = MappedWeightArchive(SafeTensorArchive(path), mapping)
-        self.weights = load_cast_weights(
-            archive, tuple(mapping), self.device, self.dtype
+        super().__init__(
+            path,
+            _qwen_config(config),
+            SafeTensorArchive(path),
+            mapping,
+            cache_capacity=cache_capacity,
+            prefill_chunk_size=prefill_chunk_size,
+            device=device,
+            dtype=dtype,
+            use_cublas=use_cublas,
         )
-        self.tokenizer = None
-        self.cublas = (
-            try_create_cublas() if use_cublas and self.device.is_cuda else None
-        )
-        self._last_plan = None
-        self._initialize_execution_state()
-
-    def _run(self, plan, graph_key=None):
-        output = super()._run(plan, graph_key)
-        self._last_plan = plan
-        return output
-
-    @property
-    def last_hidden(self) -> wp.array:
-        if self._last_plan is None:
-            raise RuntimeError("Qwen3-TTS runner has not executed")
-        return self._last_plan.final_hidden
-
-    def prefill_embeddings(self, embeddings: wp.array) -> wp.array:
-        """Reset and prefill from a complete device embedding sequence."""
-        if (
-            embeddings.ndim != 2
-            or embeddings.shape[1] != self.hidden_size
-            or embeddings.dtype != self.dtype
-            or embeddings.device != self.device
-        ):
-            raise TypeError("Qwen3-TTS prefill embeddings do not match the runner")
-        rows = embeddings.shape[0]
-        return super().prefill_with_embeddings(
-            [0] * rows, embeddings, tuple(range(rows))
-        )
-
-    def decode_embedding(self, embedding: wp.array) -> wp.array:
-        """Append one externally supplied embedding."""
-        if (
-            embedding.shape != (1, self.hidden_size)
-            or embedding.dtype != self.dtype
-            or embedding.device != self.device
-        ):
-            raise TypeError("Qwen3-TTS decode embedding does not match the runner")
-        position = self.sequence_length
-        return self._stage_one(0, embedding, (position,), token_offset=position)
 
 
 class _Projection:
@@ -289,7 +213,7 @@ class _TextProjection:
         return self.second(self.first(gathered.reshape((values.size, -1))))
 
 
-class _CodePredictorPlan(_TTSCausalPlan):
+class _CodePredictorPlan(_ExternalEmbeddingQwen3CausalPlan):
     """One predictor plan with lightweight selectable per-codebook heads."""
 
     def __init__(self, runner, rows: int):

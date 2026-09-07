@@ -392,6 +392,37 @@ def test_preserves_floating_point_dtypes(device, np_dtype, tensor_type, warp_dty
         path.unlink(missing_ok=True)
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_static_cast_to_bfloat16_preserves_values(device):
+    if not is_device_available(device):
+        pytest.skip(f"Device '{device}' is not available")
+
+    values = np.asarray((1, -2, 13), dtype=np.int64)
+    model = helper.make_model(
+        helper.make_graph(
+            [
+                helper.make_node(
+                    "Cast", ("values",), ("output",), to=TensorProto.BFLOAT16
+                )
+            ],
+            "static-bfloat16-cast",
+            [],
+            [helper.make_tensor_value_info("output", TensorProto.BFLOAT16, [3])],
+            [numpy_helper.from_array(values, name="values")],
+        ),
+        opset_imports=[helper.make_opsetid("", 18)],
+    )
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        onnx.save(model, str(path))
+        output = OnnxRuntime(str(path), device=device)({})["output"]
+        assert output.dtype == wp.bfloat16
+        np.testing.assert_array_equal(output.numpy(), values.astype(np.float32))
+    finally:
+        path.unlink(missing_ok=True)
+
+
 @pytest.mark.parametrize("device", ["cuda"])
 def test_mlp_policy_input_gradients(device):
     if not is_device_available(device):

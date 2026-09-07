@@ -622,6 +622,13 @@ def _transpose_021_kernel(x: wp.array3d[Any], output: wp.array3d[Any]):
 
 
 @wp.kernel(enable_backward=False)
+def _transpose_2d_kernel(x: wp.array2d[Any], output: wp.array2d[Any]):
+    """Transpose a dense matrix, primarily for one-time checkpoint conversion."""
+    row, column = wp.tid()
+    output[column, row] = x[row, column]
+
+
+@wp.kernel(enable_backward=False)
 def _transpose_0213_kernel(x: wp.array4d[Any], output: wp.array4d[Any]):
     """Transpose a rank-4 tensor from axes 0-1-2-3 to 0-2-1-3."""
     i, j, k, column = wp.tid()
