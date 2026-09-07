@@ -148,12 +148,13 @@ def test_skintokens_attention_primitives():
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6)
 
 
-def test_skintokens_shape_comparison_and_constant_ops():
+def test_skintokens_shape_comparison_and_expand_ops():
     shape = np.asarray([2, 3], dtype=np.int64)
     nodes = [
         helper.make_node("LessOrEqual", ["x", "zero"], ["condition"]),
         helper.make_node("Equal", ["x", "x"], ["equal"]),
         helper.make_node("Where", ["condition", "negative", "positive"], ["selected"]),
+        helper.make_node("Expand", ["selected", "shape"], ["expanded"]),
         helper.make_node(
             "ConstantOfShape",
             ["shape"],
@@ -166,7 +167,7 @@ def test_skintokens_shape_comparison_and_constant_ops():
         "skintokens_shape_ops",
         [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 1])],
         [
-            helper.make_tensor_value_info("selected", TensorProto.FLOAT, [1, 1]),
+            helper.make_tensor_value_info("expanded", TensorProto.FLOAT, [2, 3]),
             helper.make_tensor_value_info("equal", TensorProto.BOOL, [1, 1]),
             helper.make_tensor_value_info("filled", TensorProto.INT64, [2, 3]),
         ],
@@ -182,7 +183,27 @@ def test_skintokens_shape_comparison_and_constant_ops():
 
     actual = _run(model, {"x": np.asarray([[-1.0]], dtype=np.float32)})
     np.testing.assert_array_equal(
-        actual["selected"], np.asarray([[-2.0]], dtype=np.float32)
+        actual["expanded"], np.full((2, 3), -2.0, dtype=np.float32)
     )
     np.testing.assert_array_equal(actual["equal"], np.ones((1, 1), dtype=np.bool_))
     np.testing.assert_array_equal(actual["filled"], np.full((2, 3), 4, dtype=np.int64))
+
+
+def test_skintokens_rank_five_shape_views_use_flat_storage():
+    axes = np.asarray([0], dtype=np.int64)
+    nodes = [
+        helper.make_node("Unsqueeze", ["x", "axes"], ["rank_five"]),
+        helper.make_node("Squeeze", ["rank_five", "axes"], ["restored"]),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "skintokens_rank_five_views",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 2, 1, 3])],
+        [helper.make_tensor_value_info("restored", TensorProto.FLOAT, [1, 2, 1, 3])],
+        initializer=[_initializer("axes", axes)],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+    model.ir_version = 8
+
+    x = np.arange(6, dtype=np.float32).reshape(1, 2, 1, 3)
+    np.testing.assert_array_equal(_run(model, {"x": x})["restored"], x)

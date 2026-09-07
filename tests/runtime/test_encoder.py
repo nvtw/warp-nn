@@ -6,6 +6,7 @@ import math
 import numpy as np
 import warp as wp
 
+from warp_nn.runtime.kernels import _get_residual_layer_norm_kernel
 from warp_nn.runtime.operators import EncoderLayerPlan
 
 
@@ -77,3 +78,29 @@ def test_encoder_layer_matches_numpy_cpu():
     )
     plan.execute()
     np.testing.assert_allclose(plan.output.numpy(), expected, rtol=4e-3, atol=4e-3)
+
+
+def test_wide_residual_layer_norm_matches_numpy_cpu():
+    rng = np.random.default_rng(97)
+    rows, width = 3, 1024
+    branch = rng.normal(0, 0.7, (rows, width)).astype(np.float32)
+    residual = rng.normal(0, 0.7, (rows, width)).astype(np.float32)
+    bias = rng.normal(0, 0.1, width).astype(np.float32)
+    scale = rng.normal(1, 0.1, width).astype(np.float32)
+    shift = rng.normal(0, 0.1, width).astype(np.float32)
+    combined = branch + residual + bias
+    expected = _layer_norm(combined, scale, shift)
+    inputs = [
+        wp.array(value, dtype=wp.float32, device="cpu")
+        for value in (branch, residual, bias, scale, shift)
+    ]
+    output = wp.empty((rows, width), dtype=wp.float32, device="cpu")
+    tile_width, kernel = _get_residual_layer_norm_kernel(width, wp.float32)
+    wp.launch_tiled(
+        kernel,
+        dim=rows,
+        inputs=[*inputs, output, wp.float32(1.0e-5)],
+        block_dim=tile_width,
+        device="cpu",
+    )
+    np.testing.assert_allclose(output.numpy(), expected, rtol=2e-5, atol=2e-5)

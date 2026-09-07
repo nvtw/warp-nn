@@ -489,6 +489,43 @@ def _where_scalar_kernel(
     output[index] = wp.where(condition[index], x[0], y[0])
 
 
+@wp.kernel(enable_backward=False, module="unique")
+def _expand_5d_kernel(
+    x: wp.array1d[Any],
+    output: wp.array1d[Any],
+    input_0: int,
+    input_1: int,
+    input_2: int,
+    input_3: int,
+    input_4: int,
+    output_0: int,
+    output_1: int,
+    output_2: int,
+    output_3: int,
+    output_4: int,
+):
+    """Expand a rank-five-or-lower tensor using ONNX multidirectional broadcast."""
+    index = wp.tid()
+    coordinate_4 = index % output_4
+    index = index / output_4
+    coordinate_3 = index % output_3
+    index = index / output_3
+    coordinate_2 = index % output_2
+    index = index / output_2
+    coordinate_1 = index % output_1
+    coordinate_0 = index / output_1
+    coordinate_0 = wp.where(input_0 == 1, 0, coordinate_0)
+    coordinate_1 = wp.where(input_1 == 1, 0, coordinate_1)
+    coordinate_2 = wp.where(input_2 == 1, 0, coordinate_2)
+    coordinate_3 = wp.where(input_3 == 1, 0, coordinate_3)
+    coordinate_4 = wp.where(input_4 == 1, 0, coordinate_4)
+    source = (
+        ((coordinate_0 * input_1 + coordinate_1) * input_2 + coordinate_2) * input_3
+        + coordinate_3
+    ) * input_4 + coordinate_4
+    output[wp.tid()] = x[source]
+
+
 @wp.kernel
 def _reduce_mean_rows_kernel(x: wp.array2d[Any], out: wp.array2d[Any]):
     """Reduce each matrix row to its mean."""
@@ -2329,6 +2366,142 @@ def _get_layer_norm_kernel(width: int, dtype: type):
     if key not in _layer_norm_kernel_cache:
         _layer_norm_kernel_cache[key] = _create_layer_norm_kernel(*key)
     return tile_width, _layer_norm_kernel_cache[key]
+
+
+def _create_residual_layer_norm_kernel(tile_width: int, dtype: type):
+    """Build fused bias + residual + affine LayerNorm with parallel reductions."""
+    TILE_WIDTH = tile_width
+    DTYPE = dtype
+
+    @wp.func
+    def combine(branch: dtype, residual: dtype, bias: dtype):
+        return (
+            wp.float32(dtype(branch))
+            + wp.float32(dtype(residual))
+            + wp.float32(dtype(bias))
+        )
+
+    @wp.func
+    def centered_square(value: wp.float32, mean: wp.float32):
+        centered = value - mean
+        return centered * centered
+
+    @wp.func
+    def mask_padding(value: wp.float32, index: wp.int32, width: wp.int32):
+        return wp.where(index < width, value, wp.float32(0.0))
+
+    @wp.func
+    def add_offset(index: wp.int32, offset: wp.int32):
+        return index + offset
+
+    @wp.func
+    def normalize(
+        value: wp.float32,
+        scale: dtype,
+        shift: dtype,
+        mean: wp.float32,
+        inverse_std: wp.float32,
+    ):
+        return dtype(
+            (value - mean) * inverse_std * wp.float32(dtype(scale))
+            + wp.float32(dtype(shift))
+        )
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def residual_layer_norm(
+        branch: wp.array2d(dtype=DTYPE),
+        residual: wp.array2d(dtype=DTYPE),
+        bias: wp.array1d(dtype=DTYPE),
+        scale: wp.array1d(dtype=DTYPE),
+        shift: wp.array1d(dtype=DTYPE),
+        output: wp.array2d(dtype=DTYPE),
+        epsilon: wp.float32,
+    ):
+        row = wp.tid()
+        typed_zero = DTYPE(0.0)
+        partials = wp.tile_zeros(shape=(TILE_WIDTH,), dtype=wp.float32)
+        for tile_index in range((branch.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
+            offset = tile_index * TILE_WIDTH
+            values = wp.tile_map(
+                combine,
+                wp.tile_load(branch[row], shape=(TILE_WIDTH,), offset=(offset,)),
+                wp.tile_load(residual[row], shape=(TILE_WIDTH,), offset=(offset,)),
+                wp.tile_load(bias, shape=(TILE_WIDTH,), offset=(offset,)),
+            )
+            values = wp.tile_map(
+                mask_padding,
+                values,
+                wp.tile_map(
+                    add_offset,
+                    wp.tile_arange(TILE_WIDTH, dtype=wp.int32),
+                    offset,
+                ),
+                branch.shape[1],
+            )
+            partials += values
+        mean = wp.tile_extract(wp.tile_sum(partials), 0) / wp.float32(branch.shape[1])
+        squares = wp.tile_zeros(shape=(TILE_WIDTH,), dtype=wp.float32)
+        for tile_index in range((branch.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
+            offset = tile_index * TILE_WIDTH
+            values = wp.tile_map(
+                combine,
+                wp.tile_load(branch[row], shape=(TILE_WIDTH,), offset=(offset,)),
+                wp.tile_load(residual[row], shape=(TILE_WIDTH,), offset=(offset,)),
+                wp.tile_load(bias, shape=(TILE_WIDTH,), offset=(offset,)),
+            )
+            indices = wp.tile_map(
+                add_offset,
+                wp.tile_arange(TILE_WIDTH, dtype=wp.int32),
+                offset,
+            )
+            squares += wp.tile_map(
+                mask_padding,
+                wp.tile_map(centered_square, values, mean),
+                indices,
+                branch.shape[1],
+            )
+        variance = wp.tile_extract(wp.tile_sum(squares), 0) / wp.float32(
+            branch.shape[1]
+        )
+        inverse_std = wp.float32(1.0) / wp.sqrt(
+            variance + epsilon + wp.float32(typed_zero)
+        )
+        for tile_index in range((branch.shape[1] + TILE_WIDTH - 1) / TILE_WIDTH):
+            offset = tile_index * TILE_WIDTH
+            values = wp.tile_map(
+                combine,
+                wp.tile_load(branch[row], shape=(TILE_WIDTH,), offset=(offset,)),
+                wp.tile_load(residual[row], shape=(TILE_WIDTH,), offset=(offset,)),
+                wp.tile_load(bias, shape=(TILE_WIDTH,), offset=(offset,)),
+            )
+            wp.tile_store(
+                output[row],
+                wp.tile_map(
+                    normalize,
+                    values,
+                    wp.tile_load(scale, shape=(TILE_WIDTH,), offset=(offset,)),
+                    wp.tile_load(shift, shape=(TILE_WIDTH,), offset=(offset,)),
+                    mean,
+                    inverse_std,
+                ),
+                offset=(offset,),
+            )
+
+    return residual_layer_norm
+
+
+_residual_layer_norm_kernel_cache = {}
+
+
+def _get_residual_layer_norm_kernel(width: int, dtype: type):
+    """Return a cached fused post-norm kernel and its launch width."""
+    tile_width = min(512, max(32, 1 << (width - 1).bit_length()))
+    key = (tile_width, dtype)
+    if key not in _residual_layer_norm_kernel_cache:
+        _residual_layer_norm_kernel_cache[key] = _create_residual_layer_norm_kernel(
+            *key
+        )
+    return tile_width, _residual_layer_norm_kernel_cache[key]
 
 
 def _create_gated_rms_norm_kernel(
@@ -4794,47 +4967,6 @@ def _encoder_kernels(dtype: type, head_size: int):
         x[row, column] = DTYPE(value)
 
     @wp.kernel(enable_backward=False, module="unique")
-    def residual_layer_norm(
-        branch: wp.array2d(dtype=DTYPE),
-        residual: wp.array2d(dtype=DTYPE),
-        bias: wp.array1d(dtype=DTYPE),
-        scale: wp.array1d(dtype=DTYPE),
-        shift: wp.array1d(dtype=DTYPE),
-        output: wp.array2d(dtype=DTYPE),
-        epsilon: wp.float32,
-    ):
-        row = wp.tid()
-        width = branch.shape[1]
-        mean = wp.float32(0.0)
-        for column in range(width):
-            mean += (
-                wp.float32(branch[row, column])
-                + wp.float32(bias[column])
-                + wp.float32(residual[row, column])
-            )
-        mean /= wp.float32(width)
-        variance = wp.float32(0.0)
-        for column in range(width):
-            value = (
-                wp.float32(branch[row, column])
-                + wp.float32(bias[column])
-                + wp.float32(residual[row, column])
-                - mean
-            )
-            variance += value * value
-        inverse = wp.float32(1.0) / wp.sqrt(variance / wp.float32(width) + epsilon)
-        for column in range(width):
-            value = (
-                wp.float32(branch[row, column])
-                + wp.float32(bias[column])
-                + wp.float32(residual[row, column])
-            )
-            output[row, column] = DTYPE(
-                (value - mean) * inverse * wp.float32(scale[column])
-                + wp.float32(shift[column])
-            )
-
-    @wp.kernel(enable_backward=False, module="unique")
     def split_qkv(
         packed: wp.array2d(dtype=DTYPE),
         query: wp.array4d(dtype=DTYPE),
@@ -4913,7 +5045,6 @@ def _encoder_kernels(dtype: type, head_size: int):
     return (
         add_bias,
         bias_gelu,
-        residual_layer_norm,
         split_qkv,
         merge_heads,
         full_attention,

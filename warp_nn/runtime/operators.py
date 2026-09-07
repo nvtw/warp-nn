@@ -23,6 +23,7 @@ from warp_nn.runtime.kernels import (
     _concatenate_attention_streams_kernel,
     _concatenate_validity_kernel,
     _get_layer_norm_kernel,
+    _get_residual_layer_norm_kernel,
     _merge_attention_heads_kernel,
     _rotary_cache_kernel,
     _sequence_slice_kernel,
@@ -965,6 +966,22 @@ def _exec_identity(op, tensors, shapes, device):
     tensors[op.outputs[0]] = tensors[op.inputs[0]]
 
 
+def _exec_expand(op, tensors, shapes, device):
+    output = tensors[op.outputs[0]]
+    if output.size:
+        wp.launch(
+            op.attrs["_kernel"],
+            dim=output.size,
+            inputs=[
+                tensors[op.inputs[0]].flatten(),
+                output.flatten(),
+                *op.attrs["_input_shape_5d"],
+                *op.attrs["_output_shape_5d"],
+            ],
+            device=device,
+        )
+
+
 def _exec_concat(op, tensors, shapes, device):
     if op.attrs.get("_static_output"):
         return
@@ -1190,7 +1207,9 @@ def _exec_constant(op, tensors, shapes, device):
 
 
 def _exec_reshape(op, tensors, shapes, device):
-    tensors[op.outputs[0]] = tensors[op.inputs[0]].reshape(op.attrs["_out_shape"])
+    out_shape = op.attrs["_out_shape"]
+    storage_shape = out_shape if len(out_shape) <= 4 else (int(np.prod(out_shape)),)
+    tensors[op.outputs[0]] = tensors[op.inputs[0]].reshape(storage_shape)
 
 
 def _exec_transpose(op, tensors, shapes, device):
@@ -1610,7 +1629,8 @@ def _exec_group_query_attention(op, tensors, shapes, device):
 def _exec_squeeze(op, tensors, shapes, device):
     src = tensors[op.inputs[0]]
     out_shape = op.attrs["_out_shape"]
-    tensors[op.outputs[0]] = src.reshape(out_shape)
+    storage_shape = out_shape if len(out_shape) <= 4 else (int(np.prod(out_shape)),)
+    tensors[op.outputs[0]] = src.reshape(storage_shape)
     shapes[op.outputs[0]] = out_shape
 
 
@@ -1791,11 +1811,13 @@ class EncoderLayerPlan:
         (
             self._add_bias,
             self._bias_gelu,
-            self._residual_norm,
             self._split,
             self._merge,
             self._attention,
         ) = kernels
+        self._residual_norm_width, self._residual_norm = (
+            _get_residual_layer_norm_kernel(hidden, x.dtype)
+        )
 
     def _execute(self, op):
         execute_operations([op], self._tensors, self._shapes, self.device)
@@ -1837,7 +1859,7 @@ class EncoderLayerPlan:
             device=self.device,
         )
         self._execute(self._out)
-        wp.launch(
+        wp.launch_tiled(
             self._residual_norm,
             dim=self.batch * self.sequence,
             inputs=[
@@ -1849,6 +1871,7 @@ class EncoderLayerPlan:
                 self._norm1,
                 wp.float32(self._epsilon),
             ],
+            block_dim=self._residual_norm_width,
             device=self.device,
         )
         self._execute(self._ff1)
@@ -1859,7 +1882,7 @@ class EncoderLayerPlan:
             device=self.device,
         )
         self._execute(self._ff2)
-        wp.launch(
+        wp.launch_tiled(
             self._residual_norm,
             dim=self.batch * self.sequence,
             inputs=[
@@ -1871,6 +1894,7 @@ class EncoderLayerPlan:
                 self._norm2,
                 wp.float32(self._epsilon),
             ],
+            block_dim=self._residual_norm_width,
             device=self.device,
         )
         return self.output
@@ -2632,6 +2656,7 @@ _OP_DISPATCH: dict[str, Any] = {
     "Concat": _exec_concat,
     "Div": _exec_binary,
     "Elu": _exec_elu,
+    "Expand": _exec_expand,
     "Equal": _exec_comparison,
     "Erf": _exec_unary,
     "Gemm": _exec_gemm,

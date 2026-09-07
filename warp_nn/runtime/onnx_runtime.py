@@ -90,6 +90,7 @@ from warp_nn.runtime.kernels import (
     _causal_conv_state_kernel,
     _create_rms_normalization_kernel,
     _elu_kernel,
+    _expand_5d_kernel,
     _gather_rows_kernel,
     _gather_axis_kernel,
     _gather_single_index_kernel,
@@ -1492,6 +1493,44 @@ def _shape_constant_of_shape(op, shapes, dtypes, tensors, device, requires_grad=
     op.attrs["_static_output"] = True
 
 
+def _shape_expand(op, shapes, dtypes, tensors, device, requires_grad=False):
+    if len(op.inputs) != 2 or not op.attrs["_static_inputs"][1]:
+        raise NotImplementedError("OnnxRuntime Expand: shape input must be constant")
+    in_shape = shapes[op.inputs[0]]
+    requested = tuple(int(value) for value in tensors[op.inputs[1]].numpy().reshape(-1))
+    rank = max(len(in_shape), len(requested))
+    if rank > 5:
+        raise NotImplementedError(
+            "OnnxRuntime Expand: ranks above five are unsupported"
+        )
+    source = (1,) * (rank - len(in_shape)) + in_shape
+    target = (1,) * (rank - len(requested)) + requested
+    if any(
+        target_size < 0
+        or (source_size != target_size and source_size != 1 and target_size != 1)
+        for source_size, target_size in zip(source, target)
+    ):
+        raise ValueError(
+            f"OnnxRuntime Expand: shape {in_shape} cannot broadcast with {requested}"
+        )
+    out_shape = tuple(
+        max(source_size, target_size)
+        for source_size, target_size in zip(source, target)
+    )
+    dtype = dtypes[op.inputs[0]]
+    storage_shape = out_shape if len(out_shape) <= 4 else (int(np.prod(out_shape)),)
+    tensors[op.outputs[0]] = wp.zeros(
+        storage_shape, dtype=dtype, device=device, requires_grad=requires_grad
+    )
+    shapes[op.outputs[0]] = out_shape
+    dtypes[op.outputs[0]] = dtype
+    op.attrs["_input_shape_5d"] = (1,) * (5 - rank) + source
+    op.attrs["_output_shape_5d"] = (1,) * (5 - rank) + out_shape
+    op.attrs["_kernel"] = _kernel_for_dtype(
+        _expand_5d_kernel, dtype, (1,), (1,), *([int] * 10)
+    )
+
+
 def _shape_range(op, shapes, dtypes, tensors, device, requires_grad=False):
     if len(op.inputs) != 3 or not all(op.attrs["_static_inputs"]):
         raise NotImplementedError(
@@ -1739,7 +1778,10 @@ def _shape_reshape(op, shapes, dtypes, tensors, device, requires_grad=False):
     shapes[op.outputs[0]] = tuple(out_shape)
     dtypes[op.outputs[0]] = dtypes[op.inputs[0]]
     if op.attrs["_static_inputs"][0]:
-        tensors[op.outputs[0]] = tensors[op.inputs[0]].reshape(tuple(out_shape))
+        storage_shape = (
+            tuple(out_shape) if len(out_shape) <= 4 else (int(np.prod(out_shape)),)
+        )
+        tensors[op.outputs[0]] = tensors[op.inputs[0]].reshape(storage_shape)
         op.attrs["_static_output"] = True
 
 
@@ -2341,7 +2383,8 @@ def _shape_squeeze(op, shapes, dtypes, tensors, device, requires_grad=False):
     dtypes[op.outputs[0]] = dtypes[op.inputs[0]]
     op.attrs["_out_shape"] = out_shape
     if op.attrs["_static_inputs"][0]:
-        tensors[op.outputs[0]] = tensors[op.inputs[0]].reshape(out_shape)
+        storage_shape = out_shape if len(out_shape) <= 4 else (int(np.prod(out_shape)),)
+        tensors[op.outputs[0]] = tensors[op.inputs[0]].reshape(storage_shape)
         op.attrs["_static_output"] = True
 
 
@@ -2653,6 +2696,7 @@ _SHAPE_DISPATCH: dict[str, Any] = {
     "Concat": _shape_concat,
     "Div": _shape_elementwise_binary,
     "Elu": _shape_elementwise_unary,
+    "Expand": _shape_expand,
     "Equal": _shape_comparison,
     "Erf": _shape_elementwise_unary,
     "Gemm": _shape_gemm,
