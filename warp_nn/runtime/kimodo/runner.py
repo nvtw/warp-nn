@@ -1010,7 +1010,9 @@ def _sampling_kernels(dtype):
         embedding: wp.array2d(dtype=DTYPE), text: wp.array3d(dtype=DTYPE)
     ):
         batch, column = wp.tid()
-        text[batch, 0, column] = embedding[batch, column]
+        # A shared prompt is encoded once, then broadcast entirely on-device.
+        source = batch % embedding.shape[0]
+        text[batch, 0, column] = embedding[source, column]
 
     return prepare_motion, combine_guidance, stage_embedding
 
@@ -1077,6 +1079,7 @@ class KimodoGenerationPlan:
         )
         self._prepare, self._combine, self._stage_embedding = _sampling_kernels(dtype)
         self._ddim = _motion_kernels(dtype)[4]
+        self._enforce = _motion_kernels(dtype)[1]
         self._observed_mean = stats.mean.astype(np.float32, copy=False)
         self._observed_scale = np.sqrt(
             stats.std.astype(np.float32, copy=False) ** 2 + np.float32(stats.epsilon)
@@ -1087,6 +1090,8 @@ class KimodoGenerationPlan:
     def stage(self, text, lengths, *, heading=None, observed=None, mask=None, seed=0):
         if isinstance(text, wp.array):
             if text.shape not in (
+                (1, self.config.text_dim),
+                (1, 1, self.config.text_dim),
                 (self.batch, self.config.text_dim),
                 (self.batch, 1, self.config.text_dim),
             ):
@@ -1095,7 +1100,7 @@ class KimodoGenerationPlan:
             wp.launch(
                 self._stage_embedding,
                 dim=(self.batch, self.config.text_dim),
-                inputs=[text.reshape((self.batch, self.config.text_dim)), self.text],
+                inputs=[text.reshape((text.shape[0], self.config.text_dim)), self.text],
                 device=self.device,
             )
         else:
@@ -1223,6 +1228,15 @@ class KimodoGenerationPlan:
             )
             if progress is not None:
                 progress(len(selected) - index, len(selected))
+        # DDIM's final update consumes a conditioned input but returns the model's
+        # clean prediction. Project once more so authored values survive exactly
+        # (to the plan's storage precision) without another denoiser evaluation.
+        wp.launch(
+            self._enforce,
+            dim=self.motion.shape,
+            inputs=[self.motion, self.observed, self.mask, self.motion],
+            device=self.device,
+        )
         return self.motion
 
 
@@ -1285,6 +1299,7 @@ class KimodoRunner:
         prompt,
         frames,
         *,
+        num_samples=1,
         denoising_steps=100,
         cfg_type="separated",
         text_weight=2.0,
@@ -1292,14 +1307,22 @@ class KimodoRunner:
         heading=None,
         observed=None,
         mask=None,
+        constraints=None,
         seed=0,
         progress=None,
     ):
-        """Encode one prompt and generate normalized Kimodo motion features."""
+        """Encode one prompt and generate one or more motion variations."""
         if self.text_encoder is None:
             raise RuntimeError(
                 "generate(prompt) requires a configured LLM2Vec text encoder"
             )
+        if constraints is not None:
+            if observed is not None or mask is not None:
+                raise ValueError("pass constraints or observed/mask, not both")
+            observed, mask = constraints.observed, constraints.mask
+        num_samples = int(num_samples)
+        if num_samples < 1:
+            raise ValueError("num_samples must be positive")
         embedding = (
             wp.zeros(
                 (1, self.config.text_dim),
@@ -1309,11 +1332,23 @@ class KimodoRunner:
             if not prompt.strip()
             else self.text_encoder.encode(prompt)
         )
-        plan = self.plan(frames, 1, cfg_type)
+        plan = self.plan(frames, num_samples, cfg_type)
+        if observed is not None and np.shape(observed)[0] == 1 and num_samples > 1:
+            observed = np.broadcast_to(observed, (num_samples, *np.shape(observed)[1:]))
+        if mask is not None and np.shape(mask)[0] == 1 and num_samples > 1:
+            mask = np.broadcast_to(mask, (num_samples, *np.shape(mask)[1:]))
+        if heading is None:
+            sample_heading = None
+        else:
+            sample_heading = np.asarray(heading, dtype=np.float32)
+            if sample_heading.ndim == 0 or sample_heading.shape == (1,):
+                sample_heading = np.full(
+                    num_samples, float(sample_heading.flat[0]), np.float32
+                )
         plan.stage(
             embedding,
-            np.array([frames], dtype=np.int32),
-            heading=heading,
+            np.full(num_samples, frames, dtype=np.int32),
+            heading=sample_heading,
             observed=observed,
             mask=mask,
             seed=seed,
@@ -1324,6 +1359,115 @@ class KimodoRunner:
             constraint_weight=constraint_weight,
             progress=progress,
         )
+
+    def generate_sequence(
+        self,
+        prompts,
+        frames,
+        *,
+        transition_frames=5,
+        constraints=None,
+        denoising_steps=100,
+        cfg_type="separated",
+        text_weight=2.0,
+        constraint_weight=2.0,
+        heading=None,
+        seed=0,
+        progress=None,
+    ):
+        """Generate sequential prompt segments with constrained overlap transitions.
+
+        This follows Kimodo's released multi-prompt strategy: each new segment
+        sees the preceding tail as full-body constraints, is generated in that
+        tail's local origin, and is blended only across the overlap.
+        """
+        from .constraints import KimodoConstraints
+
+        prompts = tuple(str(prompt) for prompt in prompts)
+        if isinstance(frames, (int, np.integer)):
+            frames = (int(frames),) * len(prompts)
+        else:
+            frames = tuple(int(count) for count in frames)
+        if not prompts or len(prompts) != len(frames):
+            raise ValueError("prompts and frames must be matching non-empty sequences")
+        overlap = int(transition_frames)
+        if overlap < 1 or any(count <= overlap for count in frames):
+            raise ValueError(
+                "transition_frames must be positive and shorter than every segment"
+            )
+        total_frames = sum(frames)
+        if constraints is not None and constraints.frames != total_frames:
+            raise ValueError(
+                "sequence constraints must span the complete output timeline"
+            )
+
+        scale = np.sqrt(self.stats.std**2 + self.stats.epsilon)
+        assembled = None
+        current = 0
+        for index, (prompt, count) in enumerate(zip(prompts, frames)):
+            prefix = 0 if assembled is None else overlap
+            segment_constraints = (
+                constraints.crop(current, current + count, prefix=prefix)
+                if constraints is not None
+                else KimodoConstraints.empty(prefix + count, self.config.joints)
+            )
+            segment_heading = heading
+            anchor = np.zeros(2, dtype=np.float32)
+            if assembled is not None:
+                tail = assembled[-overlap:]
+                pose_source = tail
+                if self.config.joints == 30:
+                    pose_source = decode_motion_features(
+                        ((tail - self.stats.mean) / scale)[None],
+                        self.stats,
+                        self.config.joints,
+                    )
+                for frame in range(overlap):
+                    segment_constraints.pose(frame, pose_source, source_frame=frame)
+                    if self.config.joints == 30:
+                        segment_constraints.end_effectors(
+                            frame,
+                            pose_source,
+                            ("LeftHand", "RightHand", "LeftFoot", "RightFoot"),
+                            source_frame=frame,
+                        )
+                anchor = tail[0, [0, 2]].copy()
+                segment_constraints.translate_root(-anchor)
+                segment_heading = np.array(
+                    [np.arctan2(tail[0, 4], tail[0, 3])], dtype=np.float32
+                )
+            normalized = self.generate(
+                prompt,
+                prefix + count,
+                denoising_steps=denoising_steps,
+                cfg_type=cfg_type,
+                text_weight=text_weight,
+                constraint_weight=constraint_weight,
+                heading=segment_heading,
+                constraints=segment_constraints
+                if segment_constraints.mask.any()
+                else None,
+                seed=seed + index,
+                progress=progress,
+            )
+            if isinstance(normalized, wp.array):
+                normalized = normalized.numpy()
+            normalized = np.asarray(normalized, dtype=np.float32)
+            raw = normalized[0] * scale + self.stats.mean
+            raw[:, 0] += anchor[0]
+            raw[:, 2] += anchor[1]
+            if assembled is None:
+                assembled = raw
+            else:
+                amount = np.linspace(0.0, 1.0, overlap, dtype=np.float32)[:, None]
+                transition = (
+                    assembled[-overlap:] * (1.0 - amount) + raw[:overlap] * amount
+                )
+                assembled = np.concatenate(
+                    (assembled[:-overlap], transition, raw[overlap:])
+                )
+            current += count
+        return ((assembled - self.stats.mean) / scale)[None].astype(np.float32)
 
 
 _SOMA30_PARENTS = np.asarray(
@@ -1397,6 +1541,57 @@ _SOMA30_NEUTRAL = np.asarray(
     dtype=np.float32,
 )
 
+_SOMA30_EFFECTOR_CHAINS = {
+    13: (11, 12, 13),
+    19: (17, 18, 19),
+    24: (22, 23, 24),
+    28: (26, 27, 28),
+}
+
+
+def _rotation_between_vectors(source, target):
+    """Return the minimum rotation taking one 3D direction onto another."""
+    source = source / max(np.linalg.norm(source), 1.0e-8)
+    target = target / max(np.linalg.norm(target), 1.0e-8)
+    cosine = float(np.clip(np.dot(source, target), -1.0, 1.0))
+    cross = np.cross(source, target)
+    sine = float(np.linalg.norm(cross))
+    if sine < 1.0e-7:
+        if cosine > 0.0:
+            return np.eye(3, dtype=np.float32)
+        basis = np.eye(3, dtype=np.float32)[np.argmin(np.abs(source))]
+        axis = np.cross(source, basis)
+        axis /= np.linalg.norm(axis)
+        return (2.0 * np.outer(axis, axis) - np.eye(3)).astype(np.float32)
+    x, y, z = cross
+    skew = np.asarray(((0, -z, y), (z, 0, -x), (-y, x, 0)), dtype=np.float32)
+    return np.eye(3, dtype=np.float32) + skew + skew @ skew * ((1.0 - cosine) / sine**2)
+
+
+def _fabrik_chain(points, target):
+    """Move a short joint chain to a target while preserving every bone length."""
+    result = points.copy()
+    base = result[0].copy()
+    lengths = np.linalg.norm(np.diff(result, axis=0), axis=-1)
+    distance = np.linalg.norm(target - base)
+    if distance >= lengths.sum():
+        direction = (target - base) / max(distance, 1.0e-8)
+        for index, length in enumerate(lengths):
+            result[index + 1] = result[index] + direction * length
+        return result
+    for _ in range(16):
+        result[-1] = target
+        for index in range(len(result) - 2, -1, -1):
+            direction = result[index] - result[index + 1]
+            direction /= max(np.linalg.norm(direction), 1.0e-8)
+            result[index] = result[index + 1] + direction * lengths[index]
+        result[0] = base
+        for index, length in enumerate(lengths):
+            direction = result[index + 1] - result[index]
+            direction /= max(np.linalg.norm(direction), 1.0e-8)
+            result[index + 1] = result[index] + direction * length
+    return result
+
 
 def _soma30_rotation_motion(global_rotations, root_positions):
     """Convert SOMA-30 global rotations to official local rotations and FK joints."""
@@ -1420,7 +1615,9 @@ def _soma30_rotation_motion(global_rotations, root_positions):
     return local_rotations, posed
 
 
-def decode_motion_features(features, stats: KimodoStats, joints: int):
+def decode_motion_features(
+    features, stats: KimodoStats, joints: int, *, constraints=None
+):
     """Decode normalized Kimodo features into portable NumPy motion arrays.
 
     This returns all model-native geometric quantities without depending on the
@@ -1461,7 +1658,7 @@ def decode_motion_features(features, stats: KimodoStats, joints: int):
     if joints != 30:
         raise ValueError("rotation-based decoding currently supports SOMA-30")
     local_rotations, posed = _soma30_rotation_motion(global_rotations, root_positions)
-    return {
+    output = {
         "features": unnormalized,
         "smooth_root_pos": smooth_root,
         "global_root_heading": heading,
@@ -1473,6 +1670,159 @@ def decode_motion_features(features, stats: KimodoStats, joints: int):
         "velocities": velocities,
         "foot_contacts": contacts,
     }
+    if constraints is not None:
+        _project_constraints(output, constraints, joints)
+    return output
+
+
+def _project_constraints(motion, constraints, joints):
+    """Make authored poses/effectors exact without altering unconstrained motion."""
+    observed = np.asarray(constraints.observed, dtype=np.float32)
+    mask = np.asarray(constraints.mask, dtype=bool)
+    if observed.shape != mask.shape or observed.shape[0] != 1:
+        raise ValueError(
+            "constraints must contain one observed motion and matching mask"
+        )
+    if motion["posed_joints"].ndim == 4:
+        batch = motion["posed_joints"].shape[0]
+        names = (
+            "posed_joints",
+            "posed_joints_from_positions",
+            "root_positions",
+            "global_rot_mats",
+            "local_rot_mats",
+            "smooth_root_pos",
+            "global_root_heading",
+        )
+        for sample in range(batch):
+            _project_constraints(
+                {name: motion[name][sample] for name in names}, constraints, joints
+            )
+        return
+    positions_begin = 5
+    rotations_begin = positions_begin + joints * 3
+    position_mask = mask[0, :, positions_begin:rotations_begin].reshape(-1, joints, 3)
+    frames = np.flatnonzero(position_mask.all(axis=(1, 2)))
+    posed = motion["posed_joints"]
+    posed_from_positions = motion["posed_joints_from_positions"]
+    roots = motion["root_positions"]
+    global_rotations = motion["global_rot_mats"]
+    local_rotations = motion["local_rot_mats"]
+    posed_view = posed
+    position_view = posed_from_positions
+    roots_view = roots
+    global_view = global_rotations
+    local_view = local_rotations
+    smooth = motion["smooth_root_pos"]
+    heading = motion["global_root_heading"]
+    if len(frames):
+        target = (
+            observed[0, frames, positions_begin:rotations_begin]
+            .reshape(-1, joints, 3)
+            .copy()
+        )
+        target[..., 0] += observed[0, frames, 0, None]
+        target[..., 2] += observed[0, frames, 2, None]
+        posed_view[frames] = target
+        position_view[frames] = target
+        roots_view[frames] = target[:, 0]
+        smooth[frames] = observed[0, frames, :3]
+        heading[frames] = observed[0, frames, 3:5]
+
+        rotation6d = observed[
+            0, frames, rotations_begin : rotations_begin + joints * 6
+        ].reshape(-1, joints, 6)
+        exact_global, valid = _rotation6d_matrices(rotation6d)
+        if np.any(valid):
+            exact_local, _ = _soma30_rotation_motion(
+                exact_global[valid], target[valid, 0]
+            )
+            global_view[frames[valid]] = exact_global[valid]
+            local_view[frames[valid]] = exact_local
+
+    if joints == 30:
+        full_body = np.zeros(len(position_mask), dtype=bool)
+        full_body[frames] = True
+        _project_soma30_effectors(
+            observed,
+            mask,
+            full_body,
+            posed_view,
+            global_view,
+            local_view,
+            positions_begin,
+            rotations_begin,
+        )
+
+
+def _rotation6d_matrices(rotation6d):
+    first, second = rotation6d[..., :3].copy(), rotation6d[..., 3:].copy()
+    valid = (np.linalg.norm(first, axis=-1) > 1.0e-6).all(axis=1)
+    if np.any(valid):
+        first[valid] /= np.linalg.norm(first[valid], axis=-1, keepdims=True)
+        second[valid] -= (
+            np.sum(first[valid] * second[valid], axis=-1, keepdims=True) * first[valid]
+        )
+        second_norm = np.linalg.norm(second[valid], axis=-1, keepdims=True)
+        valid_indices = np.flatnonzero(valid)
+        valid[valid_indices[np.any(second_norm <= 1.0e-6, axis=(1, 2))]] = False
+        if np.any(valid):
+            second[valid] /= np.linalg.norm(second[valid], axis=-1, keepdims=True)
+    return np.stack((first, second, np.cross(first, second)), axis=-1), valid
+
+
+def _project_soma30_effectors(
+    observed,
+    mask,
+    full_body,
+    posed,
+    global_rotations,
+    local_rotations,
+    positions_begin,
+    rotations_begin,
+):
+    position_mask = mask[0, :, positions_begin:rotations_begin].reshape(-1, 30, 3)
+    rotation_mask = mask[0, :, rotations_begin : rotations_begin + 180].reshape(
+        -1, 30, 6
+    )
+    for effector, chain in _SOMA30_EFFECTOR_CHAINS.items():
+        active = position_mask[:, effector].all(axis=1) & ~full_body
+        for frame in np.flatnonzero(active):
+            original = posed[frame].copy()
+            target = observed[
+                0,
+                frame,
+                positions_begin + effector * 3 : positions_begin + (effector + 1) * 3,
+            ].copy()
+            target[0] += observed[0, frame, 0]
+            target[2] += observed[0, frame, 2]
+            corrected = _fabrik_chain(original[list(chain)], target)
+            for parent, child, source, destination in zip(
+                chain[:-1], chain[1:], original[list(chain[:-1])], corrected[:-1]
+            ):
+                delta = _rotation_between_vectors(
+                    original[child] - source,
+                    corrected[list(chain).index(child)] - destination,
+                )
+                global_rotations[frame, parent] = (
+                    delta @ global_rotations[frame, parent]
+                )
+            if rotation_mask[frame, effector].all():
+                rotation6d = observed[
+                    0,
+                    frame,
+                    rotations_begin + effector * 6 : rotations_begin
+                    + (effector + 1) * 6,
+                ].reshape(1, 1, 6)
+                target_rotation, valid = _rotation6d_matrices(rotation6d)
+                if valid[0]:
+                    global_rotations[frame, effector] = target_rotation[0, 0]
+            local, reconstructed = _soma30_rotation_motion(
+                global_rotations[frame : frame + 1],
+                posed[frame : frame + 1, 0],
+            )
+            local_rotations[frame] = local[0]
+            posed[frame] = reconstructed[0]
 
 
 def save_motion_npz(path, motion, *, fps):

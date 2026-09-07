@@ -28,6 +28,13 @@ from warp_nn.runtime.kimodo.runner import (
     decode_motion_features,
     save_motion_npz,
 )
+from warp_nn.runtime.kimodo.constraints import KimodoConstraints
+from warp_nn.runtime.kimodo.motion import (
+    blend_motions,
+    make_seamless_loop,
+    retarget_soma30_motion,
+)
+from warp_nn.runtime.kimodo.quadruped import PanQuadrupedPlan, PanQuadrupedRetargeter
 from warp_nn.runtime.kimodo.viewer import write_motion_html
 from warp_nn.runtime.llama.encoder import LLM2VecRunner, Llama3Tokenizer
 from warp_nn.runtime.onnx_runtime import OnnxRuntime
@@ -50,6 +57,14 @@ from warp_nn.runtime.qwen.vision import (
     QwenMultimodalProcessor,
     QwenMultimodalPrompt,
     QwenVisionEncoder,
+)
+from warp_nn.runtime.skinning import (
+    RiggedMesh,
+    deform_rigged_mesh,
+    load_rigged_mesh,
+    normalize_skin_weights,
+    save_rigged_mesh,
+    skinning_transforms,
 )
 
 
@@ -134,13 +149,17 @@ def create_multimodal_processor(path):
 
 __all__ = [
     "GGUFArchive",
+    "RiggedMesh",
     "KimodoConfig",
+    "KimodoConstraints",
     "KimodoRunner",
     "LLM2VecRunner",
     "Llama3Tokenizer",
     "OnnxRuntime",
     "ChatCompletions",
     "OpenAIHTTPServer",
+    "PanQuadrupedPlan",
+    "PanQuadrupedRetargeter",
     "NemotronHRunner",
     "NemotronMultimodalProcessor",
     "NemotronMultimodalPrompt",
@@ -156,9 +175,17 @@ __all__ = [
     "create_text_runner",
     "create_tokenizer",
     "decode_motion_features",
+    "deform_rigged_mesh",
+    "blend_motions",
+    "load_rigged_mesh",
+    "make_seamless_loop",
+    "normalize_skin_weights",
     "parse_atem_tool_calls",
     "parse_qwen_tool_calls",
     "save_motion_npz",
+    "save_rigged_mesh",
+    "skinning_transforms",
+    "retarget_soma30_motion",
     "write_motion_html",
     "sample_token",
 ]

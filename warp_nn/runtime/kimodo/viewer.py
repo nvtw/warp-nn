@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ..skinning import RiggedMesh
 from .runner import _SOMA30_PARENTS
 
 
@@ -67,30 +68,32 @@ const {OrbitControls}=await import('three/addons/controls/OrbitControls.js');
 const raw=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(PAYLOAD),c=>c.charCodeAt(0))));
 const decode=(text,Type)=>{const bytes=Uint8Array.from(atob(text),c=>c.charCodeAt(0));return new Type(bytes.buffer)};
 const positions=decode(raw.positions,Float32Array),contacts=decode(raw.contacts,Uint8Array),meta=raw.meta;
-const T=meta.frames,J=meta.joints,FPS=meta.fps,total=(T-1)/FPS,parents=meta.parents;
-document.title=`Kimodo · ${meta.prompt}`;document.querySelector('#prompt').textContent=meta.prompt;
+const T=meta.frames,J=meta.joints,FPS=meta.fps,total=(T-1)/FPS,parents=meta.parents,contactJoints=meta.contact_joints;
+document.title=`${meta.label} · ${meta.prompt}`;document.querySelector('.eyebrow').lastChild.textContent=`warp-nn · ${meta.label}`;document.querySelector('#prompt').textContent=meta.prompt;
 document.querySelector('#details').textContent=`${meta.fps} FPS · generated in ${meta.generation_seconds.toFixed(2)}s`;
 document.querySelector('#duration').textContent=`${total.toFixed(1)} s`;document.querySelector('#frames').textContent=T;document.querySelector('#seed').textContent=meta.seed;
 const stage=document.querySelector('#stage'),scene=new THREE.Scene();scene.background=new THREE.Color(0xf7f8fc);scene.fog=new THREE.Fog(0xf7f8fc,18,42);
 const renderer=new THREE.WebGLRenderer({antialias:true,powerPreference:'high-performance'});renderer.setPixelRatio(Math.min(devicePixelRatio,2));renderer.setSize(innerWidth,innerHeight);renderer.outputColorSpace=THREE.SRGBColorSpace;renderer.toneMapping=THREE.ACESFilmicToneMapping;renderer.toneMappingExposure=1.1;renderer.shadowMap.enabled=true;renderer.shadowMap.type=THREE.PCFSoftShadowMap;stage.append(renderer.domElement);
-const camera=new THREE.PerspectiveCamera(38,innerWidth/innerHeight,.03,100);const controls=new OrbitControls(camera,renderer.domElement);controls.enableDamping=true;controls.dampingFactor=.075;controls.minDistance=1.6;controls.maxDistance=18;controls.maxPolarAngle=Math.PI*.49;
+const camera=new THREE.PerspectiveCamera(38,innerWidth/innerHeight,.03,100);const controls=new OrbitControls(camera,renderer.domElement);controls.enableDamping=true;controls.dampingFactor=.075;controls.minDistance=.2;controls.maxDistance=50;controls.maxPolarAngle=Math.PI*.49;
 scene.add(new THREE.HemisphereLight(0xffffff,0xdde2ed,2.15));const sun=new THREE.DirectionalLight(0xffffff,3.3);sun.position.set(-4,8,4);sun.castShadow=true;sun.shadow.mapSize.set(2048,2048);sun.shadow.camera.left=-7;sun.shadow.camera.right=7;sun.shadow.camera.top=7;sun.shadow.camera.bottom=-7;sun.shadow.bias=-.00015;scene.add(sun);
 const ground=new THREE.Mesh(new THREE.PlaneGeometry(80,80),new THREE.ShadowMaterial({color:0x647087,opacity:.13}));ground.rotation.x=-Math.PI/2;ground.receiveShadow=true;scene.add(ground);
 const grid=new THREE.GridHelper(80,160,0xb9c1d0,0xdce1ea);grid.material.transparent=true;grid.material.opacity=.42;scene.add(grid);
-const jointGeo=new THREE.SphereGeometry(.0367,18,12),boneGeo=new THREE.CylinderGeometry(.027,.027,1,12,1,false);boneGeo.translate(0,.5,0);
+const boneLengths=[];for(let j=0;j<J;j++){const p=parents[j];if(p>=0){const i=j*3,k=p*3;boneLengths.push(Math.hypot(positions[i]-positions[k],positions[i+1]-positions[k+1],positions[i+2]-positions[k+2]))}}boneLengths.sort((x,y)=>x-y);const typical=boneLengths[Math.floor(boneLengths.length/2)]||.15,jointRadius=Math.min(.0245,Math.max(.012,typical*.16));
+const jointGeo=new THREE.SphereGeometry(jointRadius,18,12),boneGeo=new THREE.CylinderGeometry(jointRadius*.72,jointRadius*.72,1,12,1,false);boneGeo.translate(0,.5,0);
 const jointMat=new THREE.MeshStandardMaterial({color:0x252a33,roughness:.72,metalness:0});const boneMat=new THREE.MeshStandardMaterial({color:0xd89432,roughness:.58,metalness:.04});
 const joints=new THREE.InstancedMesh(jointGeo,jointMat,J),boneCount=parents.filter(x=>x>=0).length,bones=new THREE.InstancedMesh(boneGeo,boneMat,boneCount);joints.instanceMatrix.setUsage(THREE.DynamicDrawUsage);bones.instanceMatrix.setUsage(THREE.DynamicDrawUsage);joints.frustumCulled=bones.frustumCulled=false;joints.castShadow=bones.castShadow=true;scene.add(joints,bones);
-const ringGeo=new THREE.RingGeometry(.08,.13,32),ringMat=new THREE.MeshBasicMaterial({color:0x00b8d1,transparent:true,opacity:.78,side:THREE.DoubleSide,depthWrite:false});const rings=[0,1,2,3].map(()=>{const m=new THREE.Mesh(ringGeo,ringMat);m.rotation.x=-Math.PI/2;m.visible=false;scene.add(m);return m});const contactJoints=[24,25,28,29];
+let skinUniforms=null,skinRotations=null,skinRest=null;if(raw.mesh){const m=raw.mesh,vertices=decode(m.vertices,Float32Array),faces=decode(m.faces,Uint32Array),skinJoint=decode(m.joints,Uint16Array),skinWeight=decode(m.weights,Float32Array);skinRotations=decode(m.rotations,Float32Array);skinRest=decode(m.restJoints,Float32Array);const geometry=new THREE.BufferGeometry();geometry.setAttribute('position',new THREE.BufferAttribute(vertices,3));geometry.setAttribute('skinJoint',new THREE.BufferAttribute(skinJoint,4));geometry.setAttribute('skinWeight',new THREE.BufferAttribute(skinWeight,4));geometry.setIndex(new THREE.BufferAttribute(faces,1));geometry.computeVertexNormals();skinUniforms={rigMatrices:{value:Array.from({length:J},()=>new THREE.Matrix4())}};const material=new THREE.MeshStandardMaterial({color:0xd7a85a,roughness:.72,metalness:.02,side:THREE.DoubleSide});material.onBeforeCompile=shader=>{Object.assign(shader.uniforms,skinUniforms);shader.vertexShader=`attribute vec4 skinJoint;\nattribute vec4 skinWeight;\nuniform mat4 rigMatrices[${J}];\n`+shader.vertexShader;shader.vertexShader=shader.vertexShader.replace('#include <beginnormal_vertex>','mat3 skinRotation = mat3(rigMatrices[int(skinJoint.x)]) * skinWeight.x + mat3(rigMatrices[int(skinJoint.y)]) * skinWeight.y + mat3(rigMatrices[int(skinJoint.z)]) * skinWeight.z + mat3(rigMatrices[int(skinJoint.w)]) * skinWeight.w;\nvec3 objectNormal = skinRotation * normal;');shader.vertexShader=shader.vertexShader.replace('#include <begin_vertex>','vec4 skinned = (rigMatrices[int(skinJoint.x)] * vec4(position,1.0)) * skinWeight.x + (rigMatrices[int(skinJoint.y)] * vec4(position,1.0)) * skinWeight.y + (rigMatrices[int(skinJoint.z)] * vec4(position,1.0)) * skinWeight.z + (rigMatrices[int(skinJoint.w)] * vec4(position,1.0)) * skinWeight.w;\nvec3 transformed = skinned.xyz;')};const body=new THREE.Mesh(geometry,material);body.castShadow=body.receiveShadow=true;body.frustumCulled=false;scene.add(body)}
+const ringGeo=new THREE.RingGeometry(jointRadius*2.3,jointRadius*3.6,32),ringMat=new THREE.MeshBasicMaterial({color:0x00b8d1,transparent:true,opacity:.78,side:THREE.DoubleSide,depthWrite:false});const rings=contactJoints.map(()=>{const m=new THREE.Mesh(ringGeo,ringMat);m.rotation.x=-Math.PI/2;m.visible=false;scene.add(m);return m});
 const rootPoints=[];for(let f=0;f<T;f++)rootPoints.push(new THREE.Vector3(positions[(f*J)*3],.012,positions[(f*J)*3+2]));if(rootPoints.length>1){const curve=new THREE.CatmullRomCurve3(rootPoints);const trail=new THREE.Mesh(new THREE.TubeGeometry(curve,Math.max(20,T),.008,6,false),new THREE.MeshBasicMaterial({color:0x8d96aa,transparent:true,opacity:.32}));scene.add(trail)}
 const dummy=new THREE.Object3D(),a=new THREE.Vector3(),b=new THREE.Vector3(),delta=new THREE.Vector3(),up=new THREE.Vector3(0,1,0),root=new THREE.Vector3(),focus=new THREE.Vector3(),previousFocus=new THREE.Vector3();
 const value=(frame,joint,axis)=>positions[(frame*J+joint)*3+axis];
 function sample(frame,joint,out){const i=Math.floor(frame),n=Math.min(i+1,T-1),u=frame-i;out.set(THREE.MathUtils.lerp(value(i,joint,0),value(n,joint,0),u),THREE.MathUtils.lerp(value(i,joint,1),value(n,joint,1),u),THREE.MathUtils.lerp(value(i,joint,2),value(n,joint,2),u));return out}
 let elapsed=0,playing=true,looping=true,following=true,ready=false,speed=1,last=performance.now();
-function pose(){const frame=Math.min(T-1,elapsed*FPS);let bi=0,minY=Infinity,maxY=-Infinity;for(let j=0;j<J;j++){sample(frame,j,a);minY=Math.min(minY,a.y);maxY=Math.max(maxY,a.y);dummy.position.copy(a);dummy.quaternion.identity();dummy.scale.setScalar(j===6?.15:1);dummy.updateMatrix();joints.setMatrixAt(j,dummy.matrix);const p=parents[j];if(p>=0){sample(frame,p,b);delta.subVectors(a,b);dummy.position.copy(b);dummy.quaternion.setFromUnitVectors(up,delta.clone().normalize());dummy.scale.set(1,delta.length(),1);dummy.updateMatrix();bones.setMatrixAt(bi++,dummy.matrix)}}joints.instanceMatrix.needsUpdate=true;bones.instanceMatrix.needsUpdate=true;
+function pose(){const frame=Math.min(T-1,elapsed*FPS);let bi=0,minY=Infinity,maxY=-Infinity;for(let j=0;j<J;j++){sample(frame,j,a);minY=Math.min(minY,a.y);maxY=Math.max(maxY,a.y);dummy.position.copy(a);dummy.quaternion.identity();dummy.scale.setScalar(1);dummy.updateMatrix();joints.setMatrixAt(j,dummy.matrix);const p=parents[j];if(p>=0){sample(frame,p,b);delta.subVectors(a,b);dummy.position.copy(b);dummy.quaternion.setFromUnitVectors(up,delta.clone().normalize());dummy.scale.set(1,delta.length(),1);dummy.updateMatrix();bones.setMatrixAt(bi++,dummy.matrix)}}joints.instanceMatrix.needsUpdate=true;bones.instanceMatrix.needsUpdate=true;if(skinUniforms){const frameIndex=Math.min(T-1,Math.round(frame)),rot=skinRotations,rest=skinRest;for(let j=0;j<J;j++){const ri=(frameIndex*J+j)*9,rj=j*3,px=value(frameIndex,j,0),py=value(frameIndex,j,1),pz=value(frameIndex,j,2),r00=rot[ri],r01=rot[ri+1],r02=rot[ri+2],r10=rot[ri+3],r11=rot[ri+4],r12=rot[ri+5],r20=rot[ri+6],r21=rot[ri+7],r22=rot[ri+8],x=rest[rj],y=rest[rj+1],z=rest[rj+2];skinUniforms.rigMatrices.value[j].set(r00,r01,r02,px-r00*x-r01*y-r02*z,r10,r11,r12,py-r10*x-r11*y-r12*z,r20,r21,r22,pz-r20*x-r21*y-r22*z,0,0,0,1)}}
 sample(frame,0,root);focus.set(root.x,(minY+maxY)/2,root.z);if(following&&ready){delta.subVectors(focus,previousFocus);camera.position.add(delta);controls.target.add(delta)}previousFocus.copy(focus);
-const fi=Math.min(T-1,Math.round(frame));for(let i=0;i<4;i++){rings[i].visible=Boolean(contacts[fi*4+i]);if(rings[i].visible){sample(frame,contactJoints[i],a);rings[i].position.set(a.x,.016,a.z)}}
+const fi=Math.min(T-1,Math.round(frame)),C=contactJoints.length;for(let i=0;i<C;i++){rings[i].visible=Boolean(contacts[fi*C+i]);if(rings[i].visible){sample(frame,contactJoints[i],a);rings[i].position.set(a.x,.016,a.z)}}
 document.querySelector('#timeline').value=elapsed;document.querySelector('#timeline').style.setProperty('--played',`${100*elapsed/Math.max(total,.001)}%`);document.querySelector('#clock').textContent=`${Math.floor(elapsed/60)}:${(elapsed%60).toFixed(2).padStart(5,'0')}`}
-function resetCamera(){const frame=Math.min(T-1,elapsed*FPS);sample(frame,0,root);let minY=Infinity,maxY=-Infinity;for(let j=0;j<J;j++){sample(frame,j,a);minY=Math.min(minY,a.y);maxY=Math.max(maxY,a.y)}const centerY=(minY+maxY)/2;focus.set(root.x,centerY,root.z);controls.target.copy(focus);camera.position.set(root.x+2.6,centerY+1.25,root.z+3.8);previousFocus.copy(focus);controls.update()}
+function resetCamera(){const frame=Math.min(T-1,elapsed*FPS);sample(frame,0,root);let minX=Infinity,minY=Infinity,minZ=Infinity,maxX=-Infinity,maxY=-Infinity,maxZ=-Infinity;for(let j=0;j<J;j++){sample(frame,j,a);minX=Math.min(minX,a.x);minY=Math.min(minY,a.y);minZ=Math.min(minZ,a.z);maxX=Math.max(maxX,a.x);maxY=Math.max(maxY,a.y);maxZ=Math.max(maxZ,a.z)}const centerY=(minY+maxY)/2,span=Math.max(maxX-minX,maxY-minY,maxZ-minZ,.4),distance=span*2.2;focus.set(root.x,centerY,root.z);controls.target.copy(focus);camera.position.set(root.x+distance*.58,centerY+distance*.3,root.z+distance*.88);previousFocus.copy(focus);controls.update()}
 const timeline=document.querySelector('#timeline');timeline.max=total;timeline.addEventListener('input',()=>{elapsed=Number(timeline.value);setPlaying(false);pose()});
 const play=document.querySelector('#play');function setPlaying(value){playing=value;play.querySelector('.play-icon').className=`play-icon ${playing?'pause':'play'}`}play.onclick=()=>setPlaying(!playing);document.querySelector('#speed').onchange=e=>speed=Number(e.target.value);
 const loop=document.querySelector('#loop');loop.onclick=()=>{looping=!looping;loop.classList.toggle('active',looping)};const follow=document.querySelector('#follow');follow.onclick=()=>{following=!following;follow.classList.toggle('active',following);previousFocus.copy(focus)};document.querySelector('#reset').onclick=resetCamera;
@@ -112,18 +115,29 @@ def write_motion_html(
     prompt: str,
     seed: int,
     generation_seconds: float,
+    mesh: RiggedMesh | None = None,
+    label: str = "Kimodo",
 ) -> Path:
-    """Write one Kimodo motion as a single interactive HTML document."""
+    """Write one articulated motion as a single interactive HTML document."""
     positions = np.asarray(motion["posed_joints"], dtype=np.float32)
     contacts = np.asarray(motion["foot_contacts"], dtype=np.uint8)
     if positions.ndim == 4 and positions.shape[0] == 1:
         positions = positions[0]
     if contacts.ndim == 3 and contacts.shape[0] == 1:
         contacts = contacts[0]
-    if positions.ndim != 3 or positions.shape[1:] != (30, 3):
-        raise ValueError("viewer expects one SOMA-30 motion shaped [frames, 30, 3]")
-    if contacts.shape != (positions.shape[0], 4):
-        raise ValueError("viewer expects four foot-contact channels per frame")
+    if positions.ndim != 3 or positions.shape[2] != 3:
+        raise ValueError("viewer expects one motion shaped [frames, joints, 3]")
+    parents = np.asarray(motion.get("parents", _SOMA30_PARENTS), dtype=np.int32)
+    if parents.shape != (positions.shape[1],):
+        raise ValueError("motion parents must contain one entry per joint")
+    default_contacts = (24, 25, 28, 29) if positions.shape[1] == 30 else ()
+    contact_joints = np.asarray(
+        motion.get("contact_joints", default_contacts), dtype=np.int32
+    )
+    if contacts.shape != (positions.shape[0], len(contact_joints)):
+        raise ValueError("foot contacts must contain one channel per contact joint")
+    if np.any(contact_joints < 0) or np.any(contact_joints >= positions.shape[1]):
+        raise ValueError("contact joint index is out of range")
     if not np.isfinite(positions).all():
         raise ValueError("motion contains non-finite joint positions")
 
@@ -138,11 +152,33 @@ def write_motion_html(
             "fps": float(fps),
             "frames": int(positions.shape[0]),
             "joints": int(positions.shape[1]),
-            "parents": _SOMA30_PARENTS.tolist(),
+            "parents": parents.tolist(),
+            "contact_joints": contact_joints.tolist(),
+            "joint_names": list(motion.get("joint_names", ())),
+            "label": str(label),
         },
         "positions": encode(np.ascontiguousarray(positions, dtype="<f4").tobytes()),
         "contacts": encode(np.ascontiguousarray(contacts).tobytes()),
     }
+    if mesh is not None:
+        if len(mesh.rest_joints) != len(parents) or not np.array_equal(
+            mesh.parents, parents
+        ):
+            raise ValueError("mesh and motion must use the same ordered hierarchy")
+        rotations = np.asarray(motion["global_rot_mats"], dtype=np.float32)
+        if rotations.ndim == 5 and rotations.shape[0] == 1:
+            rotations = rotations[0]
+        if rotations.shape != (len(positions), len(parents), 3, 3):
+            raise ValueError("mesh preview requires global_rot_mats per frame")
+        joint_indices, joint_weights = mesh.top4
+        payload["mesh"] = {
+            "vertices": encode(mesh.vertices.astype("<f4", copy=False).tobytes()),
+            "faces": encode(mesh.faces.astype("<u4", copy=False).tobytes()),
+            "restJoints": encode(mesh.rest_joints.astype("<f4", copy=False).tobytes()),
+            "joints": encode(joint_indices.astype("<u2", copy=False).tobytes()),
+            "weights": encode(joint_weights.astype("<f4", copy=False).tobytes()),
+            "rotations": encode(np.ascontiguousarray(rotations, dtype="<f4").tobytes()),
+        }
     encoded = encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     destination = Path(path).expanduser()
     destination.parent.mkdir(parents=True, exist_ok=True)

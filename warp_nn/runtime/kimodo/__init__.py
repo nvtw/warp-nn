@@ -3,6 +3,17 @@
 
 """Kimodo text-to-motion runtime implementations."""
 
+from .constraints import KimodoConstraints
+from .motion import blend_motions, make_seamless_loop, retarget_soma30_motion
+from .quadruped import PanQuadrupedPlan, PanQuadrupedRetargeter
 from .viewer import write_motion_html
 
-__all__ = ["write_motion_html"]
+__all__ = [
+    "PanQuadrupedPlan",
+    "PanQuadrupedRetargeter",
+    "KimodoConstraints",
+    "blend_motions",
+    "make_seamless_loop",
+    "retarget_soma30_motion",
+    "write_motion_html",
+]
