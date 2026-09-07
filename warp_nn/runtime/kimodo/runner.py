@@ -21,6 +21,7 @@ import warp as wp
 
 from .constraints import SOMA30_PARENTS
 
+from ..geometry import fabrik_chain, rotation_between_vectors
 from ..kernels import _encoder_kernels
 from ..operators import EncoderStackPlan
 from ..operators import Operation, execute_operations, plan_linear
@@ -1516,50 +1517,6 @@ _SOMA30_EFFECTOR_CHAINS = {
 }
 
 
-def _rotation_between_vectors(source, target):
-    """Return the minimum rotation taking one 3D direction onto another."""
-    source = source / max(np.linalg.norm(source), 1.0e-8)
-    target = target / max(np.linalg.norm(target), 1.0e-8)
-    cosine = float(np.clip(np.dot(source, target), -1.0, 1.0))
-    cross = np.cross(source, target)
-    sine = float(np.linalg.norm(cross))
-    if sine < 1.0e-7:
-        if cosine > 0.0:
-            return np.eye(3, dtype=np.float32)
-        basis = np.eye(3, dtype=np.float32)[np.argmin(np.abs(source))]
-        axis = np.cross(source, basis)
-        axis /= np.linalg.norm(axis)
-        return (2.0 * np.outer(axis, axis) - np.eye(3)).astype(np.float32)
-    x, y, z = cross
-    skew = np.asarray(((0, -z, y), (z, 0, -x), (-y, x, 0)), dtype=np.float32)
-    return np.eye(3, dtype=np.float32) + skew + skew @ skew * ((1.0 - cosine) / sine**2)
-
-
-def _fabrik_chain(points, target):
-    """Move a short joint chain to a target while preserving every bone length."""
-    result = points.copy()
-    base = result[0].copy()
-    lengths = np.linalg.norm(np.diff(result, axis=0), axis=-1)
-    distance = np.linalg.norm(target - base)
-    if distance >= lengths.sum():
-        direction = (target - base) / max(distance, 1.0e-8)
-        for index, length in enumerate(lengths):
-            result[index + 1] = result[index] + direction * length
-        return result
-    for _ in range(16):
-        result[-1] = target
-        for index in range(len(result) - 2, -1, -1):
-            direction = result[index] - result[index + 1]
-            direction /= max(np.linalg.norm(direction), 1.0e-8)
-            result[index] = result[index + 1] + direction * lengths[index]
-        result[0] = base
-        for index, length in enumerate(lengths):
-            direction = result[index + 1] - result[index]
-            direction /= max(np.linalg.norm(direction), 1.0e-8)
-            result[index + 1] = result[index] + direction * length
-    return result
-
-
 def _soma30_rotation_motion(global_rotations, root_positions):
     """Convert SOMA-30 global rotations to official local rotations and FK joints."""
     parent_rotations = global_rotations[..., SOMA30_PARENTS, :, :].copy()
@@ -1763,11 +1720,11 @@ def _project_soma30_effectors(
             ].copy()
             target[0] += observed[0, frame, 0]
             target[2] += observed[0, frame, 2]
-            corrected = _fabrik_chain(original[list(chain)], target)
+            corrected = fabrik_chain(original[list(chain)], target)
             for parent, child, source, destination in zip(
                 chain[:-1], chain[1:], original[list(chain[:-1])], corrected[:-1]
             ):
-                delta = _rotation_between_vectors(
+                delta = rotation_between_vectors(
                     original[child] - source,
                     corrected[list(chain).index(child)] - destination,
                 )

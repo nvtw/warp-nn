@@ -17,6 +17,7 @@ import numpy as np
 import warp as wp
 
 from ..formats.pytorch import load_pytorch_zip
+from ..geometry import fabrik_chain, rotation_between_vectors
 from ..operators import (
     BiasedLinearPlan,
     Conv1dPlan,
@@ -24,7 +25,6 @@ from ..operators import (
     LinearUpsample1dPlan,
     ReflectPad1dPlan,
 )
-from .runner import _rotation_between_vectors
 
 
 _HUMAN_JOINTS = (
@@ -246,27 +246,9 @@ def _stabilize_paws(positions):
     paws, contacts, targets, changed = _smooth_contact_targets(positions)
     for paw, chain in enumerate(_DOG_PAW_CHAINS):
         for frame in np.flatnonzero(changed[:, paw]):
-            points = corrected[frame, chain].copy()
-            base = points[0].copy()
-            lengths = np.linalg.norm(np.diff(points, axis=0), axis=-1)
-            target = targets[frame, paw]
-            if np.linalg.norm(target - base) >= lengths.sum():
-                direction = (target - base) / max(np.linalg.norm(target - base), 1.0e-8)
-                for index, length in enumerate(lengths):
-                    points[index + 1] = points[index] + direction * length
-            else:
-                for _ in range(8):
-                    points[-1] = target
-                    for index in range(len(points) - 2, -1, -1):
-                        direction = points[index] - points[index + 1]
-                        direction /= max(np.linalg.norm(direction), 1.0e-8)
-                        points[index] = points[index + 1] + direction * lengths[index]
-                    points[0] = base
-                    for index, length in enumerate(lengths):
-                        direction = points[index + 1] - points[index]
-                        direction /= max(np.linalg.norm(direction), 1.0e-8)
-                        points[index + 1] = points[index] + direction * length
-            corrected[frame, chain] = points
+            corrected[frame, chain] = fabrik_chain(
+                corrected[frame, chain], targets[frame, paw], iterations=8
+            )
     return corrected, contacts, paws
 
 
@@ -277,7 +259,7 @@ def _rotations_for_corrected_limbs(original, corrected, global_rotations, parent
     for chain in _DOG_PAW_CHAINS:
         for frame in np.flatnonzero(np.any(changed[:, chain], axis=1)):
             for parent, child in zip(chain[:-1], chain[1:]):
-                delta = _rotation_between_vectors(
+                delta = rotation_between_vectors(
                     original[frame, child] - original[frame, parent],
                     corrected[frame, child] - corrected[frame, parent],
                 )

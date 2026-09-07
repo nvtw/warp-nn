@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from ..geometry import rotation_between_vectors
 from .constraints import SOMA30_PARENTS
 from .runner import _SOMA30_NEUTRAL
 
@@ -232,35 +233,6 @@ def make_seamless_loop(motion, *, blend_frames: int = 15):
     return _pack(posed, rotations, contacts)
 
 
-def _rotation_between(source, target):
-    """Return the minimum rotation mapping one nonzero vector onto another."""
-    source = np.asarray(source, dtype=np.float64)
-    target = np.asarray(target, dtype=np.float64)
-    source /= np.linalg.norm(source)
-    target /= np.linalg.norm(target)
-    cross = np.cross(source, target)
-    cosine = float(np.clip(np.dot(source, target), -1.0, 1.0))
-    sine = float(np.linalg.norm(cross))
-    if sine < 1.0e-10:
-        if cosine > 0.0:
-            return np.eye(3, dtype=np.float32)
-        axis = np.zeros(3)
-        axis[int(np.argmin(np.abs(source)))] = 1.0
-        axis = np.cross(source, axis)
-        axis /= np.linalg.norm(axis)
-        return (2.0 * np.outer(axis, axis) - np.eye(3)).astype(np.float32)
-    skew = np.asarray(
-        (
-            (0.0, -cross[2], cross[1]),
-            (cross[2], 0.0, -cross[0]),
-            (-cross[1], cross[0], 0.0),
-        )
-    )
-    return (np.eye(3) + skew + skew @ skew * ((1.0 - cosine) / (sine * sine))).astype(
-        np.float32
-    )
-
-
 def _retarget_bind_alignments(source_rest, target_rest):
     """Map target bind-bone axes into the model's bind-bone axes."""
     children = [[] for _ in range(len(SOMA30_PARENTS))]
@@ -287,7 +259,7 @@ def _retarget_bind_alignments(source_rest, target_rest):
             parent = int(SOMA30_PARENTS[joint])
             source = source_rest[joint] - source_rest[parent]
             target = target_rest[joint] - target_rest[parent]
-        result[joint] = _rotation_between(target, source)
+        result[joint] = rotation_between_vectors(target, source)
     return result
 
 
