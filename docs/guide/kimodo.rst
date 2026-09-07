@@ -35,5 +35,25 @@ Llama base checkpoint. They must be supplied in MNTP-then-supervised order.
 The output NPZ contains model-native features, root positions, posed joint
 positions, global rotation matrices, velocities, headings, and foot contacts.
 The portable decoder intentionally does not require Kimodo's renderer or
-skeleton classes. Full-checkpoint numerical comparison remains the acceptance
-test before using generated motion in production.
+skeleton classes.
+
+Interactive browser preview
+---------------------------
+
+``kimodo_chat.py`` keeps Kimodo and its LLM2Vec conditioner loaded. Each normal
+line entered at ``Motion>`` generates a new single-file HTML preview and opens
+it in the default browser. The exact joint positions and foot contacts are
+embedded in the page; no NPZ or server is needed. The viewer loads its pinned
+Three.js renderer from the web when opened.
+
+.. code-block:: bash
+
+    python examples/kimodo_chat.py \
+      /models/Kimodo-SOMA-RP-v1.1 \
+      /models/Meta-Llama-3-8B-Instruct \
+      --text-adapter /models/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp \
+      --text-adapter /models/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised
+
+Use ``/duration``, ``/steps``, ``/seed``, ``/open`` and ``/progress`` to adjust
+the resident session. The browser preview provides playback, scrubbing,
+looping, speed control, an orbit camera, root following and camera reset.

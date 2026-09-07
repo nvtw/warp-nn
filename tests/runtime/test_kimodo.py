@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
 # SPDX-License-Identifier: Apache-2.0
 
+import base64
+import json
 import math
 
 import numpy as np
@@ -18,6 +20,7 @@ from warp_nn.runtime.kimodo.runner import (
     load_kimodo_config,
     save_motion_npz,
 )
+from warp_nn.runtime.kimodo.viewer import write_motion_html
 
 
 def test_soma_config_and_cosine_schedule():
@@ -146,6 +149,32 @@ def test_motion_condition_root_and_ddim_cpu():
     noise = (0.5 / math.sqrt(0.6) - 0.25) / math.sqrt(0.4 / 0.6)
     expected = 0.25 * math.sqrt(0.8) + math.sqrt(0.2) * noise
     np.testing.assert_allclose(result, expected, rtol=1e-6)
+
+
+def test_motion_html_is_single_file_with_exact_positions(tmp_path):
+    frames = 3
+    positions = np.arange(frames * 30 * 3, dtype=np.float32).reshape(frames, 30, 3)
+    contacts = np.zeros((frames, 4), dtype=bool)
+    contacts[1, 2] = True
+    path = write_motion_html(
+        tmp_path / "motion.html",
+        {"posed_joints": positions, "foot_contacts": contacts},
+        fps=30,
+        prompt="A person waves </script>",
+        seed=7,
+        generation_seconds=1.25,
+    )
+    html = path.read_text(encoding="utf-8")
+    assert "three@0.185.0" in html
+    assert "A person waves" not in html
+    encoded = html.split('const PAYLOAD="', 1)[1].split('";', 1)[0]
+    payload = json.loads(base64.b64decode(encoded))
+    recovered = np.frombuffer(
+        base64.b64decode(payload["positions"]), dtype="<f4"
+    ).reshape(frames, 30, 3)
+    np.testing.assert_array_equal(recovered, positions)
+    assert payload["meta"]["prompt"] == "A person waves </script>"
+    assert base64.b64decode(payload["contacts"])[6] == 1
 
 
 def _tiny_weights(config, device="cpu", dtype=wp.float32):

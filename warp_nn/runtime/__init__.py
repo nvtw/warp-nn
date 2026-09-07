@@ -28,6 +28,7 @@ from warp_nn.runtime.kimodo.runner import (
     decode_motion_features,
     save_motion_npz,
 )
+from warp_nn.runtime.kimodo.viewer import write_motion_html
 from warp_nn.runtime.llama.encoder import LLM2VecRunner, Llama3Tokenizer
 from warp_nn.runtime.onnx_runtime import OnnxRuntime
 from warp_nn.runtime.services.openai_server import ChatCompletions, OpenAIHTTPServer
@@ -158,5 +159,6 @@ __all__ = [
     "parse_atem_tool_calls",
     "parse_qwen_tool_calls",
     "save_motion_npz",
+    "write_motion_html",
     "sample_token",
 ]

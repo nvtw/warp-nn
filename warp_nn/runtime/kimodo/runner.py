@@ -1180,7 +1180,14 @@ class KimodoGenerationPlan:
             device=self.device,
         )
 
-    def denoise(self, denoising_steps=100, *, text_weight=2.0, constraint_weight=2.0):
+    def denoise(
+        self,
+        denoising_steps=100,
+        *,
+        text_weight=2.0,
+        constraint_weight=2.0,
+        progress=None,
+    ):
         selected, alpha, previous = cosine_ddim_schedule(
             self.config.diffusion_steps, denoising_steps
         )
@@ -1214,6 +1221,8 @@ class KimodoGenerationPlan:
                 ],
                 device=self.device,
             )
+            if progress is not None:
+                progress(len(selected) - index, len(selected))
         return self.motion
 
 
@@ -1284,6 +1293,7 @@ class KimodoRunner:
         observed=None,
         mask=None,
         seed=0,
+        progress=None,
     ):
         """Encode one prompt and generate normalized Kimodo motion features."""
         if self.text_encoder is None:
@@ -1312,6 +1322,7 @@ class KimodoRunner:
             denoising_steps,
             text_weight=text_weight,
             constraint_weight=constraint_weight,
+            progress=progress,
         )
 
 
