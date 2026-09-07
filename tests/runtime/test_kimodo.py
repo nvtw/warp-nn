@@ -29,6 +29,23 @@ def test_soma_config_and_cosine_schedule():
     assert selected[0] == 0 and selected[-1] == 999
     assert previous[0] == 1.0
     np.testing.assert_allclose(previous[1:], alpha[:-1])
+    np.testing.assert_array_equal(
+        cosine_ddim_schedule(1000, 15)[0],
+        [0, 71, 143, 214, 285, 357, 428, 499, 571, 642, 714, 785, 856, 928, 999],
+    )
+    np.testing.assert_allclose(
+        alpha[[0, 1, 49, 99]],
+        [
+            0.9999586939811707,
+            0.9992788434028625,
+            0.5016361474990845,
+            2.4287349909002387e-9,
+        ],
+        rtol=1.0e-6,
+        atol=1.0e-12,
+    )
+    with pytest.raises(ValueError, match="cannot exceed"):
+        cosine_ddim_schedule(10, 11)
 
 
 def test_official_config_nested_stats_and_portable_decode(tmp_path):
@@ -64,6 +81,8 @@ input_first_heading_angle: true
     features = np.zeros((2, config.motion_dim), dtype=np.float32)
     decoded = decode_motion_features(features, stats, config.joints)
     assert decoded["posed_joints"].shape == (2, config.joints, 3)
+    assert decoded["posed_joints_from_positions"].shape == (2, config.joints, 3)
+    assert decoded["local_rot_mats"].shape == (2, config.joints, 3, 3)
     assert decoded["global_rot_mats"].shape == (2, config.joints, 3, 3)
     output = tmp_path / "motion.npz"
     save_motion_npz(output, decoded, fps=config.fps)
@@ -220,6 +239,37 @@ def test_tiny_two_stage_denoiser_cpu_is_fixed_and_finite():
     assert np.isfinite(first).all()
     np.testing.assert_array_equal(first, second)
     assert pointers == (plan.output.ptr, plan.root_input.ptr, plan.body_input.ptr)
+
+
+def test_generation_plan_normalizes_observed_motion_cpu():
+    config = KimodoConfig(33, 2, 30.0, 8, 16, 1, 2, text_dim=8, text_tokens=2)
+    stats = KimodoStats(
+        np.arange(5, dtype=np.float32),
+        np.full(5, 2.0, dtype=np.float32),
+        np.zeros(4, dtype=np.float32),
+        np.ones(4, dtype=np.float32),
+        np.arange(config.body_dim, dtype=np.float32),
+        np.full(config.body_dim, 3.0, dtype=np.float32),
+    )
+    plan = KimodoGenerationPlan(
+        1,
+        3,
+        config,
+        stats,
+        _tiny_weights(config),
+        dtype=wp.float32,
+        device="cpu",
+    )
+    observed = np.arange(3 * config.motion_dim, dtype=np.float32).reshape(
+        plan.observed.shape
+    )
+    plan.stage(
+        np.zeros((1, config.text_tokens, config.text_dim), dtype=np.float32),
+        [3],
+        observed=observed,
+    )
+    expected = (observed - stats.mean) / np.sqrt(stats.std**2 + stats.epsilon)
+    np.testing.assert_allclose(plan.observed.numpy(), expected, rtol=1.0e-6)
 
 
 @pytest.mark.skipif(not wp.get_cuda_devices(), reason="CUDA is unavailable")

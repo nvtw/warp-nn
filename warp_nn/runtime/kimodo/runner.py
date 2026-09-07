@@ -63,6 +63,10 @@ class KimodoConfig:
             )
         if self.latent_dim % self.heads:
             raise ValueError("Kimodo latent_dim must be divisible by heads")
+        if not self.first_heading:
+            raise ValueError(
+                "Kimodo models without first-heading input are unsupported"
+            )
         expected = 12 * self.joints + 9
         if self.motion_dim != expected:
             raise ValueError(
@@ -147,6 +151,8 @@ def cosine_ddim_schedule(base_steps: int, denoising_steps: int):
     """Return Kimodo's exact subsampled cumulative-alpha DDIM schedule."""
     if base_steps <= 0 or denoising_steps <= 0:
         raise ValueError("diffusion step counts must be positive")
+    if denoising_steps > base_steps:
+        raise ValueError("denoising_steps cannot exceed base_steps")
 
     def alpha_bar(value):
         return math.cos((value + 0.008) / 1.008 * math.pi / 2.0) ** 2
@@ -160,17 +166,19 @@ def cosine_ddim_schedule(base_steps: int, denoising_steps: int):
             )
             for index in range(base_steps)
         ],
-        dtype=np.float64,
+        dtype=np.float32,
     )
-    cumulative = np.cumprod(1.0 - beta)
-    stride = (base_steps - 1) / max(1, denoising_steps - 1)
-    selected = np.rint(np.arange(denoising_steps) * stride).astype(np.int64)
+    cumulative = np.cumprod(np.float32(1.0) - beta, dtype=np.float32)
+    stride = np.float32((base_steps - 1) / max(1, denoising_steps - 1))
+    selected = np.rint(np.arange(denoising_steps, dtype=np.float32) * stride).astype(
+        np.int64
+    )
     selected = np.clip(selected, 0, base_steps - 1)
     cumulative = cumulative[selected]
     previous = np.concatenate(([1.0], cumulative[:-1]))
     return (
         selected.astype(np.int32),
-        cumulative.astype(np.float32),
+        cumulative,
         previous.astype(np.float32),
     )
 
@@ -857,7 +865,25 @@ def load_kimodo_config(path: str | Path):
     else:
         raise ValueError("unsupported or missing Kimodo skeleton in config")
     llm = re.search(r"(?m)^\s*llm_shape:\s*\[\s*\d+\s*,\s*(\d+)\s*\]", text)
-    text_dim = int(llm.group(1)) if llm else 4096
+    if llm is None:
+        llm = re.search(
+            r"(?m)^\s*llm_shape:\s*\n\s*-\s*\d+\s*\n\s*-\s*(\d+)\s*$",
+            text,
+        )
+    if llm is None:
+        raise ValueError("Kimodo config has no supported llm_shape setting")
+    unsupported = []
+    if scalar("activation", str, "gelu").lower() != "gelu":
+        unsupported.append("activation")
+    if scalar("norm_first", str, "false").lower() != "false":
+        unsupported.append("norm_first")
+    if scalar("use_text_mask", str, "false").lower() != "false":
+        unsupported.append("use_text_mask")
+    if unsupported:
+        raise ValueError(
+            "unsupported Kimodo architecture settings: " + ", ".join(unsupported)
+        )
+    text_dim = int(llm.group(1))
     return KimodoConfig(
         12 * joints + 9,
         joints,
@@ -1051,6 +1077,10 @@ class KimodoGenerationPlan:
         )
         self._prepare, self._combine, self._stage_embedding = _sampling_kernels(dtype)
         self._ddim = _motion_kernels(dtype)[4]
+        self._observed_mean = stats.mean.astype(np.float32, copy=False)
+        self._observed_scale = np.sqrt(
+            stats.std.astype(np.float32, copy=False) ** 2 + np.float32(stats.epsilon)
+        )
         self._graph = None
         self._capture_ready = False
 
@@ -1104,7 +1134,14 @@ class KimodoGenerationPlan:
         if observed is None:
             self.observed.zero_()
         else:
-            self.observed.assign(np.asarray(observed))
+            observed = np.asarray(observed, dtype=np.float32)
+            if observed.shape != self.observed.shape:
+                raise ValueError(
+                    f"observed motion must have shape {self.observed.shape}"
+                )
+            self.observed.assign(
+                (observed - self._observed_mean) / self._observed_scale
+            )
         if mask is None:
             self.mask.zero_()
         else:
@@ -1253,7 +1290,15 @@ class KimodoRunner:
             raise RuntimeError(
                 "generate(prompt) requires a configured LLM2Vec text encoder"
             )
-        embedding = self.text_encoder.encode(prompt)
+        embedding = (
+            wp.zeros(
+                (1, self.config.text_dim),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            if not prompt.strip()
+            else self.text_encoder.encode(prompt)
+        )
         plan = self.plan(frames, 1, cfg_type)
         plan.stage(
             embedding,
@@ -1268,6 +1313,100 @@ class KimodoRunner:
             text_weight=text_weight,
             constraint_weight=constraint_weight,
         )
+
+
+_SOMA30_PARENTS = np.asarray(
+    (
+        -1,
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        6,
+        6,
+        3,
+        10,
+        11,
+        12,
+        13,
+        13,
+        3,
+        16,
+        17,
+        18,
+        19,
+        19,
+        0,
+        22,
+        23,
+        24,
+        0,
+        26,
+        27,
+        28,
+    ),
+    dtype=np.int32,
+)
+_SOMA30_NEUTRAL = np.asarray(
+    (
+        (0.0, 0.0, 0.0),
+        (-0.00013727, 0.05003763, -0.00053727),
+        (-0.00013727, 0.12129064, -0.00083552),
+        (-0.00013728, 0.19679127, -0.00899523),
+        (-0.00195404, 0.45990422, -0.01452871),
+        (-0.00195407, 0.53699819, 0.00849715),
+        (-0.00195412, 0.59828735, 0.02803423),
+        (-0.00192775, 0.60304327, 0.05898364),
+        (0.03010969, 0.6520894, 0.10390306),
+        (-0.03417852, 0.65190604, 0.10361657),
+        (0.01607924, 0.42916291, 0.04213891),
+        (0.1652777, 0.42916293, -0.01288435),
+        (0.45267078, 0.42916294, -0.01291023),
+        (0.72361059, 0.42916293, -0.01288414),
+        (0.84629685, 0.39696117, 0.03544655),
+        (0.91373018, 0.42603414, -0.01322371),
+        (-0.01393846, 0.42859436, 0.04314635),
+        (-0.16431042, 0.42859447, -0.01230969),
+        (-0.45167682, 0.42859449, -0.01233566),
+        (-0.72301301, 0.42859449, -0.01230953),
+        (-0.8456555, 0.39647995, 0.03573086),
+        (-0.91301896, 0.42552834, -0.01262527),
+        (0.10043214, -0.08434527, 0.02595655),
+        (0.10043213, -0.5165628, 0.01792742),
+        (0.10043214, -0.93811376, -0.01688781),
+        (0.10043214, -0.98870848, 0.11542748),
+        (-0.10047278, -0.0829526, 0.02620317),
+        (-0.10047277, -0.51657466, 0.01814761),
+        (-0.10047275, -0.9377486, -0.01663637),
+        (-0.10047275, -0.98854469, 0.11620559),
+    ),
+    dtype=np.float32,
+)
+
+
+def _soma30_rotation_motion(global_rotations, root_positions):
+    """Convert SOMA-30 global rotations to official local rotations and FK joints."""
+    parent_rotations = global_rotations[..., _SOMA30_PARENTS, :, :].copy()
+    parent_rotations[..., 0, :, :] = np.eye(3, dtype=np.float32)
+    local_rotations = np.swapaxes(parent_rotations, -1, -2) @ global_rotations
+
+    posed = np.empty((*root_positions.shape[:-1], 30, 3), dtype=np.float32)
+    reconstructed = np.empty_like(global_rotations)
+    posed[..., 0, :] = root_positions
+    reconstructed[..., 0, :, :] = local_rotations[..., 0, :, :]
+    for joint in range(1, 30):
+        parent = int(_SOMA30_PARENTS[joint])
+        reconstructed[..., joint, :, :] = (
+            reconstructed[..., parent, :, :] @ local_rotations[..., joint, :, :]
+        )
+        offset = _SOMA30_NEUTRAL[joint] - _SOMA30_NEUTRAL[parent]
+        posed[..., joint, :] = posed[..., parent, :] + np.einsum(
+            "...ij,j->...i", reconstructed[..., parent, :, :], offset
+        )
+    return local_rotations, posed
 
 
 def decode_motion_features(features, stats: KimodoStats, joints: int):
@@ -1304,15 +1443,21 @@ def decode_motion_features(features, stats: KimodoStats, joints: int):
     second /= np.maximum(np.linalg.norm(second, axis=-1, keepdims=True), 1.0e-12)
     third = np.cross(first, second)
     global_rotations = np.stack((first, second, third), axis=-1)
-    posed = local_positions.copy()
-    posed[..., 0] += smooth_root[..., None, 0]
-    posed[..., 2] += smooth_root[..., None, 2]
+    posed_from_positions = local_positions.copy()
+    posed_from_positions[..., 0] += smooth_root[..., None, 0]
+    posed_from_positions[..., 2] += smooth_root[..., None, 2]
+    root_positions = posed_from_positions[..., 0, :]
+    if joints != 30:
+        raise ValueError("rotation-based decoding currently supports SOMA-30")
+    local_rotations, posed = _soma30_rotation_motion(global_rotations, root_positions)
     return {
         "features": unnormalized,
         "smooth_root_pos": smooth_root,
         "global_root_heading": heading,
         "posed_joints": posed,
-        "root_positions": posed[..., 0, :],
+        "posed_joints_from_positions": posed_from_positions,
+        "root_positions": root_positions,
+        "local_rot_mats": local_rotations,
         "global_rot_mats": global_rotations,
         "velocities": velocities,
         "foot_contacts": contacts,

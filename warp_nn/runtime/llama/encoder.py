@@ -87,11 +87,36 @@ def merge_lora_adapter(weights, adapter_path, dtype, device):
     )
     rank = int(config["r"])
     scale = float(config.get("lora_alpha", rank)) / rank
+    unsupported = []
+    for name, expected in (
+        ("peft_type", "LORA"),
+        ("bias", "none"),
+        ("fan_in_fan_out", False),
+        ("use_rslora", False),
+    ):
+        if config.get(name, expected) != expected:
+            unsupported.append(name)
+    if config.get("rank_pattern") or config.get("alpha_pattern"):
+        unsupported.append("rank/alpha patterns")
+    if config.get("modules_to_save"):
+        unsupported.append("modules_to_save")
+    if unsupported:
+        raise ValueError("unsupported LoRA adapter settings: " + ", ".join(unsupported))
+    targets = set(config.get("target_modules", ()))
+    expected_targets = (
+        {
+            name
+            for name in weights
+            if name.endswith(".weight") and name.rsplit(".", 2)[-2] in targets
+        }
+        if targets
+        else None
+    )
     adapter_file = adapter_path / "adapter_model.safetensors"
     archive = SafeTensorArchive(
         adapter_file if adapter_file.is_file() else adapter_path
     )
-    merged = 0
+    pairs = {}
     for a_name in archive.names:
         base_name = _adapter_base_name(a_name)
         if base_name is None:
@@ -99,6 +124,19 @@ def merge_lora_adapter(weights, adapter_path, dtype, device):
         b_name = a_name.replace(".lora_A.weight", ".lora_B.weight")
         if b_name not in archive.names or base_name not in weights:
             raise KeyError(f"adapter target '{base_name}' is incomplete or absent")
+        pairs[base_name] = (a_name, b_name)
+    if not pairs:
+        raise ValueError(f"LoRA adapter {adapter_path!s} contains no supported targets")
+    if expected_targets is not None and set(pairs) != expected_targets:
+        missing = sorted(expected_targets - set(pairs))
+        extra = sorted(set(pairs) - expected_targets)
+        detail = []
+        if missing:
+            detail.append(f"missing {len(missing)} targets")
+        if extra:
+            detail.append(f"has {len(extra)} unexpected targets")
+        raise ValueError(f"LoRA adapter {' and '.join(detail)}")
+    for base_name, (a_name, b_name) in pairs.items():
         pair = load_cast_weights(archive, (a_name, b_name), device, dtype)
         a, b = pair[a_name], pair[b_name]
         if a.shape != (rank, weights[base_name].shape[1]) or b.shape != (
@@ -107,9 +145,6 @@ def merge_lora_adapter(weights, adapter_path, dtype, device):
         ):
             raise ValueError(f"adapter tensors for '{base_name}' have invalid shapes")
         merge_lora_weight(weights[base_name], a, b, scale)
-        merged += 1
-    if not merged:
-        raise ValueError(f"LoRA adapter {adapter_path!s} contains no supported targets")
     return weights
 
 
@@ -435,7 +470,16 @@ class LLM2VecRunner:
         self._plans = {}
 
     def encode(self, text):
-        text = text.strip()
+        if not isinstance(text, str):
+            raise TypeError("LLM2Vec text must be a string")
+        if "!@#$%^&*()" in text:
+            raise ValueError("LLM2Vec text contains its reserved instruction delimiter")
+        token_count = len(self.tokenizer.encode(text))
+        while token_count > 400:
+            words = text.split()
+            reduced_length = int(len(words) * 400 / token_count)
+            text = " ".join(words[:reduced_length])
+            token_count = len(self.tokenizer.encode(text))
         prepared = f"<|start_header_id|>user<|end_header_id|>\n\n{text}<|eot_id|>"
         ids = [int(self.config.get("bos_token_id", 128000))]
         ids.extend(self.tokenizer.encode(prepared))
@@ -445,6 +489,8 @@ class LLM2VecRunner:
         sequence = len(ids)
         plan = self._plans.get(sequence)
         if plan is None:
+            if len(self._plans) >= 2:
+                self._plans.pop(next(iter(self._plans)))
             plan = _LlamaEncoderPlan(self, sequence)
             self._plans[sequence] = plan
         plan.input_ids.assign(np.asarray(ids, dtype=np.int64)[None])

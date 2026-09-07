@@ -347,9 +347,13 @@ class Qwen3Tokenizer:
         self._normalize_nfc = normalizer is not None
         self._vocabulary = model["vocab"]
         self._tokens = {token_id: token for token, token_id in self._vocabulary.items()}
-        self._merge_ranks = {
-            tuple(pair): rank for rank, pair in enumerate(model["merges"])
-        }
+        merge_pairs = [
+            pair.split(" ", 1) if isinstance(pair, str) else pair
+            for pair in model["merges"]
+        ]
+        if any(len(pair) != 2 for pair in merge_pairs):
+            raise ValueError("ByteLevel-BPE merges must contain token pairs")
+        self._merge_ranks = {tuple(pair): rank for rank, pair in enumerate(merge_pairs)}
         self._ignore_merges = bool(model.get("ignore_merges", False))
         pretokenizer = pretokenizer or data.get("_pretokenizer")
         self._pretokenize = {

@@ -160,6 +160,18 @@ def test_qwen_tokenizer_loads_vocab_and_merges_layout(tmp_path):
     assert tokenizer.eos_token_id == reference.eos_token_id
 
 
+def test_qwen_tokenizer_accepts_hugging_face_string_merges(tmp_path):
+    path = tmp_path / "tokenizer.json"
+    _write_tokenizer(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    reference = Qwen3Tokenizer(data)
+    data["model"]["merges"] = [" ".join(pair) for pair in data["model"]["merges"]]
+    tokenizer = Qwen3Tokenizer(data)
+
+    assert tokenizer.encode("hello") == reference.encode("hello")
+    assert tokenizer.encode("hello") == [tokenizer._vocabulary["hello"]]
+
+
 def test_incremental_chat_encoding_matches_full_history(tmp_path):
     path = tmp_path / "tokenizer.json"
     _write_tokenizer(path)
