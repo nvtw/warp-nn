@@ -12,7 +12,8 @@ from warp_nn.runtime.kimodo.motion import (
     make_seamless_loop,
     retarget_soma30_motion,
 )
-from warp_nn.runtime.kimodo.runner import _SOMA30_NEUTRAL, _SOMA30_PARENTS
+from warp_nn.runtime.kimodo.constraints import SOMA30_PARENTS
+from warp_nn.runtime.kimodo.runner import _SOMA30_NEUTRAL
 from warp_nn.runtime.kimodo.viewer import write_motion_html
 from warp_nn.runtime.skinning import (
     RiggedMesh,
@@ -138,7 +139,7 @@ def test_soma_retarget_preserves_target_bone_lengths_and_scales_travel():
     target = _SOMA30_NEUTRAL * 2.5 + np.asarray((3.0, 1.0, -2.0))
     result = retarget_soma30_motion(source, target)
     for joint in range(1, 30):
-        parent = _SOMA30_PARENTS[joint]
+        parent = SOMA30_PARENTS[joint]
         expected = np.linalg.norm(target[joint] - target[parent])
         actual = np.linalg.norm(
             result["posed_joints"][:, joint] - result["posed_joints"][:, parent],
@@ -153,6 +154,75 @@ def test_soma_retarget_preserves_target_bone_lengths_and_scales_travel():
     )
 
 
+def test_soma_retarget_preserves_model_bone_directions_and_arm_sides():
+    positions = np.broadcast_to(_SOMA30_NEUTRAL, (2, 30, 3)).copy()
+    rotations = np.broadcast_to(np.eye(3), (2, 30, 3, 3)).astype(np.float32).copy()
+    motion = {
+        "posed_joints": positions,
+        "global_rot_mats": rotations,
+        "foot_contacts": np.zeros((2, 4), dtype=bool),
+    }
+    # A deliberately incompatible target bind pose: arms hang and bend forward.
+    target = _SOMA30_NEUTRAL.copy()
+    target[11:16, 1] -= np.linspace(0.05, 0.35, 5)
+    target[11:16, 2] += np.linspace(0.02, 0.30, 5)
+    target[17:22, 1] -= np.linspace(0.05, 0.35, 5)
+    target[17:22, 2] += np.linspace(0.02, 0.30, 5)
+
+    result = retarget_soma30_motion(motion, target, stance_width=1.0)
+    posed = result["posed_joints"]
+    assert np.all(posed[:, 13, 0] > posed[:, 0, 0])
+    assert np.all(posed[:, 19, 0] < posed[:, 0, 0])
+    for joint in (11, 12, 13, 17, 18, 19):
+        parent = SOMA30_PARENTS[joint]
+        expected = _SOMA30_NEUTRAL[joint] - _SOMA30_NEUTRAL[parent]
+        actual = posed[0, joint] - posed[0, parent]
+        expected /= np.linalg.norm(expected)
+        actual /= np.linalg.norm(actual)
+        np.testing.assert_allclose(actual, expected, atol=2.0e-6)
+        rotated_bind = result["global_rot_mats"][0, parent] @ (
+            target[joint] - target[parent]
+        )
+        rotated_bind /= np.linalg.norm(rotated_bind)
+        np.testing.assert_allclose(rotated_bind, expected, atol=2.0e-6)
+    for joint in (7, 8, 9):
+        parent = SOMA30_PARENTS[joint]
+        expected = result["global_rot_mats"][0, parent] @ (
+            target[joint] - target[parent]
+        )
+        np.testing.assert_allclose(
+            posed[0, joint] - posed[0, parent], expected, atol=2.0e-6
+        )
+
+
+def test_soma_retarget_posture_controls_are_monotonic_and_validated():
+    positions = np.broadcast_to(_SOMA30_NEUTRAL, (2, 30, 3)).copy()
+    rotations = np.broadcast_to(np.eye(3), (2, 30, 3, 3)).astype(np.float32)
+    motion = {
+        "posed_joints": positions,
+        "global_rot_mats": rotations,
+        "foot_contacts": np.zeros((2, 4), dtype=bool),
+    }
+    wide = retarget_soma30_motion(motion, _SOMA30_NEUTRAL, stance_width=1.0)
+    narrow = retarget_soma30_motion(motion, _SOMA30_NEUTRAL, stance_width=0.7)
+    wide_hips = abs(wide["posed_joints"][0, 22, 0] - wide["posed_joints"][0, 26, 0])
+    narrow_hips = abs(
+        narrow["posed_joints"][0, 22, 0] - narrow["posed_joints"][0, 26, 0]
+    )
+    assert narrow_hips < wide_hips
+
+    forward = positions.copy()
+    forward[:, 4:7, 2] += 0.1
+    motion["posed_joints"] = forward
+    natural = retarget_soma30_motion(motion, _SOMA30_NEUTRAL, head_forward=1.0)
+    straighter = retarget_soma30_motion(motion, _SOMA30_NEUTRAL, head_forward=0.5)
+    assert abs(straighter["posed_joints"][0, 6, 2]) < abs(
+        natural["posed_joints"][0, 6, 2]
+    )
+    with pytest.raises(ValueError, match="stance_width"):
+        retarget_soma30_motion(motion, _SOMA30_NEUTRAL, stance_width=-0.1)
+
+
 def test_kimodo_viewer_embeds_optional_skinned_mesh(tmp_path):
     motion = _motion(3)
     weights = np.zeros((3, 30), dtype=np.float32)
@@ -161,7 +231,7 @@ def test_kimodo_viewer_embeds_optional_skinned_mesh(tmp_path):
         vertices=np.asarray(((0, 0, 0), (0.1, 0, 0), (0, 0.1, 0))),
         faces=np.asarray(((0, 1, 2),)),
         rest_joints=_SOMA30_NEUTRAL,
-        parents=_SOMA30_PARENTS,
+        parents=SOMA30_PARENTS,
         weights=weights,
     )
     path = write_motion_html(
@@ -176,9 +246,14 @@ def test_kimodo_viewer_embeds_optional_skinned_mesh(tmp_path):
     html = path.read_text(encoding="utf-8")
     assert "skinUniforms" in html
     assert "rigMatrices[${J}]" in html
+    assert "slerpQuaternions" in html
+    assert "body.customDepthMaterial=depthMaterial" in html
+    assert "depthMaterial.onBeforeCompile=applySkinning" in html
+    assert "markerScale=facial?.42:1" in html
     assert "joints.visible=bones.visible=false" in html
     assert "Show or hide the skeleton" in html
     encoded = html.split('const PAYLOAD="', 1)[1].split('";', 1)[0]
     payload = json.loads(base64.b64decode(encoded))
+    assert payload["meta"]["ground_y"] == pytest.approx(0.9887085)
     assert len(base64.b64decode(payload["mesh"]["vertices"])) == 3 * 3 * 4
     assert len(base64.b64decode(payload["mesh"]["joints"])) == 3 * 4 * 2

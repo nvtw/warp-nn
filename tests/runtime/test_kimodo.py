@@ -421,6 +421,7 @@ def test_motion_html_is_single_file_with_exact_positions(tmp_path):
     assert "joints.frustumCulled=bones.frustumCulled=false" in html
     assert "if(!ready){resetCamera();pose();ready=true" in html
     assert "loading.remove();requestAnimationFrame(()=>{resetCamera();pose()})" in html
+    assert "playing=T>2" in html
     assert "A person waves" not in html
     encoded = html.split('const PAYLOAD="', 1)[1].split('";', 1)[0]
     payload = json.loads(base64.b64decode(encoded))
@@ -429,6 +430,7 @@ def test_motion_html_is_single_file_with_exact_positions(tmp_path):
     ).reshape(frames, 30, 3)
     np.testing.assert_array_equal(recovered, positions)
     assert payload["meta"]["prompt"] == "A person waves </script>"
+    assert payload["meta"]["ground_y"] == float(positions[..., 1].min())
     assert base64.b64decode(payload["contacts"])[6] == 1
 
 

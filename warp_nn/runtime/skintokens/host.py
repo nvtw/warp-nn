@@ -55,10 +55,18 @@ def normalize_geometry(vertices, joints=None):
     return transform, np.linalg.inv(transform).astype(np.float32)
 
 
-def sample_surface(mesh: TriangleMesh, count: int, *, seed: int = 0):
-    """Sample triangle surfaces using the official reflected-barycentric rule."""
+def sample_surface(
+    mesh: TriangleMesh,
+    count: int,
+    *,
+    seed: int = 0,
+    vertex_samples: int = 0,
+):
+    """Sample original vertices then surfaces using TokenRig's mixed sampler."""
     if count <= 0:
         raise ValueError("sample count must be positive")
+    if vertex_samples < 0:
+        raise ValueError("vertex sample count cannot be negative")
     triangles = mesh.vertices[mesh.faces]
     edges0 = triangles[:, 1] - triangles[:, 0]
     edges1 = triangles[:, 2] - triangles[:, 0]
@@ -67,28 +75,40 @@ def sample_surface(mesh: TriangleMesh, count: int, *, seed: int = 0):
     if not np.isfinite(total) or total <= 1.0e-20:
         raise ValueError("mesh has no nondegenerate triangle area")
     rng = np.random.RandomState(seed)
-    # The official mixed sampler draws this permutation even when zero source
-    # vertices are retained; preserving the RNG step gives exact seeded parity.
-    rng.permutation(len(mesh.vertices))
-    selected = np.searchsorted(np.cumsum(weights), rng.rand(count) * total)
-    lengths = rng.rand(count, 2, 1)
+    permutation = rng.permutation(len(mesh.vertices))
+    vertex_count = min(int(vertex_samples), len(mesh.vertices), count)
+    vertex_indices = permutation[:vertex_count]
+    surface_count = count - vertex_count
+    selected = np.searchsorted(np.cumsum(weights), rng.rand(surface_count) * total)
+    lengths = rng.rand(surface_count, 2, 1)
     reflected = lengths.sum(axis=1)[:, 0] > 1.0
     lengths[reflected] -= 1.0
     lengths = np.abs(lengths)
-    points = triangles[selected, 0] + (
+    surface_points = triangles[selected, 0] + (
         np.stack((edges0[selected], edges1[selected]), axis=1) * lengths
     ).sum(axis=1)
-    _, face_normals = mesh.normals()
-    return points.astype(np.float32), face_normals[selected]
+    vertex_normals, face_normals = mesh.normals()
+    points = np.concatenate((mesh.vertices[vertex_indices], surface_points), axis=0)
+    normals = np.concatenate(
+        (vertex_normals[vertex_indices], face_normals[selected]), axis=0
+    )
+    return points.astype(np.float32, copy=False), normals.astype(np.float32, copy=False)
 
 
-def prepare_geometry(mesh: TriangleMesh, *, points: int = 8192, seed: int = 0):
+def prepare_geometry(
+    mesh: TriangleMesh,
+    *,
+    points: int = 8192,
+    vertex_samples: int = 0,
+    seed: int = 0,
+    joints=None,
+):
     """Normalize and sample an unrigged mesh for the published TokenRig graphs."""
-    world_to_model, model_to_world = normalize_geometry(mesh.vertices)
+    world_to_model, model_to_world = normalize_geometry(mesh.vertices, joints)
     normalized = _apply_transform(mesh.vertices, world_to_model).astype(np.float32)
     normalized_mesh = TriangleMesh(normalized, mesh.faces)
     sampled_vertices, sampled_normals = sample_surface(
-        normalized_mesh, points, seed=seed
+        normalized_mesh, points, seed=seed, vertex_samples=vertex_samples
     )
     return SkinTokensGeometry(
         mesh=mesh,

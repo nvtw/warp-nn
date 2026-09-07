@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from .runner import _SOMA30_NEUTRAL, _SOMA30_PARENTS
+from .constraints import SOMA30_PARENTS
+from .runner import _SOMA30_NEUTRAL
 
 
 def _single_motion(motion):
@@ -151,7 +152,7 @@ def _yaw_matrix(angle):
 
 
 def _pack(posed, rotations, contacts):
-    parents = _SOMA30_PARENTS
+    parents = SOMA30_PARENTS
     parent_rotations = rotations[:, parents].copy()
     parent_rotations[:, 0] = np.eye(3, dtype=np.float32)
     local = np.swapaxes(parent_rotations, -1, -2) @ rotations
@@ -231,21 +232,90 @@ def make_seamless_loop(motion, *, blend_frames: int = 15):
     return _pack(posed, rotations, contacts)
 
 
-def retarget_soma30_motion(motion, rest_joints, *, scale_root_motion: bool = True):
-    """Retarget Kimodo local rotations onto a SOMA-30 bind skeleton.
+def _rotation_between(source, target):
+    """Return the minimum rotation mapping one nonzero vector onto another."""
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    source /= np.linalg.norm(source)
+    target /= np.linalg.norm(target)
+    cross = np.cross(source, target)
+    cosine = float(np.clip(np.dot(source, target), -1.0, 1.0))
+    sine = float(np.linalg.norm(cross))
+    if sine < 1.0e-10:
+        if cosine > 0.0:
+            return np.eye(3, dtype=np.float32)
+        axis = np.zeros(3)
+        axis[int(np.argmin(np.abs(source)))] = 1.0
+        axis = np.cross(source, axis)
+        axis /= np.linalg.norm(axis)
+        return (2.0 * np.outer(axis, axis) - np.eye(3)).astype(np.float32)
+    skew = np.asarray(
+        (
+            (0.0, -cross[2], cross[1]),
+            (cross[2], 0.0, -cross[0]),
+            (-cross[1], cross[0], 0.0),
+        )
+    )
+    return (np.eye(3) + skew + skew @ skew * ((1.0 - cosine) / (sine * sine))).astype(
+        np.float32
+    )
+
+
+def _retarget_bind_alignments(source_rest, target_rest):
+    """Map target bind-bone axes into the model's bind-bone axes."""
+    children = [[] for _ in range(len(SOMA30_PARENTS))]
+    for child, parent in enumerate(SOMA30_PARENTS[1:], 1):
+        children[int(parent)].append(child)
+    result = np.empty((30, 3, 3), dtype=np.float32)
+    for joint in range(30):
+        # The jaw is not a stable head-orientation axis, and the thumb is not
+        # a stable hand axis across character meshes. Use the incoming neck
+        # bone for the head and the middle-finger chain for each hand.
+        if joint == 6:
+            endpoint = int(SOMA30_PARENTS[joint])
+            source = source_rest[joint] - source_rest[endpoint]
+            target = target_rest[joint] - target_rest[endpoint]
+        elif joint in (13, 19):
+            endpoint = joint + 2
+            source = source_rest[endpoint] - source_rest[joint]
+            target = target_rest[endpoint] - target_rest[joint]
+        elif children[joint]:
+            endpoint = children[joint][0]
+            source = source_rest[endpoint] - source_rest[joint]
+            target = target_rest[endpoint] - target_rest[joint]
+        else:
+            parent = int(SOMA30_PARENTS[joint])
+            source = source_rest[joint] - source_rest[parent]
+            target = target_rest[joint] - target_rest[parent]
+        result[joint] = _rotation_between(target, source)
+    return result
+
+
+def retarget_soma30_motion(
+    motion,
+    rest_joints,
+    *,
+    scale_root_motion: bool = True,
+    stance_width: float = 1.0,
+    head_forward: float = 0.5,
+):
+    """Retarget Kimodo motion onto a SOMA-30 bind skeleton.
 
     SkinTokens can predict weights for a mesh carrying this skeleton.  Bone
-    lengths remain those of the target asset while Kimodo supplies rotations;
-    root travel is scaled by the robust median bone-length ratio.
+    lengths remain those of the target asset while Kimodo supplies directions
+    and rotations. Bind-axis correction keeps an A-pose mesh compatible with
+    Kimodo's T-pose skeleton. ``stance_width`` controls the lateral root-to-hip
+    offset, and ``head_forward`` controls forward displacement in the neck chain.
     """
     source_posed, source_global, contacts = _single_motion(motion)
     rest = np.asarray(rest_joints, dtype=np.float32)
     if rest.shape != (30, 3) or not np.isfinite(rest).all():
         raise ValueError("rest_joints must be finite SOMA-30 positions")
-    parents = _SOMA30_PARENTS
-    parent_global = source_global[:, parents].copy()
-    parent_global[:, 0] = np.eye(3, dtype=np.float32)
-    local = np.swapaxes(parent_global, -1, -2) @ source_global
+    if not 0.0 <= stance_width <= 2.0:
+        raise ValueError("stance_width must be between 0 and 2")
+    if not 0.0 <= head_forward <= 2.0:
+        raise ValueError("head_forward must be between 0 and 2")
+    parents = SOMA30_PARENTS
 
     source_lengths = np.linalg.norm(
         _SOMA30_NEUTRAL[1:] - _SOMA30_NEUTRAL[parents[1:]], axis=1
@@ -258,17 +328,36 @@ def retarget_soma30_motion(motion, rest_joints, *, scale_root_motion: bool = Tru
 
     frames = len(source_posed)
     posed = np.empty((frames, 30, 3), dtype=np.float32)
-    rotations = np.empty((frames, 30, 3, 3), dtype=np.float32)
-    rotations[:, 0] = local[:, 0]
+    alignments = _retarget_bind_alignments(_SOMA30_NEUTRAL, rest)
+    rotations = source_global @ alignments[None]
     travel = (source_posed[:, 0] - source_posed[0, 0]) * scale
     posed[:, 0] = rest[0] + travel
     for joint in range(1, 30):
         parent = int(parents[joint])
-        rotations[:, joint] = rotations[:, parent] @ local[:, joint]
-        offset = rest[joint] - rest[parent]
-        posed[:, joint] = posed[:, parent] + np.einsum(
-            "fij,j->fi", rotations[:, parent], offset
+        if joint in (7, 8, 9):
+            posed[:, joint] = posed[:, parent] + np.einsum(
+                "fij,j->fi",
+                rotations[:, parent],
+                rest[joint] - rest[parent],
+            )
+            continue
+        direction = source_posed[:, joint] - source_posed[:, parent]
+        if parent == 0 and joint in (22, 26):
+            direction[:, 0] *= stance_width
+        if joint in (4, 5, 6):
+            direction[:, 2] *= head_forward
+        norm = np.linalg.norm(direction, axis=1, keepdims=True)
+        fallback = _SOMA30_NEUTRAL[joint] - _SOMA30_NEUTRAL[parent]
+        direction = np.divide(
+            direction,
+            norm,
+            out=np.broadcast_to(
+                fallback / np.linalg.norm(fallback), direction.shape
+            ).copy(),
+            where=norm > 1.0e-7,
         )
+        length = np.linalg.norm(rest[joint] - rest[parent])
+        posed[:, joint] = posed[:, parent] + direction * length
     return _pack(posed, rotations, contacts)
 
 

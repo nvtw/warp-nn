@@ -251,6 +251,46 @@ def load_obj(path: str | Path, *, groups: str | tuple[str, ...] | None = None):
     return TriangleMesh(vertices, faces)
 
 
+def obj_group_vertex_centers(
+    path: str | Path, groups: tuple[str, ...] | list[str]
+) -> np.ndarray:
+    """Return mean positions of the vertices referenced by named OBJ groups.
+
+    This is useful for marker geometry embedded alongside a mesh. The OBJ is
+    parsed once and the requested order is preserved.
+    """
+    requested = tuple(map(str, groups))
+    if not requested or len(set(requested)) != len(requested):
+        raise ValueError("OBJ group names must be nonempty and unique")
+    wanted = set(requested)
+    vertices = []
+    referenced = {name: set() for name in requested}
+    active_groups = set()
+    for raw in Path(path).expanduser().read_text(encoding="utf-8").splitlines():
+        fields = raw.strip().split()
+        if not fields or fields[0].startswith("#"):
+            continue
+        if fields[0] == "v" and len(fields) >= 4:
+            vertices.append(tuple(float(value) for value in fields[1:4]))
+        elif fields[0] == "g":
+            active_groups = wanted.intersection(fields[1:])
+        elif fields[0] == "f" and active_groups:
+            indices = {
+                (index - 1 if index > 0 else len(vertices) + index)
+                for index in (int(field.split("/", 1)[0]) for field in fields[1:])
+            }
+            for name in active_groups:
+                referenced[name].update(indices)
+    missing = [name for name, indices in referenced.items() if not indices]
+    if missing:
+        raise ValueError(f"OBJ contains no faces in groups {missing}")
+    points = np.asarray(vertices, dtype=np.float32)
+    return np.asarray(
+        [points[sorted(referenced[name])].mean(axis=0) for name in requested],
+        dtype=np.float32,
+    )
+
+
 def load_triangle_mesh(path: str | Path, *, obj_groups=None):
     """Load a supported unrigged GLB or OBJ mesh."""
     path = Path(path).expanduser()
@@ -261,4 +301,10 @@ def load_triangle_mesh(path: str | Path, *, obj_groups=None):
     raise ValueError("unrigged mesh must be a .glb or .obj file")
 
 
-__all__ = ["TriangleMesh", "load_glb", "load_obj", "load_triangle_mesh"]
+__all__ = [
+    "TriangleMesh",
+    "load_glb",
+    "load_obj",
+    "load_triangle_mesh",
+    "obj_group_vertex_centers",
+]

@@ -35,6 +35,7 @@ from warp_nn.runtime.kimodo.motion import (
     retarget_soma30_motion,
 )
 from warp_nn.runtime.kimodo.quadruped import PanQuadrupedPlan, PanQuadrupedRetargeter
+from warp_nn.runtime.kimodo.rigging import load_makehuman_soma30
 from warp_nn.runtime.kimodo.viewer import write_motion_html
 from warp_nn.runtime.llama.encoder import LLM2VecRunner, Llama3Tokenizer
 from warp_nn.runtime.onnx_runtime import OnnxRuntime
@@ -178,6 +179,7 @@ __all__ = [
     "deform_rigged_mesh",
     "blend_motions",
     "load_rigged_mesh",
+    "load_makehuman_soma30",
     "make_seamless_loop",
     "normalize_skin_weights",
     "parse_atem_tool_calls",

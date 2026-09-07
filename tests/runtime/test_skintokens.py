@@ -7,7 +7,17 @@ import struct
 import numpy as np
 import pytest
 
-from warp_nn.runtime.formats.mesh import TriangleMesh, load_glb, load_obj
+from warp_nn.runtime.formats.mesh import (
+    TriangleMesh,
+    load_glb,
+    load_obj,
+    obj_group_vertex_centers,
+)
+from warp_nn.runtime.kimodo.rigging import (
+    MAKEHUMAN_SOMA30_GROUPS,
+    load_makehuman_soma30,
+)
+from warp_nn.runtime.geometry import farthest_point_indices
 from warp_nn.runtime.skintokens.host import (
     SkinTokensTokenizer,
     normalize_geometry,
@@ -74,6 +84,34 @@ def test_dependency_light_mesh_loaders_apply_transform_and_triangulate(tmp_path)
     body = load_obj(grouped_path, groups="body")
     np.testing.assert_array_equal(body.vertices, ((0, 0, 0), (1, 0, 0), (0, 1, 0)))
     np.testing.assert_array_equal(body.faces, ((0, 1, 2),))
+    np.testing.assert_allclose(
+        obj_group_vertex_centers(grouped_path, ("helper", "body")),
+        ((10 / 3, 3, 3), (1 / 3, 1 / 3, 0)),
+    )
+
+
+def test_makehuman_adapter_preserves_soma_joint_order(tmp_path):
+    lines = ["v 0 0 0", "v 1 0 0", "v 0 1 0", "g body", "f 1 2 3"]
+    expected = []
+    for joint, group in enumerate(MAKEHUMAN_SOMA30_GROUPS):
+        x = float(joint * 2)
+        first = 4 + joint * 3
+        lines.extend(
+            (
+                f"v {x - 1} 0 0",
+                f"v {x + 1} 0 0",
+                f"v {x} 3 0",
+                f"g {group}",
+                f"f {first} {first + 1} {first + 2}",
+            )
+        )
+        expected.append((x * 0.1, 0.1, 0))
+    path = tmp_path / "makehuman.obj"
+    path.write_text("\n".join(lines))
+    mesh, joints = load_makehuman_soma30(path)
+    assert mesh.vertices.shape == (3, 3)
+    np.testing.assert_allclose(mesh.vertices, ((0, 0, 0), (0.1, 0, 0), (0, 0.1, 0)))
+    np.testing.assert_allclose(joints, expected)
 
 
 def test_official_normalization_and_surface_sampling_are_deterministic():
@@ -94,6 +132,36 @@ def test_official_normalization_and_surface_sampling_are_deterministic():
     np.testing.assert_allclose(normals, np.tile((0, 0, 1), (64, 1)))
     prepared = prepare_geometry(mesh, points=19, seed=3)
     assert prepared.sampled_vertices.shape == prepared.sampled_normals.shape == (19, 3)
+    joint = np.asarray(((0, 2, 0),), dtype=np.float32)
+    with_joint = prepare_geometry(mesh, points=19, seed=3, joints=joint)
+    transformed_joint = (
+        joint @ with_joint.world_to_model[:3, :3].T + with_joint.world_to_model[:3, 3]
+    )
+    all_points = np.concatenate((with_joint.normalized_vertices, transformed_joint))
+    assert np.max(all_points) <= 1.0 and np.min(all_points) >= -1.0
+
+
+def test_mixed_sampler_retains_seeded_original_vertices_first():
+    mesh = TriangleMesh(
+        np.asarray(((0, 0, 0), (2, 0, 0), (0, 1, 0)), dtype=np.float32),
+        np.asarray(((0, 1, 2),), dtype=np.int32),
+    )
+    points, normals = sample_surface(mesh, 7, seed=11, vertex_samples=2)
+    expected_indices = np.random.RandomState(11).permutation(3)[:2]
+    vertex_normals, _ = mesh.normals()
+    np.testing.assert_array_equal(points[:2], mesh.vertices[expected_indices])
+    np.testing.assert_allclose(normals[:2], vertex_normals[expected_indices])
+    assert points.shape == normals.shape == (7, 3)
+    repeat = sample_surface(mesh, 7, seed=11, vertex_samples=2)
+    np.testing.assert_array_equal(repeat[0], points)
+    np.testing.assert_array_equal(repeat[1], normals)
+
+
+def test_farthest_point_indices_are_deterministic_and_stable():
+    points = np.asarray(((0, 0), (1, 0), (-1, 0), (0, 2)), dtype=np.float32)
+    np.testing.assert_array_equal(farthest_point_indices(points, 4), (0, 3, 1, 2))
+    with pytest.raises(ValueError, match="sample count"):
+        farthest_point_indices(points, 5)
 
 
 def test_skin_weight_transfer_handles_exact_samples_and_normalizes():

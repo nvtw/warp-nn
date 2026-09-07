@@ -9,9 +9,17 @@ from .host import (
     prepare_geometry,
     transfer_skin_weights,
 )
+from .pipeline import (
+    SkinTokensCheckpoint,
+    SkinTokensPipeline,
+    SkinTokensResult,
+)
 
 __all__ = [
     "SkinTokensGeometry",
+    "SkinTokensCheckpoint",
+    "SkinTokensPipeline",
+    "SkinTokensResult",
     "SkinTokensTokenizer",
     "prepare_geometry",
     "transfer_skin_weights",

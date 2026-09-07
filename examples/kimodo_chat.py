@@ -7,11 +7,15 @@ Models: ``nvidia/Kimodo-SOMA-RP-v1.1``, ``meta-llama/Meta-Llama-3-8B-Instruct``,
 and the MNTP plus supervised adapters under ``McGill-NLP`` on Hugging Face.
 Download those repositories with ``huggingface-cli download REPOSITORY --local-dir PATH``.
 The Meta checkpoint requires accepting its Hugging Face license first.
+Skinned mode additionally needs ``VAST-AI/SkinTokens`` and a CC0 MakeHuman
+male OBJ exported with its joint vertex groups.
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
+import hashlib
 import shlex
 import time
 from pathlib import Path
@@ -34,13 +38,19 @@ from warp_nn.runtime import (
     KimodoRunner,
     PanQuadrupedRetargeter,
     decode_motion_features,
+    load_makehuman_soma30,
+    load_rigged_mesh,
+    retarget_soma30_motion,
+    save_rigged_mesh,
     save_motion_npz,
     write_motion_html,
 )
-from warp_nn.runtime.kimodo.constraints import SOMA30_JOINT_NAMES
+from warp_nn.runtime.kimodo.constraints import SOMA30_JOINT_NAMES, SOMA30_PARENTS
+from warp_nn.runtime.skintokens import SkinTokensPipeline
+from warp_nn.utils.paths import application_state_dir
 
 
-def _parser(*, quadruped=False, description=None):
+def _parser(*, quadruped=False, skinned=False, description=None):
     parser = argparse.ArgumentParser(description=description or __doc__)
     parser.add_argument("model", type=Path, help="Kimodo checkpoint directory")
     parser.add_argument("text_model", type=Path, help="full Llama-3 8B checkpoint")
@@ -49,6 +59,37 @@ def _parser(*, quadruped=False, description=None):
             "quadruped_model",
             type=Path,
             help="PAN inference directory containing human, dog, and metadata",
+        )
+    if skinned:
+        parser.add_argument(
+            "skin_model", type=Path, help="converted SkinTokens checkpoint directory"
+        )
+        parser.add_argument(
+            "mesh",
+            type=Path,
+            help="MakeHuman base.obj containing body and joint groups",
+        )
+        parser.add_argument(
+            "--rig-cache",
+            type=Path,
+            help="portable rig cache path (default: platform application state)",
+        )
+        parser.add_argument(
+            "--rebuild-rig",
+            action="store_true",
+            help="ignore and replace an existing rig cache",
+        )
+        parser.add_argument(
+            "--stance-width",
+            type=float,
+            default=1.0,
+            help="lateral hip spacing relative to Kimodo motion (default: 1.0)",
+        )
+        parser.add_argument(
+            "--head-forward",
+            type=float,
+            default=0.5,
+            help="forward neck displacement relative to Kimodo motion (default: 0.5)",
         )
     parser.add_argument(
         "--text-adapter",
@@ -162,11 +203,58 @@ def _joint_indices(names):
     return result
 
 
-def main(argv=None, *, quadruped=False, description=None):
-    args = _parser(quadruped=quadruped, description=description).parse_args(argv)
+def _rig_cache_path(args):
+    if args.rig_cache is not None:
+        return args.rig_cache.expanduser()
+    digest = hashlib.sha256()
+    digest.update(b"makehuman-soma30-meters-v1")
+    for path in (args.mesh, args.skin_model / "skintokens.json"):
+        digest.update(path.expanduser().read_bytes())
+    return (
+        application_state_dir()
+        / "rigs"
+        / f"{args.mesh.stem}-{digest.hexdigest()[:16]}.npz"
+    )
+
+
+def _prepare_rig(args):
+    cache = _rig_cache_path(args)
+    if cache.is_file() and not args.rebuild_rig:
+        print(f"Loading cached SkinTokens rig: {cache}", flush=True)
+        return load_rigged_mesh(cache)
+    print("Rigging the MakeHuman mesh with SkinTokens (one time)...", flush=True)
+    mesh, joints = load_makehuman_soma30(args.mesh)
+    pipeline = SkinTokensPipeline(
+        args.skin_model,
+        dtype=wp.bfloat16,
+        device=args.device,
+        use_cublas=args.cublas,
+    )
+    try:
+        result = pipeline.rig(
+            mesh,
+            skeleton_joints=joints,
+            skeleton_parents=SOMA30_PARENTS,
+            joint_names=SOMA30_JOINT_NAMES,
+        )
+    finally:
+        del pipeline
+        gc.collect()
+    save_rigged_mesh(cache, result.rig)
+    print(f"Cached reusable rig: {cache.resolve()}", flush=True)
+    return result.rig
+
+
+def main(argv=None, *, quadruped=False, skinned=False, description=None):
+    if quadruped and skinned:
+        raise ValueError("quadruped and skinned modes are mutually exclusive")
+    args = _parser(
+        quadruped=quadruped, skinned=skinned, description=description
+    ).parse_args(argv)
     if args.steps <= 0:
         raise ValueError("--steps must be positive")
 
+    rig = _prepare_rig(args) if skinned else None
     print("Preparing Kimodo and its LLM2Vec text encoder...", flush=True)
     runner = KimodoRunner(
         args.model,
@@ -192,7 +280,11 @@ def main(argv=None, *, quadruped=False, description=None):
         raise ValueError("--num-samples must be between 1 and 16")
     auto_open = args.auto_open
     show_progress = args.progress
-    subject = "quadruped motions" if quadruped else "motions"
+    subject = (
+        "quadruped motions"
+        if quadruped
+        else ("skinned human motions" if skinned else "motions")
+    )
     print(f"Ready on {runner.device}; weights stay loaded between prompts.")
     if retargeter is not None:
         print("PAN dog retargeting is enabled; its frame plans remain cached.")
@@ -483,11 +575,23 @@ def main(argv=None, *, quadruped=False, description=None):
             viewed_motions = (
                 [retargeter.retarget(motion) for motion in sample_motions]
                 if retargeter is not None
-                else sample_motions
+                else (
+                    [
+                        retarget_soma30_motion(
+                            motion,
+                            rig.rest_joints,
+                            stance_width=args.stance_width,
+                            head_forward=args.head_forward,
+                        )
+                        for motion in sample_motions
+                    ]
+                    if rig is not None
+                    else sample_motions
+                )
             )
             retarget_seconds = (
                 time.perf_counter() - retarget_started
-                if retargeter is not None
+                if retargeter is not None or rig is not None
                 else 0.0
             )
             base = output_path(args.output_dir, prompt, ".html").resolve()
@@ -512,14 +616,19 @@ def main(argv=None, *, quadruped=False, description=None):
                     prompt=prompt,
                     seed=next_seed + sample,
                     generation_seconds=generation_seconds + retarget_seconds,
-                    label="Kimodo · Quadruped" if quadruped else "Kimodo",
+                    mesh=rig,
+                    label=(
+                        "Kimodo · Quadruped"
+                        if quadruped
+                        else ("Kimodo · SkinTokens" if skinned else "Kimodo")
+                    ),
                 )
                 destinations.append(destination)
         except Exception as error:
             print(f"Generation failed: {error}")
             continue
         timing = f"{generation_seconds:.2f}s"
-        if retargeter is not None:
+        if retargeter is not None or rig is not None:
             timing += f" + {retarget_seconds:.2f}s retargeting"
         print(f"Kimodo> {', '.join(map(str, destinations))} ({timing})")
         next_seed += num_samples

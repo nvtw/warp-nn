@@ -6,6 +6,7 @@
 from .constraints import KimodoConstraints
 from .motion import blend_motions, make_seamless_loop, retarget_soma30_motion
 from .quadruped import PanQuadrupedPlan, PanQuadrupedRetargeter
+from .rigging import load_makehuman_soma30
 from .viewer import write_motion_html
 
 __all__ = [
@@ -14,6 +15,7 @@ __all__ = [
     "KimodoConstraints",
     "blend_motions",
     "make_seamless_loop",
+    "load_makehuman_soma30",
     "retarget_soma30_motion",
     "write_motion_html",
 ]

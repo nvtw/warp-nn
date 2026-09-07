@@ -19,6 +19,8 @@ from typing import Mapping
 import numpy as np
 import warp as wp
 
+from .constraints import SOMA30_PARENTS
+
 from ..kernels import _encoder_kernels
 from ..operators import EncoderStackPlan
 from ..operators import Operation, execute_operations, plan_linear
@@ -1470,41 +1472,6 @@ class KimodoRunner:
         return ((assembled - self.stats.mean) / scale)[None].astype(np.float32)
 
 
-_SOMA30_PARENTS = np.asarray(
-    (
-        -1,
-        0,
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        6,
-        6,
-        3,
-        10,
-        11,
-        12,
-        13,
-        13,
-        3,
-        16,
-        17,
-        18,
-        19,
-        19,
-        0,
-        22,
-        23,
-        24,
-        0,
-        26,
-        27,
-        28,
-    ),
-    dtype=np.int32,
-)
 _SOMA30_NEUTRAL = np.asarray(
     (
         (0.0, 0.0, 0.0),
@@ -1595,7 +1562,7 @@ def _fabrik_chain(points, target):
 
 def _soma30_rotation_motion(global_rotations, root_positions):
     """Convert SOMA-30 global rotations to official local rotations and FK joints."""
-    parent_rotations = global_rotations[..., _SOMA30_PARENTS, :, :].copy()
+    parent_rotations = global_rotations[..., SOMA30_PARENTS, :, :].copy()
     parent_rotations[..., 0, :, :] = np.eye(3, dtype=np.float32)
     local_rotations = np.swapaxes(parent_rotations, -1, -2) @ global_rotations
 
@@ -1604,7 +1571,7 @@ def _soma30_rotation_motion(global_rotations, root_positions):
     posed[..., 0, :] = root_positions
     reconstructed[..., 0, :, :] = local_rotations[..., 0, :, :]
     for joint in range(1, 30):
-        parent = int(_SOMA30_PARENTS[joint])
+        parent = int(SOMA30_PARENTS[joint])
         reconstructed[..., joint, :, :] = (
             reconstructed[..., parent, :, :] @ local_rotations[..., joint, :, :]
         )
