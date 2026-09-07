@@ -67,6 +67,14 @@ def test_dependency_light_mesh_loaders_apply_transform_and_triangulate(tmp_path)
     obj = load_obj(obj_path)
     np.testing.assert_array_equal(obj.faces, ((0, 1, 2), (0, 2, 3)))
 
+    grouped_path = tmp_path / "grouped.obj"
+    grouped_path.write_text(
+        "v 9 9 9\nv 0 0 0\nv 1 0 0\nv 0 1 0\ng helper\nf 1 2 3\ng body\nf 2 3 4\n"
+    )
+    body = load_obj(grouped_path, groups="body")
+    np.testing.assert_array_equal(body.vertices, ((0, 0, 0), (1, 0, 0), (0, 1, 0)))
+    np.testing.assert_array_equal(body.faces, ((0, 1, 2),))
+
 
 def test_official_normalization_and_surface_sampling_are_deterministic():
     mesh = TriangleMesh(

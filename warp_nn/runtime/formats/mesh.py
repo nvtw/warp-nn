@@ -204,9 +204,15 @@ def load_glb(path: str | Path):
     return TriangleMesh(np.concatenate(vertices_out), np.concatenate(faces_out))
 
 
-def load_obj(path: str | Path):
-    """Load positions and triangulated polygon faces from a Wavefront OBJ."""
+def load_obj(path: str | Path, *, groups: str | tuple[str, ...] | None = None):
+    """Load triangulated OBJ geometry, optionally selecting named groups."""
+    selected = (
+        None if groups is None else {groups} if isinstance(groups, str) else set(groups)
+    )
+    if selected is not None and not selected:
+        raise ValueError("OBJ group selection must not be empty")
     vertices, faces = [], []
+    active_groups = set()
     for raw in (
         Path(path)
         .expanduser()
@@ -219,7 +225,13 @@ def load_obj(path: str | Path):
         fields = line.split()
         if fields[0] == "v" and len(fields) >= 4:
             vertices.append(tuple(float(value) for value in fields[1:4]))
-        elif fields[0] == "f" and len(fields) >= 4:
+        elif fields[0] == "g":
+            active_groups = set(fields[1:])
+        elif (
+            fields[0] == "f"
+            and len(fields) >= 4
+            and (selected is None or not selected.isdisjoint(active_groups))
+        ):
             polygon = []
             for field in fields[1:]:
                 index = int(field.split("/", 1)[0])
@@ -228,16 +240,24 @@ def load_obj(path: str | Path):
                 (polygon[0], polygon[i], polygon[i + 1])
                 for i in range(1, len(polygon) - 1)
             )
+    if selected is not None:
+        if not faces:
+            raise ValueError(f"OBJ contains no faces in groups {sorted(selected)}")
+        used = np.unique(np.asarray(faces, dtype=np.int32))
+        remap = np.full(len(vertices), -1, dtype=np.int32)
+        remap[used] = np.arange(len(used), dtype=np.int32)
+        vertices = np.asarray(vertices, dtype=np.float32)[used]
+        faces = remap[np.asarray(faces, dtype=np.int32)]
     return TriangleMesh(vertices, faces)
 
 
-def load_triangle_mesh(path: str | Path):
+def load_triangle_mesh(path: str | Path, *, obj_groups=None):
     """Load a supported unrigged GLB or OBJ mesh."""
     path = Path(path).expanduser()
     if path.suffix.lower() == ".glb":
         return load_glb(path)
     if path.suffix.lower() == ".obj":
-        return load_obj(path)
+        return load_obj(path, groups=obj_groups)
     raise ValueError("unrigged mesh must be a .glb or .obj file")
 
 

@@ -176,6 +176,8 @@ def test_kimodo_viewer_embeds_optional_skinned_mesh(tmp_path):
     html = path.read_text(encoding="utf-8")
     assert "skinUniforms" in html
     assert "rigMatrices[${J}]" in html
+    assert "joints.visible=bones.visible=false" in html
+    assert "Show or hide the skeleton" in html
     encoded = html.split('const PAYLOAD="', 1)[1].split('";', 1)[0]
     payload = json.loads(base64.b64decode(encoded))
     assert len(base64.b64decode(payload["mesh"]["vertices"])) == 3 * 3 * 4
