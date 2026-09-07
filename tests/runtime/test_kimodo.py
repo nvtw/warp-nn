@@ -166,6 +166,8 @@ def test_motion_html_is_single_file_with_exact_positions(tmp_path):
     )
     html = path.read_text(encoding="utf-8")
     assert "three@0.185.0" in html
+    assert "joints.frustumCulled=bones.frustumCulled=false" in html
+    assert "resetCamera();pose();renderer.render(scene,camera);loading.remove()" in html
     assert "A person waves" not in html
     encoded = html.split('const PAYLOAD="', 1)[1].split('";', 1)[0]
     payload = json.loads(base64.b64decode(encoded))
