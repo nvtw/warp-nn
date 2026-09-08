@@ -14,6 +14,7 @@ from warp_nn.runtime.autoregressive import _PlanMemoryError, _union_storage_byte
 from warp_nn.runtime.qwen.qwen35 import (
     Qwen35Runner,
     _mtp_weight_names,
+    _verification_attention_partitions,
     _validate_config,
     _weight_names,
 )
@@ -539,6 +540,16 @@ def test_qwen35_single_slot_decode_uses_batch_one_plan_and_isolates_state(tmp_pa
             key_before[slot * cache_rows : (slot + 1) * cache_rows],
             equal_nan=True,
         )
+
+
+@pytest.mark.parametrize(
+    "head_size,sequence_length,partitions",
+    [(256, 4096, 16), (256, 49151, 16), (256, 49152, 64), (128, 49152, 32)],
+)
+def test_qwen35_verification_attention_partitions(
+    head_size, sequence_length, partitions
+):
+    assert _verification_attention_partitions(head_size, sequence_length) == partitions
 
 
 def test_qwen35_mtp_uses_compatible_checkpoint_weights(tmp_path):

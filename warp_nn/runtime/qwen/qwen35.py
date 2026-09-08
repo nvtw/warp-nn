@@ -76,6 +76,15 @@ from warp_nn.utils.device import parse_device
 from warp_nn.runtime.autoregressive import AutoregressiveRunner
 
 
+_MTP_LONG_CONTEXT = 49152
+
+
+def _verification_attention_partitions(head_size: int, sequence_length: int) -> int:
+    if sequence_length < _MTP_LONG_CONTEXT:
+        return 16
+    return max(16, _decode_attention_partitions(head_size) // 4)
+
+
 def _weight_names(config: dict) -> list[str]:
     names = [
         "model.language_model.embed_tokens.weight",
@@ -753,7 +762,13 @@ class _Qwen35Plan:
                 if self.rows == 1 or self.decode_batch
                 else 16
             )
-            partitions = self.attention_partitions
+            partition_counts = {self.attention_partitions}
+            if self.all_logits:
+                partition_counts.add(
+                    _verification_attention_partitions(
+                        self.runner.head_size, _MTP_LONG_CONTEXT
+                    )
+                )
             self.partitioned_attention = {
                 partitions: _allocate_partitioned_gqa(
                     self.runner.query_heads,
@@ -766,6 +781,7 @@ class _Qwen35Plan:
                     kv_heads=self.runner.kv_heads,
                     mapped=self.mapped_state,
                 )
+                for partitions in partition_counts
             }
         layer["partitioned_attention"] = self.partitioned_attention
         if self.decode_batch:
@@ -1706,7 +1722,7 @@ class Qwen35Runner(AutoregressiveRunner):
     ) -> tuple[list[int], int]:
         """Verify greedy tokens from the embedded MTP head and return (tokens, accepted)."""
         if draft_tokens is None:
-            draft_tokens = 1 if self.sequence_length >= 49152 else 2
+            draft_tokens = 1 if self.sequence_length >= _MTP_LONG_CONTEXT else 2
         if not self.use_mtp:
             raise RuntimeError("Qwen embedded MTP was not enabled")
         if self.sequence_length == 0:
@@ -1734,6 +1750,9 @@ class Qwen35Runner(AutoregressiveRunner):
             wp.copy(self._mtp_conv_snapshots[index], state)
         inputs = [int(token_id), *drafts]
         verifier = self._verification_plan_for_rows(len(inputs))
+        verifier.attention_partitions = _verification_attention_partitions(
+            self.head_size, base
+        )
         positions = np.arange(base, base + len(inputs), dtype=np.int64)
         verifier.input_ids.assign(np.asarray(inputs, dtype=np.int64)[None, :])
         verifier.position_ids.assign(positions[None, :])
