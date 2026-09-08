@@ -13,6 +13,7 @@ from warp_nn.runtime.kernels import _get_small_batch_grouped_linear_kernel
 from warp_nn.runtime.autoregressive import _PlanMemoryError, _union_storage_bytes
 from warp_nn.runtime.qwen.qwen35 import (
     Qwen35Runner,
+    _mtp_weight_names,
     _validate_config,
     _weight_names,
 )
@@ -25,14 +26,19 @@ def _bfloat16_bytes(values: np.ndarray) -> bytes:
     return (rounded >> 16).astype(np.uint16).tobytes()
 
 
-def _write_tiny_qwen35(path):
+def _write_tiny_qwen35(path, *, mtp=False):
+    layer_types = (
+        ["linear_attention", "linear_attention", "full_attention"]
+        if mtp
+        else ["linear_attention", "full_attention"]
+    )
     config = {
         "model_type": "qwen3_5_text",
         "hidden_size": 8,
         "intermediate_size": 12,
         "vocab_size": 16,
-        "num_hidden_layers": 2,
-        "layer_types": ["linear_attention", "full_attention"],
+        "num_hidden_layers": len(layer_types),
+        "layer_types": layer_types,
         "num_attention_heads": 3,
         "num_key_value_heads": 1,
         "head_dim": 4,
@@ -51,13 +57,15 @@ def _write_tiny_qwen35(path):
             "partial_rotary_factor": 0.5,
         },
     }
+    if mtp:
+        config["mtp_num_hidden_layers"] = 1
     rng = np.random.default_rng(97)
     shapes = {
         "model.language_model.embed_tokens.weight": (16, 8),
         "model.language_model.norm.weight": (8,),
         "lm_head.weight": (16, 8),
     }
-    for index in range(2):
+    for index in range(len(layer_types)):
         prefix = f"model.language_model.layers.{index}."
         shapes.update(
             {
@@ -68,21 +76,24 @@ def _write_tiny_qwen35(path):
                 prefix + "mlp.down_proj.weight": (8, 12),
             }
         )
-    linear = "model.language_model.layers.0.linear_attn."
-    shapes.update(
-        {
-            linear + "in_proj_qkv.weight": (16, 8),
-            linear + "in_proj_z.weight": (8, 8),
-            linear + "in_proj_a.weight": (2, 8),
-            linear + "in_proj_b.weight": (2, 8),
-            linear + "conv1d.weight": (16, 1, 3),
-            linear + "A_log": (2,),
-            linear + "dt_bias": (2,),
-            linear + "norm.weight": (4,),
-            linear + "out_proj.weight": (8, 8),
-        }
-    )
-    attention = "model.language_model.layers.1.self_attn."
+    for index, layer_type in enumerate(layer_types):
+        if layer_type != "linear_attention":
+            continue
+        linear = f"model.language_model.layers.{index}.linear_attn."
+        shapes.update(
+            {
+                linear + "in_proj_qkv.weight": (16, 8),
+                linear + "in_proj_z.weight": (8, 8),
+                linear + "in_proj_a.weight": (2, 8),
+                linear + "in_proj_b.weight": (2, 8),
+                linear + "conv1d.weight": (16, 1, 3),
+                linear + "A_log": (2,),
+                linear + "dt_bias": (2,),
+                linear + "norm.weight": (4,),
+                linear + "out_proj.weight": (8, 8),
+            }
+        )
+    attention = f"model.language_model.layers.{len(layer_types) - 1}.self_attn."
     shapes.update(
         {
             attention + "q_proj.weight": (24, 8),
@@ -93,8 +104,29 @@ def _write_tiny_qwen35(path):
             attention + "o_proj.weight": (8, 12),
         }
     )
+    if mtp:
+        prefix = f"model.language_model.layers.{len(layer_types)}."
+        shapes.update(
+            {
+                prefix + "input_layernorm.weight": (8,),
+                prefix + "post_attention_layernorm.weight": (8,),
+                prefix + "mlp.gate_proj.weight": (12, 8),
+                prefix + "mlp.up_proj.weight": (12, 8),
+                prefix + "mlp.down_proj.weight": (8, 12),
+                prefix + "self_attn.q_proj.weight": (24, 8),
+                prefix + "self_attn.k_proj.weight": (4, 8),
+                prefix + "self_attn.v_proj.weight": (4, 8),
+                prefix + "self_attn.q_norm.weight": (4,),
+                prefix + "self_attn.k_norm.weight": (4,),
+                prefix + "self_attn.o_proj.weight": (8, 12),
+                prefix + "nextn.eh_proj.weight": (8, 16),
+                prefix + "nextn.enorm.weight": (8,),
+                prefix + "nextn.hnorm.weight": (8,),
+                prefix + "nextn.shared_head_norm.weight": (8,),
+            }
+        )
     tensors = {}
-    for name in _weight_names(config):
+    for name in [*_weight_names(config), *_mtp_weight_names(config)]:
         shape = shapes[name]
         if (
             name.endswith("layernorm.weight")
@@ -507,3 +539,88 @@ def test_qwen35_single_slot_decode_uses_batch_one_plan_and_isolates_state(tmp_pa
             key_before[slot * cache_rows : (slot + 1) * cache_rows],
             equal_nan=True,
         )
+
+
+def test_qwen35_mtp_rejection_rollback_matches_decode_and_replays(tmp_path):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    model_path = tmp_path / "tiny-qwen35-mtp"
+    _write_tiny_qwen35(model_path, mtp=True)
+
+    def make_runner():
+        return Qwen35Runner(
+            model_path,
+            device="cuda:0",
+            cache_capacity=12,
+            prefill_chunk_size=4,
+            use_cublas=False,
+            use_mtp=True,
+        )
+
+    speculative = make_runner()
+    reference = make_runner()
+    prompt = [1, 2, 3]
+    for expected_accepted in range(4):
+        prompt_logits = reference.prefill(prompt)
+        speculative.prefill(prompt)
+        input_token = reference.sample_greedy(prompt_logits)
+        predictions = []
+        current = input_token
+        for _ in range(expected_accepted + 1):
+            expected = reference.decode(current)
+            current = reference.sample_greedy(expected)
+            predictions.append(current)
+
+        forced_drafts = predictions[:expected_accepted]
+        if expected_accepted < 3:
+            forced_drafts.append((predictions[expected_accepted] + 1) % 16)
+        forced_drafts.extend([forced_drafts[-1]] * (3 - len(forced_drafts)))
+        drafts = iter(forced_drafts)
+        speculative.sample_greedy = lambda _logits: next(drafts)
+
+        tokens, accepted = speculative.decode_speculative(input_token, draft_tokens=3)
+        assert accepted == expected_accepted
+        assert tokens == predictions
+        assert speculative.sequence_length == reference.sequence_length
+        assert speculative._mtp_sequence_length == reference._mtp_sequence_length
+        for index in speculative.recurrent_states:
+            np.testing.assert_allclose(
+                speculative.recurrent_states[index].numpy(),
+                reference.recurrent_states[index].numpy(),
+                atol=1.0e-6,
+                rtol=1.0e-6,
+            )
+            np.testing.assert_array_equal(
+                speculative.conv_states[index].numpy(),
+                reference.conv_states[index].numpy(),
+            )
+        for index in speculative.kv_caches:
+            for actual_cache, expected_cache in zip(
+                speculative.kv_caches[index], reference.kv_caches[index]
+            ):
+                np.testing.assert_array_equal(
+                    actual_cache.numpy()[: reference.sequence_length],
+                    expected_cache.numpy()[: reference.sequence_length],
+                )
+        np.testing.assert_array_equal(
+            speculative._mtp_carry_hidden.numpy(),
+            reference._mtp_carry_hidden.numpy(),
+        )
+        correction = predictions[-1]
+        np.testing.assert_allclose(
+            speculative.decode(correction).numpy(),
+            reference.decode(correction).numpy(),
+            atol=2.0e-2,
+            rtol=2.0e-2,
+        )
+        speculative.reset()
+        reference.reset()
+
+    verifier = speculative._verification_plans[4]
+    qkv_pointers = [
+        verifier.tensors[layer["qkv"].outputs[0]].ptr
+        for layer in verifier.layers
+        if layer["type"] == "linear_attention"
+    ]
+    assert len(qkv_pointers) == len(set(qkv_pointers))
+    assert 16 in verifier.graphs

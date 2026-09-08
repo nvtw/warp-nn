@@ -1127,6 +1127,7 @@ def test_mixed_state_linear_attention_bfloat16(tiled_value_heads, scalar_gated_d
             beta,
             output,
             present,
+            present.reshape((1, *present.shape)),
             rows,
             query_heads,
             key_heads,

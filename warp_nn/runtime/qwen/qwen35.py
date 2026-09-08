@@ -23,6 +23,7 @@ from warp_nn.runtime.formats.gguf import (
 )
 from warp_nn.runtime.kernels import (
     _append_head_cache_kernel,
+    _concat_axis_kernel,
     _get_append_head_cache_decode_batch_kernel,
     _causal_conv_rows_kernel,
     _get_causal_conv_decode_batch_kernels,
@@ -124,8 +125,38 @@ def _weight_names(config: dict) -> list[str]:
     return names
 
 
+def _mtp_weight_names(config: dict) -> list[str]:
+    """Return the single embedded Qwen MTP block, when present."""
+    if int(config.get("mtp_num_hidden_layers", 0)) != 1:
+        return []
+    index = int(config["num_hidden_layers"])
+    prefix = f"model.language_model.layers.{index}."
+    return [
+        prefix + suffix
+        for suffix in (
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.q_norm.weight",
+            "self_attn.k_norm.weight",
+            "self_attn.o_proj.weight",
+            "nextn.eh_proj.weight",
+            "nextn.enorm.weight",
+            "nextn.hnorm.weight",
+            "nextn.shared_head_norm.weight",
+        )
+    ]
+
+
 def _gguf_weight_map(
-    config: dict, available_names: set[str] | None = None
+    config: dict,
+    available_names: set[str] | None = None,
+    include_mtp: bool = False,
 ) -> dict[str, str]:
     names = {
         "model.language_model.embed_tokens.weight": "token_embd.weight",
@@ -165,6 +196,25 @@ def _gguf_weight_map(
             {
                 prefix + target: f"blk.{index}.{source}"
                 for target, source in suffixes.items()
+            }
+        )
+    if include_mtp and _mtp_weight_names(config):
+        index = int(config["num_hidden_layers"])
+        prefix = f"model.language_model.layers.{index}."
+        suffixes = common | attention
+        names.update(
+            {
+                prefix + target: f"blk.{index}.{source}"
+                for target, source in suffixes.items()
+            }
+        )
+        names.update(
+            {
+                prefix + "nextn.eh_proj.weight": f"blk.{index}.nextn.eh_proj.weight",
+                prefix + "nextn.enorm.weight": f"blk.{index}.nextn.enorm.weight",
+                prefix + "nextn.hnorm.weight": f"blk.{index}.nextn.hnorm.weight",
+                prefix
+                + "nextn.shared_head_norm.weight": f"blk.{index}.nextn.shared_head_norm.weight",
             }
         )
     if available_names is not None:
@@ -210,6 +260,9 @@ def _gguf_config(metadata: dict) -> dict:
         "max_position_embeddings": int(metadata["qwen35.context_length"]),
         "num_attention_heads": int(metadata["qwen35.attention.head_count"]),
         "num_hidden_layers": layers,
+        "mtp_num_hidden_layers": int(
+            metadata.get("qwen35.nextn_predict_layers", 0)
+        ),
         "num_key_value_heads": int(metadata["qwen35.attention.head_count_kv"]),
         "output_gate_type": "swish",
         "rms_norm_eps": float(metadata["qwen35.attention.layer_norm_rms_epsilon"]),
@@ -274,13 +327,21 @@ class _Qwen35Plan:
         rows: int,
         external_embeddings: bool = False,
         decode_batch: bool = False,
+        mtp: bool = False,
+        all_logits: bool = False,
+        output_logits: bool = True,
     ):
         self.runner = weakref.proxy(runner)
         self.rows = rows
         self.decode_batch = bool(decode_batch)
+        self.mtp = bool(mtp)
+        self.all_logits = bool(all_logits)
+        self.output_logits = bool(output_logits)
         self.mapped_state = bool(getattr(runner, "mapped_state", False))
         if self.decode_batch and (external_embeddings or rows not in (2, 4, 8)):
             raise ValueError("Qwen decode batches require 2, 4, or 8 text-only slots")
+        if self.mtp and (external_embeddings or self.decode_batch):
+            raise ValueError("Qwen MTP plans are text-only single-sequence plans")
         self.device = runner.device
         self.dtype = runner.dtype
         self.config = runner.config
@@ -300,6 +361,12 @@ class _Qwen35Plan:
         )
         self.tensors["hidden.0"] = self.embedding.reshape((rows, runner.hidden_size))
         self.shapes["hidden.0"] = (rows, runner.hidden_size)
+        if self.mtp:
+            self.target_hidden = wp.empty(
+                (rows, runner.hidden_size), dtype=self.dtype, device=self.device
+            )
+            self.tensors["mtp.target_hidden"] = self.target_hidden
+            self.shapes["mtp.target_hidden"] = tuple(self.target_hidden.shape)
         self.layers = []
         self._layer_buffer_pool = {}
         self._build()
@@ -362,14 +429,40 @@ class _Qwen35Plan:
         return op
 
     def _build(self) -> None:
-        hidden_name = "hidden.0"
-        first_scale = "model.language_model.layers.0.input_layernorm.weight"
-        normalized_name = "layer.0.input"
+        if self.mtp:
+            index = int(self.config["num_hidden_layers"])
+            prefix = f"model.language_model.layers.{index}."
+            self.mtp_hidden_norm = self._rms(
+                "mtp.hidden_norm", "mtp.target_hidden", prefix + "nextn.hnorm.weight"
+            )
+            self.mtp_embedding_norm = self._rms(
+                "mtp.embedding_norm", "hidden.0", prefix + "nextn.enorm.weight"
+            )
+            self.tensors["mtp.concat"] = wp.empty(
+                (self.rows, 2 * self.runner.hidden_size),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.shapes["mtp.concat"] = (self.rows, 2 * self.runner.hidden_size)
+            self.mtp_projection = self._linear(
+                "mtp.projected", "mtp.concat", prefix + "nextn.eh_proj.weight"
+            )
+            hidden_name = "mtp.projected"
+            layer_specs = [(index, "full_attention")]
+        else:
+            hidden_name = "hidden.0"
+            layer_specs = list(enumerate(self.config["layer_types"]))
+
+        first_index = layer_specs[0][0]
+        first_scale = (
+            f"model.language_model.layers.{first_index}.input_layernorm.weight"
+        )
+        normalized_name = f"layer.{first_index}.input"
         self.first_norm = self._rms(normalized_name, hidden_name, first_scale)
 
-        for index, layer_type in enumerate(self.config["layer_types"]):
+        for layer_number, (index, layer_type) in enumerate(layer_specs):
             prefix = f"model.language_model.layers.{index}."
-            layer = {"type": layer_type}
+            layer = {"type": layer_type, "index": index}
             if layer_type == "linear_attention":
                 self._build_linear_attention(layer, index, prefix, normalized_name)
             else:
@@ -408,11 +501,15 @@ class _Qwen35Plan:
                 layer["swiglu"].outputs[0],
                 prefix + "mlp.down_proj.weight",
             )
-            if index + 1 < len(self.config["layer_types"]):
+            if layer_number + 1 < len(layer_specs):
+                next_index = layer_specs[layer_number + 1][0]
                 next_scale = (
-                    f"model.language_model.layers.{index + 1}.input_layernorm.weight"
+                    f"model.language_model.layers.{next_index}.input_layernorm.weight"
                 )
-                normalized_name = f"layer.{index + 1}.input"
+                normalized_name = f"layer.{next_index}.input"
+            elif self.mtp:
+                next_scale = prefix + "nextn.shared_head_norm.weight"
+                normalized_name = "mtp.final.normalized"
             else:
                 next_scale = "model.language_model.norm.weight"
                 normalized_name = "final.normalized"
@@ -424,23 +521,30 @@ class _Qwen35Plan:
                 next_scale,
                 hidden_name,
             )
-            reuse_linear_outputs(layer, self.tensors, self._layer_buffer_pool)
+            reuse_linear_outputs(
+                layer,
+                self.tensors,
+                self._layer_buffer_pool,
+                preserved_roles=("qkv",) if self.all_logits else (),
+            )
             self.layers.append(layer)
 
-        last_normalized = "final.last_normalized"
-        if self.decode_batch:
-            self.tensors[last_normalized] = self.tensors[normalized_name]
-            self.shapes[last_normalized] = (self.rows, self.runner.hidden_size)
-        else:
-            self.tensors[last_normalized] = self.tensors[normalized_name][
-                self.rows - 1 : self.rows
-            ]
-            self.shapes[last_normalized] = (1, self.runner.hidden_size)
-        self.lm_head = self._linear("logits", last_normalized, "lm_head.weight")
-        output_rows = self.rows if self.decode_batch else 1
-        self.logits = self.tensors["logits"].reshape(
-            (output_rows, 1, self.config["vocab_size"])
-        )
+        self.normalized = self.tensors[normalized_name]
+        self.lm_head = None
+        self.logits = None
+        if self.output_logits:
+            last_normalized = "final.last_normalized"
+            if self.decode_batch or self.all_logits:
+                self.tensors[last_normalized] = self.normalized
+                self.shapes[last_normalized] = (self.rows, self.runner.hidden_size)
+            else:
+                self.tensors[last_normalized] = self.normalized[self.rows - 1 : self.rows]
+                self.shapes[last_normalized] = (1, self.runner.hidden_size)
+            self.lm_head = self._linear("logits", last_normalized, "lm_head.weight")
+            output_rows = self.rows if self.decode_batch or self.all_logits else 1
+            self.logits = self.tensors["logits"].reshape(
+                (output_rows, 1, self.config["vocab_size"])
+            )
 
     def _build_linear_attention(
         self, layer: dict, index: int, prefix: str, x: str
@@ -501,6 +605,15 @@ class _Qwen35Plan:
             self.dtype,
             wp.float32,
             scalar_gated_delta=True,
+            record_history=self.all_logits,
+        )
+        state = self.runner.recurrent_states[index]
+        layer["state_history"] = (
+            wp.empty(
+                (self.rows, *state.shape), dtype=state.dtype, device=self.device
+            )
+            if self.all_logits
+            else state.reshape((1, *state.shape))
         )
         if self.decode_batch:
             layer["attention_kernel_batch"] = _get_gated_delta_decode_batch_kernel(
@@ -630,6 +743,9 @@ class _Qwen35Plan:
                     self.device,
                     partitions,
                     rows=self.rows,
+                    rows_per_group=(
+                        2 if self.all_logits and self.rows > 1 else None
+                    ),
                     kv_heads=self.runner.kv_heads,
                     mapped=self.mapped_state,
                 )
@@ -850,6 +966,7 @@ class _Qwen35Plan:
                 layer["beta"],
                 layer["core"],
                 state,
+                layer["state_history"],
                 self.rows,
                 self.runner.linear_key_heads,
                 self.runner.linear_key_heads,
@@ -1155,8 +1272,30 @@ class _Qwen35Plan:
                 ],
                 device=self.device,
             )
+        if self.mtp:
+            self._execute_op(self.mtp_hidden_norm)
+            self._execute_op(self.mtp_embedding_norm)
+            for source, offset in (
+                (self.mtp_embedding_norm.outputs[0], 0),
+                (self.mtp_hidden_norm.outputs[0], self.runner.hidden_size),
+            ):
+                wp.launch(
+                    _concat_axis_kernel,
+                    dim=self.rows * self.runner.hidden_size,
+                    inputs=[
+                        self.tensors[source].flatten(),
+                        self.tensors["mtp.concat"].flatten(),
+                        self.runner.hidden_size,
+                        2 * self.runner.hidden_size,
+                        1,
+                        offset,
+                    ],
+                    device=self.device,
+                )
+            self._execute_op(self.mtp_projection)
         self._execute_op(self.first_norm)
-        for index, layer in enumerate(self.layers):
+        for layer in self.layers:
+            index = layer["index"]
             if layer["type"] == "linear_attention":
                 self._execute_linear_attention(layer, index)
             else:
@@ -1170,8 +1309,10 @@ class _Qwen35Plan:
                 "next_norm",
             ):
                 self._execute_op(layer[name])
-        self._execute_op(self.lm_head)
-        return self.logits
+        if self.lm_head is not None:
+            self._execute_op(self.lm_head)
+            return self.logits
+        return self.normalized
 
 
 class Qwen35BatchDecoder(NativeBatchDecoder):
@@ -1194,8 +1335,10 @@ class Qwen35Runner(AutoregressiveRunner):
         rope_scaling: Mapping[str, object] | None = None,
         weight_quantization: str | None = None,
         vision_path: str | Path | None = None,
+        use_mtp: bool = False,
     ):
         path = Path(path)
+        self.use_mtp = bool(use_mtp)
         self.model_path = path
         self.vision_path = None if vision_path is None else Path(vision_path)
         directory = path if path.is_dir() else path.parent
@@ -1211,6 +1354,8 @@ class Qwen35Runner(AutoregressiveRunner):
                 raise ValueError("GGUF checkpoint is not a Qwen 3.5 model")
             self.config = _gguf_config(gguf.metadata)
         _validate_config(self.config)
+        if self.use_mtp and int(self.config.get("mtp_num_hidden_layers", 0)) != 1:
+            raise ValueError("Qwen checkpoint does not contain one embedded MTP layer")
         self.device = parse_device(device)
         self.weight_quantization = normalize_weight_quantization(weight_quantization)
         self.cache_capacity = int(cache_capacity)
@@ -1248,12 +1393,18 @@ class Qwen35Runner(AutoregressiveRunner):
             self.ssm_a_is_decay = False
         else:
             archive = MappedWeightArchive(
-                gguf, _gguf_weight_map(self.config, set(gguf.names)), gguf.tensor
+                gguf,
+                _gguf_weight_map(
+                    self.config, set(gguf.names), include_mtp=self.use_mtp
+                ),
+                gguf.tensor
             )
             self.gguf_layout = True
             self.centered_norm_scales = False
             self.ssm_a_is_decay = True
         names = _weight_names(self.config)
+        if self.use_mtp:
+            names.extend(_mtp_weight_names(self.config))
         names.extend(
             name
             for name in archive.names
@@ -1267,7 +1418,15 @@ class Qwen35Runner(AutoregressiveRunner):
             archive, names, self.weight_quantization
         )
         weight_load_peak = required_bytes + largest_weight_source
+        if self.use_mtp:
+            required_bytes += sum(
+                int(np.prod(archive.metadata(name).shape)) * 2
+                for name in _mtp_weight_names(self.config)
+                if archive.metadata(name).format == "Q2_K"
+            )
         full_layers = self.config["layer_types"].count("full_attention")
+        if self.use_mtp:
+            full_layers += 1
         required_bytes += (
             full_layers * 2 * self.kv_heads * self.cache_capacity * self.head_size * 2
         )
@@ -1308,6 +1467,29 @@ class Qwen35Runner(AutoregressiveRunner):
         )
         if self.dtype not in (wp.float16, wp.bfloat16):
             raise TypeError("Qwen 3.5 activations require FP16 or BF16 weights")
+        if self.use_mtp:
+            for name in _mtp_weight_names(self.config):
+                weight = self.weights[name]
+                if not isinstance(weight, PackedQuantizedTensor):
+                    continue
+                if weight.format != "Q2_K":
+                    raise TypeError(f"Qwen MTP does not support packed {weight.format}")
+                rows, columns = weight.shape
+                indices = wp.array(
+                    np.arange(rows, dtype=np.int64)[None, :],
+                    dtype=wp.int64,
+                    device=self.device,
+                )
+                expanded = wp.empty(
+                    (1, rows, columns), dtype=self.dtype, device=self.device
+                )
+                wp.launch(
+                    _get_gather_q2_k_rows_kernel(self.dtype),
+                    dim=expanded.shape,
+                    inputs=[weight.blocks, indices, expanded],
+                    device=self.device,
+                )
+                self.weights[name] = expanded.reshape(weight.shape)
         for index, layer_type in enumerate(self.config["layer_types"]):
             if layer_type == "linear_attention":
                 name = (
@@ -1348,6 +1530,13 @@ class Qwen35Runner(AutoregressiveRunner):
                     wp.empty(shape, dtype=self.dtype, device=self.device),
                     wp.empty(shape, dtype=self.dtype, device=self.device),
                 )
+        if self.use_mtp:
+            index = int(self.config["num_hidden_layers"])
+            shape = (self.kv_heads * self.cache_capacity, self.head_size)
+            self.kv_caches[index] = (
+                wp.empty(shape, dtype=self.dtype, device=self.device),
+                wp.empty(shape, dtype=self.dtype, device=self.device),
+            )
         cos_cache, sin_cache = rotary_cache_values(
             self.cache_capacity, self.rotary_dim, self.rope_parameters
         )
@@ -1358,8 +1547,187 @@ class Qwen35Runner(AutoregressiveRunner):
         self._chunk_plan._capture_ready = False
         self._record_plan_storage(self._decode_plan)
         self._record_plan_storage(self._chunk_plan)
+        if self.use_mtp:
+            self._mtp_decode_plan = _Qwen35Plan(self, 1, mtp=True)
+            self._record_plan_storage(self._mtp_decode_plan)
+            self._verification_plans = {}
+            self._mtp_prefill_plans = {}
+            self._mtp_carry_hidden = wp.zeros(
+                (1, self.hidden_size), dtype=self.dtype, device=self.device
+            )
+            self._mtp_sequence_length = 0
+            self._mtp_conv_snapshots = {
+                index: wp.empty_like(state) for index, state in self.conv_states.items()
+            }
         self._initialize_sampling()
         self.sequence_length = 0
+
+    def reset(self) -> None:
+        super().reset()
+        if self.use_mtp:
+            self._mtp_carry_hidden.zero_()
+            self._mtp_sequence_length = 0
+
+    def _mtp_plan_for_rows(self, rows: int) -> _Qwen35Plan:
+        plan = self._mtp_prefill_plans.get(rows)
+        if plan is None:
+            self._require_lazy_plan_headroom(rows)
+            plan = self._mtp_prefill_plans[rows] = _Qwen35Plan(
+                self, rows, mtp=True, output_logits=False
+            )
+            plan._capture_ready = False
+            self._record_plan_storage(plan)
+        return plan
+
+    def _stage_mtp_plan(
+        self, plan: _Qwen35Plan, token_ids, start: int
+    ) -> wp.array:
+        rows = len(token_ids)
+        end = start + rows
+        plan.input_ids.assign(np.asarray(token_ids, dtype=np.int64)[None, :])
+        positions = np.arange(start, end, dtype=np.int64)
+        plan.position_ids.assign(positions[None, :])
+        plan.rope_position_ids.assign(np.broadcast_to(positions, (3, rows)))
+        self.sequence_end.assign(np.asarray([end - 1], dtype=np.int32))
+        output = self._run(plan, plan.attention_partitions)
+        self._mtp_sequence_length = end
+        return output
+
+    def _sync_mtp(self, token_ids, target_plan: _Qwen35Plan) -> None:
+        rows = len(token_ids)
+        plan = self._mtp_plan_for_rows(rows)
+        width = self.hidden_size
+        wp.copy(plan.target_hidden.flatten(), self._mtp_carry_hidden.flatten(), count=width)
+        if rows > 1:
+            wp.copy(
+                plan.target_hidden.flatten(),
+                target_plan.normalized.flatten(),
+                dest_offset=width,
+                count=(rows - 1) * width,
+            )
+        self._stage_mtp_plan(plan, token_ids, self._mtp_sequence_length)
+        wp.copy(
+            self._mtp_carry_hidden.flatten(),
+            target_plan.normalized.flatten(),
+            src_offset=(rows - 1) * width,
+            count=width,
+        )
+
+    def _stage_one(
+        self, token_id: int, embeddings=None, positions=(), token_offset=0
+    ) -> wp.array:
+        logits = super()._stage_one(token_id, embeddings, positions, token_offset)
+        if self.use_mtp:
+            if embeddings is not None:
+                raise NotImplementedError("Qwen MTP does not support embedding overrides")
+            self._sync_mtp([token_id], self._decode_plan)
+        return logits
+
+    def _stage_many(
+        self, token_ids, embeddings=None, positions=(), token_offset=0
+    ) -> wp.array:
+        logits = super()._stage_many(token_ids, embeddings, positions, token_offset)
+        if self.use_mtp:
+            if embeddings is not None:
+                raise NotImplementedError("Qwen MTP does not support embedding overrides")
+            self._sync_mtp(token_ids, self._plan_for_rows(len(token_ids)))
+        return logits
+
+    def _verification_plan_for_rows(self, rows: int) -> _Qwen35Plan:
+        plan = self._verification_plans.get(rows)
+        if plan is None:
+            self._require_lazy_plan_headroom(rows)
+            plan = self._verification_plans[rows] = _Qwen35Plan(
+                self, rows, all_logits=True
+            )
+            plan._capture_ready = False
+            self._record_plan_storage(plan)
+        return plan
+
+    def decode_speculative(
+        self, token_id: int, draft_tokens: int = 4
+    ) -> tuple[list[int], int]:
+        """Verify greedy tokens from the embedded MTP head and return (tokens, accepted)."""
+        if not self.use_mtp:
+            raise RuntimeError("Qwen embedded MTP was not enabled")
+        if self.sequence_length == 0:
+            raise RuntimeError("decode_speculative requires a preceding prefill")
+        if not 1 <= draft_tokens <= 4:
+            raise ValueError("draft_tokens must be between 1 and 4")
+        if self.sequence_length + draft_tokens + 1 > self.cache_capacity:
+            raise ValueError("Qwen KV cache does not have room for verification")
+        if self._mtp_sequence_length != self.sequence_length:
+            raise RuntimeError("Qwen target and MTP states are out of sync")
+
+        base = self.sequence_length
+        drafts = []
+        current = int(token_id)
+        plan = self._mtp_decode_plan
+        for _ in range(draft_tokens):
+            plan.input_ids.assign(np.asarray([[current]], dtype=np.int64))
+            wp.copy(plan.target_hidden, self._mtp_carry_hidden)
+            logits = self._stage_mtp_plan(plan, [current], self._mtp_sequence_length)
+            current = self.sample_greedy(logits)
+            drafts.append(current)
+            wp.copy(self._mtp_carry_hidden, plan.normalized)
+
+        for index, state in self.conv_states.items():
+            wp.copy(self._mtp_conv_snapshots[index], state)
+        inputs = [int(token_id), *drafts]
+        verifier = self._verification_plan_for_rows(len(inputs))
+        positions = np.arange(base, base + len(inputs), dtype=np.int64)
+        verifier.input_ids.assign(np.asarray(inputs, dtype=np.int64)[None, :])
+        verifier.position_ids.assign(positions[None, :])
+        verifier.rope_position_ids.assign(np.broadcast_to(positions, (3, len(inputs))))
+        self.sequence_end.assign(np.asarray([positions[-1]], dtype=np.int32))
+        logits = self._run(verifier, verifier.attention_partitions)
+        self.sequence_length = base + len(inputs)
+        predictions = np.argmax(logits.numpy()[:, 0].astype(np.float32), axis=1)
+        accepted = next(
+            (index for index, draft in enumerate(drafts) if draft != predictions[index]),
+            draft_tokens,
+        )
+        valid = accepted + 1
+
+        target_hidden = verifier.normalized
+        if valid < len(inputs):
+            for index, state in self.conv_states.items():
+                wp.copy(state, self._mtp_conv_snapshots[index])
+            for layer in verifier.layers:
+                if layer["type"] != "linear_attention":
+                    continue
+                index = layer["index"]
+                wp.copy(
+                    self.recurrent_states[index], layer["state_history"][valid - 1]
+                )
+                qkv = verifier.tensors[layer["qkv"].outputs[0]][:valid]
+                wp.launch(
+                    _update_conv_rows_state_kernel,
+                    dim=qkv.shape[1],
+                    inputs=[qkv, self.conv_states[index]],
+                    device=self.device,
+                )
+            self.sequence_length = base + valid
+            self.sequence_end.assign(
+                np.asarray([self.sequence_length - 1], dtype=np.int32)
+            )
+
+        if accepted:
+            correction = self._mtp_plan_for_rows(accepted)
+            wp.copy(
+                correction.target_hidden.flatten(),
+                target_hidden.flatten(),
+                count=accepted * self.hidden_size,
+            )
+            self._stage_mtp_plan(correction, inputs[1:valid], base + 1)
+        self._mtp_sequence_length = base + valid
+        wp.copy(
+            self._mtp_carry_hidden.flatten(),
+            target_hidden.flatten(),
+            src_offset=(valid - 1) * self.hidden_size,
+            count=self.hidden_size,
+        )
+        return [*drafts[:accepted], int(predictions[accepted])], accepted
 
     def create_batch_decoder(self, max_batch_size: int = 4) -> Qwen35BatchDecoder:
         """Allocate opt-in independent decode state without duplicating weights."""

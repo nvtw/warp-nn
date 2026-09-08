@@ -1490,6 +1490,9 @@ def _exec_linear_attention(op, tensors, shapes, device):
             tensors[op.outputs[1]].reshape(
                 (batch * value_heads * key_size, value_size)
             ),
+            tensors[op.outputs[1]].reshape(
+                (1, batch * value_heads * key_size, value_size)
+            ),
             sequence_length,
             query_heads,
             key_heads,
@@ -1688,10 +1691,16 @@ def _exec_lstm(op, tensors, shapes, device):
 
 
 def reuse_operation_outputs(
-    layer: dict, tensors: dict, pool: dict, op_type: str | None = None
+    layer: dict,
+    tensors: dict,
+    pool: dict,
+    op_type: str | None = None,
+    preserved_roles: tuple[str, ...] = (),
 ) -> None:
     """Alias same-role operation outputs across sequential model layers."""
     for role, value in layer.items():
+        if role in preserved_roles:
+            continue
         if isinstance(value, Operation) and (
             op_type is None or value.op_type == op_type
         ):
@@ -1735,9 +1744,13 @@ def reuse_operation_outputs(
                         )
 
 
-def reuse_linear_outputs(layer: dict, tensors: dict, pool: dict) -> None:
+def reuse_linear_outputs(
+    layer: dict, tensors: dict, pool: dict, preserved_roles: tuple[str, ...] = ()
+) -> None:
     """Alias same-role Linear outputs across sequential model layers."""
-    reuse_operation_outputs(layer, tensors, pool, "Linear")
+    reuse_operation_outputs(
+        layer, tensors, pool, "Linear", preserved_roles=preserved_roles
+    )
 
 
 _ENCODER_DTYPES = (wp.float16, wp.bfloat16, wp.float32)

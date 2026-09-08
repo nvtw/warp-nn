@@ -2946,6 +2946,7 @@ def _create_linear_attention_kernel(
     dtype: type,
     state_dtype: type,
     scalar_gated_delta: bool,
+    record_history: bool,
 ):
     """Build recurrent linear attention for fixed key and value widths.
     Value channels are processed in tiles of at most 32."""
@@ -2956,6 +2957,7 @@ def _create_linear_attention_kernel(
     DTYPE = dtype
     STATE_DTYPE = state_dtype
     SCALAR_GATED_DELTA = scalar_gated_delta
+    RECORD_HISTORY = record_history
     if SCALAR_GATED_DELTA and STATE_DTYPE != wp.float32:
         raise ValueError("the scalar gated-delta path requires float32 state")
 
@@ -2981,6 +2983,7 @@ def _create_linear_attention_kernel(
         beta: wp.array2d(dtype=STATE_DTYPE),
         output: wp.array2d(dtype=DTYPE),
         present: wp.array2d(dtype=STATE_DTYPE),
+        history: wp.array3d(dtype=STATE_DTYPE),
         sequence_length: int,
         query_heads: int,
         key_heads: int,
@@ -3072,6 +3075,12 @@ def _create_linear_attention_kernel(
                     wp.tile_map(to_output, STATE_DTYPE(scale) * result),
                     offset=(token_row, value_head * VALUE_SIZE + value_offset),
                 )
+                if wp.static(RECORD_HISTORY):
+                    wp.tile_store(
+                        history[token_row],
+                        state,
+                        offset=(state_offset, value_offset),
+                    )
                 continue
             if needs_decay:
                 if decay_per_key:
@@ -3155,6 +3164,11 @@ def _create_linear_attention_kernel(
                     offset=(token_row, value_head * VALUE_SIZE + value_offset),
                 )
 
+            if wp.static(RECORD_HISTORY):
+                wp.tile_store(
+                    history[token_row], state, offset=(state_offset, value_offset)
+                )
+
         wp.tile_store(present, state, offset=(state_offset, value_offset))
 
     kernel.module.options["enable_backward"] = False
@@ -3170,9 +3184,17 @@ def _get_linear_attention_kernel(
     dtype: type,
     state_dtype: type | None = None,
     scalar_gated_delta: bool = False,
+    record_history: bool = False,
 ):
     """Return a cached recurrent linear-attention kernel."""
-    key = (key_size, value_size, dtype, state_dtype or dtype, scalar_gated_delta)
+    key = (
+        key_size,
+        value_size,
+        dtype,
+        state_dtype or dtype,
+        scalar_gated_delta,
+        record_history,
+    )
     if key not in _linear_attention_kernel_cache:
         _linear_attention_kernel_cache[key] = _create_linear_attention_kernel(*key)
     return _linear_attention_kernel_cache[key]
