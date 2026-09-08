@@ -22,7 +22,11 @@ def _reference(query, key, value, query_valid, key_valid, window=None):
                 indices = [
                     k
                     for k in range(key.shape[2])
-                    if key_valid[b, k] and (window is None or abs(q - k) <= window)
+                    if key_valid[b, k]
+                    and (
+                        window is None
+                        or abs(q + key.shape[2] - query_length - k) <= window
+                    )
                 ]
                 if not indices:
                     continue
@@ -133,12 +137,16 @@ def test_tiled_attention_matches_reference_across_query_tiles(head_size):
 
 
 @pytest.mark.parametrize("dtype", [wp.float16, wp.bfloat16])
-def test_native_attention_batch_gqa_sliding_tail_and_cuda_graph(dtype):
+@pytest.mark.parametrize(("query_length", "key_length"), [(129, 129), (8, 25)])
+def test_native_attention_batch_gqa_sliding_tail_and_cuda_graph(
+    dtype, query_length, key_length
+):
     """Cover native D128 batching, GQA, masks, tail tiles, and graph replay."""
     if not is_device_available("cuda:0") or wp.get_device("cuda:0").arch < 80:
         pytest.skip("native D128 attention requires SM80+")
     rng = np.random.default_rng(113)
-    shape, kv_shape = (2, 8, 129, 128), (2, 2, 129, 128)
+    shape = (2, 8, query_length, 128)
+    kv_shape = (2, 2, key_length, 128)
     query = rng.normal(0.0, 0.2, size=shape).astype(np.float32)
     key = rng.normal(0.0, 0.2, size=kv_shape).astype(np.float32)
     value = rng.normal(0.0, 0.2, size=kv_shape).astype(np.float32)
@@ -167,10 +175,3 @@ def test_attention_rejects_incompatible_geometry():
     value = wp.zeros_like(key)
     with pytest.raises(ValueError, match="head geometry"):
         BidirectionalGQAPlan(query, key, value)
-    with pytest.raises(ValueError, match="equal Q/K"):
-        BidirectionalGQAPlan(
-            wp.zeros((1, 4, 3, 8), dtype=wp.float32, device="cpu"),
-            key,
-            value,
-            window=2,
-        )

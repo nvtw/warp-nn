@@ -3739,7 +3739,11 @@ def _create_bidirectional_gqa_attention_kernel(head_size: int, dtype: type):
                 query[batch, head, query_token], shape=(head_size,)
             )
             for key_token in range(key.shape[2]):
-                in_window = window <= 0 or wp.abs(query_token - key_token) <= window
+                in_window = (
+                    window <= 0
+                    or wp.abs(query_token + key.shape[2] - query.shape[2] - key_token)
+                    <= window
+                )
                 if key_valid[batch, key_token] and in_window:
                     key_values = wp.tile_load(
                         key[batch, kv_head, key_token], shape=(head_size,)
@@ -5852,7 +5856,9 @@ def _create_tiled_bidirectional_gqa_attention_kernel(head_size: int, dtype: type
         )
         denominators = wp.tile_zeros(shape=(QUERY_TILE,), dtype=wp.float32)
         query_offsets = wp.tile_arange(QUERY_TILE, dtype=wp.int32)
-        query_positions = wp.tile_map(add_offset, query_offsets, query_start)
+        query_positions = wp.tile_map(
+            add_offset, query_offsets, query_start + key_length - query_length
+        )
         query_positions_group = wp.tile_broadcast(
             wp.tile_reshape(query_positions, shape=(QUERY_TILE, 1)),
             shape=(QUERY_TILE, KEY_TILE),

@@ -539,11 +539,7 @@ def plan_linear(
             # splits the long dependent MMA chain across eight co-resident warps.
             reuse_weights = padded_rows >= 64 and padded_rows % 64 == 0
             split_k = (
-                8
-                if padded_rows == 16
-                and columns >= 1024
-                and inner >= 5120
-                else 0
+                8 if padded_rows == 16 and columns >= 1024 and inner >= 5120 else 0
             )
             op.attrs.update(
                 {
@@ -1992,8 +1988,6 @@ class BidirectionalGQAPlan:
             raise ValueError("attention head geometry is incompatible")
         if window is not None and int(window) <= 0:
             raise ValueError("attention window must be positive")
-        if window is not None and query_length != key.shape[2]:
-            raise ValueError("sliding attention requires equal Q/K sequence lengths")
         self.query = query
         self.key = key
         self.value = value

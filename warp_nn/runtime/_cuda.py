@@ -466,7 +466,7 @@ _BIDIRECTIONAL_ATTENTION_D128 = r"""
         const bool key_valid_1 = key_column_1 < key_length && key_valid.data[batch * key_length + key_column_1];
         const bool key_valid_8 = key_column_8 < key_length && key_valid.data[batch * key_length + key_column_8];
         const bool key_valid_9 = key_column_9 < key_length && key_valid.data[batch * key_length + key_column_9];
-        #define VALID_PAIR(Q, K, QVALID, KVALID) ((QVALID) && (KVALID) && (window <= 0 || abs((Q) - (K)) <= window))
+        #define VALID_PAIR(Q, K, QVALID, KVALID) ((QVALID) && (KVALID) && (window <= 0 || abs((Q) + key_length - query_length - (K)) <= window))
         const bool valid_00 = VALID_PAIR(query_0, key_column_0, query_valid_0, key_valid_0);
         const bool valid_01 = VALID_PAIR(query_0, key_column_1, query_valid_0, key_valid_1);
         const bool valid_08 = VALID_PAIR(query_0, key_column_8, query_valid_0, key_valid_8);
