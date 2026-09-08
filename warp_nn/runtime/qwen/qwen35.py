@@ -82,7 +82,7 @@ _MTP_LONG_CONTEXT = 49152
 def _verification_attention_partitions(head_size: int, sequence_length: int) -> int:
     if sequence_length < _MTP_LONG_CONTEXT:
         return 16
-    return max(16, _decode_attention_partitions(head_size) // 4)
+    return _decode_attention_partitions(head_size)
 
 
 def _weight_names(config: dict) -> list[str]:
@@ -778,6 +778,14 @@ class _Qwen35Plan:
                     partitions,
                     rows=self.rows,
                     rows_per_group=(2 if self.all_logits and self.rows > 1 else None),
+                    heads_per_group=(
+                        6
+                        if self.all_logits
+                        and partitions > 16
+                        and self.runner.head_size == 256
+                        and self.runner.query_heads == 6 * self.runner.kv_heads
+                        else None
+                    ),
                     kv_heads=self.runner.kv_heads,
                     mapped=self.mapped_state,
                 )

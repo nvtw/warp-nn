@@ -757,6 +757,8 @@ def test_circular_window_attention_and_logit_softcap():
         (12, 1, 128, 13, 16, 0, 1, 1),
         (16, 1, 128, 13, 16, 0, 1, 1),
         (24, 4, 256, 13, 16, 0, 1, 1),
+        # Long verification groups two rows with all six sibling query heads.
+        (24, 4, 256, 13, 16, 0, 2, 2),
         (6, 1, 32, 19, 20, 0, 4, 1),
         (4, 2, 32, 19, 8, 5, 4, 1),
         (6, 1, 32, 19, 20, 0, 3, 2),
@@ -824,6 +826,7 @@ def test_partitioned_decode_attention_matches_serial(
         "cuda:0",
         rows=rows,
         rows_per_group=rows_per_group,
+        heads_per_group=(6 if head_size == 256 and rows == 2 else None),
         kv_heads=kv_heads,
     )
     _launch_partitioned_gqa(

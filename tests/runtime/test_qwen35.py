@@ -544,7 +544,7 @@ def test_qwen35_single_slot_decode_uses_batch_one_plan_and_isolates_state(tmp_pa
 
 @pytest.mark.parametrize(
     "head_size,sequence_length,partitions",
-    [(256, 4096, 16), (256, 49151, 16), (256, 49152, 64), (128, 49152, 32)],
+    [(256, 4096, 16), (256, 49151, 16), (256, 49152, 256), (128, 49152, 128)],
 )
 def test_qwen35_verification_attention_partitions(
     head_size, sequence_length, partitions

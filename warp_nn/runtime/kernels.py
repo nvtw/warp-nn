@@ -3780,7 +3780,7 @@ def _create_partitioned_gqa_attention_kernels(
     GROUP = heads_per_group
     ROWS_PER_GROUP = rows_per_group
     QUERY_GROUP = GROUP * ROWS_PER_GROUP
-    KEY_TILE = 32
+    KEY_TILE = 16 if head_size == 256 and QUERY_GROUP == 12 else 32
     MAPPED = mapped
 
     @wp.func
