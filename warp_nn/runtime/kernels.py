@@ -4159,7 +4159,7 @@ def _create_partitioned_gqa_attention_kernels(
     native = (
         head_size == 256
         and GROUP == 6
-        and ROWS_PER_GROUP in (1, 2)
+        and ROWS_PER_GROUP in (1, 2, 8)
         and not MAPPED
         and dtype in (wp.float16, wp.bfloat16)
     )

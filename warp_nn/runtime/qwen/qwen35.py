@@ -777,11 +777,17 @@ class _Qwen35Plan:
                     self.device,
                     partitions,
                     rows=self.rows,
-                    rows_per_group=(2 if self.all_logits and self.rows > 1 else None),
+                    rows_per_group=(
+                        8
+                        if self.all_logits and self.rows >= 8
+                        else 2
+                        if self.all_logits and self.rows > 1
+                        else None
+                    ),
                     heads_per_group=(
                         6
                         if self.all_logits
-                        and partitions > 16
+                        and (self.rows >= 8 or partitions > 16)
                         and self.runner.head_size == 256
                         and self.runner.query_heads == 6 * self.runner.kv_heads
                         else None
