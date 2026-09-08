@@ -81,15 +81,24 @@ def _storage_bytes(value, excluded=()) -> int:
 
 
 class AutoregressiveRunner:
+    _sample_rows = 8
+
     def _initialize_sampling(self) -> None:
         """Allocate the fixed device and bounded host buffers used by sampling."""
         self._sample_partial_values = wp.empty(
-            128, dtype=wp.float32, device=self.device
+            self._sample_rows * 128, dtype=wp.float32, device=self.device
         )
-        self._sample_partial_tokens = wp.empty(128, dtype=wp.int32, device=self.device)
-        self._sampled_token = wp.empty(1, dtype=wp.int32, device=self.device)
+        self._sample_partial_tokens = wp.empty(
+            self._sample_rows * 128, dtype=wp.int32, device=self.device
+        )
+        self._sampled_token = wp.empty(
+            self._sample_rows, dtype=wp.int32, device=self.device
+        )
         self._sampled_token_host = wp.empty(
-            1, dtype=wp.int32, device="cpu", pinned=self.device.is_cuda
+            self._sample_rows,
+            dtype=wp.int32,
+            device="cpu",
+            pinned=self.device.is_cuda,
         )
         self._sampled_token_host_view = self._sampled_token_host.numpy()
         self._greedy_argmax_kernels = _get_greedy_argmax_kernels(1024, 128, self.dtype)
@@ -433,24 +442,36 @@ class AutoregressiveRunner:
 
     def sample_greedy(self, logits: wp.array) -> int:
         """Select the largest logit while transferring only its token ID."""
+        return int(self._sample_greedy_rows(logits)[0])
+
+    def sample_greedy_rows(self, logits: wp.array) -> np.ndarray:
+        """Select one argmax per leading logits row with one bounded transfer."""
+        return self._sample_greedy_rows(logits).copy()
+
+    def _sample_greedy_rows(self, logits: wp.array) -> np.ndarray:
         if (
             logits.device != self.device
             or logits.dtype != self.dtype
             or logits.ndim != 3
         ):
             raise TypeError(
-                f"{type(self).__name__}.sample_greedy expects runner logits"
+                f"{type(self).__name__}.sample_greedy_rows expects runner logits"
+            )
+        rows = logits.shape[0]
+        if rows > self._sample_rows:
+            raise ValueError(
+                f"greedy sampling supports at most {self._sample_rows} rows"
             )
         wp.launch_tiled(
             self._greedy_argmax_kernels[0],
-            dim=128,
+            dim=rows * 128,
             inputs=[logits, self._sample_partial_values, self._sample_partial_tokens],
             block_dim=256,
             device=self.device,
         )
         wp.launch_tiled(
             self._greedy_argmax_kernels[1],
-            dim=1,
+            dim=rows,
             inputs=[
                 self._sample_partial_values,
                 self._sample_partial_tokens,
@@ -460,9 +481,9 @@ class AutoregressiveRunner:
             block_dim=128,
             device=self.device,
         )
-        wp.copy(self._sampled_token_host, self._sampled_token, count=1)
+        wp.copy(self._sampled_token_host, self._sampled_token, count=rows)
         wp.synchronize_stream(self.device)
-        return int(self._sampled_token_host_view[0])
+        return self._sampled_token_host_view[:rows]
 
     def read_top_k(
         self,

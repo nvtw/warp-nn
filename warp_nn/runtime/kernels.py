@@ -4399,7 +4399,9 @@ def _get_greedy_argmax_kernels(
         tokens: wp.array1d[wp.int32],
     ):
         """Find one deterministic argmax candidate per vocabulary partition."""
-        partial = wp.tid()
+        item = wp.tid()
+        row = item / PARTIAL_COUNT
+        partial = item % PARTIAL_COUNT
         vocabulary = logits.shape[2]
         tile_count = (vocabulary + TILE_WIDTH - 1) / TILE_WIDTH
         best_value = wp.float32(-3.402823466e38) + wp.float32(DTYPE(0.0))
@@ -4411,7 +4413,7 @@ def _get_greedy_argmax_kernels(
             tile = wp.tile_map(
                 mask_logit,
                 wp.tile_load(
-                    logits[0, logits.shape[1] - 1], shape=TILE_WIDTH, offset=offset
+                    logits[row, logits.shape[1] - 1], shape=TILE_WIDTH, offset=offset
                 ),
                 indices,
                 vocabulary,
@@ -4425,20 +4427,23 @@ def _get_greedy_argmax_kernels(
         wp.tile_store(
             values,
             wp.tile_full(shape=1, value=best_value, dtype=wp.float32),
-            offset=partial,
+            offset=item,
         )
         wp.tile_store(
             tokens,
             wp.tile_full(shape=1, value=best_token, dtype=wp.int32),
-            offset=partial,
+            offset=item,
         )
 
     @wp.func
     def select_token(
-        values: wp.array1d[wp.float32], tokens: wp.array1d[wp.int32], vocabulary: int
+        values: wp.array1d[wp.float32],
+        tokens: wp.array1d[wp.int32],
+        vocabulary: int,
+        offset: int,
     ):
-        value_tile = wp.tile_load(values, shape=PARTIAL_COUNT)
-        token_tile = wp.tile_load(tokens, shape=PARTIAL_COUNT)
+        value_tile = wp.tile_load(values, shape=PARTIAL_COUNT, offset=offset)
+        token_tile = wp.tile_load(tokens, shape=PARTIAL_COUNT, offset=offset)
         maximum_index = wp.tile_extract(wp.tile_argmax(value_tile), 0)
         maximum = wp.tile_extract(value_tile, maximum_index)
         candidates = wp.tile_map(
@@ -4455,11 +4460,15 @@ def _get_greedy_argmax_kernels(
         vocabulary: int,
     ):
         """Reduce partial candidates and store the winning token."""
+        row = wp.tid()
         wp.tile_store(
             output,
             wp.tile_full(
-                shape=1, value=select_token(values, tokens, vocabulary), dtype=wp.int32
+                shape=1,
+                value=select_token(values, tokens, vocabulary, row * PARTIAL_COUNT),
+                dtype=wp.int32,
             ),
+            offset=row,
         )
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -4479,7 +4488,7 @@ def _get_greedy_argmax_kernels(
         """Select, store, and stage the next token unless generation finished."""
         if finished[0] != 0:
             return
-        best_token = select_token(values, tokens, vocabulary)
+        best_token = select_token(values, tokens, vocabulary, 0)
         count = generated_count[0]
         generated_ids[count] = wp.int64(best_token)
         generated_count[0] = count + 1

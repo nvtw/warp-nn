@@ -936,28 +936,29 @@ def test_head_layout_cache_and_bfloat16_argmax():
     expected_gated = expected_gated / (1.0 + np.exp(-expected_gated))
     np.testing.assert_allclose(gated.numpy(), expected_gated, atol=0.04)
 
-    logits_np = np.arange(34, dtype=np.float32).reshape(1, 2, 17)
+    logits_np = np.arange(68, dtype=np.float32).reshape(2, 2, 17)
     logits_np[0, -1, 7] = 100.0
+    logits_np[1, -1, 3] = 200.0
     logits = wp.array(logits_np, dtype=wp.bfloat16, device="cuda:0")
-    partial_values = wp.empty(4, dtype=wp.float32, device="cuda:0")
-    partial_tokens = wp.empty(4, dtype=wp.int32, device="cuda:0")
-    token = wp.empty(1, dtype=wp.int32, device="cuda:0")
+    partial_values = wp.empty(8, dtype=wp.float32, device="cuda:0")
+    partial_tokens = wp.empty(8, dtype=wp.int32, device="cuda:0")
+    token = wp.empty(2, dtype=wp.int32, device="cuda:0")
     partial, final, _ = _get_greedy_argmax_kernels(32, 4, wp.bfloat16)
     wp.launch_tiled(
         partial,
-        dim=4,
+        dim=8,
         inputs=[logits, partial_values, partial_tokens],
         block_dim=32,
         device="cuda:0",
     )
     wp.launch_tiled(
         final,
-        dim=1,
+        dim=2,
         inputs=[partial_values, partial_tokens, token, 17],
         block_dim=32,
         device="cuda:0",
     )
-    assert token.numpy()[0] == 7
+    np.testing.assert_array_equal(token.numpy(), [7, 3])
 
 
 def test_bfloat16_top_k_matches_host():

@@ -1739,7 +1739,7 @@ class Qwen35Runner(AutoregressiveRunner):
         self.sequence_end.assign(np.asarray([positions[-1]], dtype=np.int32))
         logits = self._run(verifier, verifier.attention_partitions)
         self.sequence_length = base + len(inputs)
-        predictions = np.argmax(logits.numpy()[:, 0].astype(np.float32), axis=1)
+        predictions = self.sample_greedy_rows(logits)
         accepted = next(
             (
                 index
