@@ -163,6 +163,7 @@ def test_nvfp4_two_level_scaling_prevents_small_activation_underflow():
     ("rows", "split_k", "reuse_weights"),
     [
         (16, 1, False),
+        (16, 2, False),
         (16, 8, False),
         (64, 1, True),
     ],
@@ -311,9 +312,15 @@ def test_nvfp4_linear_operation_pads_single_row():
     )
 
 
-def test_nvfp4_narrow_decode_projection_uses_split_k():
+@pytest.mark.parametrize(
+    ("columns", "inner", "split_k", "block_dim"),
+    [(1024, 5120, 8, 256), (5120, 6144, 2, 128)],
+)
+def test_nvfp4_narrow_decode_projection_uses_split_k(
+    columns, inner, split_k, block_dim
+):
     device = _sm120()
-    rows, columns, inner = 1, 1024, 5120
+    rows = 1
     values = wp.zeros((columns, inner // 2), dtype=wp.uint8, device=device)
     words = wp.array(
         ptr=values.ptr,
@@ -335,8 +342,8 @@ def test_nvfp4_narrow_decode_projection_uses_split_k():
 
     plan_linear(operation, tensors, shapes, device)
 
-    assert operation.attrs["_nvfp4_grid_multiplier"] == 8
-    assert operation.attrs["_nvfp4_block_dim"] == 256
+    assert operation.attrs["_nvfp4_grid_multiplier"] == split_k
+    assert operation.attrs["_nvfp4_block_dim"] == block_dim
 
 
 def test_nvfp4_archive_load_prepares_weight_once_for_all_plans():

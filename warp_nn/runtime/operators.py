@@ -538,7 +538,14 @@ def plan_linear(
                 and columns >= 1024
                 and inner >= 5120
                 and (inner >= 8192 or columns // 32 <= device.sm_count // 2)
-                else 0
+                else (
+                    2
+                    if padded_rows == 16
+                    and columns >= 1024
+                    and inner >= 6144
+                    and columns // 32 <= device.sm_count
+                    else 0
+                )
             )
             op.attrs.update(
                 {
