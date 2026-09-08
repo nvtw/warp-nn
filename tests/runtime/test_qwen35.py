@@ -26,7 +26,7 @@ def _bfloat16_bytes(values: np.ndarray) -> bytes:
     return (rounded >> 16).astype(np.uint16).tobytes()
 
 
-def _write_tiny_qwen35(path, *, mtp=False):
+def _write_tiny_qwen35(path, *, mtp=False, seed=97):
     layer_types = (
         ["linear_attention", "linear_attention", "full_attention"]
         if mtp
@@ -59,7 +59,7 @@ def _write_tiny_qwen35(path, *, mtp=False):
     }
     if mtp:
         config["mtp_num_hidden_layers"] = 1
-    rng = np.random.default_rng(97)
+    rng = np.random.default_rng(seed)
     shapes = {
         "model.language_model.embed_tokens.weight": (16, 8),
         "model.language_model.norm.weight": (8,),
@@ -539,6 +539,31 @@ def test_qwen35_single_slot_decode_uses_batch_one_plan_and_isolates_state(tmp_pa
             key_before[slot * cache_rows : (slot + 1) * cache_rows],
             equal_nan=True,
         )
+
+
+def test_qwen35_mtp_uses_compatible_checkpoint_weights(tmp_path):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    model_path = tmp_path / "tiny-qwen35-mtp"
+    mtp_path = tmp_path / "tiny-qwen35-mtp-alternate"
+    _write_tiny_qwen35(model_path, mtp=True)
+    _write_tiny_qwen35(mtp_path, mtp=True, seed=101)
+    common = dict(device="cuda:0", cache_capacity=8, prefill_chunk_size=4, use_mtp=True)
+    embedded = Qwen35Runner(model_path, **common)
+    alternate = Qwen35Runner(model_path, mtp_path=mtp_path, **common)
+    target_name = _weight_names(alternate.config)[3]
+    mtp_name = _mtp_weight_names(alternate.config)[3]
+    np.testing.assert_array_equal(
+        alternate.weights[target_name].numpy(), embedded.weights[target_name].numpy()
+    )
+    assert not np.array_equal(
+        alternate.weights[mtp_name].numpy(), embedded.weights[mtp_name].numpy()
+    )
+    logits = alternate.prefill([1, 2, 3])
+    tokens, accepted = alternate.decode_speculative(
+        alternate.sample_greedy(logits), draft_tokens=3
+    )
+    assert len(tokens) == accepted + 1
 
 
 def test_qwen35_mtp_rejection_rollback_matches_decode_and_replays(tmp_path):

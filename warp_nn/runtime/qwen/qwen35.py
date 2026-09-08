@@ -317,6 +317,26 @@ def _validate_config(config: dict) -> None:
         raise ValueError("Only default Qwen rotary embeddings are supported")
 
 
+def _qwen_checkpoint_source(path: Path, include_mtp: bool):
+    directory = path if path.is_dir() else path.parent
+    if any(directory.glob("*.safetensors")):
+        config_data = json.loads(
+            (directory / "config.json").read_text(encoding="utf-8")
+        )
+        config = config_data.get("text_config", config_data)
+        return config, SafeTensorArchive(directory), False
+    gguf = GGUFArchive(find_gguf_files(path))
+    if gguf.metadata.get("general.architecture") != "qwen35":
+        raise ValueError("GGUF checkpoint is not a Qwen 3.5 model")
+    config = _gguf_config(gguf.metadata)
+    archive = MappedWeightArchive(
+        gguf,
+        _gguf_weight_map(config, set(gguf.names), include_mtp=include_mtp),
+        gguf.tensor,
+    )
+    return config, archive, True
+
+
 class _Qwen35Plan:
     """Fixed-row execution plan sharing weights and recurrent state."""
 
@@ -1333,23 +1353,18 @@ class Qwen35Runner(AutoregressiveRunner):
         weight_quantization: str | None = None,
         vision_path: str | Path | None = None,
         use_mtp: bool = False,
+        mtp_path: str | Path | None = None,
     ):
         path = Path(path)
         self.use_mtp = bool(use_mtp)
         self.model_path = path
         self.vision_path = None if vision_path is None else Path(vision_path)
-        directory = path if path.is_dir() else path.parent
-        if any(directory.glob("*.safetensors")):
-            config_data = json.loads(
-                (directory / "config.json").read_text(encoding="utf-8")
-            )
-            self.config = config_data.get("text_config", config_data)
-            gguf = None
-        else:
-            gguf = GGUFArchive(find_gguf_files(path))
-            if gguf.metadata.get("general.architecture") != "qwen35":
-                raise ValueError("GGUF checkpoint is not a Qwen 3.5 model")
-            self.config = _gguf_config(gguf.metadata)
+        self.mtp_path = None if mtp_path is None else Path(mtp_path)
+        if self.mtp_path is not None and not self.use_mtp:
+            raise ValueError("mtp_path requires use_mtp=True")
+        self.config, archive, self.gguf_layout = _qwen_checkpoint_source(
+            path, self.use_mtp and self.mtp_path is None
+        )
         _validate_config(self.config)
         if self.use_mtp and int(self.config.get("mtp_num_hidden_layers", 0)) != 1:
             raise ValueError("Qwen checkpoint does not contain one embedded MTP layer")
@@ -1383,43 +1398,65 @@ class Qwen35Runner(AutoregressiveRunner):
         if self.rotary_dim <= 0 or self.rotary_dim % 2:
             raise ValueError("Qwen 3.5 rotary dimension must be positive and even")
 
-        if gguf is None:
-            archive = SafeTensorArchive(directory)
-            self.gguf_layout = False
-            self.centered_norm_scales = True
-            self.ssm_a_is_decay = False
-        else:
-            archive = MappedWeightArchive(
-                gguf,
-                _gguf_weight_map(
-                    self.config, set(gguf.names), include_mtp=self.use_mtp
-                ),
-                gguf.tensor,
+        self.centered_norm_scales = not self.gguf_layout
+        self.ssm_a_is_decay = self.gguf_layout
+        mtp_archive = None
+        if self.mtp_path is not None:
+            mtp_config, mtp_archive, mtp_layout = _qwen_checkpoint_source(
+                self.mtp_path, True
             )
-            self.gguf_layout = True
-            self.centered_norm_scales = False
-            self.ssm_a_is_decay = True
-        names = _weight_names(self.config)
-        if self.use_mtp:
-            names.extend(_mtp_weight_names(self.config))
-        names.extend(
-            name
-            for name in archive.names
-            if name.endswith(".scale")
-            and name.removesuffix(".scale") + ".weight" in names
-        )
-        missing = set(names) - set(archive.names)
-        if missing:
-            raise ValueError(f"Qwen 3.5 checkpoint is missing {sorted(missing)[:5]}")
-        required_bytes, largest_weight_source = estimate_loaded_weight_bytes(
-            archive, names, self.weight_quantization
-        )
+            _validate_config(mtp_config)
+            fields = (
+                "hidden_size",
+                "intermediate_size",
+                "vocab_size",
+                "num_hidden_layers",
+                "num_attention_heads",
+                "num_key_value_heads",
+                "head_dim",
+            )
+            if (
+                int(mtp_config.get("mtp_num_hidden_layers", 0)) != 1
+                or mtp_layout != self.gguf_layout
+                or any(mtp_config[field] != self.config[field] for field in fields)
+            ):
+                raise ValueError("MTP checkpoint is incompatible with the Qwen target")
+
+        target_names = _weight_names(self.config)
+        draft_names = _mtp_weight_names(self.config) if self.use_mtp else []
+        sources = [(archive, target_names)]
+        if mtp_archive is None:
+            target_names.extend(draft_names)
+        else:
+            sources.append((mtp_archive, draft_names))
+        for source, selected in sources:
+            selected.extend(
+                name
+                for name in source.names
+                if name.endswith(".scale")
+                and name.removesuffix(".scale") + ".weight" in selected
+            )
+            missing = set(selected) - set(source.names)
+            if missing:
+                raise ValueError(
+                    f"Qwen 3.5 checkpoint is missing {sorted(missing)[:5]}"
+                )
+
+        required_bytes = 0
+        largest_weight_source = 0
+        for source, selected in sources:
+            source_bytes, source_largest = estimate_loaded_weight_bytes(
+                source, selected, self.weight_quantization
+            )
+            required_bytes += source_bytes
+            largest_weight_source = max(largest_weight_source, source_largest)
         weight_load_peak = required_bytes + largest_weight_source
-        if self.use_mtp:
+        draft_archive = mtp_archive or archive
+        if draft_names:
             required_bytes += sum(
-                int(np.prod(archive.metadata(name).shape)) * 2
-                for name in _mtp_weight_names(self.config)
-                if archive.metadata(name).format == "Q2_K"
+                int(np.prod(draft_archive.metadata(name).shape)) * 2
+                for name in draft_names
+                if draft_archive.metadata(name).format == "Q2_K"
             )
         full_layers = self.config["layer_types"].count("full_attention")
         if self.use_mtp:
@@ -1434,9 +1471,13 @@ class Qwen35Runner(AutoregressiveRunner):
                 f"Qwen 3.5 needs at least {required_bytes / 2**30:.1f} GiB for selected weights and KV cache; "
                 f"{self.device.free_memory / 2**30:.1f} GiB is currently free"
             )
-        self.weights = load_native_weights(
-            archive, self.device, names, self.weight_quantization
-        )
+        self.weights = {}
+        for source, selected in sources:
+            self.weights.update(
+                load_native_weights(
+                    source, self.device, selected, self.weight_quantization
+                )
+            )
         self.linear_output_scales = {
             name.removesuffix(".scale") + ".weight": float(
                 self.weights.pop(name).numpy()[0]
