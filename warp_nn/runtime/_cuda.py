@@ -949,14 +949,18 @@ def get_prefill_mma_split_k_projection(
 _Q8_GROUPED_DECODE_PROJECTION = r"""
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
     const int lane = tid & 7;
-    const int column_0 = (tid >> 3) * OUTPUTS_PER_GROUP;
+    const int group = tid >> 3;
+    const int column_groups = output.shape.dims[1] / OUTPUTS_PER_GROUP;
+    const int row = group / column_groups;
+    const int column_0 = (group - row * column_groups) * OUTPUTS_PER_GROUP;
     float total_0 = 0.0f;
     #if OUTPUTS_PER_GROUP == 2
     const int column_1 = column_0 + 1;
     float total_1 = 0.0f;
     #endif
     for (int block = 0; block < blocks; ++block) {
-        const int activation = static_cast<int>(activations.data[block * 8 + lane]);
+        const int activation = static_cast<int>(
+            activations.data[(row * blocks + block) * 8 + lane]);
         const int weight_0 = static_cast<int>(
             weights.data[(column_0 * blocks + block) * 8 + lane]);
         #if OUTPUTS_PER_GROUP == 2
@@ -975,7 +979,7 @@ _Q8_GROUPED_DECODE_PROJECTION = r"""
             : "=r"(dot_1) : "r"(weight_1), "r"(activation), "r"(zero));
         #endif
         float activation_scale =
-            lane == 0 ? activation_scales.data[block] : 0.0f;
+            lane == 0 ? activation_scales.data[row * blocks + block] : 0.0f;
         float weight_scale_0 = lane == 0
             ? static_cast<float>(weight_scales.data[column_0 * blocks + block])
             : 0.0f;
@@ -1001,9 +1005,9 @@ _Q8_GROUPED_DECODE_PROJECTION = r"""
         #endif
     }
     if (lane == 0) {
-        output.data[column_0] = NATIVE_TYPE(total_0);
+        output.data[row * output.shape.dims[1] + column_0] = NATIVE_TYPE(total_0);
         #if OUTPUTS_PER_GROUP == 2
-        output.data[column_1] = NATIVE_TYPE(total_1);
+        output.data[row * output.shape.dims[1] + column_1] = NATIVE_TYPE(total_1);
         #endif
     }
 #endif

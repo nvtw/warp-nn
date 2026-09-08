@@ -296,7 +296,7 @@ def test_q8_0_linear_operation(rows, columns, inner, dtype):
     assert ("_q8_mma_kernel" in operation.attrs) == uses_mma
     if uses_mma:
         assert operation.attrs["_q8_mma_tile_m"] == rows
-    uses_grouped_decode = rows == 1
+    uses_grouped_decode = rows <= 8
     assert ("_q8_grouped_decode_kernel" in operation.attrs) == uses_grouped_decode
     if uses_grouped_decode:
         expected_group = 2 if columns == 12288 else 1
