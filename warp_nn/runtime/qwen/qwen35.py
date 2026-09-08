@@ -1702,7 +1702,7 @@ class Qwen35Runner(AutoregressiveRunner):
         return plan
 
     def decode_speculative(
-        self, token_id: int, draft_tokens: int = 4
+        self, token_id: int, draft_tokens: int = 2
     ) -> tuple[list[int], int]:
         """Verify greedy tokens from the embedded MTP head and return (tokens, accepted)."""
         if not self.use_mtp:
