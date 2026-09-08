@@ -529,11 +529,16 @@ def plan_linear(
                 op.attrs["_nvfp4_quantize_kernel"] = _get_quantize_nvfp4_kernel(dtype)
                 op.attrs["_nvfp4_row_scale_kernel"] = _get_nvfp4_row_scale_kernel(dtype)
             quantized, activation_scales, activation_global_scales = cached_activation
-            # Prefill reuses each K256 weight tile across four M16 warps. Decode's
-            # long-K down projection instead needs more warps to saturate SM120.
+            # Prefill reuses each K256 weight tile across four M16 warps. Decode
+            # splits either long-K work or a narrow grid below half an SM wave.
             reuse_weights = padded_rows >= 64 and padded_rows % 64 == 0
             split_k = (
-                8 if padded_rows == 16 and columns >= 1024 and inner >= 8192 else 0
+                8
+                if padded_rows == 16
+                and columns >= 1024
+                and inner >= 5120
+                and (inner >= 8192 or columns // 32 <= device.sm_count // 2)
+                else 0
             )
             op.attrs.update(
                 {

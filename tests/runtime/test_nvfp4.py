@@ -288,6 +288,34 @@ def test_nvfp4_linear_operation_pads_single_row():
     )
 
 
+def test_nvfp4_narrow_decode_projection_uses_split_k():
+    device = _sm120()
+    rows, columns, inner = 1, 1024, 5120
+    values = wp.zeros((columns, inner // 2), dtype=wp.uint8, device=device)
+    words = wp.array(
+        ptr=values.ptr,
+        dtype=wp.uint32,
+        shape=(columns, inner // 8),
+        capacity=values.capacity,
+        device=device,
+        copy=False,
+    )
+    scales = wp.zeros((columns, inner // 16), dtype=wp.uint8, device=device)
+    tensors = {
+        "x": wp.zeros((rows, inner), dtype=wp.bfloat16, device=device),
+        "weight": BlockQuantizedTensor(
+            values, words, scales, (columns, inner), "NVFP4_MMA"
+        ),
+    }
+    shapes = {"x": (rows, inner), "weight": (columns, inner)}
+    operation = Operation("Linear", ["x", "weight"], ["output"])
+
+    plan_linear(operation, tensors, shapes, device)
+
+    assert operation.attrs["_nvfp4_grid_multiplier"] == 8
+    assert operation.attrs["_nvfp4_block_dim"] == 256
+
+
 def test_nvfp4_archive_load_prepares_weight_once_for_all_plans():
     device = _sm120()
 
