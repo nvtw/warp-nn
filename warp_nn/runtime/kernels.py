@@ -1692,7 +1692,7 @@ def _get_dequantize_nvfp4_kernel(dtype: type):
 def _create_nvfp4_row_scale_kernel(dtype: type):
     """Build a deterministic tiled row-maximum reduction for NVFP4."""
     DTYPE = dtype
-    TILE_WIDTH = 256
+    TILE_WIDTH = 512
 
     @wp.func
     def absolute(value: DTYPE):

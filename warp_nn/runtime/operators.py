@@ -264,7 +264,7 @@ def _exec_linear(op, tensors, shapes, device):
                 op.attrs["_nvfp4_row_scale_kernel"],
                 dim=op.attrs["_rows"],
                 inputs=[x, op.attrs["_nvfp4_global_scales"]],
-                block_dim=128,
+                block_dim=256,
                 device=device,
             )
             wp.launch(
