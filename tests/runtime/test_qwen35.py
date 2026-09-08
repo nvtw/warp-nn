@@ -560,9 +560,7 @@ def test_qwen35_mtp_uses_compatible_checkpoint_weights(tmp_path):
         alternate.weights[mtp_name].numpy(), embedded.weights[mtp_name].numpy()
     )
     logits = alternate.prefill([1, 2, 3])
-    tokens, accepted = alternate.decode_speculative(
-        alternate.sample_greedy(logits), draft_tokens=3
-    )
+    tokens, accepted = alternate.decode_speculative(alternate.sample_greedy(logits))
     assert len(tokens) == accepted + 1
 
 

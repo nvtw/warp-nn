@@ -1702,9 +1702,11 @@ class Qwen35Runner(AutoregressiveRunner):
         return plan
 
     def decode_speculative(
-        self, token_id: int, draft_tokens: int = 2
+        self, token_id: int, draft_tokens: int | None = None
     ) -> tuple[list[int], int]:
         """Verify greedy tokens from the embedded MTP head and return (tokens, accepted)."""
+        if draft_tokens is None:
+            draft_tokens = 1 if self.sequence_length >= 49152 else 2
         if not self.use_mtp:
             raise RuntimeError("Qwen embedded MTP was not enabled")
         if self.sequence_length == 0:
