@@ -12,6 +12,7 @@ import warp as wp
 
 from warp_nn.runtime.formats.gguf import BlockQuantizedTensor
 from warp_nn.runtime.kernels import (
+    _get_dequantize_nvfp4_kernel,
     _get_nvfp4_mma_linear_kernel,
     _get_nvfp4_row_scale_kernel,
     _get_quantize_int8_kernel,
@@ -178,6 +179,29 @@ def repack_gguf_nvfp4_weight(weight: BlockQuantizedTensor) -> BlockQuantizedTens
         copy=False,
     )
     return BlockQuantizedTensor(output, words, weight.scales, weight.shape, "NVFP4_MMA")
+
+
+def dequantize_nvfp4_weight(
+    weight: BlockQuantizedTensor, dtype: type, global_scale: float = 1.0
+) -> wp.array:
+    """Expand one NVFP4 matrix once for a more efficient narrow projection."""
+    if weight.format == "NVFP4":
+        weight = repack_gguf_nvfp4_weight(weight)
+    elif weight.format != "NVFP4_MMA":
+        raise TypeError("expected an NVFP4 block-quantized tensor")
+    output = wp.empty(weight.shape, dtype=dtype, device=weight.values.device)
+    wp.launch(
+        _get_dequantize_nvfp4_kernel(dtype),
+        dim=output.shape,
+        inputs=[
+            weight.values.reshape((weight.shape[0], weight.shape[1] // 2)),
+            weight.scales.reshape((weight.shape[0], weight.shape[1] // 16)),
+            global_scale,
+            output,
+        ],
+        device=output.device,
+    )
+    return output
 
 
 def launch_nvfp4_linear(

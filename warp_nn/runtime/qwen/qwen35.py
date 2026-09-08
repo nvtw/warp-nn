@@ -65,6 +65,7 @@ from warp_nn.runtime.operators import (
 )
 from warp_nn.runtime.weights import MappedWeightArchive, cast_weight
 from warp_nn.runtime.quantization import (
+    dequantize_nvfp4_weight,
     estimate_loaded_weight_bytes,
     load_native_weights,
     normalize_weight_quantization,
@@ -260,9 +261,7 @@ def _gguf_config(metadata: dict) -> dict:
         "max_position_embeddings": int(metadata["qwen35.context_length"]),
         "num_attention_heads": int(metadata["qwen35.attention.head_count"]),
         "num_hidden_layers": layers,
-        "mtp_num_hidden_layers": int(
-            metadata.get("qwen35.nextn_predict_layers", 0)
-        ),
+        "mtp_num_hidden_layers": int(metadata.get("qwen35.nextn_predict_layers", 0)),
         "num_key_value_heads": int(metadata["qwen35.attention.head_count_kv"]),
         "output_gate_type": "swish",
         "rms_norm_eps": float(metadata["qwen35.attention.layer_norm_rms_epsilon"]),
@@ -538,7 +537,9 @@ class _Qwen35Plan:
                 self.tensors[last_normalized] = self.normalized
                 self.shapes[last_normalized] = (self.rows, self.runner.hidden_size)
             else:
-                self.tensors[last_normalized] = self.normalized[self.rows - 1 : self.rows]
+                self.tensors[last_normalized] = self.normalized[
+                    self.rows - 1 : self.rows
+                ]
                 self.shapes[last_normalized] = (1, self.runner.hidden_size)
             self.lm_head = self._linear("logits", last_normalized, "lm_head.weight")
             output_rows = self.rows if self.decode_batch or self.all_logits else 1
@@ -609,9 +610,7 @@ class _Qwen35Plan:
         )
         state = self.runner.recurrent_states[index]
         layer["state_history"] = (
-            wp.empty(
-                (self.rows, *state.shape), dtype=state.dtype, device=self.device
-            )
+            wp.empty((self.rows, *state.shape), dtype=state.dtype, device=self.device)
             if self.all_logits
             else state.reshape((1, *state.shape))
         )
@@ -743,9 +742,7 @@ class _Qwen35Plan:
                     self.device,
                     partitions,
                     rows=self.rows,
-                    rows_per_group=(
-                        2 if self.all_logits and self.rows > 1 else None
-                    ),
+                    rows_per_group=(2 if self.all_logits and self.rows > 1 else None),
                     kv_heads=self.runner.kv_heads,
                     mapped=self.mapped_state,
                 )
@@ -1397,7 +1394,7 @@ class Qwen35Runner(AutoregressiveRunner):
                 _gguf_weight_map(
                     self.config, set(gguf.names), include_mtp=self.use_mtp
                 ),
-                gguf.tensor
+                gguf.tensor,
             )
             self.gguf_layout = True
             self.centered_norm_scales = False
@@ -1492,6 +1489,21 @@ class Qwen35Runner(AutoregressiveRunner):
                 self.weights[name] = expanded.reshape(weight.shape)
         for index, layer_type in enumerate(self.config["layer_types"]):
             if layer_type == "linear_attention":
+                beta = (
+                    f"model.language_model.layers.{index}.linear_attn.in_proj_b.weight"
+                )
+                beta_weight = self.weights[beta]
+                if isinstance(
+                    beta_weight, BlockQuantizedTensor
+                ) and beta_weight.format in (
+                    "NVFP4",
+                    "NVFP4_MMA",
+                ):
+                    self.weights[beta] = dequantize_nvfp4_weight(
+                        beta_weight,
+                        self.dtype,
+                        self.linear_output_scales.pop(beta, 1.0),
+                    )
                 name = (
                     f"model.language_model.layers.{index}.linear_attn.in_proj_a.weight"
                 )
@@ -1579,9 +1591,7 @@ class Qwen35Runner(AutoregressiveRunner):
             self._record_plan_storage(plan)
         return plan
 
-    def _stage_mtp_plan(
-        self, plan: _Qwen35Plan, token_ids, start: int
-    ) -> wp.array:
+    def _stage_mtp_plan(self, plan: _Qwen35Plan, token_ids, start: int) -> wp.array:
         rows = len(token_ids)
         end = start + rows
         plan.input_ids.assign(np.asarray(token_ids, dtype=np.int64)[None, :])
@@ -1597,7 +1607,9 @@ class Qwen35Runner(AutoregressiveRunner):
         rows = len(token_ids)
         plan = self._mtp_plan_for_rows(rows)
         width = self.hidden_size
-        wp.copy(plan.target_hidden.flatten(), self._mtp_carry_hidden.flatten(), count=width)
+        wp.copy(
+            plan.target_hidden.flatten(), self._mtp_carry_hidden.flatten(), count=width
+        )
         if rows > 1:
             wp.copy(
                 plan.target_hidden.flatten(),
@@ -1619,7 +1631,9 @@ class Qwen35Runner(AutoregressiveRunner):
         logits = super()._stage_one(token_id, embeddings, positions, token_offset)
         if self.use_mtp:
             if embeddings is not None:
-                raise NotImplementedError("Qwen MTP does not support embedding overrides")
+                raise NotImplementedError(
+                    "Qwen MTP does not support embedding overrides"
+                )
             self._sync_mtp([token_id], self._decode_plan)
         return logits
 
@@ -1629,7 +1643,9 @@ class Qwen35Runner(AutoregressiveRunner):
         logits = super()._stage_many(token_ids, embeddings, positions, token_offset)
         if self.use_mtp:
             if embeddings is not None:
-                raise NotImplementedError("Qwen MTP does not support embedding overrides")
+                raise NotImplementedError(
+                    "Qwen MTP does not support embedding overrides"
+                )
             self._sync_mtp(token_ids, self._plan_for_rows(len(token_ids)))
         return logits
 
@@ -1684,7 +1700,11 @@ class Qwen35Runner(AutoregressiveRunner):
         self.sequence_length = base + len(inputs)
         predictions = np.argmax(logits.numpy()[:, 0].astype(np.float32), axis=1)
         accepted = next(
-            (index for index, draft in enumerate(drafts) if draft != predictions[index]),
+            (
+                index
+                for index, draft in enumerate(drafts)
+                if draft != predictions[index]
+            ),
             draft_tokens,
         )
         valid = accepted + 1
@@ -1697,9 +1717,7 @@ class Qwen35Runner(AutoregressiveRunner):
                 if layer["type"] != "linear_attention":
                     continue
                 index = layer["index"]
-                wp.copy(
-                    self.recurrent_states[index], layer["state_history"][valid - 1]
-                )
+                wp.copy(self.recurrent_states[index], layer["state_history"][valid - 1])
                 qkv = verifier.tensors[layer["qkv"].outputs[0]][:valid]
                 wp.launch(
                     _update_conv_rows_state_kernel,

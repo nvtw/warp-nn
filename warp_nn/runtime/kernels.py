@@ -1653,6 +1653,42 @@ def _get_quantize_nvfp4_kernel(dtype: type):
     return _create_quantize_nvfp4_kernel(dtype)
 
 
+def _create_dequantize_nvfp4_kernel(dtype: type):
+    """Build adjacent-nibble E2M1 weight expansion with E4M3 scales."""
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    def kernel(
+        packed: wp.array2d[wp.uint8],
+        scales: wp.array2d[wp.uint8],
+        global_scale: float,
+        output: wp.array2d(dtype=DTYPE),
+    ):
+        row, column = wp.tid()
+        byte = wp.int32(packed[row, column / 2])
+        code = (byte >> (4 * (column % 2))) & 15
+        magnitude_code = code & 7
+        magnitude = wp.float32(magnitude_code) * 0.5
+        if magnitude_code == 5:
+            magnitude = 3.0
+        elif magnitude_code == 6:
+            magnitude = 4.0
+        elif magnitude_code == 7:
+            magnitude = 6.0
+        sign = -1.0 if code & 8 else 1.0
+        scale = decode_ue4m3(wp.int32(scales[row, column / 16]))
+        output[row, column] = DTYPE(sign * magnitude * scale * global_scale)
+
+    return kernel
+
+
+@lru_cache(maxsize=None)
+def _get_dequantize_nvfp4_kernel(dtype: type):
+    if dtype not in (wp.float16, wp.bfloat16):
+        raise TypeError("NVFP4 weight expansion requires FP16 or BF16 output")
+    return _create_dequantize_nvfp4_kernel(dtype)
+
+
 def _create_nvfp4_row_scale_kernel(dtype: type):
     """Build a deterministic tiled row-maximum reduction for NVFP4."""
     DTYPE = dtype

@@ -16,6 +16,7 @@ from warp_nn.runtime.operators import (
     reuse_operation_outputs,
 )
 from warp_nn.runtime.quantization import (
+    dequantize_nvfp4_weight,
     enable_nvfp4_native,
     launch_nvfp4_linear,
     launch_quantize_nvfp4,
@@ -80,6 +81,28 @@ def test_nvfp4_gguf_repack_basis_order():
     repacked = repack_gguf_nvfp4_weight(weight).values.numpy()[0, 0]
     expected = np.array([index | ((index + 1) << 4) for index in range(0, 16, 2)] * 4)
     np.testing.assert_array_equal(repacked, expected.astype(np.uint8))
+
+
+def test_nvfp4_weight_dequantization():
+    device = _sm120()
+    rng = np.random.default_rng(115)
+    packed = rng.integers(0, 256, (3, 32), dtype=np.uint8)
+    scales = rng.integers(0, 127, (3, 4), dtype=np.uint8)
+    values = wp.array(packed, device=device)
+    words = wp.array(
+        ptr=values.ptr,
+        dtype=wp.uint32,
+        shape=(3, 8),
+        capacity=values.capacity,
+        device=device,
+        copy=False,
+    )
+    weight = BlockQuantizedTensor(
+        values, words, wp.array(scales, device=device), (3, 64), "NVFP4_MMA"
+    )
+    actual = dequantize_nvfp4_weight(weight, wp.bfloat16, 0.75).numpy()
+    expected = _dequantize(packed, scales, 64) * 0.75
+    np.testing.assert_allclose(actual, expected, atol=0.03125, rtol=0.004)
 
 
 def test_nvfp4_quantization_adjacent_nibbles():
