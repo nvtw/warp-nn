@@ -206,7 +206,13 @@ def test_linear_operation_cublas():
 
 @pytest.mark.parametrize(
     "query_heads,kv_heads,head_size,group",
-    [(32, 2, 128, 16), (16, 2, 128, 8), (24, 4, 128, 4), (24, 4, 256, 4)],
+    [
+        (32, 2, 128, 16),
+        (16, 2, 128, 8),
+        (24, 4, 128, 4),
+        (24, 4, 256, 6),
+        (32, 4, 256, 4),
+    ],
 )
 def test_decode_attention_head_group_follows_gqa_geometry(
     query_heads, kv_heads, head_size, group
@@ -750,6 +756,7 @@ def test_circular_window_attention_and_logit_softcap():
         (8, 1, 128, 13, 16, 0, 1, 1),
         (12, 1, 128, 13, 16, 0, 1, 1),
         (16, 1, 128, 13, 16, 0, 1, 1),
+        (24, 4, 256, 13, 16, 0, 1, 1),
         (6, 1, 32, 19, 20, 0, 4, 1),
         (4, 2, 32, 19, 8, 5, 4, 1),
         (6, 1, 32, 19, 20, 0, 3, 2),

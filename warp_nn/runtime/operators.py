@@ -88,9 +88,10 @@ def _decode_attention_head_group(
     """Choose bounded K/V reuse from the grouped-query ratio."""
     if kv_heads <= 0 or query_heads < kv_heads or query_heads % kv_heads:
         raise ValueError("query_heads must be a positive multiple of kv_heads")
-    if head_size > 128:
-        return 4
     queries_per_kv = query_heads // kv_heads
+    if head_size > 128:
+        # Six D256 queries fit the tile kernel; larger groups exceed its shared-memory budget.
+        return queries_per_kv if head_size == 256 and queries_per_kv <= 6 else 4
     return max(4, min(16, 1 << (queries_per_kv.bit_length() - 1)))
 
 
@@ -102,7 +103,7 @@ def _attention_group_geometry(
     if kv_heads and (rows == 1 or rows >= 16):
         candidate = _decode_attention_head_group(query_heads, kv_heads, head_size)
         queries_per_kv = query_heads // kv_heads
-        if rows == 1 or queries_per_kv % candidate == 0:
+        if rows == 1 or (head_size <= 128 and queries_per_kv % candidate == 0):
             heads_per_group = candidate
     rows_per_group = (
         1 if rows < 16 else max(1, min(4, 2048 // head_size // heads_per_group))
