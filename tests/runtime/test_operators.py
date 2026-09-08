@@ -757,8 +757,13 @@ def test_circular_window_attention_and_logit_softcap():
         (12, 1, 128, 13, 16, 0, 1, 1),
         (16, 1, 128, 13, 16, 0, 1, 1),
         (24, 4, 256, 13, 16, 0, 1, 1),
+        (24, 4, 256, 257, 260, 0, 1, 1),
+        (24, 4, 256, 19, 20, 5, 1, 1),
         # Long verification groups two rows with all six sibling query heads.
         (24, 4, 256, 13, 16, 0, 2, 2),
+        (24, 4, 256, 257, 260, 0, 2, 2),
+        (12, 1, 256, 17, 20, 0, 2, 2),
+        (8, 1, 256, 17, 20, 0, 2, 2),
         (6, 1, 32, 19, 20, 0, 4, 1),
         (4, 2, 32, 19, 8, 5, 4, 1),
         (6, 1, 32, 19, 20, 0, 3, 2),
@@ -767,15 +772,24 @@ def test_circular_window_attention_and_logit_softcap():
         (4, 2, 32, 19, 8, 5, 5, 4),
     ],
 )
+@pytest.mark.parametrize("dtype", [wp.bfloat16, wp.float16])
 def test_partitioned_decode_attention_matches_serial(
-    query_heads, kv_heads, head_size, length, capacity, window, rows, rows_per_group
+    dtype,
+    query_heads,
+    kv_heads,
+    head_size,
+    length,
+    capacity,
+    window,
+    rows,
+    rows_per_group,
 ):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
     rng = np.random.default_rng(41)
     query = wp.array(
         rng.normal(size=(query_heads * rows, head_size)).astype(np.float32),
-        dtype=wp.bfloat16,
+        dtype=dtype,
         device="cuda:0",
     )
     key_np = rng.normal(size=(kv_heads, length, head_size)).astype(np.float32)
@@ -788,17 +802,13 @@ def test_partitioned_decode_attention_matches_serial(
     if window == 0 and length < capacity:
         key_cache[:, length:] = np.nan
         value_cache[:, length:] = np.nan
-    key = wp.array(key_cache.reshape(-1, head_size), dtype=wp.bfloat16, device="cuda:0")
-    value = wp.array(
-        value_cache.reshape(-1, head_size), dtype=wp.bfloat16, device="cuda:0"
-    )
+    key = wp.array(key_cache.reshape(-1, head_size), dtype=dtype, device="cuda:0")
+    value = wp.array(value_cache.reshape(-1, head_size), dtype=dtype, device="cuda:0")
     lengths = wp.array(np.array([length - 1], dtype=np.int32), device="cuda:0")
-    expected = wp.empty(
-        (rows, query_heads * head_size), dtype=wp.bfloat16, device="cuda:0"
-    )
+    expected = wp.empty((rows, query_heads * head_size), dtype=dtype, device="cuda:0")
     actual = wp.empty_like(expected)
 
-    block_dim, serial = _get_gqa_attention_kernel(head_size, wp.bfloat16)
+    block_dim, serial = _get_gqa_attention_kernel(head_size, dtype)
     wp.launch_tiled(
         serial,
         dim=query_heads * rows,
@@ -822,7 +832,7 @@ def test_partitioned_decode_attention_matches_serial(
     workspace = _allocate_partitioned_gqa(
         query_heads,
         head_size,
-        wp.bfloat16,
+        dtype,
         "cuda:0",
         rows=rows,
         rows_per_group=rows_per_group,

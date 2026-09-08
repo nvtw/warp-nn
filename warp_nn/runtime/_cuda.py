@@ -46,6 +46,295 @@ def warp_max_broadcast(value: float) -> float: ...
 def subgroup_max_broadcast(value: float, width: int) -> float: ...
 
 
+_D256_GQA6_SPLIT = r"""
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr int D = 256, G = 6, M = 16, N = 16, WD = 32;
+    constexpr int QLD = 264, KVLD = 264;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int lane4 = lane & 3;
+    const int r8 = lane >> 2;
+    const int item = blockIdx.x;
+    const int part = item % PARTS;
+    const int group_item = item / PARTS;
+    const int queries_per_kv = query_heads / kv_heads;
+    const int groups_per_kv = (queries_per_kv + G - 1) / G;
+    const int groups_per_batch = kv_heads * groups_per_kv;
+    const int sequence_item = group_item / groups_per_batch;
+    const int row_groups = (sequence_length + ROWS - 1) / ROWS;
+    const int row_group = sequence_item % row_groups;
+    const int batch = sequence_item / row_groups;
+    const int group = group_item % groups_per_batch;
+    const int kv_head = group / groups_per_kv;
+    const int subgroup = group % groups_per_kv;
+    const int qtoken0 = row_group * ROWS;
+    const int valid_rows = min(ROWS, sequence_length - qtoken0);
+    const int head0 = kv_head * queries_per_kv + subgroup * G;
+    const int valid_heads = min(G, (kv_head + 1) * queries_per_kv - head0);
+    const int first_end = sequence_ends.data[batch] - sequence_length + qtoken0 + 2;
+    const int common_end = first_end + valid_rows - 1;
+    const int keys_per_part = (common_end + PARTS - 1) / PARTS;
+    const int part_start = part * keys_per_part;
+    const int part_end = min(common_end, part_start + keys_per_part);
+    const int cache_base = (batch * kv_heads + kv_head) * total_length;
+
+    __shared__ __align__(16) unsigned short qs[M * QLD];
+    __shared__ __align__(16) unsigned short ks[N * KVLD];
+    __shared__ __align__(16) unsigned short vs[N * KVLD];
+    __shared__ __align__(16) float score_parts[8][32][8];
+    __shared__ __align__(16) unsigned short ps[M * N];
+
+    const NATIVE_TYPE* qptr = query.data;
+    const NATIVE_TYPE* kptr = key.data;
+    const NATIVE_TYPE* vptr = value.data;
+    float* optr = partial_output.data;
+
+    for (int copy = threadIdx.x; copy < M * (D / 8); copy += 256) {
+        const int member = copy / (D / 8);
+        const int segment = copy % (D / 8);
+        const int query_row = member / G;
+        const int query_head = member % G;
+        unsigned short* dst = qs + member * QLD + segment * 8;
+        if (query_row < valid_rows && query_head < valid_heads) {
+            const int qi = (batch * query_heads + head0 + query_head)
+                * sequence_length + qtoken0 + query_row;
+            *reinterpret_cast<uint4*>(dst) =
+                *reinterpret_cast<const uint4*>(qptr + qi * D + segment * 8);
+        } else {
+            *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+        }
+    }
+    __syncthreads();
+
+    float max0 = -3.402823466e38f, max1 = -3.402823466e38f;
+    float den0 = 0.0f, den1 = 0.0f;
+    float acc[2][8] = {};
+    const int member0 = r8, member1 = r8 + 8;
+    const bool member_valid0 =
+        member0 / G < valid_rows && member0 % G < valid_heads;
+    const bool member_valid1 =
+        member1 / G < valid_rows && member1 % G < valid_heads;
+    const int end0 = first_end + min(member0 / G, valid_rows - 1);
+    const int end1 = first_end + min(member1 / G, valid_rows - 1);
+
+    for (int key_start = part_start; key_start < part_end; key_start += N) {
+        for (int copy = threadIdx.x; copy < N * (D / 8); copy += 256) {
+            const int key_row = copy / (D / 8);
+            const int segment = copy % (D / 8);
+            const int source_row = key_start + key_row;
+            unsigned short* kd = ks + key_row * KVLD + segment * 8;
+            unsigned short* vd = vs + key_row * KVLD + segment * 8;
+            if (source_row < part_end) {
+                const int source = (cache_base + source_row) * D + segment * 8;
+                *reinterpret_cast<uint4*>(kd) =
+                    *reinterpret_cast<const uint4*>(kptr + source);
+                *reinterpret_cast<uint4*>(vd) =
+                    *reinterpret_cast<const uint4*>(vptr + source);
+            } else {
+                *reinterpret_cast<uint4*>(kd) = make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4*>(vd) = make_uint4(0, 0, 0, 0);
+            }
+        }
+        __syncthreads();
+
+        float score[8] = {};
+        const int quad = lane >> 3;
+        const int lr = lane & 7;
+        #pragma unroll
+        for (int dpart = 0; dpart < 2; ++dpart) {
+            unsigned a0, a1, a2, a3, b0, b1, b2, b3;
+            const int d = warp * WD + dpart * 16;
+            const unsigned pa = static_cast<unsigned>(__cvta_generic_to_shared(
+                qs + (lr + ((quad & 1) * 8)) * QLD + d + ((quad >> 1) * 8)));
+            const unsigned pb = static_cast<unsigned>(__cvta_generic_to_shared(
+                ks + (lr + ((quad >> 1) * 8)) * KVLD + d + ((quad & 1) * 8)));
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(pa) : "memory");
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3) : "r"(pb) : "memory");
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.PTX.PTX.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+f"(score[0]), "+f"(score[1]), "+f"(score[2]), "+f"(score[3])
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.PTX.PTX.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+f"(score[4]), "+f"(score[5]), "+f"(score[6]), "+f"(score[7])
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b2), "r"(b3));
+        }
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) score_parts[warp][lane][i] = score[i];
+        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            score[i] = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) score[i] += score_parts[w][lane][i];
+        }
+
+        const int k0 = key_start + lane4 * 2, k1 = k0 + 1;
+        const int k8 = k0 + 8, k9 = k0 + 9;
+        const bool v00 = member_valid0 && k0 < end0 && k0 < part_end;
+        const bool v01 = member_valid0 && k1 < end0 && k1 < part_end;
+        const bool v08 = member_valid0 && k8 < end0 && k8 < part_end;
+        const bool v09 = member_valid0 && k9 < end0 && k9 < part_end;
+        const bool v10 = member_valid1 && k0 < end1 && k0 < part_end;
+        const bool v11 = member_valid1 && k1 < end1 && k1 < part_end;
+        const bool v18 = member_valid1 && k8 < end1 && k8 < part_end;
+        const bool v19 = member_valid1 && k9 < end1 && k9 < part_end;
+        const bool valid[8] = {v00, v01, v10, v11, v08, v09, v18, v19};
+        #pragma unroll
+        for (int i = 0; i < 8; ++i)
+            score[i] = valid[i] ? score[i] * scale : -3.402823466e38f;
+        float bm0 = max(max(score[0], score[1]), max(score[4], score[5]));
+        float bm1 = max(max(score[2], score[3]), max(score[6], score[7]));
+        bm0 = max(bm0, __shfl_xor_sync(0xffffffffu, bm0, 2, 4));
+        bm0 = max(bm0, __shfl_xor_sync(0xffffffffu, bm0, 1, 4));
+        bm1 = max(bm1, __shfl_xor_sync(0xffffffffu, bm1, 2, 4));
+        bm1 = max(bm1, __shfl_xor_sync(0xffffffffu, bm1, 1, 4));
+        const float nm0 = max(max0, bm0), nm1 = max(max1, bm1);
+        const float os0 = expf(max0 - nm0), os1 = expf(max1 - nm1);
+        float prob[8];
+        prob[0] = v00 ? expf(score[0] - nm0) : 0.0f;
+        prob[1] = v01 ? expf(score[1] - nm0) : 0.0f;
+        prob[2] = v10 ? expf(score[2] - nm1) : 0.0f;
+        prob[3] = v11 ? expf(score[3] - nm1) : 0.0f;
+        prob[4] = v08 ? expf(score[4] - nm0) : 0.0f;
+        prob[5] = v09 ? expf(score[5] - nm0) : 0.0f;
+        prob[6] = v18 ? expf(score[6] - nm1) : 0.0f;
+        prob[7] = v19 ? expf(score[7] - nm1) : 0.0f;
+        float sum0 = prob[0] + prob[1] + prob[4] + prob[5];
+        float sum1 = prob[2] + prob[3] + prob[6] + prob[7];
+        sum0 += __shfl_xor_sync(0xffffffffu, sum0, 2, 4);
+        sum0 += __shfl_xor_sync(0xffffffffu, sum0, 1, 4);
+        sum1 += __shfl_xor_sync(0xffffffffu, sum1, 2, 4);
+        sum1 += __shfl_xor_sync(0xffffffffu, sum1, 1, 4);
+        den0 = den0 * os0 + sum0; den1 = den1 * os1 + sum1;
+        max0 = nm0; max1 = nm1;
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            acc[j][0] *= os0; acc[j][1] *= os0;
+            acc[j][2] *= os1; acc[j][3] *= os1;
+            acc[j][4] *= os0; acc[j][5] *= os0;
+            acc[j][6] *= os1; acc[j][7] *= os1;
+        }
+
+        if (warp == 0) {
+            NATIVE_TYPE* pp = reinterpret_cast<NATIVE_TYPE*>(ps);
+            const int c = lane4 * 2;
+            pp[r8 * N + c] = NATIVE_TYPE(prob[0]); pp[r8 * N + c + 1] = NATIVE_TYPE(prob[1]);
+            pp[(r8 + 8) * N + c] = NATIVE_TYPE(prob[2]);
+            pp[(r8 + 8) * N + c + 1] = NATIVE_TYPE(prob[3]);
+            pp[r8 * N + c + 8] = NATIVE_TYPE(prob[4]);
+            pp[r8 * N + c + 9] = NATIVE_TYPE(prob[5]);
+            pp[(r8 + 8) * N + c + 8] = NATIVE_TYPE(prob[6]);
+            pp[(r8 + 8) * N + c + 9] = NATIVE_TYPE(prob[7]);
+        }
+        __syncthreads();
+
+        unsigned a0, a1, a2, a3;
+        const unsigned pa = static_cast<unsigned>(__cvta_generic_to_shared(
+            ps + (lr + ((quad & 1) * 8)) * N + ((quad >> 1) * 8)));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+            : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(pa) : "memory");
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            unsigned b0, b1, b2, b3;
+            const unsigned pb = static_cast<unsigned>(__cvta_generic_to_shared(
+                vs + (lane & 15) * KVLD + warp * WD + j * 16 + (lane >> 4) * 8));
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3) : "r"(pb) : "memory");
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.PTX.PTX.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+f"(acc[j][0]), "+f"(acc[j][1]), "+f"(acc[j][2]), "+f"(acc[j][3])
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.PTX.PTX.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+f"(acc[j][4]), "+f"(acc[j][5]), "+f"(acc[j][6]), "+f"(acc[j][7])
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b2), "r"(b3));
+        }
+        __syncthreads();
+    }
+
+    if (warp == 0 && lane4 == 0) {
+        if (member_valid0) {
+            const int qr = member0 / G, qh = member0 % G;
+            const int hi = (batch * sequence_length + qtoken0 + qr)
+                * query_heads + head0 + qh;
+            const int pi = hi * PARTS + part;
+            partial_maximum.data[pi] = max0;
+            partial_denominator.data[pi] = den0;
+        }
+        if (member_valid1) {
+            const int qr = member1 / G, qh = member1 % G;
+            const int hi = (batch * sequence_length + qtoken0 + qr)
+                * query_heads + head0 + qh;
+            const int pi = hi * PARTS + part;
+            partial_maximum.data[pi] = max1;
+            partial_denominator.data[pi] = den1;
+        }
+    }
+    const int oc = lane4 * 2;
+    #pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int col = warp * WD + j * 16 + oc;
+        if (member_valid0) {
+            const int qr = member0 / G, qh = member0 % G;
+            const int hi = (batch * sequence_length + qtoken0 + qr)
+                * query_heads + head0 + qh;
+            float* dst = optr + (hi * PARTS + part) * D + col;
+            dst[0] = acc[j][0]; dst[1] = acc[j][1];
+            dst[8] = acc[j][4]; dst[9] = acc[j][5];
+        }
+        if (member_valid1) {
+            const int qr = member1 / G, qh = member1 % G;
+            const int hi = (batch * sequence_length + qtoken0 + qr)
+                * query_heads + head0 + qh;
+            float* dst = optr + (hi * PARTS + part) * D + col;
+            dst[0] = acc[j][2]; dst[1] = acc[j][3];
+            dst[8] = acc[j][6]; dst[9] = acc[j][7];
+        }
+    }
+#endif
+"""
+
+
+@lru_cache(maxsize=None)
+def get_d256_gqa6_split_attention(dtype: type, partitions: int, rows: int):
+    """Return exact native D256 attention for one GQA6 decode row group."""
+    if dtype == wp.float16:
+        native_type, ptx_type = "wp::float16", "f16"
+    elif dtype == wp.bfloat16:
+        native_type, ptx_type = "wp::bfloat16", "bf16"
+    else:
+        raise TypeError("Native D256 attention requires FP16 or BF16")
+    if rows not in (1, 2):
+        raise ValueError("Native D256 attention requires one or two rows")
+    source = (
+        _D256_GQA6_SPLIT.replace("NATIVE_TYPE", native_type)
+        .replace("PTX", ptx_type)
+        .replace("PARTS", str(int(partitions)))
+        .replace("ROWS", str(int(rows)))
+    )
+
+    @wp.func_native(source)
+    def attention(
+        query: wp.array2d[dtype],
+        key: wp.array2d[dtype],
+        value: wp.array2d[dtype],
+        sequence_ends: wp.array1d[wp.int32],
+        partial_maximum: wp.array1d[wp.float32],
+        partial_denominator: wp.array1d[wp.float32],
+        partial_output: wp.array2d[wp.float32],
+        query_heads: int,
+        kv_heads: int,
+        sequence_length: int,
+        total_length: int,
+        scale: float,
+    ): ...
+
+    return attention
+
+
 _BIDIRECTIONAL_ATTENTION_D128 = r"""
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     // Eight warps own 16 query rows each while sharing one 16-row K/V tile.

@@ -181,8 +181,9 @@ def _launch_partitioned_gqa(
     sequence_length = output.shape[0] if sequence_length is None else sequence_length
     row_groups = (sequence_length + rows_per_group - 1) // rows_per_group
     batches = query.shape[0] // (query_heads * sequence_length)
+    partial_kernel = kernels[2] if window and len(kernels) > 2 else kernels[0]
     wp.launch_tiled(
-        kernels[0],
+        partial_kernel,
         dim=batches * row_groups * groups_per_batch * partitions,
         inputs=[
             query,

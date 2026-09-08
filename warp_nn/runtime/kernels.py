@@ -30,6 +30,7 @@ from warp_nn.runtime._cuda import (
     expand_int4x4_high,
     expand_int4x4_low,
     get_bidirectional_attention_d128,
+    get_d256_gqa6_split_attention,
     get_grouped_decode_projection,
     get_nvfp4_mma_projection,
     get_small_batch_grouped_projection,
@@ -3766,6 +3767,53 @@ def _create_bidirectional_gqa_attention_kernel(head_size: int, dtype: type):
     return kernel
 
 
+def _create_native_d256_gqa6_partial(dtype: type, partitions: int, rows: int):
+    """Build the standard split-attention wrapper around the native specialization."""
+    DTYPE = dtype
+    attention = get_d256_gqa6_split_attention(dtype, partitions, rows)
+
+    @wp.kernel(
+        enable_backward=False,
+        module="unique",
+        module_options={"enable_backward": False},
+        grid_stride=False,
+    )
+    def partial(
+        query: wp.array2d(dtype=DTYPE),
+        key: wp.array2d(dtype=DTYPE),
+        value: wp.array2d(dtype=DTYPE),
+        sequence_lengths_minus_one: wp.array1d[wp.int32],
+        slot_indices: wp.array1d[wp.int32],
+        partial_maximum: wp.array1d[wp.float32],
+        partial_denominator: wp.array1d[wp.float32],
+        partial_output: wp.array2d[wp.float32],
+        query_heads: int,
+        kv_heads: int,
+        sequence_length: int,
+        total_length: int,
+        scale: float,
+        window: int,
+    ):
+        if wp.static(DTYPE == wp.float16):
+            pass
+        attention(
+            query,
+            key,
+            value,
+            sequence_lengths_minus_one,
+            partial_maximum,
+            partial_denominator,
+            partial_output,
+            query_heads,
+            kv_heads,
+            sequence_length,
+            total_length,
+            scale,
+        )
+
+    return partial
+
+
 def _create_partitioned_gqa_attention_kernels(
     head_size: int,
     dtype: type,
@@ -4108,11 +4156,26 @@ def _create_partitioned_gqa_attention_kernels(
             offset=(head * head_size,),
         )
 
+    native = (
+        head_size == 256
+        and GROUP == 6
+        and ROWS_PER_GROUP in (1, 2)
+        and not MAPPED
+        and dtype in (wp.float16, wp.bfloat16)
+    )
+    partial_kernel = (
+        _create_native_d256_gqa6_partial(dtype, PARTITIONS, ROWS_PER_GROUP)
+        if native
+        else partial
+    )
     partial.module.options["enable_backward"] = False
     partial.module.mark_modified()
+    if native:
+        partial_kernel.module.options["enable_backward"] = False
+        partial_kernel.module.mark_modified()
     reduce.module.options["enable_backward"] = False
     reduce.module.mark_modified()
-    return partial, reduce
+    return (partial_kernel, reduce, partial) if native else (partial, reduce)
 
 
 _gqa_attention_kernel_cache = {}
