@@ -839,8 +839,8 @@ class _MusePlan:
         if not hasattr(self, "partitioned_attention"):
             self.attention_partitions = (
                 _decode_attention_partitions(self.runner.head_dim)
-                if self.rows == 1 or self.decode_batch
-                else 16
+                if self.decode_batch
+                else (64 if self.rows == 1 else 16)
             )
             partitions = self.attention_partitions
             self.partitioned_attention = {

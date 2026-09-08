@@ -348,6 +348,7 @@ def test_muse_glimmer_prefill_decode_ring_cache_and_graph_replay(tmp_path, use_c
 
     assert isinstance(runner, MuseGlimmerRunner)
     assert runner.local_cache_capacity == 6
+    assert runner._decode_plan.attention_partitions == 64
     first = runner.prefill([1, 2, 3]).numpy()
     assert set(runner._chunk_plans) == {2, 4}
     assert first.shape == (1, 1, 16)
