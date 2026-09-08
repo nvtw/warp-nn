@@ -530,22 +530,14 @@ def plan_linear(
                 op.attrs["_nvfp4_row_scale_kernel"] = _get_nvfp4_row_scale_kernel(dtype)
             quantized, activation_scales, activation_global_scales = cached_activation
             # Prefill reuses each K256 weight tile across four M16 warps. Decode
-            # splits either long-K work or a narrow grid below half an SM wave.
+            # splits the long dependent MMA chain across eight co-resident warps.
             reuse_weights = padded_rows >= 64 and padded_rows % 64 == 0
             split_k = (
                 8
                 if padded_rows == 16
                 and columns >= 1024
                 and inner >= 5120
-                and (inner >= 8192 or columns // 32 <= device.sm_count // 2)
-                else (
-                    2
-                    if padded_rows == 16
-                    and columns >= 1024
-                    and inner >= 6144
-                    and columns // 32 <= device.sm_count
-                    else 0
-                )
+                else 0
             )
             op.attrs.update(
                 {

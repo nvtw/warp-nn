@@ -314,9 +314,9 @@ def test_nvfp4_linear_operation_pads_single_row():
 
 @pytest.mark.parametrize(
     ("columns", "inner", "split_k", "block_dim"),
-    [(1024, 5120, 8, 256), (5120, 6144, 2, 128)],
+    [(512, 4096, 1, 128), (1024, 5120, 8, 256), (17408, 5120, 8, 256)],
 )
-def test_nvfp4_narrow_decode_projection_uses_split_k(
+def test_nvfp4_decode_projection_uses_split_k(
     columns, inner, split_k, block_dim
 ):
     device = _sm120()
