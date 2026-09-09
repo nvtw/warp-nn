@@ -342,7 +342,7 @@ def _exec_linear(op, tensors, shapes, device):
             wp.launch(
                 q8_mma,
                 dim=(
-                    op.attrs["_rows"]
+                    op.attrs["_q8_mma_rows"]
                     // op.attrs["_q8_mma_tile_m"]
                     * (op.attrs["_columns"] // 32)
                     * op.attrs["_q8_mma_tile_m"]
@@ -353,7 +353,7 @@ def _exec_linear(op, tensors, shapes, device):
                     op.attrs["_q8_scales"],
                     weight.values,
                     weight.scales,
-                    output,
+                    op.attrs["_q8_mma_output"],
                     op.attrs["_columns"],
                     op.attrs["_inner"] // 32,
                 ],
@@ -565,28 +565,49 @@ def plan_linear(
             raise TypeError("Q8_0 Linear requires CUDA FP16/BF16 activations")
         if inner % 32:
             raise ValueError("Q8_0 Linear requires an inner width divisible by 32")
-        output = wp.empty((rows, columns), dtype=dtype, device=device)
+        padded_rows = 16 if op.attrs.get("_small_batch_decode") and rows == 8 else rows
+        padded_output = wp.empty((padded_rows, columns), dtype=dtype, device=device)
+        output = (
+            wp.array(
+                ptr=padded_output.ptr,
+                dtype=dtype,
+                shape=(rows, columns),
+                capacity=padded_output.capacity,
+                device=device,
+                copy=False,
+            )
+            if padded_rows != rows
+            else padded_output
+        )
         tensors[op.outputs[0]] = output
         shapes[op.outputs[0]] = output.shape
-        op.attrs.update({"_rows": rows, "_columns": columns, "_inner": inner})
+        op.attrs.update(
+            {
+                "_rows": rows,
+                "_columns": columns,
+                "_inner": inner,
+                "_q8_mma_rows": padded_rows,
+                "_q8_mma_output": padded_output,
+            }
+        )
         blocks = inner // 32
-        cache_key = (weight.format, op.inputs[0], rows, inner, dtype)
+        cache_key = (weight.format, op.inputs[0], padded_rows, inner, dtype)
         cached_activation = (
             quantized_activation_cache.get(cache_key)
             if quantized_activation_cache is not None
             else None
         )
         if cached_activation is None:
-            quantized = wp.empty((rows, inner), dtype=wp.int8, device=device)
+            quantized = wp.zeros((padded_rows, inner), dtype=wp.int8, device=device)
             activation_words = wp.array(
                 ptr=quantized.ptr,
                 capacity=quantized.capacity,
                 dtype=wp.uint32,
-                shape=(rows, blocks, 8),
+                shape=(padded_rows, blocks, 8),
                 device=device,
             )
-            activation_scales = wp.empty(
-                (rows, blocks), dtype=wp.float32, device=device
+            activation_scales = wp.zeros(
+                (padded_rows, blocks), dtype=wp.float32, device=device
             )
             if quantized_activation_cache is not None:
                 quantized_activation_cache[cache_key] = (
@@ -604,7 +625,7 @@ def plan_linear(
         op.attrs["_q8_scales"] = activation_scales
         if (
             device.arch >= 80
-            and rows % 16 == 0
+            and padded_rows % 16 == 0
             and columns % 32 == 0
             and quantized.is_contiguous
             and weight.values.is_contiguous
@@ -615,7 +636,7 @@ def plan_linear(
         ):
             tile_m = (
                 64
-                if rows % 64 == 0
+                if padded_rows % 64 == 0
                 and quantized.ptr % 16 == 0
                 and weight.values.ptr % 16 == 0
                 else 16
@@ -628,7 +649,12 @@ def plan_linear(
         grouped_blocks = (rows * ((columns + 1) // 2) * 8 + 127) // 128
         outputs_per_group = 2 if grouped_blocks >= 2 * device.sm_count else 1
         op.attrs["_q8_outputs_per_group"] = outputs_per_group
-        if rows <= 8 and columns % outputs_per_group == 0 and device.arch >= 61:
+        if (
+            "_q8_mma_kernel" not in op.attrs
+            and rows <= 8
+            and columns % outputs_per_group == 0
+            and device.arch >= 61
+        ):
             op.attrs["_q8_decode_outputs_per_group"] = outputs_per_group
             op.attrs["_q8_grouped_decode_kernel"] = (
                 _get_q8_grouped_decode_linear_kernel(dtype, outputs_per_group)
@@ -1721,24 +1747,23 @@ def reuse_operation_outputs(
                         value.attrs["_output_2d"] = shared.reshape(
                             value.attrs["_output_2d"].shape
                         )
-                    if (
-                        output_index == 0
-                        and shared is not output
-                        and "_nvfp4_output" in value.attrs
-                    ):
-                        padded = value.attrs["_nvfp4_output"]
-                        if shared.capacity < padded.capacity:
-                            raise ValueError(
-                                "shared output cannot hold NVFP4 row padding"
+                    if output_index == 0 and shared is not output:
+                        for attribute in ("_nvfp4_output", "_q8_mma_output"):
+                            padded = value.attrs.get(attribute)
+                            if padded is None:
+                                continue
+                            if shared.capacity < padded.capacity:
+                                raise ValueError(
+                                    "shared output cannot hold quantized row padding"
+                                )
+                            value.attrs[attribute] = wp.array(
+                                ptr=shared.ptr,
+                                dtype=shared.dtype,
+                                shape=padded.shape,
+                                capacity=shared.capacity,
+                                device=shared.device,
+                                copy=False,
                             )
-                        value.attrs["_nvfp4_output"] = wp.array(
-                            ptr=shared.ptr,
-                            dtype=shared.dtype,
-                            shape=padded.shape,
-                            capacity=shared.capacity,
-                            device=shared.device,
-                            copy=False,
-                        )
                     if output_index == 3 and "_residual_2d" in value.attrs:
                         value.attrs["_residual_2d"] = shared.reshape(
                             value.attrs["_residual_2d"].shape

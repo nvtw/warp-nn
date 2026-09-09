@@ -575,6 +575,109 @@ def test_qwen35_mtp_uses_compatible_checkpoint_weights(tmp_path):
     assert len(tokens) == accepted + 1
 
 
+def test_qwen35_dflash_rejection_rollback_matches_decode_and_replays(
+    tmp_path, monkeypatch
+):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    model_path = tmp_path / "tiny-qwen35"
+    draft_path = tmp_path / "tiny-dflash"
+    _write_tiny_qwen35(model_path)
+    draft_path.mkdir()
+    (draft_path / "config.json").write_text(
+        json.dumps({"dflash_config": {"target_layer_ids": [0, 1]}}),
+        encoding="utf-8",
+    )
+
+    class StubDFlash:
+        block_size = 4
+
+        def __init__(self, target, path):
+            self.sequence_length = 0
+            self.drafts = [0, 0, 0]
+
+        def reset(self):
+            self.sequence_length = 0
+
+        def append_context(self, hidden, start):
+            assert start == self.sequence_length
+            assert hidden.shape[1] == 2 * 8
+            self.sequence_length += hidden.shape[0]
+
+        def propose(self, anchor):
+            return self.drafts.copy()
+
+    import warp_nn.runtime.qwen.dflash as dflash_module
+
+    monkeypatch.setattr(dflash_module, "DFlash2Draft", StubDFlash)
+
+    def make_runner(dflash=False):
+        return Qwen35Runner(
+            model_path,
+            device="cuda:0",
+            cache_capacity=12,
+            prefill_chunk_size=4,
+            use_cublas=False,
+            dflash_path=draft_path if dflash else None,
+        )
+
+    speculative = make_runner(dflash=True)
+    reference = make_runner()
+    prompt = [1, 2, 3]
+    for expected_accepted in range(4):
+        prompt_logits = reference.prefill(prompt)
+        speculative.prefill(prompt)
+        input_token = reference.sample_greedy(prompt_logits)
+        predictions = []
+        current = input_token
+        for _ in range(expected_accepted + 1):
+            expected = reference.decode(current)
+            current = reference.sample_greedy(expected)
+            predictions.append(current)
+
+        drafts = predictions[:expected_accepted]
+        if expected_accepted < 3:
+            drafts.append((predictions[expected_accepted] + 1) % 16)
+        drafts.extend([drafts[-1]] * (3 - len(drafts)))
+        speculative.dflash.drafts = drafts
+
+        tokens, accepted = speculative.decode_dflash(input_token)
+        assert accepted == expected_accepted
+        assert tokens == predictions
+        assert speculative.sequence_length == reference.sequence_length
+        assert speculative.dflash.sequence_length == reference.sequence_length
+        for index in speculative.recurrent_states:
+            np.testing.assert_allclose(
+                speculative.recurrent_states[index].numpy(),
+                reference.recurrent_states[index].numpy(),
+                atol=1.0e-6,
+                rtol=1.0e-6,
+            )
+            np.testing.assert_array_equal(
+                speculative.conv_states[index].numpy(),
+                reference.conv_states[index].numpy(),
+            )
+        for index in speculative.kv_caches:
+            for actual_cache, expected_cache in zip(
+                speculative.kv_caches[index], reference.kv_caches[index]
+            ):
+                np.testing.assert_array_equal(
+                    actual_cache.numpy()[: reference.sequence_length],
+                    expected_cache.numpy()[: reference.sequence_length],
+                )
+        correction = predictions[-1]
+        np.testing.assert_allclose(
+            speculative.decode(correction).numpy(),
+            reference.decode(correction).numpy(),
+            atol=2.0e-2,
+            rtol=2.0e-2,
+        )
+        speculative.reset()
+        reference.reset()
+
+    assert 64 in speculative._verification_plans[4].graphs
+
+
 def test_qwen35_mtp_rejection_rollback_matches_decode_and_replays(tmp_path):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")

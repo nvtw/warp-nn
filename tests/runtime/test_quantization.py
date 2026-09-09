@@ -10,6 +10,7 @@ import warp as wp
 from tests.utilities import is_device_available
 from warp_nn.runtime.formats.gguf import BlockQuantizedTensor
 from warp_nn.runtime.quantization import (
+    dequantize_q8_0_weight,
     estimate_loaded_weight_bytes,
     is_q8_linear_weight,
     load_native_weights,
@@ -99,6 +100,13 @@ def test_quantize_q8_0_weight_matches_block_reference(dtype):
     np.testing.assert_array_equal(quantized.scales.numpy(), scales.astype(np.float16))
     np.testing.assert_array_equal(
         quantized.words.numpy().view(np.int8).reshape(3, 2, 32), expected_values
+    )
+    expanded = dequantize_q8_0_weight(quantized)
+    np.testing.assert_allclose(
+        expanded.numpy(),
+        (expected_values.astype(np.float32) * scales[:, :, None]).reshape(3, 64),
+        atol=0.004,
+        rtol=0.004,
     )
 
 

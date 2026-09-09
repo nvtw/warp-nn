@@ -389,6 +389,16 @@ class _Qwen35Plan:
         )
         self.tensors["hidden.0"] = self.embedding.reshape((rows, runner.hidden_size))
         self.shapes["hidden.0"] = (rows, runner.hidden_size)
+        self.dflash_target_hidden = None
+        self._dflash_tap_offsets = {
+            index: offset for offset, index in enumerate(runner.dflash_target_layers)
+        }
+        if self._dflash_tap_offsets and not self.mtp:
+            self.dflash_target_hidden = wp.empty(
+                (rows, len(self._dflash_tap_offsets) * runner.hidden_size),
+                dtype=self.dtype,
+                device=self.device,
+            )
         if self.mtp:
             self.target_hidden = wp.empty(
                 (rows, runner.hidden_size), dtype=self.dtype, device=self.device
@@ -407,7 +417,7 @@ class _Qwen35Plan:
         output_scale = self.runner.linear_output_scales.get(weight)
         if output_scale is not None:
             op.attrs["_output_scale"] = output_scale
-        if self.decode_batch:
+        if self.decode_batch or (self.all_logits and self.rows == 8):
             op.attrs.update(_small_batch_decode=True, _small_batch_outputs_per_group=4)
         plan_linear(
             op,
@@ -1356,6 +1366,22 @@ class _Qwen35Plan:
                 "next_norm",
             ):
                 self._execute_op(layer[name])
+            tap = self._dflash_tap_offsets.get(index)
+            if tap is not None:
+                source = self.tensors[layer["next_norm"].outputs[3]]
+                wp.launch(
+                    _concat_axis_kernel,
+                    dim=self.rows * self.runner.hidden_size,
+                    inputs=[
+                        source.flatten(),
+                        self.dflash_target_hidden.flatten(),
+                        self.runner.hidden_size,
+                        len(self._dflash_tap_offsets) * self.runner.hidden_size,
+                        1,
+                        tap * self.runner.hidden_size,
+                    ],
+                    device=self.device,
+                )
         if self.lm_head is not None:
             self._execute_op(self.lm_head)
             return self.logits
@@ -1384,6 +1410,7 @@ class Qwen35Runner(AutoregressiveRunner):
         vision_path: str | Path | None = None,
         use_mtp: bool = False,
         mtp_path: str | Path | None = None,
+        dflash_path: str | Path | None = None,
     ):
         path = Path(path)
         self.use_mtp = bool(use_mtp)
@@ -1396,6 +1423,35 @@ class Qwen35Runner(AutoregressiveRunner):
             path, self.use_mtp and self.mtp_path is None
         )
         _validate_config(self.config)
+        self.dflash_path = None if dflash_path is None else Path(dflash_path)
+        self.dflash_target_layers = ()
+        if self.dflash_path is not None:
+            try:
+                draft_config = json.loads(
+                    (self.dflash_path / "config.json").read_text(encoding="utf-8")
+                )
+                self.dflash_target_layers = tuple(
+                    int(index)
+                    for index in draft_config["dflash_config"]["target_layer_ids"]
+                )
+            except (
+                OSError,
+                KeyError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as exc:
+                raise ValueError("Invalid DFlash checkpoint configuration") from exc
+            if (
+                not self.dflash_target_layers
+                or len(set(self.dflash_target_layers)) != len(self.dflash_target_layers)
+                or min(self.dflash_target_layers) < 0
+                or max(self.dflash_target_layers)
+                >= int(self.config["num_hidden_layers"])
+            ):
+                raise ValueError("DFlash target layers are incompatible with Qwen")
+        if self.use_mtp and self.dflash_path is not None:
+            raise ValueError("Qwen MTP and DFlash cannot be enabled together")
         if self.use_mtp and int(self.config.get("mtp_num_hidden_layers", 0)) != 1:
             raise ValueError("Qwen checkpoint does not contain one embedded MTP layer")
         self.device = parse_device(device)
@@ -1633,23 +1689,31 @@ class Qwen35Runner(AutoregressiveRunner):
         if self.use_mtp:
             self._mtp_decode_plan = _Qwen35Plan(self, 1, mtp=True)
             self._record_plan_storage(self._mtp_decode_plan)
-            self._verification_plans = {}
             self._mtp_prefill_plans = {}
             self._mtp_carry_hidden = wp.zeros(
                 (1, self.hidden_size), dtype=self.dtype, device=self.device
             )
             self._mtp_sequence_length = 0
-            self._mtp_conv_snapshots = {
+        if self.use_mtp or self.dflash_path is not None:
+            self._verification_plans = {}
+            self._spec_conv_snapshots = {
                 index: wp.empty_like(state) for index, state in self.conv_states.items()
             }
         self._initialize_sampling()
         self.sequence_length = 0
+        self.dflash = None
+        if self.dflash_path is not None:
+            from .dflash import DFlash2Draft
+
+            self.dflash = DFlash2Draft(self, self.dflash_path)
 
     def reset(self) -> None:
         super().reset()
         if self.use_mtp:
             self._mtp_carry_hidden.zero_()
             self._mtp_sequence_length = 0
+        if self.dflash is not None:
+            self.dflash.reset()
 
     def _mtp_plan_for_rows(self, rows: int) -> _Qwen35Plan:
         plan = self._mtp_prefill_plans.get(rows)
@@ -1699,6 +1763,7 @@ class Qwen35Runner(AutoregressiveRunner):
     def _stage_one(
         self, token_id: int, embeddings=None, positions=(), token_offset=0
     ) -> wp.array:
+        start = self.sequence_length
         logits = super()._stage_one(token_id, embeddings, positions, token_offset)
         if self.use_mtp:
             if embeddings is not None:
@@ -1706,11 +1771,18 @@ class Qwen35Runner(AutoregressiveRunner):
                     "Qwen MTP does not support embedding overrides"
                 )
             self._sync_mtp([token_id], self._decode_plan)
+        if self.dflash is not None:
+            if embeddings is not None:
+                raise NotImplementedError(
+                    "Qwen DFlash does not support embedding overrides"
+                )
+            self.dflash.append_context(self._decode_plan.dflash_target_hidden, start)
         return logits
 
     def _stage_many(
         self, token_ids, embeddings=None, positions=(), token_offset=0
     ) -> wp.array:
+        start = self.sequence_length
         logits = super()._stage_many(token_ids, embeddings, positions, token_offset)
         if self.use_mtp:
             if embeddings is not None:
@@ -1718,6 +1790,13 @@ class Qwen35Runner(AutoregressiveRunner):
                     "Qwen MTP does not support embedding overrides"
                 )
             self._sync_mtp(token_ids, self._plan_for_rows(len(token_ids)))
+        if self.dflash is not None:
+            if embeddings is not None:
+                raise NotImplementedError(
+                    "Qwen DFlash does not support embedding overrides"
+                )
+            plan = self._plan_for_rows(len(token_ids))
+            self.dflash.append_context(plan.dflash_target_hidden, start)
         return logits
 
     def _verification_plan_for_rows(self, rows: int) -> _Qwen35Plan:
@@ -1730,6 +1809,26 @@ class Qwen35Runner(AutoregressiveRunner):
             plan._capture_ready = False
             self._record_plan_storage(plan)
         return plan
+
+    def _rollback_verification(
+        self, verifier: _Qwen35Plan, base: int, valid: int
+    ) -> None:
+        for index, state in self.conv_states.items():
+            wp.copy(state, self._spec_conv_snapshots[index])
+        for layer in verifier.layers:
+            if layer["type"] != "linear_attention":
+                continue
+            index = layer["index"]
+            wp.copy(self.recurrent_states[index], layer["state_history"][valid - 1])
+            qkv = verifier.tensors[layer["qkv"].outputs[0]][:valid]
+            wp.launch(
+                _update_conv_rows_state_kernel,
+                dim=qkv.shape[1],
+                inputs=[qkv, self.conv_states[index]],
+                device=self.device,
+            )
+        self.sequence_length = base + valid
+        self.sequence_end.assign(np.asarray([self.sequence_length - 1], dtype=np.int32))
 
     def decode_speculative(
         self, token_id: int, draft_tokens: int | None = None
@@ -1761,7 +1860,7 @@ class Qwen35Runner(AutoregressiveRunner):
             wp.copy(self._mtp_carry_hidden, plan.normalized)
 
         for index, state in self.conv_states.items():
-            wp.copy(self._mtp_conv_snapshots[index], state)
+            wp.copy(self._spec_conv_snapshots[index], state)
         inputs = [int(token_id), *drafts]
         verifier = self._verification_plan_for_rows(len(inputs))
         verifier.attention_partitions = _verification_attention_partitions(
@@ -1787,24 +1886,7 @@ class Qwen35Runner(AutoregressiveRunner):
 
         target_hidden = verifier.normalized
         if valid < len(inputs):
-            for index, state in self.conv_states.items():
-                wp.copy(state, self._mtp_conv_snapshots[index])
-            for layer in verifier.layers:
-                if layer["type"] != "linear_attention":
-                    continue
-                index = layer["index"]
-                wp.copy(self.recurrent_states[index], layer["state_history"][valid - 1])
-                qkv = verifier.tensors[layer["qkv"].outputs[0]][:valid]
-                wp.launch(
-                    _update_conv_rows_state_kernel,
-                    dim=qkv.shape[1],
-                    inputs=[qkv, self.conv_states[index]],
-                    device=self.device,
-                )
-            self.sequence_length = base + valid
-            self.sequence_end.assign(
-                np.asarray([self.sequence_length - 1], dtype=np.int32)
-            )
+            self._rollback_verification(verifier, base, valid)
 
         if accepted:
             correction = self._mtp_plan_for_rows(accepted)
@@ -1821,6 +1903,52 @@ class Qwen35Runner(AutoregressiveRunner):
             src_offset=(valid - 1) * self.hidden_size,
             count=self.hidden_size,
         )
+        return [*drafts[:accepted], int(predictions[accepted])], accepted
+
+    def decode_dflash(self, token_id: int) -> tuple[list[int], int]:
+        """Verify one seven-token DFlash proposal and return (tokens, accepted)."""
+        if self.dflash is None:
+            raise RuntimeError("Qwen DFlash was not enabled")
+        if self.sequence_length == 0:
+            raise RuntimeError("decode_dflash requires a preceding prefill")
+        rows = self.dflash.block_size
+        if self.sequence_length + rows > self.cache_capacity:
+            raise ValueError("Qwen KV cache does not have room for verification")
+        if self.dflash.sequence_length != self.sequence_length:
+            raise RuntimeError("Qwen target and DFlash states are out of sync")
+
+        base = self.sequence_length
+        drafts = self.dflash.propose(int(token_id))
+        for index, state in self.conv_states.items():
+            wp.copy(self._spec_conv_snapshots[index], state)
+
+        inputs = [int(token_id), *drafts]
+        verifier = self._verification_plan_for_rows(rows)
+        # Match ordinary decode geometry so verification does not change greedy
+        # decisions merely because the target is evaluated in a wider batch.
+        verifier.attention_partitions = _decode_attention_partitions(self.head_size)
+        positions = np.arange(base, base + rows, dtype=np.int64)
+        verifier.input_ids.assign(np.asarray(inputs, dtype=np.int64)[None, :])
+        verifier.position_ids.assign(positions[None, :])
+        verifier.rope_position_ids.assign(np.broadcast_to(positions, (3, rows)))
+        self.sequence_end.assign(np.asarray([positions[-1]], dtype=np.int32))
+        logits = self._run(verifier, verifier.attention_partitions)
+        self.sequence_length = base + rows
+        predictions = self.sample_greedy_rows(logits)
+        accepted = next(
+            (
+                index
+                for index, draft in enumerate(drafts)
+                if draft != predictions[index]
+            ),
+            len(drafts),
+        )
+        valid = accepted + 1
+
+        if valid < rows:
+            self._rollback_verification(verifier, base, valid)
+
+        self.dflash.append_context(verifier.dflash_target_hidden[:valid], base)
         return [*drafts[:accepted], int(predictions[accepted])], accepted
 
     def create_batch_decoder(self, max_batch_size: int = 4) -> Qwen35BatchDecoder:

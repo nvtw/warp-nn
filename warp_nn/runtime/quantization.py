@@ -10,8 +10,10 @@ from collections.abc import Iterable
 
 import warp as wp
 
-from warp_nn.runtime.formats.gguf import BlockQuantizedTensor
+from warp_nn.runtime.formats.gguf import BlockQuantizedTensor, PackedQuantizedTensor
 from warp_nn.runtime.kernels import (
+    _float_from_fp16_bytes,
+    _q3_k_scale,
     _get_dequantize_nvfp4_kernel,
     _get_nvfp4_mma_linear_kernel,
     _get_nvfp4_row_scale_kernel,
@@ -20,10 +22,49 @@ from warp_nn.runtime.kernels import (
     _repack_gguf_nvfp4_kernel,
 )
 
+
+@wp.kernel(enable_backward=False, module="unique")
+def _dequantize_q8_0_kernel(
+    values: wp.array3d(dtype=wp.int8),
+    scales: wp.array2d(dtype=wp.float16),
+    output: wp.array2d(dtype=wp.bfloat16),
+):
+    row, column = wp.tid()
+    block = column >> 5
+    output[row, column] = wp.bfloat16(
+        wp.float32(values[row, block, column & 31]) * wp.float32(scales[row, block])
+    )
+
+
 NVFP4_BLOCK_SIZE = 16
 NVFP4_MMA_K = 64
 NVFP4_MMA_M = 16
 NVFP4_MMA_N = 8
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _dequantize_q3_k_kernel(
+    blocks: wp.array3d(dtype=wp.uint8),
+    output: wp.array2d(dtype=wp.bfloat16),
+):
+    row, column = wp.tid()
+    block = column >> 8
+    local = column & 255
+    group = local >> 4
+    component = local & 15
+    half = group >> 3
+    local_group = group & 7
+    shift = (local_group >> 1) << 1
+    mask = 1 << (half * 4 + (local_group >> 1))
+    quant_index = 32 + half * 32 + (local_group & 1) * 16 + component
+    quant = (wp.int32(blocks[row, block, quant_index]) >> shift) & 3
+    if (wp.int32(blocks[row, block, component + (local_group & 1) * 16]) & mask) == 0:
+        quant -= 4
+    scale = _float_from_fp16_bytes(
+        blocks[row, block, 108], blocks[row, block, 109]
+    ) * wp.float32(_q3_k_scale(blocks, row, block, group))
+    output[row, column] = wp.bfloat16(scale * wp.float32(quant))
+
 
 _PROJECTION_SUFFIXES = (
     "self_attn.q_proj.weight",
@@ -100,6 +141,34 @@ def quantize_q8_0_weight(weight: wp.array) -> BlockQuantizedTensor:
         copy=False,
     )
     return BlockQuantizedTensor(values, words, scales, tuple(weight.shape), "Q8_0")
+
+
+def dequantize_q8_0_weight(weight: BlockQuantizedTensor) -> wp.array:
+    """Expand one Q8 matrix to BF16 for a repeatedly reused small-batch GEMM."""
+    if weight.format != "Q8_0":
+        raise TypeError("expected a Q8_0 block-quantized tensor")
+    output = wp.empty(weight.shape, dtype=wp.bfloat16, device=weight.values.device)
+    wp.launch(
+        _dequantize_q8_0_kernel,
+        dim=output.shape,
+        inputs=[weight.values, weight.scales, output],
+        device=output.device,
+    )
+    return output
+
+
+def dequantize_q3_k_weight(weight: PackedQuantizedTensor) -> wp.array:
+    """Expand one Q3_K matrix to BF16 for a repeatedly reused small-batch GEMM."""
+    if weight.format != "Q3_K":
+        raise TypeError("expected a Q3_K packed tensor")
+    output = wp.empty(weight.shape, dtype=wp.bfloat16, device=weight.blocks.device)
+    wp.launch(
+        _dequantize_q3_k_kernel,
+        dim=output.shape,
+        inputs=[weight.blocks, output],
+        device=output.device,
+    )
+    return output
 
 
 def enable_nvfp4_native(device=None):

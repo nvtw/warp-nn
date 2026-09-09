@@ -31,6 +31,7 @@ from warp_nn.runtime.kernels import (
     _unpack_gated_heads_kernel,
     _update_conv_rows_state_kernel,
 )
+from warp_nn.runtime.quantization import dequantize_q3_k_weight
 from warp_nn.runtime.operators import (
     Operation,
     _allocate_partitioned_gqa,
@@ -41,6 +42,7 @@ from warp_nn.runtime.operators import (
     execute_operations,
     plan_linear,
     plan_rms_norm,
+    reuse_operation_outputs,
 )
 
 
@@ -393,6 +395,93 @@ def test_q8_linear_operations_share_quantized_activation():
     np.testing.assert_array_equal(second_output, tensors["output.1"].numpy())
 
 
+def test_q8_eight_row_decode_uses_padded_mma_and_reuses_outputs():
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(37)
+    rows, columns, inner = 8, 64, 64
+    blocks = inner // 32
+    values = wp.array(
+        rng.integers(-127, 128, (columns, blocks, 32), dtype=np.int8),
+        device="cuda:0",
+    )
+    words = wp.array(
+        ptr=values.ptr,
+        capacity=values.capacity,
+        shape=(columns, blocks, 8),
+        dtype=wp.uint32,
+        device="cuda:0",
+        copy=False,
+    )
+    scales = wp.array(
+        rng.uniform(0.001, 0.02, (columns, blocks)).astype(np.float16),
+        device="cuda:0",
+    )
+    weight = BlockQuantizedTensor(values, words, scales, (columns, inner), "Q8_0")
+    tensors = {
+        "x": wp.array(
+            rng.normal(0.0, 0.5, (rows, inner)).astype(np.float32),
+            dtype=wp.bfloat16,
+            device="cuda:0",
+        ),
+        "weight.0": weight,
+        "weight.1": weight,
+    }
+    shapes = {name: tuple(value.shape) for name, value in tensors.items()}
+    operations = [
+        Operation(
+            "Linear",
+            ["x", f"weight.{index}"],
+            [f"output.{index}"],
+            {"_small_batch_decode": True},
+        )
+        for index in range(2)
+    ]
+    cache = {}
+    device = wp.get_device("cuda:0")
+    for operation in operations:
+        plan_linear(
+            operation,
+            tensors,
+            shapes,
+            device,
+            quantized_activation_cache=cache,
+        )
+
+    assert all(operation.attrs["_q8_mma_rows"] == 16 for operation in operations)
+    assert all("_q8_mma_kernel" in operation.attrs for operation in operations)
+    assert all(
+        "_q8_grouped_decode_kernel" not in operation.attrs for operation in operations
+    )
+    pool = {}
+    for index, operation in enumerate(operations):
+        reuse_operation_outputs({"linear": operation}, tensors, pool)
+        if index:
+            assert operation.attrs["_q8_mma_output"].ptr == tensors["output.0"].ptr
+
+    with wp.ScopedCapture(device) as capture:
+        execute_operations(operations, tensors, shapes, device)
+    wp.capture_launch(capture.graph)
+    np.testing.assert_array_equal(
+        tensors["output.0"].numpy(), tensors["output.1"].numpy()
+    )
+    x = tensors["x"].numpy().astype(np.float32).reshape(rows, blocks, 32)
+    activation_scales = np.max(np.abs(x), axis=2, keepdims=True) / 127.0
+    activation_scales[activation_scales == 0.0] = 1.0
+    quantized_x = (
+        np.clip(np.rint(x / activation_scales), -127, 127) * activation_scales
+    ).reshape(rows, inner)
+    dequantized_weight = (
+        values.numpy().astype(np.float32) * scales.numpy()[:, :, None]
+    ).reshape(columns, inner)
+    np.testing.assert_allclose(
+        tensors["output.0"].numpy(),
+        quantized_x @ dequantized_weight.T,
+        atol=0.3,
+        rtol=0.03,
+    )
+
+
 def test_q8_grouped_outputs_match_single_output_kernel():
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
@@ -562,6 +651,12 @@ def test_q3_k_linear_matches_scalar_reference_and_captures(rows):
     wp.capture_launch(capture.graph)
     expected = tensors["x"].numpy().astype(np.float32) @ _q3_k_reference(raw).T
     np.testing.assert_allclose(tensors["output"].numpy(), expected, atol=2.0, rtol=0.02)
+    np.testing.assert_allclose(
+        dequantize_q3_k_weight(weight).numpy(),
+        _q3_k_reference(raw),
+        atol=0.5,
+        rtol=0.01,
+    )
 
 
 def test_gated_rms_norm_bfloat16():
