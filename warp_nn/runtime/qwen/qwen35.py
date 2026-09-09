@@ -39,6 +39,7 @@ from warp_nn.runtime.kernels import (
     _get_linear_attention_kernel,
     _get_lp_normalization_kernel,
     _linear_attention_value_blocks,
+    _merge_attention_heads_kernel,
     _prepare_gated_delta_kernel,
     _reorder_heads_kernel,
     _reorder_heads_decode_batch_kernel,
@@ -365,6 +366,11 @@ class _Qwen35Plan:
         self.mtp = bool(mtp)
         self.all_logits = bool(all_logits)
         self.output_logits = bool(output_logits)
+        self.flash_prefill = (
+            runner.device.is_cuda
+            and rows >= 256
+            and not (self.decode_batch or self.mtp or self.all_logits)
+        )
         self.mapped_state = bool(getattr(runner, "mapped_state", False))
         if self.decode_batch and (external_embeddings or rows not in (2, 4, 8)):
             raise ValueError("Qwen decode batches require 2, 4, or 8 text-only slots")
@@ -377,6 +383,11 @@ class _Qwen35Plan:
         self.shapes = {name: tuple(value.shape) for name, value in self.tensors.items()}
         self.input_ids = wp.zeros((1, rows), dtype=wp.int64, device=self.device)
         self.position_ids = wp.zeros((1, rows), dtype=wp.int64, device=self.device)
+        self.flash_position_ids = (
+            wp.zeros(rows, dtype=wp.int32, device=self.device)
+            if self.flash_prefill
+            else None
+        )
         self.rope_position_ids = wp.zeros((3, rows), dtype=wp.int64, device=self.device)
         self.external_embeddings = external_embeddings
         if external_embeddings:
@@ -762,6 +773,25 @@ class _Qwen35Plan:
         layer["core"] = wp.empty(
             (self.rows, attention_width), dtype=self.dtype, device=self.device
         )
+        if self.flash_prefill:
+            if not hasattr(self, "flash_attention"):
+                output = wp.empty(
+                    (1, self.runner.query_heads, self.rows, self.runner.head_size),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                self.flash_attention = {
+                    "output": output,
+                    "lse": wp.empty(
+                        (1, self.runner.query_heads, self.rows),
+                        dtype=wp.float32,
+                        device=self.device,
+                    ),
+                    "workspace": wp.empty(
+                        output.shape, dtype=wp.float32, device=self.device
+                    ),
+                }
+            layer["flash_attention"] = self.flash_attention
         layer["gated"] = wp.empty_like(layer["core"])
         layer["attention_block"], layer["attention_kernel"] = _get_gqa_attention_kernel(
             self.runner.head_size, self.dtype
@@ -1240,7 +1270,49 @@ class _Qwen35Plan:
                 ],
                 device=self.device,
             )
-        if "partitioned_attention" in layer:
+        if self.flash_prefill:
+            from warp_nn.flash_attention import flash_gqa_cache_forward
+
+            flash = layer["flash_attention"]
+            flash_gqa_cache_forward(
+                layer["q_rotated"].reshape(
+                    (1, self.runner.query_heads, self.rows, self.runner.head_size)
+                ),
+                key_cache.reshape(
+                    (
+                        1,
+                        self.runner.kv_heads,
+                        self.runner.cache_capacity,
+                        self.runner.head_size,
+                    )
+                ),
+                value_cache.reshape(
+                    (
+                        1,
+                        self.runner.kv_heads,
+                        self.runner.cache_capacity,
+                        self.runner.head_size,
+                    )
+                ),
+                self.runner.sequence_end,
+                self.flash_position_ids,
+                flash["output"],
+                flash["lse"],
+                flash["workspace"],
+                scale=self.runner.head_size**-0.5,
+            )
+            wp.launch(
+                _merge_attention_heads_kernel,
+                dim=flash["output"].shape,
+                inputs=[
+                    flash["output"],
+                    layer["core"].reshape(
+                        (1, self.rows, self.runner.query_heads * self.runner.head_size)
+                    ),
+                ],
+                device=self.device,
+            )
+        elif "partitioned_attention" in layer:
             _launch_partitioned_gqa(
                 layer["partitioned_attention"][self.attention_partitions],
                 layer["q_rotated"],
@@ -1783,6 +1855,11 @@ class Qwen35Runner(AutoregressiveRunner):
         self, token_ids, embeddings=None, positions=(), token_offset=0
     ) -> wp.array:
         start = self.sequence_length
+        plan = self._plan_for_rows(len(token_ids))
+        if plan.flash_position_ids is not None:
+            plan.flash_position_ids.assign(
+                np.arange(start, start + len(token_ids), dtype=np.int32)
+            )
         logits = super()._stage_many(token_ids, embeddings, positions, token_offset)
         if self.use_mtp:
             if embeddings is not None:

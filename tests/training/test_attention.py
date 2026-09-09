@@ -6,6 +6,8 @@ import pytest
 
 import warp as wp
 
+from tests.utilities import is_device_available
+from warp_nn.flash_attention import flash_gqa_cache_forward
 from warp_nn.training.attention import (
     _attention_kernels,
     gqa_attention_backward,
@@ -161,3 +163,52 @@ def test_gqa_attention_rejects_non_divisible_heads():
     accumulator = wp.empty(query.shape, dtype=wp.float32, device="cpu")
     with pytest.raises(ValueError, match="divisible"):
         gqa_attention_forward(query, key, value, lengths, output, lse, accumulator)
+
+
+@pytest.mark.parametrize("dtype", [wp.float16, wp.bfloat16])
+def test_flash_gqa_cache_forward_matches_reference_and_replays(dtype):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(91)
+    query_heads, kv_heads, rows, capacity, head_size = 6, 1, 17, 64, 256
+    query_np = rng.normal(0.0, 0.2, (1, query_heads, rows, head_size)).astype(
+        np.float32
+    )
+    key_np = rng.normal(0.0, 0.2, (1, kv_heads, capacity, head_size)).astype(np.float32)
+    value_np = rng.normal(0.0, 0.2, (1, kv_heads, capacity, head_size)).astype(
+        np.float32
+    )
+    positions_np = np.arange(37, 37 + rows, dtype=np.int32)
+    query = wp.array(query_np, dtype=dtype, device="cuda:0")
+    key = wp.array(key_np, dtype=dtype, device="cuda:0")
+    value = wp.array(value_np, dtype=dtype, device="cuda:0")
+    positions = wp.array(positions_np, device="cuda:0")
+    length = wp.array(np.array([positions_np[-1]], dtype=np.int32), device="cuda:0")
+    output = wp.empty_like(query)
+    lse = wp.empty((1, query_heads, rows), dtype=wp.float32, device="cuda:0")
+    workspace = wp.empty(query.shape, dtype=wp.float32, device="cuda:0")
+
+    def launch():
+        flash_gqa_cache_forward(
+            query, key, value, length, positions, output, lse, workspace
+        )
+
+    launch()
+    wp.synchronize_device("cuda:0")
+    wp.capture_begin(device="cuda:0")
+    launch()
+    graph = wp.capture_end(device="cuda:0")
+    wp.capture_launch(graph)
+    wp.synchronize_device("cuda:0")
+
+    reference = np.empty_like(query_np)
+    scale = head_size**-0.5
+    for head in range(query_heads):
+        for row, position in enumerate(positions_np):
+            scores = key_np[0, 0, : position + 1] @ query_np[0, head, row] * scale
+            probabilities = np.exp(scores - np.max(scores))
+            probabilities /= np.sum(probabilities)
+            reference[0, head, row] = probabilities @ value_np[0, 0, : position + 1]
+    np.testing.assert_allclose(
+        output.numpy().astype(np.float32), reference, atol=8.0e-4, rtol=8.0e-3
+    )

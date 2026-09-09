@@ -13,7 +13,7 @@ import math
 
 import warp as wp
 
-from .flash_attention import (
+from ..flash_attention import (
     flash_gqa_forward,
     flash_gqa_key_value_backward,
     flash_gqa_query_backward,

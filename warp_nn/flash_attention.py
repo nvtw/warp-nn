@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tensor-core online attention kernels for dependency-free GPU training."""
+"""Shared tensor-core online attention kernels."""
 
 from functools import lru_cache
 import math
@@ -15,10 +15,13 @@ _SUPPORTED_DTYPES = (wp.float16, wp.bfloat16)
 
 
 @lru_cache(maxsize=None)
-def _forward_kernel(dtype: type, head_size: int, segmented: bool = False):
+def _forward_kernel(
+    dtype: type, head_size: int, segmented: bool = False, cached: bool = False
+):
     DTYPE = dtype
     HEAD_SIZE = head_size
     SEGMENTED = segmented
+    CACHED = cached
 
     @wp.func
     def maximum(left: wp.float32, right: wp.float32):
@@ -92,9 +95,11 @@ def _forward_kernel(dtype: type, head_size: int, segmented: bool = False):
         output: wp.array2d(dtype=DTYPE),
         lse: wp.array1d(dtype=wp.float32),
         workspace: wp.array2d(dtype=wp.float32),
+        query_positions: wp.array1d(dtype=wp.int32),
         query_heads: wp.int32,
         kv_heads: wp.int32,
         sequence: wp.int32,
+        key_sequence: wp.int32,
         scale: wp.float32,
         window: wp.int32,
     ):
@@ -104,10 +109,12 @@ def _forward_kernel(dtype: type, head_size: int, segmented: bool = False):
         query_head = (item / query_tiles) % query_heads
         batch = item / (query_tiles * query_heads)
         query_start = tile_index * _QUERY_TILE
-        length = wp.clamp(lengths[batch], 0, sequence)
+        length = wp.clamp(
+            lengths[batch] + (1 if wp.static(CACHED) else 0), 0, key_sequence
+        )
         kv_head = query_head / (query_heads / kv_heads)
         query_base = (batch * query_heads + query_head) * sequence
-        cache_base = (batch * kv_heads + kv_head) * sequence
+        cache_base = (batch * kv_heads + kv_head) * key_sequence
 
         queries = wp.tile_load(
             query,
@@ -123,6 +130,11 @@ def _forward_kernel(dtype: type, head_size: int, segmented: bool = False):
         denominators = wp.tile_zeros(shape=(_QUERY_TILE,), dtype=wp.float32)
         query_offsets = wp.tile_arange(_QUERY_TILE, dtype=wp.int32)
         row_ends = wp.tile_map(row_end, query_offsets, query_start)
+        if wp.static(CACHED):
+            positions = wp.tile_load(
+                query_positions, shape=(_QUERY_TILE,), offset=(query_start,)
+            )
+            row_ends = wp.tile_map(add_offset, positions, wp.int32(1))
         row_firsts = wp.tile_map(row_first, row_ends, window)
         if wp.static(SEGMENTED):
             bounds = wp.tile_load(
@@ -146,7 +158,10 @@ def _forward_kernel(dtype: type, head_size: int, segmented: bool = False):
             shape=(_QUERY_TILE, _KEY_TILE),
         )
         key_offsets = wp.tile_arange(_KEY_TILE, dtype=wp.int32)
-        key_limit = wp.min(length, query_start + _QUERY_TILE)
+        key_limit = wp.min(
+            length,
+            wp.tile_extract(wp.tile_reduce(maximum_int, row_ends), 0),
+        )
         key_begin = wp.int32(0)
         if wp.static(SEGMENTED):
             first = wp.tile_extract(wp.tile_reduce(minimum, row_firsts), 0)
@@ -920,11 +935,98 @@ def flash_gqa_forward(
             output_2d,
             lse_1d,
             workspace_2d,
+            lengths,
             query_heads,
             kv_heads,
             sequence,
+            sequence,
             effective_scale,
             window,
+        ],
+        block_dim=128,
+        device=query.device,
+    )
+
+
+def flash_gqa_cache_forward(
+    query,
+    key,
+    value,
+    sequence_lengths_minus_one,
+    query_positions,
+    output,
+    lse,
+    workspace,
+    *,
+    scale: float | None = None,
+) -> None:
+    """Launch causal tensor-core GQA for a query chunk over an existing KV cache."""
+    if query.dtype not in _SUPPORTED_DTYPES or key.dtype != query.dtype:
+        raise TypeError("Flash cache GQA requires matching FP16/BF16 Q/K/V storage")
+    if value.dtype != query.dtype or query.ndim != 4 or key.ndim != 4:
+        raise TypeError("Flash cache GQA requires rank-4 matching Q/K/V arrays")
+    batch, query_heads, sequence, head_size = query.shape
+    if key.shape != value.shape or key.shape[0] != batch or key.shape[3] != head_size:
+        raise ValueError("Flash cache GQA key/value geometry does not match query")
+    kv_heads, key_sequence = key.shape[1:3]
+    if min(batch, query_heads, kv_heads, sequence, key_sequence, head_size) <= 0:
+        raise ValueError("Flash cache GQA dimensions must be positive")
+    if query_heads % kv_heads:
+        raise ValueError("Flash cache GQA query heads must be divisible by KV heads")
+    if output.shape != query.shape or output.dtype != query.dtype:
+        raise ValueError("Flash cache GQA output geometry does not match query")
+    if workspace.shape != query.shape or workspace.dtype != wp.float32:
+        raise ValueError("Flash cache GQA workspace geometry is invalid")
+    if lse.shape != (batch, query_heads, sequence) or lse.dtype != wp.float32:
+        raise ValueError("Flash cache GQA LSE geometry is invalid")
+    if query_positions.shape != (sequence,) or query_positions.dtype != wp.int32:
+        raise ValueError("Flash cache GQA query positions are invalid")
+    if (
+        sequence_lengths_minus_one.shape != (batch,)
+        or sequence_lengths_minus_one.dtype != wp.int32
+    ):
+        raise ValueError("Flash cache GQA sequence lengths are invalid")
+    arrays = (
+        query,
+        key,
+        value,
+        sequence_lengths_minus_one,
+        query_positions,
+        output,
+        lse,
+        workspace,
+    )
+    minimum_arch = 80 if query.dtype == wp.bfloat16 else 70
+    if (
+        not query.device.is_cuda
+        or query.device.arch < minimum_arch
+        or any(
+            array.device != query.device or not array.is_contiguous for array in arrays
+        )
+    ):
+        raise ValueError("Flash cache GQA arrays must be contiguous on one CUDA device")
+    effective_scale = head_size**-0.5 if scale is None else float(scale)
+    if not math.isfinite(effective_scale):
+        raise ValueError("Flash cache GQA scale must be finite")
+    wp.launch_tiled(
+        _forward_kernel(query.dtype, head_size, False, True),
+        dim=batch * query_heads * ((sequence + _QUERY_TILE - 1) // _QUERY_TILE),
+        inputs=[
+            query.reshape((batch * query_heads * sequence, head_size)),
+            key.reshape((batch * kv_heads * key_sequence, head_size)),
+            value.reshape((batch * kv_heads * key_sequence, head_size)),
+            sequence_lengths_minus_one,
+            sequence_lengths_minus_one.reshape((batch, 1)),
+            output.reshape((batch * query_heads * sequence, head_size)),
+            lse.flatten(),
+            workspace.reshape((batch * query_heads * sequence, head_size)),
+            query_positions,
+            query_heads,
+            kv_heads,
+            sequence,
+            key_sequence,
+            effective_scale,
+            0,
         ],
         block_dim=128,
         device=query.device,
