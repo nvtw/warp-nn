@@ -137,10 +137,16 @@ class AutoregressiveRunner:
             self._chunk_plan._pool_storage_bytes
         )
 
-    def _require_lazy_plan_headroom(self, rows: int) -> None:
+    def _require_lazy_plan_headroom(
+        self, rows: int, required_bytes: int | None = None
+    ) -> None:
         if not self.device.is_cuda:
             return
-        required = self._lazy_plan_allocation_bound()
+        required = (
+            self._lazy_plan_allocation_bound()
+            if required_bytes is None
+            else required_bytes
+        )
         free = self.device.free_memory
         if free < required:
             raise _PlanMemoryError(

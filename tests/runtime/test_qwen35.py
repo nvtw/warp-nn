@@ -637,6 +637,19 @@ def test_qwen35_dflash_rejection_rollback_matches_decode_and_replays(
 
     speculative = make_runner(dflash=True)
     reference = make_runner()
+    full_plan_bound = speculative._lazy_plan_allocation_bound()
+    decode_bytes = speculative._decode_plan._owned_storage_bytes + (
+        speculative._decode_plan._pool_storage_bytes
+    )
+    expected_verification_bound = min(full_plan_bound, 16 * 4 * decode_bytes)
+    headroom_checks = []
+    require_headroom = speculative._require_lazy_plan_headroom
+
+    def record_headroom(rows, required_bytes=None):
+        headroom_checks.append((rows, required_bytes))
+        require_headroom(rows, required_bytes)
+
+    monkeypatch.setattr(speculative, "_require_lazy_plan_headroom", record_headroom)
     prompt = [1, 2, 3]
     for expected_accepted in range(4):
         prompt_logits = reference.prefill(prompt)
@@ -706,6 +719,9 @@ def test_qwen35_dflash_rejection_rollback_matches_decode_and_replays(
     assert speculative.dflash.sequence_length == speculative.sequence_length
 
     assert 64 in speculative._verification_plans[4].graphs
+    assert [check for check in headroom_checks if check[1] is not None] == [
+        (4, expected_verification_bound)
+    ]
 
 
 def test_qwen35_mtp_rejection_rollback_matches_decode_and_replays(tmp_path):

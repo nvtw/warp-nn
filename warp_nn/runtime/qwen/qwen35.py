@@ -1893,7 +1893,15 @@ class Qwen35Runner(AutoregressiveRunner):
     def _verification_plan_for_rows(self, rows: int) -> _Qwen35Plan:
         plan = self._verification_plans.get(rows)
         if plan is None:
-            self._require_lazy_plan_headroom(rows)
+            # All-logits verification storage scales linearly with rows.  Qwen
+            # plans use about 10x the one-row decode storage per row; 16x keeps
+            # a conservative margin without reserving the much larger prefill
+            # plan for an eight-row verifier.
+            decode_bytes = self._decode_plan._owned_storage_bytes + (
+                self._decode_plan._pool_storage_bytes
+            )
+            required = min(self._lazy_plan_allocation_bound(), 16 * rows * decode_bytes)
+            self._require_lazy_plan_headroom(rows, required)
             plan = self._verification_plans[rows] = _Qwen35Plan(
                 self, rows, all_logits=True
             )
