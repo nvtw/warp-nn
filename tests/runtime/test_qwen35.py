@@ -709,6 +709,11 @@ def test_qwen35_dflash_rejection_rollback_matches_decode_and_replays(
 
     def sample(logits, accepted_drafts):
         assert logits.shape == (1, 1, 16)
+        values, tokens = speculative.read_top_k(logits, 8)
+        host = logits.numpy()[0, 0].astype(np.float32)
+        expected = np.lexsort((np.arange(host.size), -host))[:8]
+        np.testing.assert_array_equal(tokens, expected)
+        np.testing.assert_array_equal(values, host[expected])
         prefixes.append(accepted_drafts)
         return next(sampled)
 
