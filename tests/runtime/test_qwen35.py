@@ -799,6 +799,26 @@ def test_qwen35_mtp_rejection_rollback_matches_decode_and_replays(tmp_path):
         speculative.reset()
         reference.reset()
 
+    speculative.prefill(prompt)
+    input_token = 1
+    drafts = iter((4, 5, 6))
+    speculative.sample_greedy = lambda _logits: next(drafts)
+    sampled = iter((4, 9))
+    prefixes = []
+
+    def sample(logits, accepted_drafts):
+        assert logits.shape == (1, 1, 16)
+        prefixes.append(accepted_drafts)
+        return next(sampled)
+
+    tokens, accepted = speculative.decode_speculative(
+        input_token, draft_tokens=3, sample=sample
+    )
+    assert (tokens, accepted) == ([4, 9], 1)
+    assert prefixes == [[], [4]]
+    assert speculative.sequence_length == len(prompt) + 2
+    assert speculative._mtp_sequence_length == speculative.sequence_length
+
     verifier = speculative._verification_plans[4]
     qkv_pointers = [
         verifier.tensors[layer["qkv"].outputs[0]].ptr

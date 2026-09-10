@@ -424,8 +424,9 @@ def test_console_generation_uses_embedded_mtp(capsys):
         def sample_greedy(self, logits):
             return logits
 
-        def decode_speculative(self, token_id):
+        def decode_speculative(self, token_id, *, sample=None):
             assert token_id == 1
+            assert sample is None
             return [2, 3], 1
 
         def decode(self, token_id):

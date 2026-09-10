@@ -1930,9 +1930,9 @@ class Qwen35Runner(AutoregressiveRunner):
         self.sequence_end.assign(np.asarray([self.sequence_length - 1], dtype=np.int32))
 
     def decode_speculative(
-        self, token_id: int, draft_tokens: int | None = None
+        self, token_id: int, draft_tokens: int | None = None, *, sample=None
     ) -> tuple[list[int], int]:
-        """Verify greedy tokens from the embedded MTP head and return (tokens, accepted)."""
+        """Verify tokens from the embedded MTP head and return (tokens, accepted)."""
         if draft_tokens is None:
             draft_tokens = 1 if self.sequence_length >= _MTP_LONG_CONTEXT else 2
         if not self.use_mtp:
@@ -1972,15 +1972,24 @@ class Qwen35Runner(AutoregressiveRunner):
         self.sequence_end.assign(np.asarray([positions[-1]], dtype=np.int32))
         logits = self._run(verifier, verifier.attention_partitions)
         self.sequence_length = base + len(inputs)
-        predictions = self.sample_greedy_rows(logits)
-        accepted = next(
-            (
-                index
-                for index, draft in enumerate(drafts)
-                if draft != predictions[index]
-            ),
-            draft_tokens,
-        )
+        if sample is None:
+            predictions = self.sample_greedy_rows(logits)
+            accepted = next(
+                (
+                    index
+                    for index, draft in enumerate(drafts)
+                    if draft != predictions[index]
+                ),
+                draft_tokens,
+            )
+            correction = int(predictions[accepted])
+        else:
+            for accepted in range(len(inputs)):
+                correction = int(
+                    sample(logits[accepted : accepted + 1], drafts[:accepted])
+                )
+                if accepted == len(drafts) or correction != drafts[accepted]:
+                    break
         valid = accepted + 1
 
         target_hidden = verifier.normalized
@@ -1988,13 +1997,13 @@ class Qwen35Runner(AutoregressiveRunner):
             self._rollback_verification(verifier, base, valid)
 
         if accepted:
-            correction = self._mtp_plan_for_rows(accepted)
+            correction_plan = self._mtp_plan_for_rows(accepted)
             wp.copy(
-                correction.target_hidden.flatten(),
+                correction_plan.target_hidden.flatten(),
                 target_hidden.flatten(),
                 count=accepted * self.hidden_size,
             )
-            self._stage_mtp_plan(correction, inputs[1:valid], base + 1)
+            self._stage_mtp_plan(correction_plan, inputs[1:valid], base + 1)
         self._mtp_sequence_length = base + valid
         wp.copy(
             self._mtp_carry_hidden.flatten(),
@@ -2002,7 +2011,7 @@ class Qwen35Runner(AutoregressiveRunner):
             src_offset=(valid - 1) * self.hidden_size,
             count=self.hidden_size,
         )
-        return [*drafts[:accepted], int(predictions[accepted])], accepted
+        return [*drafts[:accepted], correction], accepted
 
     def decode_dflash(self, token_id: int, *, sample=None) -> tuple[list[int], int]:
         """Verify one seven-token DFlash proposal and return (tokens, accepted)."""

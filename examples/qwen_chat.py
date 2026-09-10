@@ -18,9 +18,9 @@ Run the locally installed BF16 Qwen3.8 model with sampled DFlash2 acceleration::
 
     .venv/bin/python examples/qwen_chat.py /home/twidmer/.lmstudio/models/unsloth/Qwen3.8-27B-GGUF --dflash-path /home/twidmer/.cache/huggingface/hub/models--z-lab--Qwen3.8-27B-DFlash2/snapshots/50307d4c4cde6860d4eee73e2547cd786fe8e8a4 --reasoning-effort medium --cache-capacity 262144 --prefill-chunk-size 2048
 
-Use the checkpoint's embedded MTP head for greedy speculative decoding::
+Use the checkpoint's embedded MTP head for speculative decoding::
 
-    .venv/bin/python examples/qwen_chat.py /home/twidmer/.lmstudio/models/unsloth/Qwen3.8-27B-GGUF --mtp --temperature 0 --reasoning-effort medium --cache-capacity 262144 --prefill-chunk-size 2048
+    .venv/bin/python examples/qwen_chat.py /home/twidmer/.lmstudio/models/unsloth/Qwen3.8-27B-GGUF --mtp --reasoning-effort medium --cache-capacity 262144 --prefill-chunk-size 2048
 
 The DFlash2 draft is published at
 https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2. The default Qwen3.8 sampling
@@ -180,25 +180,27 @@ def _generate(
         if pending_tokens:
             continue
         remaining = limit - len(generated)
+        sample = None
+        if temperature > 0.0 and (use_dflash or use_mtp):
+
+            def sample(row_logits, accepted_drafts):
+                return sample_runner_token(
+                    runner,
+                    row_logits,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    presence_penalty=presence_penalty,
+                    previous_tokens=(*generated, *accepted_drafts),
+                    rng=rng,
+                )
+
         if use_dflash and remaining >= runner.dflash.block_size:
-            sample = None
-            if temperature > 0.0:
-
-                def sample(row_logits, accepted_drafts):
-                    return sample_runner_token(
-                        runner,
-                        row_logits,
-                        temperature=temperature,
-                        top_p=top_p,
-                        top_k=top_k,
-                        presence_penalty=presence_penalty,
-                        previous_tokens=(*generated, *accepted_drafts),
-                        rng=rng,
-                    )
-
             pending_tokens.extend(runner.decode_dflash(token_id, sample=sample)[0])
-        elif use_mtp and temperature <= 0.0 and remaining >= 3:
-            pending_tokens.extend(runner.decode_speculative(token_id)[0])
+        elif use_mtp and remaining >= 3:
+            pending_tokens.extend(
+                runner.decode_speculative(token_id, sample=sample)[0]
+            )
         else:
             logits = runner.decode(token_id)
     if pending_tokens:
@@ -354,7 +356,7 @@ def main():
     speculation.add_argument(
         "--mtp",
         action="store_true",
-        help="Enable Qwen's embedded MTP speculative decoder (greedy generation only)",
+        help="Enable Qwen's embedded MTP speculative decoder",
     )
     parser.add_argument(
         "--weight-quantization",
@@ -445,8 +447,6 @@ def main():
         parser.error("--yarn-factor requires --yarn and must be at least 1")
     if args.reasoning_effort and not thinking:
         parser.error("--reasoning-effort requires thinking mode")
-    if args.mtp and temperature > 0.0:
-        parser.error("--mtp currently requires --temperature 0")
     if args.reasoning_effort and not tokenizer.supports_reasoning_effort:
         parser.error("this model's chat template does not support --reasoning-effort")
     rng = np.random.default_rng(args.seed)
