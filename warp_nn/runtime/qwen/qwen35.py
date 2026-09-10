@@ -1775,7 +1775,7 @@ class Qwen35Runner(AutoregressiveRunner):
         if self.use_mtp:
             self._mtp_decode_plan = _Qwen35Plan(self, 1, mtp=True)
             self._record_plan_storage(self._mtp_decode_plan)
-            self._mtp_prefill_plans = {}
+            self._mtp_prefill_plans = {1: self._mtp_decode_plan}
             self._mtp_carry_hidden = wp.zeros(
                 (1, self.hidden_size), dtype=self.dtype, device=self.device
             )

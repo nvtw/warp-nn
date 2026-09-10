@@ -566,7 +566,7 @@ def test_qwen35_verification_attention_partitions(
     assert _verification_attention_partitions(head_size, sequence_length) == partitions
 
 
-def test_qwen35_mtp_uses_compatible_checkpoint_weights(tmp_path):
+def test_qwen35_mtp_uses_compatible_checkpoint_weights(tmp_path, monkeypatch):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
     model_path = tmp_path / "tiny-qwen35-mtp"
@@ -584,7 +584,15 @@ def test_qwen35_mtp_uses_compatible_checkpoint_weights(tmp_path):
     assert not np.array_equal(
         alternate.weights[mtp_name].numpy(), embedded.weights[mtp_name].numpy()
     )
-    logits = alternate.prefill([1, 2, 3])
+    assert alternate._mtp_prefill_plans[1] is alternate._mtp_decode_plan
+
+    def deny_new_plan(rows, required_bytes=None):
+        raise _PlanMemoryError("test headroom denial")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(alternate, "_require_lazy_plan_headroom", deny_new_plan)
+        logits = alternate.prefill([1, 2, 3])
+    assert alternate.sequence_length == 3
     tokens, accepted = alternate.decode_speculative(alternate.sample_greedy(logits))
     assert len(tokens) == accepted + 1
 
