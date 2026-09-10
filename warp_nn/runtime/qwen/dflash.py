@@ -21,6 +21,8 @@ from warp_nn.runtime.kernels import (
     _get_gather_q8_0_rows_kernel,
     _get_mrope_embedding_kernel,
     _get_top_k_kernels,
+    _shift_append_heads_kernel,
+    _shift_valid_kernel,
 )
 from warp_nn.runtime.operators import (
     AttentionHeadsPlan,
@@ -62,33 +64,6 @@ def _grouped_dynamic_conv_kernel(
             )
             value += coefficient * wp.float32(hidden[source, column])
     output[row, column] = wp.bfloat16(value)
-
-
-@wp.kernel(enable_backward=False, module="unique")
-def _shift_append_heads_kernel(
-    cache: wp.array4d(dtype=wp.bfloat16),
-    appended: wp.array4d(dtype=wp.bfloat16),
-    output: wp.array4d(dtype=wp.bfloat16),
-):
-    batch, head, sequence, column = wp.tid()
-    source = sequence + appended.shape[2]
-    if source < cache.shape[2]:
-        output[batch, head, sequence, column] = cache[batch, head, source, column]
-    else:
-        output[batch, head, sequence, column] = appended[
-            batch, head, source - cache.shape[2], column
-        ]
-
-
-@wp.kernel(enable_backward=False, module="unique")
-def _shift_valid_kernel(
-    valid: wp.array2d(dtype=wp.bool),
-    output: wp.array2d(dtype=wp.bool),
-    appended: int,
-):
-    batch, sequence = wp.tid()
-    source = sequence + appended
-    output[batch, sequence] = valid[batch, source] if source < output.shape[1] else True
 
 
 @wp.kernel(enable_backward=False, module="unique")

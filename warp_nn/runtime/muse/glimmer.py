@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from datetime import date
 from pathlib import Path
 
+import numpy as np
 import warp as wp
 
 from warp_nn.runtime._cublas import try_create_cublas
@@ -25,6 +26,7 @@ from warp_nn.runtime.kernels import (
     _append_circular_head_cache_kernel,
     _append_head_cache_kernel,
     _binary_broadcast_kernel,
+    _concat_axis_kernel,
     _gather_rows_kernel,
     _get_gather_q8_0_rows_kernel,
     _get_append_head_cache_decode_batch_kernel,
@@ -311,6 +313,7 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
     """Dependency-free o200k tokenizer and ATEM text/tool chat formatter."""
 
     tool_call_start = "<atem:function_calls>"
+    default_top_k = 64
 
     def __init__(self, path: str | Path):
         path = Path(path)
@@ -359,9 +362,7 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
     def _reasoning_strength(enable_thinking: bool, reasoning_effort: str | None) -> str:
         if not enable_thinking:
             return "low"
-        return {None: "high", "xhigh": "high", "medium": "medium", "low": "low"}.get(
-            reasoning_effort, reasoning_effort
-        )
+        return reasoning_effort or "medium"
 
     @staticmethod
     def _tool_call_text(call: Mapping[str, object]) -> str:
@@ -541,11 +542,16 @@ class _MusePlan:
     """Fixed-row Muse execution plan sharing the runner's persistent caches."""
 
     def __init__(
-        self, runner: MuseGlimmerRunner, rows: int, decode_batch: bool = False
+        self,
+        runner: MuseGlimmerRunner,
+        rows: int,
+        decode_batch: bool = False,
+        all_logits: bool = False,
     ):
         self.runner = weakref.proxy(runner)
         self.rows = rows
         self.decode_batch = bool(decode_batch)
+        self.all_logits = bool(all_logits)
         self.mapped_state = bool(getattr(runner, "mapped_state", False))
         if self.decode_batch and rows not in (2, 4, 8):
             raise ValueError("Muse decode batches require 2, 4, or 8 slots")
@@ -565,6 +571,16 @@ class _MusePlan:
         )
         self.tensors["hidden.0"] = self.embedding.reshape((rows, runner.hidden_size))
         self.shapes["hidden.0"] = (rows, runner.hidden_size)
+        self.dflash_target_hidden = None
+        self._dflash_tap_offsets = {
+            index: offset for offset, index in enumerate(runner.dflash_target_layers)
+        }
+        if self._dflash_tap_offsets:
+            self.dflash_target_hidden = wp.empty(
+                (rows, len(self._dflash_tap_offsets) * runner.hidden_size),
+                dtype=self.dtype,
+                device=self.device,
+            )
         self.layers = []
         self._layer_buffer_pool = {}
         self._build()
@@ -741,7 +757,7 @@ class _MusePlan:
             self._reuse_layer_buffers(layer, index)
             self.layers.append(layer)
         final_input = "final.input"
-        if self.decode_batch:
+        if self.decode_batch or self.all_logits:
             self.tensors[final_input] = self.tensors[hidden]
             self.shapes[final_input] = (self.rows, self.runner.hidden_size)
         else:
@@ -756,7 +772,7 @@ class _MusePlan:
         self.lm_head = self._linear(
             "logits", self.final_norm.outputs[0], "lm_head.weight"
         )
-        output_rows = self.rows if self.decode_batch else 1
+        output_rows = self.rows if self.decode_batch or self.all_logits else 1
         self.logits = self.tensors["logits"].reshape(
             (output_rows, 1, self.runner.vocab_size)
         )
@@ -1168,6 +1184,21 @@ class _MusePlan:
                 device=self.device,
             )
             hidden = layer["output"]
+            tap = self._dflash_tap_offsets.get(index)
+            if tap is not None:
+                wp.launch(
+                    _concat_axis_kernel,
+                    dim=self.rows * self.runner.hidden_size,
+                    inputs=[
+                        self.tensors[hidden].flatten(),
+                        self.dflash_target_hidden.flatten(),
+                        self.runner.hidden_size,
+                        len(self._dflash_tap_offsets) * self.runner.hidden_size,
+                        1,
+                        tap * self.runner.hidden_size,
+                    ],
+                    device=self.device,
+                )
         self._execute_op(self.final_norm)
         self._execute_op(self.lm_head)
         wp.launch(
@@ -1203,6 +1234,7 @@ class MuseGlimmerRunner(AutoregressiveRunner):
         use_cublas: bool = True,
         rope_scaling: Mapping[str, object] | None = None,
         weight_quantization: str | None = None,
+        dflash_path: str | Path | None = None,
     ):
         path = Path(path)
         directory = path if path.is_dir() else path.parent
@@ -1236,6 +1268,17 @@ class MuseGlimmerRunner(AutoregressiveRunner):
         if not 2 <= prefill_chunk_size <= self.cache_capacity:
             raise ValueError("prefill_chunk_size must be between 2 and cache_capacity")
         self.prefill_chunk_size = int(prefill_chunk_size)
+        self.dflash_path = Path(dflash_path) if dflash_path is not None else None
+        self.dflash_target_layers = ()
+        self.dflash_block_size = 0
+        if self.dflash_path is not None:
+            draft_config = json.loads(
+                (self.dflash_path / "config.json").read_text(encoding="utf-8")
+            )
+            self.dflash_target_layers = tuple(
+                int(index) for index in draft_config["target_layer_ids"]
+            )
+            self.dflash_block_size = int(draft_config["block_size"])
         self.hidden_size = int(self.config["hidden_size"])
         self.vocab_size = int(self.config["vocab_size"])
         self.num_layers = int(self.config["num_hidden_layers"])
@@ -1252,7 +1295,9 @@ class MuseGlimmerRunner(AutoregressiveRunner):
         self.local_cache_capacity = (
             self.cache_capacity
             if self.cache_capacity <= self.local_window
-            else self.local_window + self.prefill_chunk_size - 1
+            else self.local_window
+            + max(self.prefill_chunk_size, self.dflash_block_size)
+            - 1
         )
 
         names = _weight_names(self.config)
@@ -1325,8 +1370,101 @@ class MuseGlimmerRunner(AutoregressiveRunner):
         self._chunk_plan._capture_ready = False
         self._record_plan_storage(self._decode_plan)
         self._record_plan_storage(self._chunk_plan)
+        self._verification_plans = {}
         self._initialize_sampling()
         self.sequence_length = 0
+        self.dflash = None
+        if self.dflash_path is not None:
+            from .dflash import MuseDFlashDraft
+
+            self.dflash = MuseDFlashDraft(self, self.dflash_path)
+
+    def reset(self) -> None:
+        super().reset()
+        if self.dflash is not None:
+            self.dflash.reset()
+
+    def _stage_one(
+        self, token_id: int, embeddings=None, positions=(), token_offset=0
+    ) -> wp.array:
+        start = self.sequence_length
+        logits = super()._stage_one(token_id, embeddings, positions, token_offset)
+        if self.dflash is not None:
+            self.dflash.append_context(self._decode_plan.dflash_target_hidden, start)
+        return logits
+
+    def _stage_many(
+        self, token_ids, embeddings=None, positions=(), token_offset=0
+    ) -> wp.array:
+        start = self.sequence_length
+        plan = self._plan_for_rows(len(token_ids))
+        logits = super()._stage_many(token_ids, embeddings, positions, token_offset)
+        if self.dflash is not None:
+            self.dflash.append_context(plan.dflash_target_hidden, start)
+        return logits
+
+    def _verification_plan_for_rows(self, rows: int) -> _MusePlan:
+        plan = self._verification_plans.get(rows)
+        if plan is None:
+            decode_bytes = self._decode_plan._owned_storage_bytes + (
+                self._decode_plan._pool_storage_bytes
+            )
+            required = min(self._lazy_plan_allocation_bound(), 16 * rows * decode_bytes)
+            self._require_lazy_plan_headroom(rows, required)
+            plan = self._verification_plans[rows] = _MusePlan(
+                self, rows, all_logits=True
+            )
+            plan._capture_ready = False
+            self._record_plan_storage(plan)
+        return plan
+
+    def decode_dflash(self, token_id: int, *, sample=None) -> tuple[list[int], int]:
+        """Verify one Muse DFlash proposal and return (tokens, accepted)."""
+        if self.dflash is None:
+            raise RuntimeError("Muse DFlash was not enabled")
+        if self.sequence_length == 0:
+            raise RuntimeError("decode_dflash requires a preceding prefill")
+        rows = self.dflash.block_size
+        if self.sequence_length + rows > self.cache_capacity:
+            raise ValueError("Muse KV cache does not have room for verification")
+        if self.dflash.sequence_length != self.sequence_length:
+            raise RuntimeError("Muse target and DFlash states are out of sync")
+        drafts = self.dflash.propose(int(token_id))
+        if len(drafts) + 1 != rows:
+            raise RuntimeError("Muse DFlash returned an incomplete proposal")
+
+        base = self.sequence_length
+        verifier = self._verification_plan_for_rows(rows)
+        inputs = [int(token_id), *drafts]
+        positions = np.arange(base, base + rows, dtype=np.int64)
+        verifier.input_ids.assign(np.asarray(inputs, dtype=np.int64)[None, :])
+        verifier.position_ids.assign(positions[None, :])
+        self.sequence_end.assign(np.asarray([positions[-1]], dtype=np.int32))
+        logits = self._run(verifier, verifier.attention_partitions)
+        self.sequence_length = base + rows
+        if sample is None:
+            predictions = self.sample_greedy_rows(logits)
+            accepted = next(
+                (
+                    index
+                    for index, draft in enumerate(drafts)
+                    if draft != predictions[index]
+                ),
+                len(drafts),
+            )
+            correction = int(predictions[accepted])
+        else:
+            for accepted in range(rows):
+                correction = int(
+                    sample(logits[accepted : accepted + 1], drafts[:accepted])
+                )
+                if accepted == len(drafts) or correction != drafts[accepted]:
+                    break
+        valid = accepted + 1
+        self.sequence_length = base + valid
+        self.sequence_end.assign(np.asarray([self.sequence_length - 1], dtype=np.int32))
+        self.dflash.append_context(verifier.dflash_target_hidden[:valid], base)
+        return [*drafts[:accepted], correction], accepted
 
     def create_batch_decoder(self, max_batch_size: int = 4) -> MuseGlimmerBatchDecoder:
         """Allocate independent Muse decode state without duplicating weights."""

@@ -81,7 +81,7 @@ def _storage_bytes(value, excluded=()) -> int:
 
 
 class AutoregressiveRunner:
-    _sample_rows = 8
+    _sample_rows = 16
 
     def _initialize_sampling(self) -> None:
         """Allocate the fixed device and bounded host buffers used by sampling."""
@@ -520,8 +520,8 @@ class AutoregressiveRunner:
             (1, 1, token_stop - token_start)
         )
         vocabulary = token_stop - token_start
-        if not 1 <= top_k <= 32:
-            raise ValueError("top_k must be between 1 and 32")
+        if not 1 <= top_k <= 64:
+            raise ValueError("top_k must be between 1 and 64")
         top_k = min(top_k, vocabulary)
         if not self.device.is_cuda:
             values = np.asarray(logits.numpy(), dtype=np.float32).reshape(
@@ -532,14 +532,16 @@ class AutoregressiveRunner:
 
         tile_width = 512
         partial_count = (vocabulary + tile_width - 1) // tile_width
-        maximum_k = min(32, vocabulary)
+        maximum_k = min(32 if top_k <= 32 else 64, vocabulary)
+        merge_groups = min(16, tile_width // maximum_k)
         states = getattr(self, "_top_k_states", None)
         if states is None:
             states = self._top_k_states = {}
-        state = states.get(vocabulary)
+        state_key = (vocabulary, maximum_k)
+        state = states.get(state_key)
         if state is None:
             candidate_count = partial_count * maximum_k
-            merge_count = (partial_count + 15) // 16
+            merge_count = (partial_count + merge_groups - 1) // merge_groups
             values = wp.empty(candidate_count, dtype=wp.float32, device=self.device)
             tokens = wp.empty(candidate_count, dtype=wp.int32, device=self.device)
             merge_values = wp.empty(
@@ -552,7 +554,7 @@ class AutoregressiveRunner:
                 maximum_k, dtype=wp.float32, device="cpu", pinned=True
             )
             host_tokens = wp.empty(maximum_k, dtype=wp.int32, device="cpu", pinned=True)
-            state = states[vocabulary] = (
+            state = states[state_key] = (
                 _get_top_k_kernels(tile_width, maximum_k, self.dtype),
                 values,
                 tokens,
@@ -584,7 +586,7 @@ class AutoregressiveRunner:
         target_values, target_tokens = merge_values, merge_tokens
         input_groups = partial_count
         while input_groups > 1:
-            output_groups = (input_groups + 15) // 16
+            output_groups = (input_groups + merge_groups - 1) // merge_groups
             wp.launch_tiled(
                 kernels[1],
                 dim=output_groups,

@@ -176,6 +176,7 @@ def test_muse_tokenizer_chat_and_atem_tools(tmp_path):
     tokenizer = create_tokenizer(tmp_path)
 
     assert isinstance(tokenizer, MuseGlimmerTokenizer)
+    assert tokenizer.default_top_k == 64
     assert tokenizer.encode("1234camelCase")[:4] == [
         tokenizer._vocabulary["123"],
         tokenizer._vocabulary["4"],
@@ -192,8 +193,12 @@ def test_muse_tokenizer_chat_and_atem_tools(tmp_path):
         [{"role": "user", "content": "Read it"}], tools=tools
     )
     assert formatted.startswith("<|begin_of_text|><|start|>system<|message|>")
+    assert "Reasoning strength: medium." in formatted
     assert '"name":"read_file"' in formatted
     assert formatted.endswith("<|start|>assistant")
+    assert "Reasoning strength: xhigh." in tokenizer.format_chat(
+        [{"role": "user", "content": "Read it"}], reasoning_effort="xhigh"
+    )
 
     response = (
         'Checking.<atem:function_calls>\n<atem:invoke name="read_file">\n'
@@ -363,6 +368,103 @@ def test_muse_glimmer_prefill_decode_ring_cache_and_graph_replay(tmp_path, use_c
     sequential = runner.decode(4).numpy()
     assert full_chunk.shape == (1, 1, 16)
     np.testing.assert_allclose(full_chunk, sequential, atol=2.0e-2, rtol=2.0e-2)
+
+
+def test_muse_dflash_verification_matches_decode_across_ring_cache(
+    tmp_path, monkeypatch
+):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA is not available")
+    model_path = tmp_path / "tiny-muse-dflash"
+    draft_path = tmp_path / "tiny-muse-assistant"
+    _write_tiny_muse(model_path)
+    draft_path.mkdir()
+    (draft_path / "config.json").write_text(
+        json.dumps({"target_layer_ids": [0, 1], "block_size": 4}),
+        encoding="utf-8",
+    )
+
+    class StubDFlash:
+        block_size = 4
+
+        def __init__(self, target, path):
+            self.sequence_length = 0
+            self.drafts = [0, 0, 0]
+
+        def reset(self):
+            self.sequence_length = 0
+
+        def append_context(self, hidden, start):
+            assert start == self.sequence_length
+            assert hidden.shape[1] == 2 * 8
+            self.sequence_length += hidden.shape[0]
+
+        def propose(self, anchor):
+            return self.drafts.copy()
+
+    import warp_nn.runtime.muse.dflash as dflash_module
+
+    monkeypatch.setattr(dflash_module, "MuseDFlashDraft", StubDFlash)
+
+    def make_runner(dflash=False):
+        return MuseGlimmerRunner(
+            model_path,
+            device="cuda:0",
+            cache_capacity=12,
+            prefill_chunk_size=4,
+            use_cublas=False,
+            dflash_path=draft_path if dflash else None,
+        )
+
+    speculative = make_runner(True)
+    reference = make_runner()
+    prompt = [1, 2, 3, 4, 5]
+    assert speculative.local_cache_capacity == 6
+    for expected_accepted in range(4):
+        prompt_logits = reference.prefill(prompt)
+        speculative.prefill(prompt)
+        input_token = reference.sample_greedy(prompt_logits)
+        predictions = []
+        current = input_token
+        for _ in range(expected_accepted + 1):
+            current = reference.sample_greedy(reference.decode(current))
+            predictions.append(current)
+
+        drafts = predictions[:expected_accepted]
+        if expected_accepted < 3:
+            drafts.append((predictions[expected_accepted] + 1) % 16)
+        drafts.extend([drafts[-1]] * (3 - len(drafts)))
+        speculative.dflash.drafts = drafts
+
+        tokens, accepted = speculative.decode_dflash(input_token)
+        assert (tokens, accepted) == (predictions, expected_accepted)
+        assert speculative.sequence_length == reference.sequence_length
+        assert speculative.dflash.sequence_length == speculative.sequence_length
+        correction = predictions[-1]
+        np.testing.assert_allclose(
+            speculative.decode(correction).numpy(),
+            reference.decode(correction).numpy(),
+            atol=2.0e-2,
+            rtol=2.0e-2,
+        )
+        speculative.reset()
+        reference.reset()
+    prompt_logits = speculative.prefill(prompt)
+    input_token = speculative.sample_greedy(prompt_logits)
+    speculative.dflash.drafts = [4, 5, 6]
+    sampled = iter((4, 9))
+    prefixes = []
+
+    def sample(logits, accepted_drafts):
+        assert logits.shape == (1, 1, 16)
+        prefixes.append(accepted_drafts)
+        return next(sampled)
+
+    tokens, accepted = speculative.decode_dflash(input_token, sample=sample)
+    assert (tokens, accepted) == ([4, 9], 1)
+    assert prefixes == [[], [4]]
+    assert speculative.sequence_length == len(prompt) + 2
+    assert speculative.dflash.sequence_length == speculative.sequence_length
 
 
 @pytest.mark.parametrize("batch_size", [2, 4, 8])

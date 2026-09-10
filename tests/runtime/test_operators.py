@@ -1139,7 +1139,7 @@ def test_bfloat16_top_k_matches_host():
 def test_bfloat16_top_k_real_vocabulary_resource_shape():
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
-    vocabulary, tile_width, top_k = 248_320, 512, 32
+    vocabulary, tile_width, top_k = 248_320, 512, 64
     logits_np = (
         np.random.default_rng(52).normal(size=(1, 1, vocabulary)).astype(np.float32)
     )
@@ -1149,7 +1149,8 @@ def test_bfloat16_top_k_real_vocabulary_resource_shape():
     partial_count = (vocabulary + tile_width - 1) // tile_width
     partial_values = wp.empty(partial_count * top_k, dtype=wp.float32, device="cuda:0")
     partial_tokens = wp.empty(partial_count * top_k, dtype=wp.int32, device="cuda:0")
-    merge_count = (partial_count + 15) // 16
+    merge_groups = min(16, tile_width // top_k)
+    merge_count = (partial_count + merge_groups - 1) // merge_groups
     merge_values = wp.empty(merge_count * top_k, dtype=wp.float32, device="cuda:0")
     merge_tokens = wp.empty(merge_count * top_k, dtype=wp.int32, device="cuda:0")
     partial, merge = _get_top_k_kernels(tile_width, top_k, wp.bfloat16)
@@ -1164,7 +1165,7 @@ def test_bfloat16_top_k_real_vocabulary_resource_shape():
     target_values, target_tokens = merge_values, merge_tokens
     input_groups = partial_count
     while input_groups > 1:
-        output_groups = (input_groups + 15) // 16
+        output_groups = (input_groups + merge_groups - 1) // merge_groups
         wp.launch_tiled(
             merge,
             dim=output_groups,

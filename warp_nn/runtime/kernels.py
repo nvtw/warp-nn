@@ -1526,6 +1526,35 @@ def _append_circular_head_cache_kernel(
 
 
 @wp.kernel(enable_backward=False, module="unique")
+def _shift_append_heads_kernel(
+    cache: wp.array4d(dtype=wp.bfloat16),
+    appended: wp.array4d(dtype=wp.bfloat16),
+    output: wp.array4d(dtype=wp.bfloat16),
+):
+    """Shift a fixed attention window and append new head-major rows."""
+    batch, head, sequence, column = wp.tid()
+    source = sequence + appended.shape[2]
+    if source < cache.shape[2]:
+        output[batch, head, sequence, column] = cache[batch, head, source, column]
+    else:
+        output[batch, head, sequence, column] = appended[
+            batch, head, source - cache.shape[2], column
+        ]
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _shift_valid_kernel(
+    valid: wp.array2d(dtype=wp.bool),
+    output: wp.array2d(dtype=wp.bool),
+    appended: int,
+):
+    """Shift validity for a fixed attention window and mark appended rows valid."""
+    batch, sequence = wp.tid()
+    source = sequence + appended
+    output[batch, sequence] = valid[batch, source] if source < output.shape[1] else True
+
+
+@wp.kernel(enable_backward=False, module="unique")
 def _sigmoid_gate_kernel(
     x: wp.array2d[Any], gate: wp.array2d[Any], output: wp.array2d[Any]
 ):
@@ -4575,7 +4604,7 @@ def _get_top_k_kernels(tile_width: int, top_k: int, dtype: type):
     """Build an exact hierarchical top-k over the final vocabulary row."""
     TILE_WIDTH = tile_width
     TOP_K = top_k
-    MERGE_GROUPS = 16
+    MERGE_GROUPS = min(16, tile_width // top_k)
     MERGE_CANDIDATES = MERGE_GROUPS * top_k
     DTYPE = dtype
 

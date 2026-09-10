@@ -9,6 +9,7 @@ Download the wanted Hugging Face repository to the standard local model root::
     hf download esatapedico/Qwen3.8-27B-NVFP4-MTP-GGUF --local-dir ~/Models/warp-nn/Qwen/Qwen3.8-27B-NVFP4-MTP-GGUF
     hf download z-lab/Qwen3.8-27B-DFlash2
     hf download unsloth/Muse-Glimmer-30B-GGUF --local-dir ~/Models/warp-nn/unsloth/Muse-Glimmer-30B-GGUF
+    hf download meta-models/Muse-Glimmer-30B-assistant
     hf download nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 --local-dir ~/Models/warp-nn/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
     hf download nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4 --local-dir ~/Models/warp-nn/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4
 
@@ -21,6 +22,10 @@ Run the locally installed BF16 Qwen3.8 model with sampled DFlash2 acceleration::
 Use the checkpoint's embedded MTP head for speculative decoding::
 
     .venv/bin/python examples/qwen_chat.py /home/twidmer/.lmstudio/models/unsloth/Qwen3.8-27B-GGUF --mtp --reasoning-effort medium --cache-capacity 262144 --prefill-chunk-size 2048
+
+Run Muse Glimmer BF16 with its official DFlash assistant::
+
+    .venv/bin/python examples/qwen_chat.py /home/twidmer/.lmstudio/models/unsloth/Muse-Glimmer-30B-GGUF --dflash-path /home/twidmer/.cache/huggingface/hub/models--meta-models--Muse-Glimmer-30B-assistant/snapshots/e8192f3a8f617f74be2ce220360c89ef4789f39f --reasoning-effort medium --cache-capacity 131072 --prefill-chunk-size 2048
 
 The DFlash2 draft is published at
 https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2. The default Qwen3.8 sampling
@@ -217,9 +222,7 @@ def _generate(
         if use_dflash and remaining >= runner.dflash.block_size:
             pending_tokens.extend(runner.decode_dflash(token_id, sample=sample)[0])
         elif use_mtp and remaining >= 3:
-            pending_tokens.extend(
-                runner.decode_speculative(token_id, sample=sample)[0]
-            )
+            pending_tokens.extend(runner.decode_speculative(token_id, sample=sample)[0])
         else:
             logits = runner.decode(token_id)
     if pending_tokens or repetitive:
@@ -404,7 +407,7 @@ def main():
     )
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--top-p", type=float)
-    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--top-k", type=int)
     parser.add_argument("--presence-penalty", type=float)
     parser.add_argument("--seed", type=int)
     parser.add_argument(
@@ -449,12 +452,17 @@ def main():
         args.temperature if args.temperature is not None else (1.0 if thinking else 0.7)
     )
     top_p = args.top_p if args.top_p is not None else (0.95 if thinking else 0.8)
+    top_k = (
+        args.top_k
+        if args.top_k is not None
+        else getattr(tokenizer, "default_top_k", 20)
+    )
     presence_penalty = (
         args.presence_penalty
         if args.presence_penalty is not None
         else (0.0 if thinking else 1.5)
     )
-    if temperature < 0.0 or not 0.0 < top_p <= 1.0 or args.top_k < 0:
+    if temperature < 0.0 or not 0.0 < top_p <= 1.0 or top_k < 0:
         parser.error("invalid sampling parameters")
     if not -2.0 <= presence_penalty <= 2.0:
         parser.error("--presence-penalty must be between -2 and 2")
@@ -719,7 +727,7 @@ def main():
                     cached_ids,
                     tool_marker=tokenizer.tool_call_start if coding_tools else None,
                     top_p=top_p,
-                    top_k=args.top_k,
+                    top_k=top_k,
                     presence_penalty=presence_penalty,
                     rng=rng,
                     cancelled=cancel.cancelled.is_set,
