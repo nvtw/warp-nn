@@ -74,7 +74,7 @@ from warp_nn.runtime.quantization import (
 from warp_nn.runtime.operators import resolve_rope_parameters, rotary_cache_values
 from warp_nn.runtime.formats.safetensors import SafeTensorArchive
 from warp_nn.utils.device import parse_device
-from warp_nn.runtime.autoregressive import AutoregressiveRunner
+from warp_nn.runtime.autoregressive import AutoregressiveRunner, _PlanMemoryError
 
 
 _MTP_LONG_CONTEXT = 49152
@@ -1804,7 +1804,11 @@ class Qwen35Runner(AutoregressiveRunner):
     def _mtp_plan_for_rows(self, rows: int) -> _Qwen35Plan:
         plan = self._mtp_prefill_plans.get(rows)
         if plan is None:
-            self._require_lazy_plan_headroom(rows)
+            decode_bytes = self._mtp_decode_plan._owned_storage_bytes + (
+                self._mtp_decode_plan._pool_storage_bytes
+            )
+            required = min(self._lazy_plan_allocation_bound(), rows * decode_bytes)
+            self._require_lazy_plan_headroom(rows, required)
             plan = self._mtp_prefill_plans[rows] = _Qwen35Plan(
                 self, rows, mtp=True, output_logits=False
             )
@@ -1823,6 +1827,28 @@ class Qwen35Runner(AutoregressiveRunner):
         output = self._run(plan, plan.attention_partitions)
         self._mtp_sequence_length = end
         return output
+
+    def _stage_mtp_rows(self, token_ids, target_hidden: wp.array, start: int) -> None:
+        rows = len(token_ids)
+        try:
+            plan = self._mtp_plan_for_rows(rows)
+        except _PlanMemoryError:
+            plan = self._mtp_decode_plan
+            for offset, token in enumerate(token_ids):
+                wp.copy(
+                    plan.target_hidden.flatten(),
+                    target_hidden.flatten(),
+                    src_offset=offset * self.hidden_size,
+                    count=self.hidden_size,
+                )
+                self._stage_mtp_plan(plan, [token], start + offset)
+            return
+        wp.copy(
+            plan.target_hidden.flatten(),
+            target_hidden.flatten(),
+            count=rows * self.hidden_size,
+        )
+        self._stage_mtp_plan(plan, token_ids, start)
 
     def _sync_mtp(self, token_ids, target_plan: _Qwen35Plan) -> None:
         rows = len(token_ids)
@@ -1997,13 +2023,7 @@ class Qwen35Runner(AutoregressiveRunner):
             self._rollback_verification(verifier, base, valid)
 
         if accepted:
-            correction_plan = self._mtp_plan_for_rows(accepted)
-            wp.copy(
-                correction_plan.target_hidden.flatten(),
-                target_hidden.flatten(),
-                count=accepted * self.hidden_size,
-            )
-            self._stage_mtp_plan(correction_plan, inputs[1:valid], base + 1)
+            self._stage_mtp_rows(inputs[1:valid], target_hidden, base + 1)
         self._mtp_sequence_length = base + valid
         wp.copy(
             self._mtp_carry_hidden.flatten(),

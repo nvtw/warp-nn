@@ -593,6 +593,23 @@ def test_qwen35_mtp_uses_compatible_checkpoint_weights(tmp_path, monkeypatch):
         patch.setattr(alternate, "_require_lazy_plan_headroom", deny_new_plan)
         logits = alternate.prefill([1, 2, 3])
     assert alternate.sequence_length == 3
+
+    headroom_checks = []
+    require_headroom = alternate._require_lazy_plan_headroom
+
+    def record_headroom(rows, required_bytes=None):
+        headroom_checks.append((rows, required_bytes))
+        require_headroom(rows, required_bytes)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(alternate, "_require_lazy_plan_headroom", record_headroom)
+        alternate._mtp_plan_for_rows(2)
+    decode_bytes = alternate._mtp_decode_plan._owned_storage_bytes + (
+        alternate._mtp_decode_plan._pool_storage_bytes
+    )
+    assert headroom_checks == [
+        (2, min(alternate._lazy_plan_allocation_bound(), 2 * decode_bytes))
+    ]
     tokens, accepted = alternate.decode_speculative(alternate.sample_greedy(logits))
     assert len(tokens) == accepted + 1
 
@@ -737,7 +754,9 @@ def test_qwen35_dflash_rejection_rollback_matches_decode_and_replays(
     ]
 
 
-def test_qwen35_mtp_rejection_rollback_matches_decode_and_replays(tmp_path):
+def test_qwen35_mtp_rejection_rollback_matches_decode_and_replays(
+    tmp_path, monkeypatch
+):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is not available")
     model_path = tmp_path / "tiny-qwen35-mtp"
@@ -774,7 +793,19 @@ def test_qwen35_mtp_rejection_rollback_matches_decode_and_replays(tmp_path):
         drafts = iter(forced_drafts)
         speculative.sample_greedy = lambda _logits: next(drafts)
 
-        tokens, accepted = speculative.decode_speculative(input_token, draft_tokens=3)
+        with monkeypatch.context() as patch:
+            if expected_accepted == 2:
+                mtp_plan_for_rows = speculative._mtp_plan_for_rows
+
+                def deny_two_rows(rows):
+                    if rows == 2:
+                        raise _PlanMemoryError("test headroom denial")
+                    return mtp_plan_for_rows(rows)
+
+                patch.setattr(speculative, "_mtp_plan_for_rows", deny_two_rows)
+            tokens, accepted = speculative.decode_speculative(
+                input_token, draft_tokens=3
+            )
         assert accepted == expected_accepted
         assert tokens == predictions
         assert speculative.sequence_length == reference.sequence_length
