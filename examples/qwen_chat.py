@@ -290,7 +290,11 @@ def main():
         help="Directory containing a supported local model",
     )
     parser.add_argument("--system", help="Optional system message")
-    parser.add_argument("--max-new-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        help="Optional response limit; defaults to the remaining KV-cache capacity",
+    )
     parser.add_argument("--cache-capacity", type=int, default=1024)
     parser.add_argument("--prefill-chunk-size", type=int, default=256)
     parser.add_argument(
@@ -373,6 +377,8 @@ def main():
         parser.error("invalid sampling parameters")
     if not -2.0 <= presence_penalty <= 2.0:
         parser.error("--presence-penalty must be between -2 and 2")
+    if args.max_new_tokens is not None and args.max_new_tokens < 1:
+        parser.error("--max-new-tokens must be positive")
     if args.dflash_path is not None and temperature > 0.0:
         parser.error("--dflash-path requires --temperature 0")
     if args.dflash_path is not None and multimodal:
@@ -615,8 +621,11 @@ def main():
                     logits = runner.prefill(token_ids)
                 cached_ids = list(token_ids)
                 cached_media_count = media_count
-                generation_limit = min(
-                    args.max_new_tokens, args.cache_capacity - len(token_ids)
+                cache_limit = args.cache_capacity - len(token_ids)
+                generation_limit = (
+                    cache_limit
+                    if args.max_new_tokens is None
+                    else min(args.max_new_tokens, cache_limit)
                 )
                 generated, response, calls = _generate(
                     runner,
@@ -647,8 +656,13 @@ def main():
                     print("[Cancelled.]")
                     break
                 if not generated or not is_eos_token(tokenizer, generated[-1]):
+                    limit_option = (
+                        "--cache-capacity"
+                        if generation_limit == cache_limit
+                        else "--max-new-tokens"
+                    )
                     print(
-                        f"[Stopped at the {generation_limit}-token limit; use --max-new-tokens or /clear.]"
+                        f"[Stopped at the {generation_limit}-token limit; increase {limit_option} or use /clear.]"
                     )
                 if not calls:
                     history_response = tokenizer.generation_prefix(thinking) + response
