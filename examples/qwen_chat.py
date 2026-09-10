@@ -134,8 +134,9 @@ def _generate(
     repetitive = False
     reasoning_tail = ""
     reasoning_complete = not hide_reasoning
+    thinking_status = hide_reasoning and sys.stdout.isatty()
     if hide_reasoning:
-        print("Thinking…", flush=True)
+        print("Thinking…", end="" if thinking_status else "\n", flush=True)
     stream_filter = (
         tokenizer.stream_filter() if hasattr(tokenizer, "stream_filter") else None
     )
@@ -177,8 +178,12 @@ def _generate(
             if not marker:
                 reasoning_tail = reasoning_tail[-7:]
                 text = ""
+                if thinking_status and len(generated) % 32 == 0:
+                    print(f"\rThinking… {len(generated)} tokens", end="", flush=True)
             else:
                 reasoning_complete = True
+                if thinking_status:
+                    print("\r\033[2K", end="", flush=True)
                 text = text.lstrip()
         if text:
             if tool_started:

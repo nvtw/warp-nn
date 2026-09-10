@@ -3,6 +3,7 @@
 
 import codecs
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -481,6 +482,31 @@ def test_console_generation_hides_reasoning(capsys):
 
     assert generated == [1, 2, 0]
     assert capsys.readouterr().out == "Thinking…\nFinal answer"
+
+
+def test_console_generation_reports_hidden_reasoning_progress(capsys, monkeypatch):
+    class Runner:
+        def sample_greedy(self, logits):
+            return logits
+
+        def decode(self, token_id):
+            return 0 if token_id == 33 else token_id + 1
+
+    class Tokenizer:
+        eos_token_id = 0
+
+        def token_bytes(self, token_id, skip_special_tokens=False):
+            return b"</think>Done" if token_id == 33 else b"x"
+
+        def decode(self, token_ids, skip_special_tokens=False):
+            return ""
+
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    _generate(Runner(), Tokenizer(), 1, 40, 0.0, [], hide_reasoning=True)
+
+    assert capsys.readouterr().out == (
+        "Thinking…\rThinking… 32 tokens\r\033[2KDone"
+    )
 
 
 def test_console_generation_stops_exact_repetition(capsys):
