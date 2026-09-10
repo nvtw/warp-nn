@@ -484,6 +484,42 @@ def test_console_generation_hides_reasoning(capsys):
     assert capsys.readouterr().out == "Thinking…\nFinal answer"
 
 
+def test_console_generation_streams_channel_filtered_answer(capsys):
+    class Runner:
+        def sample_greedy(self, logits):
+            return logits
+
+        def decode(self, token_id):
+            return {1: 2, 2: 0}[token_id]
+
+    class StreamFilter:
+        def feed(self, text, final=False):
+            del final
+            return "" if text == "private reasoning" else text
+
+    class Tokenizer:
+        eos_token_id = 0
+        pieces = {1: b"private reasoning", 2: b"Final answer"}
+
+        def stream_filter(self):
+            return StreamFilter()
+
+        def token_bytes(self, token_id, skip_special_tokens=False):
+            return self.pieces.get(token_id, b"")
+
+        def decode(self, token_ids, skip_special_tokens=False):
+            del token_ids, skip_special_tokens
+            return "Final answer"
+
+    generated, text, _ = _generate(
+        Runner(), Tokenizer(), 1, 4, 0.0, [], hide_reasoning=True
+    )
+
+    assert generated == [1, 2, 0]
+    assert text == "Final answer"
+    assert capsys.readouterr().out == "Thinking…\nFinal answer"
+
+
 def test_console_generation_reports_hidden_reasoning_progress(capsys, monkeypatch):
     class Runner:
         def sample_greedy(self, logits):

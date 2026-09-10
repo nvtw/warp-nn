@@ -178,18 +178,34 @@ def _generate(
         if stream_filter:
             text = stream_filter.feed(text)
         if not reasoning_complete:
-            reasoning_tail += text
-            _, marker, text = reasoning_tail.partition("</think>")
-            if not marker:
-                reasoning_tail = reasoning_tail[-7:]
-                text = ""
-                if thinking_status and len(generated) % 32 == 0:
-                    print(f"\rThinking… {len(generated)} tokens", end="", flush=True)
+            if stream_filter is not None:
+                if text:
+                    reasoning_complete = True
+                    if thinking_status:
+                        print("\r\033[2K", end="", flush=True)
+                elif thinking_status and len(generated) % 32 == 0:
+                    print(
+                        f"\rThinking… {len(generated)} tokens",
+                        end="",
+                        flush=True,
+                    )
             else:
-                reasoning_complete = True
-                if thinking_status:
-                    print("\r\033[2K", end="", flush=True)
-                text = text.lstrip()
+                reasoning_tail += text
+                _, marker, text = reasoning_tail.partition("</think>")
+                if not marker:
+                    reasoning_tail = reasoning_tail[-7:]
+                    text = ""
+                    if thinking_status and len(generated) % 32 == 0:
+                        print(
+                            f"\rThinking… {len(generated)} tokens",
+                            end="",
+                            flush=True,
+                        )
+                else:
+                    reasoning_complete = True
+                    if thinking_status:
+                        print("\r\033[2K", end="", flush=True)
+                    text = text.lstrip()
         if text:
             if tool_started:
                 pending += text
