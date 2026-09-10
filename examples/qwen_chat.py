@@ -55,6 +55,10 @@ from warp_nn.runtime.chat import (
 from warp_nn.runtime.services.coding_tools import CodingTools
 
 
+_REPETITION_NGRAM = 64
+_REPETITION_LIMIT = 3
+
+
 class _EscapeMonitor:
     """Watch Esc without blocking model generation or tool execution."""
 
@@ -126,6 +130,8 @@ def _generate(
     pending = ""
     tool_started = False
     pending_tokens = []
+    seen_ngrams = {}
+    repetitive = False
     reasoning_tail = ""
     reasoning_complete = not hide_reasoning
     if hide_reasoning:
@@ -152,6 +158,14 @@ def _generate(
         generated.append(token_id)
         if is_eos_token(tokenizer, token_id):
             break
+        if len(generated) >= _REPETITION_NGRAM:
+            ngram = tuple(generated[-_REPETITION_NGRAM:])
+            occurrences = seen_ngrams.get(ngram, 0) + 1
+            seen_ngrams[ngram] = occurrences
+            if occurrences >= _REPETITION_LIMIT:
+                generated.pop()
+                repetitive = True
+                break
         text = decoder.decode(
             tokenizer.token_bytes(token_id, skip_special_tokens=stream_filter is None)
         )
@@ -203,7 +217,7 @@ def _generate(
             )
         else:
             logits = runner.decode(token_id)
-    if pending_tokens:
+    if pending_tokens or repetitive:
         cached_ids.clear()
     tail = decoder.decode(b"", final=True)
     if stream_filter:
@@ -221,6 +235,8 @@ def _generate(
     )
     if pending and not calls:
         print(pending, end="", flush=True)
+    if repetitive:
+        print("\n[Stopped repetitive output; retry the request.]", flush=True)
     return generated, text, calls
 
 
@@ -719,7 +735,9 @@ def main():
                     save_session()
                     print("[Cancelled.]")
                     break
-                if not generated or not is_eos_token(tokenizer, generated[-1]):
+                if len(generated) == generation_limit and not is_eos_token(
+                    tokenizer, generated[-1]
+                ):
                     limit_option = (
                         "--cache-capacity"
                         if generation_limit == cache_limit

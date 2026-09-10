@@ -483,6 +483,33 @@ def test_console_generation_hides_reasoning(capsys):
     assert capsys.readouterr().out == "Thinking…\nFinal answer"
 
 
+def test_console_generation_stops_exact_repetition(capsys):
+    class Runner:
+        def sample_greedy(self, logits):
+            return logits
+
+        def decode(self, token_id):
+            return token_id % 64 + 1
+
+    class Tokenizer:
+        eos_token_id = 0
+
+        def token_bytes(self, token_id, skip_special_tokens=False):
+            return bytes((token_id,))
+
+        def decode(self, token_ids, skip_special_tokens=False):
+            return bytes(token_ids).decode("latin1")
+
+    cached_ids = []
+    generated, _, _ = _generate(
+        Runner(), Tokenizer(), 1, 300, 0.0, cached_ids
+    )
+
+    assert len(generated) == 191
+    assert cached_ids == []
+    assert "[Stopped repetitive output; retry the request.]" in capsys.readouterr().out
+
+
 def test_qwen3_json_tool_dialect(tmp_path):
     path = tmp_path / "tokenizer.json"
     _write_tokenizer(path)
