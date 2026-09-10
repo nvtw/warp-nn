@@ -731,18 +731,15 @@ def main():
                     chat_encoder.extend_raw(generated)
                 print()
                 if cancel.cancelled.is_set():
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": tokenizer.generation_prefix(thinking) + response,
-                        }
-                    )
-                    save_session()
+                    cached_ids.clear()
+                    chat_encoder.reset()
                     print("[Cancelled.]")
                     break
-                if len(generated) == generation_limit and not is_eos_token(
-                    tokenizer, generated[-1]
-                ):
+                completed = bool(generated) and is_eos_token(tokenizer, generated[-1])
+                if not completed:
+                    cached_ids.clear()
+                    chat_encoder.reset()
+                if len(generated) == generation_limit and not completed:
                     limit_option = (
                         "--cache-capacity"
                         if generation_limit == cache_limit
@@ -751,11 +748,12 @@ def main():
                     print(
                         f"[Stopped at the {generation_limit}-token limit; increase {limit_option} or use /clear.]"
                     )
+                if not completed:
+                    break
                 if not calls:
                     history_response = tokenizer.generation_prefix(thinking) + response
                     message = {"role": "assistant", "content": history_response}
-                    if generated and is_eos_token(tokenizer, generated[-1]):
-                        message["_raw_token_ids"] = list(generated)
+                    message["_raw_token_ids"] = list(generated)
                     messages.append(message)
                     save_session()
                     break
@@ -779,8 +777,7 @@ def main():
                     "content": history_response,
                     "tool_calls": tool_calls,
                 }
-                if generated and is_eos_token(tokenizer, generated[-1]):
-                    message["_raw_token_ids"] = list(generated)
+                message["_raw_token_ids"] = list(generated)
                 messages.append(message)
                 save_session()
                 for call, tool_call in zip(calls, tool_calls):
