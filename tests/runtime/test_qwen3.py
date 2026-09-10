@@ -372,6 +372,49 @@ def test_console_generation_streams_text_and_hides_tool_markup(capsys):
     assert (generated, text, calls, cached_ids) == ([], "", [], [])
 
 
+def test_console_generation_uses_dflash_batches(capsys):
+    class Runner:
+        class Draft:
+            block_size = 4
+
+        dflash = Draft()
+
+        def __init__(self):
+            self.decoded = []
+
+        def sample_greedy(self, logits):
+            return logits
+
+        def decode_dflash(self, token_id):
+            assert token_id == 1
+            return [2, 3, 4], 2
+
+        def decode(self, token_id):
+            self.decoded.append(token_id)
+            return 0
+
+    class Tokenizer:
+        eos_token_id = 0
+
+        def token_bytes(self, token_id, skip_special_tokens=False):
+            return str(token_id).encode()
+
+        def decode(self, token_ids, skip_special_tokens=False):
+            return "".join(map(str, token_ids))
+
+    runner = Runner()
+    cached_ids = []
+    generated, text, calls = _generate(
+        runner, Tokenizer(), 1, 5, 0.0, cached_ids, use_dflash=True
+    )
+
+    assert capsys.readouterr().out == "1234"
+    assert generated == [1, 2, 3, 4, 0]
+    assert cached_ids == [1, 2, 3, 4]
+    assert runner.decoded == [4]
+    assert (text, calls) == ("12340", [])
+
+
 def test_qwen3_json_tool_dialect(tmp_path):
     path = tmp_path / "tokenizer.json"
     _write_tokenizer(path)

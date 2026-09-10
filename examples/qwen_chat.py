@@ -104,32 +104,35 @@ def _generate(
     presence_penalty=0.0,
     rng=None,
     cancelled=None,
+    use_dflash=False,
 ):
     generated = []
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     pending = ""
     tool_started = False
+    pending_tokens = []
     stream_filter = (
         tokenizer.stream_filter() if hasattr(tokenizer, "stream_filter") else None
     )
     for _ in range(limit):
         if cancelled and cancelled():
             break
-        token_id = sample_runner_token(
-            runner,
-            logits,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            presence_penalty=presence_penalty,
-            previous_tokens=generated,
-            rng=rng,
-        )
+        if pending_tokens:
+            token_id = pending_tokens.pop(0)
+        else:
+            token_id = sample_runner_token(
+                runner,
+                logits,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                presence_penalty=presence_penalty,
+                previous_tokens=generated,
+                rng=rng,
+            )
         generated.append(token_id)
         if is_eos_token(tokenizer, token_id):
             break
-        logits = runner.decode(token_id)
-        cached_ids.append(token_id)
         text = decoder.decode(
             tokenizer.token_bytes(token_id, skip_special_tokens=stream_filter is None)
         )
@@ -142,6 +145,16 @@ def _generate(
             print(text, end="", flush=True)
         else:
             print(text, end="", flush=True)
+        cached_ids.append(token_id)
+        if pending_tokens:
+            continue
+        remaining = limit - len(generated)
+        if use_dflash and remaining >= runner.dflash.block_size:
+            pending_tokens.extend(runner.decode_dflash(token_id)[0])
+        else:
+            logits = runner.decode(token_id)
+    if pending_tokens:
+        cached_ids.clear()
     tail = decoder.decode(b"", final=True)
     if stream_filter:
         tail = stream_filter.feed(tail, final=True)
@@ -281,6 +294,11 @@ def main():
     parser.add_argument("--cache-capacity", type=int, default=1024)
     parser.add_argument("--prefill-chunk-size", type=int, default=256)
     parser.add_argument(
+        "--dflash-path",
+        type=Path,
+        help="Qwen3.8 DFlash2 draft directory; requires greedy decoding",
+    )
+    parser.add_argument(
         "--weight-quantization",
         choices=("q8_0",),
         help="Opt-in projection-weight compression during model loading",
@@ -355,6 +373,10 @@ def main():
         parser.error("invalid sampling parameters")
     if not -2.0 <= presence_penalty <= 2.0:
         parser.error("--presence-penalty must be between -2 and 2")
+    if args.dflash_path is not None and temperature > 0.0:
+        parser.error("--dflash-path requires --temperature 0")
+    if args.dflash_path is not None and multimodal:
+        parser.error("--dflash-path does not support multimodal input")
     if args.yarn_factor is not None and (not args.yarn or args.yarn_factor < 1.0):
         parser.error("--yarn-factor requires --yarn and must be at least 1")
     if args.reasoning_effort and not thinking:
@@ -371,6 +393,8 @@ def main():
     runner_options = {"rope_scaling": rope_scaling} if rope_scaling else {}
     if args.weight_quantization:
         runner_options["weight_quantization"] = args.weight_quantization
+    if args.dflash_path is not None:
+        runner_options["dflash_path"] = args.dflash_path
     if args.vision_path is not None:
         runner_options["vision_path"] = args.vision_path
     runner = create_text_runner(
@@ -607,6 +631,7 @@ def main():
                     presence_penalty=presence_penalty,
                     rng=rng,
                     cancelled=cancel.cancelled.is_set,
+                    use_dflash=args.dflash_path is not None,
                 )
                 if processor is None:
                     chat_encoder.extend_raw(generated)
