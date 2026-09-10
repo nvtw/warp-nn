@@ -86,6 +86,16 @@ def _verification_attention_partitions(head_size: int, sequence_length: int) -> 
     return _decode_attention_partitions(head_size)
 
 
+def _dflash_verification_lm_head(lm_head, dflash):
+    if (
+        dflash is not None
+        and isinstance(lm_head, PackedQuantizedTensor)
+        and lm_head.format == "Q3_K"
+    ):
+        return dflash.weights["lm_head.weight"]
+    return lm_head
+
+
 def _weight_names(config: dict) -> list[str]:
     names = [
         "model.language_model.embed_tokens.weight",
@@ -380,6 +390,10 @@ class _Qwen35Plan:
         self.dtype = runner.dtype
         self.config = runner.config
         self.tensors = dict(runner.weights)
+        if all_logits:
+            self.tensors["lm_head.weight"] = _dflash_verification_lm_head(
+                self.tensors["lm_head.weight"], getattr(runner, "dflash", None)
+            )
         self.shapes = {name: tuple(value.shape) for name, value in self.tensors.items()}
         self.input_ids = wp.zeros((1, rows), dtype=wp.int64, device=self.device)
         self.position_ids = wp.zeros((1, rows), dtype=wp.int64, device=self.device)

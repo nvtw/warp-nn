@@ -11,13 +11,27 @@ import warp as wp
 from tests.utilities import is_device_available, write_safetensors
 from warp_nn.runtime.kernels import _get_small_batch_grouped_linear_kernel
 from warp_nn.runtime.autoregressive import _PlanMemoryError, _union_storage_bytes
+from warp_nn.runtime.formats.gguf import PackedQuantizedTensor
 from warp_nn.runtime.qwen.qwen35 import (
     Qwen35Runner,
+    _dflash_verification_lm_head,
     _mtp_weight_names,
     _verification_attention_partitions,
     _validate_config,
     _weight_names,
 )
+
+
+def test_qwen35_dflash_reuses_dequantized_q3_k_lm_head_for_verification():
+    q3_head = PackedQuantizedTensor(None, (1, 256), "Q3_K", 256, 110)
+    replacement = object()
+
+    class Draft:
+        weights = {"lm_head.weight": replacement}
+
+    assert _dflash_verification_lm_head(q3_head, Draft()) is replacement
+    assert _dflash_verification_lm_head(q3_head, None) is q3_head
+    assert _dflash_verification_lm_head(object(), Draft()) is not replacement
 
 
 def _bfloat16_bytes(values: np.ndarray) -> bytes:
