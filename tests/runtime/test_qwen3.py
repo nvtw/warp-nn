@@ -416,6 +416,44 @@ def test_console_generation_uses_dflash_batches(capsys):
     assert (text, calls) == ("12340", [])
 
 
+def test_console_generation_uses_embedded_mtp(capsys):
+    class Runner:
+        def __init__(self):
+            self.decoded = []
+
+        def sample_greedy(self, logits):
+            return logits
+
+        def decode_speculative(self, token_id):
+            assert token_id == 1
+            return [2, 3], 1
+
+        def decode(self, token_id):
+            self.decoded.append(token_id)
+            return 0
+
+    class Tokenizer:
+        eos_token_id = 0
+
+        def token_bytes(self, token_id, skip_special_tokens=False):
+            return str(token_id).encode()
+
+        def decode(self, token_ids, skip_special_tokens=False):
+            return "".join(map(str, token_ids))
+
+    runner = Runner()
+    cached_ids = []
+    generated, text, calls = _generate(
+        runner, Tokenizer(), 1, 4, 0.0, cached_ids, use_mtp=True
+    )
+
+    assert capsys.readouterr().out == "123"
+    assert generated == [1, 2, 3, 0]
+    assert cached_ids == [1, 2, 3]
+    assert runner.decoded == [3]
+    assert (text, calls) == ("1230", [])
+
+
 def test_console_generation_hides_reasoning(capsys):
     class Runner:
         def sample_greedy(self, logits):

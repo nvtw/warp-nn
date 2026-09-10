@@ -18,6 +18,10 @@ Run the locally installed BF16 Qwen3.8 model with sampled DFlash2 acceleration::
 
     .venv/bin/python examples/qwen_chat.py /home/twidmer/.lmstudio/models/unsloth/Qwen3.8-27B-GGUF --dflash-path /home/twidmer/.cache/huggingface/hub/models--z-lab--Qwen3.8-27B-DFlash2/snapshots/50307d4c4cde6860d4eee73e2547cd786fe8e8a4 --reasoning-effort medium --cache-capacity 262144 --prefill-chunk-size 2048
 
+Use the checkpoint's embedded MTP head for greedy speculative decoding::
+
+    .venv/bin/python examples/qwen_chat.py /home/twidmer/.lmstudio/models/unsloth/Qwen3.8-27B-GGUF --mtp --temperature 0 --reasoning-effort medium --cache-capacity 262144 --prefill-chunk-size 2048
+
 The DFlash2 draft is published at
 https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2. The default Qwen3.8 sampling
 policy follows its official model card; medium reasoning avoids the xhigh
@@ -114,6 +118,7 @@ def _generate(
     rng=None,
     cancelled=None,
     use_dflash=False,
+    use_mtp=False,
     hide_reasoning=False,
 ):
     generated = []
@@ -192,6 +197,8 @@ def _generate(
                     )
 
             pending_tokens.extend(runner.decode_dflash(token_id, sample=sample)[0])
+        elif use_mtp and temperature <= 0.0 and remaining >= 3:
+            pending_tokens.extend(runner.decode_speculative(token_id)[0])
         else:
             logits = runner.decode(token_id)
     if pending_tokens:
@@ -338,10 +345,16 @@ def main():
     )
     parser.add_argument("--cache-capacity", type=int, default=1024)
     parser.add_argument("--prefill-chunk-size", type=int, default=256)
-    parser.add_argument(
+    speculation = parser.add_mutually_exclusive_group()
+    speculation.add_argument(
         "--dflash-path",
         type=Path,
         help="Qwen3.8 DFlash2 draft directory",
+    )
+    speculation.add_argument(
+        "--mtp",
+        action="store_true",
+        help="Enable Qwen's embedded MTP speculative decoder (greedy generation only)",
     )
     parser.add_argument(
         "--weight-quantization",
@@ -426,10 +439,14 @@ def main():
         parser.error("--max-new-tokens must be positive")
     if args.dflash_path is not None and multimodal:
         parser.error("--dflash-path does not support multimodal input")
+    if args.mtp and multimodal:
+        parser.error("--mtp does not support multimodal input")
     if args.yarn_factor is not None and (not args.yarn or args.yarn_factor < 1.0):
         parser.error("--yarn-factor requires --yarn and must be at least 1")
     if args.reasoning_effort and not thinking:
         parser.error("--reasoning-effort requires thinking mode")
+    if args.mtp and temperature > 0.0:
+        parser.error("--mtp currently requires --temperature 0")
     if args.reasoning_effort and not tokenizer.supports_reasoning_effort:
         parser.error("this model's chat template does not support --reasoning-effort")
     rng = np.random.default_rng(args.seed)
@@ -444,6 +461,8 @@ def main():
         runner_options["weight_quantization"] = args.weight_quantization
     if args.dflash_path is not None:
         runner_options["dflash_path"] = args.dflash_path
+    if args.mtp:
+        runner_options["use_mtp"] = True
     if args.vision_path is not None:
         runner_options["vision_path"] = args.vision_path
     runner = create_text_runner(
@@ -684,6 +703,7 @@ def main():
                     rng=rng,
                     cancelled=cancel.cancelled.is_set,
                     use_dflash=args.dflash_path is not None,
+                    use_mtp=args.mtp,
                     hide_reasoning=thinking,
                 )
                 if processor is None:
