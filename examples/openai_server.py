@@ -118,7 +118,11 @@ def main():
     parser.add_argument(
         "--thinking", action=argparse.BooleanOptionalAction, default=None
     )
-    parser.add_argument("--reasoning-effort", choices=("low", "medium", "xhigh"))
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("low", "medium", "xhigh"),
+        help="Qwen3.8 thinking depth (default: medium)",
+    )
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--top-p", type=float)
     parser.add_argument("--top-k", type=int, default=20)

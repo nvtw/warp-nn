@@ -7,12 +7,21 @@ Download the wanted Hugging Face repository to the standard local model root::
 
     hf download unsloth/Qwen3.8-27B-GGUF --include '*BF16*.gguf' mmproj-F16.gguf --local-dir ~/Models/warp-nn/Qwen/Qwen3.8-27B-GGUF
     hf download esatapedico/Qwen3.8-27B-NVFP4-MTP-GGUF --local-dir ~/Models/warp-nn/Qwen/Qwen3.8-27B-NVFP4-MTP-GGUF
+    hf download z-lab/Qwen3.8-27B-DFlash2
     hf download unsloth/Muse-Glimmer-30B-GGUF --local-dir ~/Models/warp-nn/unsloth/Muse-Glimmer-30B-GGUF
     hf download nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 --local-dir ~/Models/warp-nn/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
     hf download nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4 --local-dir ~/Models/warp-nn/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4
 
 Qwen vision uses ``mmproj-F16.gguf`` via ``--vision-path``; Nemotron Omni's
 image/audio/video encoders are included and enabled with ``--multimodal``.
+Run the locally installed BF16 Qwen3.8 model with sampled DFlash2 acceleration::
+
+    .venv/bin/python examples/qwen_chat.py /home/twidmer/.lmstudio/models/unsloth/Qwen3.8-27B-GGUF --dflash-path /home/twidmer/.cache/huggingface/hub/models--z-lab--Qwen3.8-27B-DFlash2/snapshots/50307d4c4cde6860d4eee73e2547cd786fe8e8a4 --reasoning-effort medium --cache-capacity 262144 --prefill-chunk-size 2048
+
+The DFlash2 draft is published at
+https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2. The default Qwen3.8 sampling
+policy follows its official model card; medium reasoning avoids the xhigh
+mode's extra instruction unless explicitly requested.
 """
 
 import argparse
@@ -105,12 +114,17 @@ def _generate(
     rng=None,
     cancelled=None,
     use_dflash=False,
+    hide_reasoning=False,
 ):
     generated = []
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     pending = ""
     tool_started = False
     pending_tokens = []
+    reasoning_tail = ""
+    reasoning_complete = not hide_reasoning
+    if hide_reasoning:
+        print("Thinking…", flush=True)
     stream_filter = (
         tokenizer.stream_filter() if hasattr(tokenizer, "stream_filter") else None
     )
@@ -138,19 +152,46 @@ def _generate(
         )
         if stream_filter:
             text = stream_filter.feed(text)
-        if tool_started:
-            pending += text
-        elif tool_marker:
-            text, pending, tool_started = split_tool_prefix(pending + text, tool_marker)
-            print(text, end="", flush=True)
-        else:
-            print(text, end="", flush=True)
+        if not reasoning_complete:
+            reasoning_tail += text
+            _, marker, text = reasoning_tail.partition("</think>")
+            if not marker:
+                reasoning_tail = reasoning_tail[-7:]
+                text = ""
+            else:
+                reasoning_complete = True
+                text = text.lstrip()
+        if text:
+            if tool_started:
+                pending += text
+            elif tool_marker:
+                text, pending, tool_started = split_tool_prefix(
+                    pending + text, tool_marker
+                )
+                print(text, end="", flush=True)
+            else:
+                print(text, end="", flush=True)
         cached_ids.append(token_id)
         if pending_tokens:
             continue
         remaining = limit - len(generated)
         if use_dflash and remaining >= runner.dflash.block_size:
-            pending_tokens.extend(runner.decode_dflash(token_id)[0])
+            sample = None
+            if temperature > 0.0:
+
+                def sample(row_logits, accepted_drafts):
+                    return sample_runner_token(
+                        runner,
+                        row_logits,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        presence_penalty=presence_penalty,
+                        previous_tokens=(*generated, *accepted_drafts),
+                        rng=rng,
+                    )
+
+            pending_tokens.extend(runner.decode_dflash(token_id, sample=sample)[0])
         else:
             logits = runner.decode(token_id)
     if pending_tokens:
@@ -300,7 +341,7 @@ def main():
     parser.add_argument(
         "--dflash-path",
         type=Path,
-        help="Qwen3.8 DFlash2 draft directory; requires greedy decoding",
+        help="Qwen3.8 DFlash2 draft directory",
     )
     parser.add_argument(
         "--weight-quantization",
@@ -333,7 +374,11 @@ def main():
     parser.add_argument(
         "--thinking", action=argparse.BooleanOptionalAction, default=None
     )
-    parser.add_argument("--reasoning-effort", choices=("low", "medium", "xhigh"))
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("low", "medium", "xhigh"),
+        help="Qwen3.8 thinking depth (default: medium)",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--chat-dir",
@@ -379,8 +424,6 @@ def main():
         parser.error("--presence-penalty must be between -2 and 2")
     if args.max_new_tokens is not None and args.max_new_tokens < 1:
         parser.error("--max-new-tokens must be positive")
-    if args.dflash_path is not None and temperature > 0.0:
-        parser.error("--dflash-path requires --temperature 0")
     if args.dflash_path is not None and multimodal:
         parser.error("--dflash-path does not support multimodal input")
     if args.yarn_factor is not None and (not args.yarn or args.yarn_factor < 1.0):
@@ -641,6 +684,7 @@ def main():
                     rng=rng,
                     cancelled=cancel.cancelled.is_set,
                     use_dflash=args.dflash_path is not None,
+                    hide_reasoning=thinking,
                 )
                 if processor is None:
                     chat_encoder.extend_raw(generated)

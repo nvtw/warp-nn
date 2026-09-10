@@ -689,6 +689,22 @@ def test_qwen35_dflash_rejection_rollback_matches_decode_and_replays(
         speculative.reset()
         reference.reset()
 
+    input_token = speculative.sample_greedy(speculative.prefill(prompt))
+    speculative.dflash.drafts = [4, 5, 6]
+    sampled = iter((4, 9))
+    prefixes = []
+
+    def sample(logits, accepted_drafts):
+        assert logits.shape == (1, 1, 16)
+        prefixes.append(accepted_drafts)
+        return next(sampled)
+
+    tokens, accepted = speculative.decode_dflash(input_token, sample=sample)
+    assert (tokens, accepted) == ([4, 9], 1)
+    assert prefixes == [[], [4]]
+    assert speculative.sequence_length == len(prompt) + 2
+    assert speculative.dflash.sequence_length == speculative.sequence_length
+
     assert 64 in speculative._verification_plans[4].graphs
 
 

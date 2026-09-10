@@ -536,7 +536,7 @@ class Qwen3Tokenizer:
                 "This Qwen chat template does not support reasoning_effort"
             )
         if self.supports_reasoning_effort and enable_thinking:
-            reasoning_effort = reasoning_effort or "xhigh"
+            reasoning_effort = reasoning_effort or "medium"
             try:
                 reasoning_instruction = _REASONING_INSTRUCTIONS[reasoning_effort]
             except KeyError as error:

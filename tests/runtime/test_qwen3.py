@@ -385,8 +385,9 @@ def test_console_generation_uses_dflash_batches(capsys):
         def sample_greedy(self, logits):
             return logits
 
-        def decode_dflash(self, token_id):
+        def decode_dflash(self, token_id, *, sample=None):
             assert token_id == 1
+            assert sample is None
             return [2, 3, 4], 2
 
         def decode(self, token_id):
@@ -413,6 +414,34 @@ def test_console_generation_uses_dflash_batches(capsys):
     assert cached_ids == [1, 2, 3, 4]
     assert runner.decoded == [4]
     assert (text, calls) == ("12340", [])
+
+
+def test_console_generation_hides_reasoning(capsys):
+    class Runner:
+        def sample_greedy(self, logits):
+            return logits
+
+        def decode(self, token_id):
+            return {1: 2, 2: 0}[token_id]
+
+    class Tokenizer:
+        eos_token_id = 0
+        pieces = {1: b"private reasoning", 2: b"</think>\n\nFinal answer"}
+
+        def token_bytes(self, token_id, skip_special_tokens=False):
+            return self.pieces.get(token_id, b"")
+
+        def decode(self, token_ids, skip_special_tokens=False):
+            return b"".join(
+                self.pieces.get(token_id, b"") for token_id in token_ids
+            ).decode()
+
+    generated, _, _ = _generate(
+        Runner(), Tokenizer(), 1, 4, 0.0, [], hide_reasoning=True
+    )
+
+    assert generated == [1, 2, 0]
+    assert capsys.readouterr().out == "Thinking…\nFinal answer"
 
 
 def test_qwen3_json_tool_dialect(tmp_path):
@@ -463,6 +492,9 @@ def test_qwen38_reasoning_template_controls(tmp_path):
     tokenizer = Qwen3Tokenizer(path)
 
     assert tokenizer.default_enable_thinking
+    assert "Reasoning effort is set to xhigh." not in tokenizer.format_chat(
+        [{"role": "user", "content": "Hello"}]
+    )
     formatted = tokenizer.format_chat(
         [
             {"role": "system", "content": "Be concise."},

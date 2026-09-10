@@ -1996,7 +1996,7 @@ class Qwen35Runner(AutoregressiveRunner):
         )
         return [*drafts[:accepted], int(predictions[accepted])], accepted
 
-    def decode_dflash(self, token_id: int) -> tuple[list[int], int]:
+    def decode_dflash(self, token_id: int, *, sample=None) -> tuple[list[int], int]:
         """Verify one seven-token DFlash proposal and return (tokens, accepted)."""
         if self.dflash is None:
             raise RuntimeError("Qwen DFlash was not enabled")
@@ -2025,22 +2025,31 @@ class Qwen35Runner(AutoregressiveRunner):
         self.sequence_end.assign(np.asarray([positions[-1]], dtype=np.int32))
         logits = self._run(verifier, verifier.attention_partitions)
         self.sequence_length = base + rows
-        predictions = self.sample_greedy_rows(logits)
-        accepted = next(
-            (
-                index
-                for index, draft in enumerate(drafts)
-                if draft != predictions[index]
-            ),
-            len(drafts),
-        )
+        if sample is None:
+            predictions = self.sample_greedy_rows(logits)
+            accepted = next(
+                (
+                    index
+                    for index, draft in enumerate(drafts)
+                    if draft != predictions[index]
+                ),
+                len(drafts),
+            )
+            correction = int(predictions[accepted])
+        else:
+            for accepted in range(rows):
+                correction = int(
+                    sample(logits[accepted : accepted + 1], drafts[:accepted])
+                )
+                if accepted == len(drafts) or correction != drafts[accepted]:
+                    break
         valid = accepted + 1
 
         if valid < rows:
             self._rollback_verification(verifier, base, valid)
 
         self.dflash.append_context(verifier.dflash_target_hidden[:valid], base)
-        return [*drafts[:accepted], int(predictions[accepted])], accepted
+        return [*drafts[:accepted], correction], accepted
 
     def create_batch_decoder(self, max_batch_size: int = 4) -> Qwen35BatchDecoder:
         """Allocate opt-in independent decode state without duplicating weights."""
