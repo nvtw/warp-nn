@@ -452,7 +452,9 @@ class Qwen3OnnxRunner:
         generated = self._generated_ids.numpy()[:max_new_tokens].tolist()
         if eos_token_id in generated:
             generated = generated[: generated.index(eos_token_id) + 1]
-        self.sequence_length += len(generated)
+        # The final sample is only staged, not decoded. An early EOS is
+        # decoded by the remaining graph replays, which keep its position fixed.
+        self.sequence_length += len(generated) - int(len(generated) == max_new_tokens)
         return generated
 
     def _stage_decode_token(self, token_id: int) -> None:

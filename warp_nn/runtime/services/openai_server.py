@@ -15,6 +15,8 @@ from collections.abc import Callable, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
+import numpy as np
+
 from warp_nn.runtime.chat import (
     ChatEncodingCache,
     Runner,
@@ -144,7 +146,12 @@ def _same_visible_assistant(
 
 
 class ChatCompletions:
-    """Translate OpenAI chat requests to a shared text-generation runner."""
+    """Translate OpenAI chat requests to a shared text-generation runner.
+
+    Unspecified sampling settings follow the tokenizer's defaults for each
+    request's thinking mode. Explicit server settings override those defaults;
+    explicit request settings take precedence over both.
+    """
 
     def __init__(
         self,
@@ -153,10 +160,10 @@ class ChatCompletions:
         tokenizer: Tokenizer,
         max_new_tokens: int = 4096,
         enable_thinking: bool = False,
-        temperature: float = 0.0,
-        top_p: float = 1.0,
-        top_k: int = 0,
-        presence_penalty: float = 0.0,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        presence_penalty: float | None = None,
         reasoning_effort: str | None = None,
         preserve_thinking: bool = True,
         max_batch_size: int = 1,
@@ -197,6 +204,48 @@ class ChatCompletions:
                 max_active=max_batch_size,
                 idle_wait_ms=batch_wait_ms,
             )
+
+    def _sampling_parameters(self, request):
+        from warp_nn.runtime.sampling import validate_sampling
+
+        template_kwargs = request.get("chat_template_kwargs") or {}
+        if not isinstance(template_kwargs, Mapping):
+            raise APIError(
+                "chat_template_kwargs must be an object", param="chat_template_kwargs"
+            )
+        thinking = template_kwargs.get(
+            "enable_thinking", request.get("enable_thinking", self.enable_thinking)
+        )
+        if not isinstance(thinking, bool):
+            raise APIError("thinking controls must be boolean")
+        defaults = {
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": 0,
+            "presence_penalty": 0.0,
+        }
+        if hasattr(self.tokenizer, "sampling_defaults"):
+            defaults.update(self.tokenizer.sampling_defaults(thinking))
+        values = {
+            name: request.get(
+                name, getattr(self, name) if getattr(self, name) is not None else value
+            )
+            for name, value in defaults.items()
+        }
+        try:
+            temperature = float(values["temperature"])
+            top_p = float(values["top_p"])
+            top_k = int(values["top_k"])
+            presence_penalty = float(values["presence_penalty"])
+            validate_sampling(temperature, top_k, top_p, presence_penalty)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise APIError("invalid sampling parameter") from error
+        seed = request.get("seed")
+        if seed is not None and (
+            isinstance(seed, bool) or not isinstance(seed, int) or seed < 0
+        ):
+            raise APIError("seed must be a non-negative integer", param="seed")
+        return temperature, top_p, top_k, presence_penalty, seed
 
     def complete(
         self,
@@ -247,22 +296,9 @@ class ChatCompletions:
                 "reasoning_effort must be low, medium, or xhigh",
                 param="reasoning_effort",
             )
-        try:
-            temperature = float(request.get("temperature", self.temperature))
-            top_p = float(request.get("top_p", self.top_p))
-            top_k = int(request.get("top_k", self.top_k))
-            presence_penalty = float(
-                request.get("presence_penalty", self.presence_penalty)
-            )
-        except (TypeError, ValueError) as error:
-            raise APIError("invalid sampling parameter") from error
-        if (
-            temperature < 0.0
-            or not 0.0 < top_p <= 1.0
-            or top_k < 0
-            or not -2.0 <= presence_penalty <= 2.0
-        ):
-            raise APIError("sampling parameters are outside their supported ranges")
+        temperature, top_p, top_k, presence_penalty, seed = self._sampling_parameters(
+            request
+        )
         max_tokens = request.get(
             "max_completion_tokens", request.get("max_tokens", self.max_new_tokens)
         )
@@ -407,6 +443,7 @@ class ChatCompletions:
                 top_p=top_p,
                 presence_penalty=presence_penalty,
                 use_dflash=self.use_dflash,
+                rng=np.random.default_rng(seed),
             )
             for token_id in generation:
                 if emit is not None and not response_started:
@@ -514,22 +551,9 @@ class ChatCompletions:
     def _complete_batched(self, request, emit):
         """Reuse the established response path around a scheduled runner proxy."""
 
-        try:
-            temperature = float(request.get("temperature", self.temperature))
-            top_p = float(request.get("top_p", self.top_p))
-            top_k = int(request.get("top_k", self.top_k))
-            presence_penalty = float(
-                request.get("presence_penalty", self.presence_penalty)
-            )
-        except (TypeError, ValueError) as error:
-            raise APIError("invalid sampling parameter") from error
-        if (
-            temperature < 0.0
-            or not 0.0 < top_p <= 1.0
-            or top_k < 0
-            or not -2.0 <= presence_penalty <= 2.0
-        ):
-            raise APIError("sampling parameters are outside their supported ranges")
+        temperature, top_p, top_k, presence_penalty, seed = self._sampling_parameters(
+            request
+        )
         max_tokens = request.get(
             "max_completion_tokens", request.get("max_tokens", self.max_new_tokens)
         )
@@ -542,9 +566,6 @@ class ChatCompletions:
                 "max tokens must be a positive integer", param="max_completion_tokens"
             )
         max_tokens = min(max_tokens, self.max_new_tokens)
-        seed = request.get("seed")
-        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
-            raise APIError("seed must be an integer", param="seed")
 
         proxy = _ScheduledRunner(
             self._batch_scheduler,

@@ -710,10 +710,8 @@ def _format_tool_value(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def parse_qwen_tool_calls(
-    text: str, *, tools=None
-) -> tuple[str, list[dict[str, object]]]:
-    """Extract Qwen XML function calls and return remaining assistant text."""
+def tool_string_parameters(tools):
+    """Return schema-declared string arguments for XML tool parsers."""
     string_parameters = {}
     for tool in tools or ():
         function = tool.get("function", tool)
@@ -723,6 +721,14 @@ def parse_qwen_tool_calls(
             for name, schema in properties.items()
             if schema.get("type") == "string"
         }
+    return string_parameters
+
+
+def parse_qwen_tool_calls(
+    text: str, *, tools=None
+) -> tuple[str, list[dict[str, object]]]:
+    """Extract Qwen XML function calls and return remaining assistant text."""
+    string_parameters = tool_string_parameters(tools)
     calls = []
     spans = []
     pattern = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)

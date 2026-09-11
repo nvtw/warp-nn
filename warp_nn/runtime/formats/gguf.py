@@ -483,7 +483,7 @@ class GGUFArchive:
                 output[name] = wp.clone(host, device=device)
         del raw
 
-        event = wp.record_event() if device.is_cuda else None
+        event = wp.get_stream(device).record_event() if device.is_cuda else None
         resources = (host_views, byte_views, mapping, stream)
         if event is None:
             _release_mapping(resources, None)

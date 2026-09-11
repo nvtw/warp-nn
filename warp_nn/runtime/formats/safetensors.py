@@ -276,7 +276,9 @@ class SafeTensorArchive:
                 host_views.append(host)
                 output[name] = wp.clone(host, device=device)
 
-        event = wp.record_event() if device.is_cuda and output else None
+        event = (
+            wp.get_stream(device).record_event() if device.is_cuda and output else None
+        )
         resources = (host_views, byte_views, mappings, streams)
         # Finish uploads before returning so mmap cleanup can never race a
         # caller that immediately begins CUDA graph capture.

@@ -449,6 +449,10 @@ class ExternalEmbeddingQwen3CausalLM(Qwen3CausalLM):
 
     def decode_embedding(self, embedding: wp.array) -> wp.array:
         """Append one externally supplied embedding."""
+        if self.sequence_length == 0:
+            raise RuntimeError("decode_embedding requires a preceding prefill")
+        if self.sequence_length >= self.cache_capacity:
+            raise ValueError("Qwen KV cache is full")
         if (
             embedding.shape != (1, self.hidden_size)
             or embedding.dtype != self.dtype

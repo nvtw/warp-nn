@@ -509,7 +509,11 @@ class OnnxRuntime:
             self._dtypes[init.name] = tensor.dtype
         arr_np = None
         if external_mappings:
-            uploads_complete = wp.record_event() if self._device.is_cuda else None
+            uploads_complete = (
+                wp.get_stream(self._device).record_event()
+                if self._device.is_cuda
+                else None
+            )
             mapping_refs = list(external_mappings.values())
             external_mappings.clear()
             Thread(

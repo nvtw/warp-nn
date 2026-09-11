@@ -235,8 +235,11 @@ def _atem_tool_definitions(tools: Sequence[Mapping[str, object]]) -> str:
     )
 
 
-def parse_atem_tool_calls(text: str) -> tuple[str, list[dict[str, object]]]:
+def parse_atem_tool_calls(text: str, *, tools=None) -> tuple[str, list[dict[str, object]]]:
     """Extract Muse ATEM function calls and return remaining assistant text."""
+    from warp_nn.runtime.tokenizers import tool_string_parameters
+
+    string_parameters = tool_string_parameters(tools)
     calls = []
     invoke_pattern = re.compile(
         r'<atem:invoke\s+name="([^"]+)">(.*?)</atem:invoke>', re.DOTALL
@@ -248,10 +251,11 @@ def parse_atem_tool_calls(text: str) -> tuple[str, list[dict[str, object]]]:
         arguments = {}
         for parameter in parameter_pattern.finditer(invoke.group(2)):
             value = parameter.group(2)
-            try:
-                value = json.loads(value)
-            except json.JSONDecodeError:
-                pass
+            if parameter.group(1) not in string_parameters.get(invoke.group(1), ()):
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    pass
             arguments[parameter.group(1)] = value
         calls.append({"name": invoke.group(1), "arguments": arguments})
     clean = re.sub(
@@ -541,7 +545,7 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
         self, text: str, *, tools=None
     ) -> tuple[str, list[dict[str, object]]]:
         """Extract structured ATEM calls from Muse assistant text."""
-        return parse_atem_tool_calls(text)
+        return parse_atem_tool_calls(text, tools=tools)
 
 
 class _MusePlan:
