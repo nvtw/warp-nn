@@ -15,6 +15,9 @@ Download one with::
 
 import argparse
 import socket
+import os
+import secrets
+import shlex
 from pathlib import Path
 
 from warp_nn.runtime import (
@@ -52,53 +55,109 @@ def _lan_ipv4() -> str | None:
 
 def _print_connection_info(server, model_id: str, host: str, api_key: str | None):
     port = server.server_port
-    wildcard = host in ("", "0.0.0.0", "::")
-    local_url = f"http://127.0.0.1:{port}/v1"
-    print(f"Serving {model_id}", flush=True)
-    print(f"  Local:  {local_url}", flush=True)
-    remote_url = None
+    wildcard = host in ("", "0.0.0.0")
+    addresses = (
+        [("This PC", "127.0.0.1")]
+        if wildcard or host in ("localhost", "127.0.0.1")
+        else []
+    )
     if wildcard:
         address = _lan_ipv4()
         if address:
-            remote_url = f"http://{address}:{port}/v1"
-            print(f"  LAN:    {remote_url}", flush=True)
+            addresses.append(("LAN", address))
         else:
-            print("  LAN:    bound to all interfaces; IP detection failed", flush=True)
-    elif not host.startswith("127.") and host != "localhost":
-        remote_url = f"http://{host}:{port}/v1"
-        print(f"  LAN:    {remote_url}", flush=True)
-    else:
+            print(
+                "LAN address detection failed; use this computer's LAN IPv4 address.",
+                flush=True,
+            )
+    elif host not in ("localhost", "127.0.0.1"):
+        addresses.append(("Bound address", host))
+    print(f"Ready: {model_id}", flush=True)
+    print(f"  Model ID: {model_id}", flush=True)
+    print(
+        f"  API key: {api_key or 'not required (use local if a client requires a value)'}",
+        flush=True,
+    )
+    for label, address in addresses:
+        base = f"http://{address}:{port}"
+        print(f"  {label} browser: {base}/", flush=True)
+        print(f"  {label} API base: {base}/v1", flush=True)
         print(
-            "  LAN:    disabled; use --host 0.0.0.0 to allow other computers",
+            f"  {label} Aider (run in your code repository on the client PC):",
             flush=True,
         )
-    if remote_url:
-        key_option = " --api-key YOUR_API_KEY" if api_key else ""
         print(
-            "  Client: python openai_client.py"
-            f" --url {remote_url} --model {model_id}{key_option}",
+            "    aider --model "
+            + shlex.quote("openai/" + model_id)
+            + " --openai-api-base "
+            + shlex.quote(base + "/v1")
+            + " --openai-api-key "
+            + shlex.quote(api_key or "local"),
             flush=True,
         )
+        print(
+            "  Terminal chat: python examples/openai_client.py --url "
+            + shlex.quote(base + "/v1")
+            + " --model "
+            + shlex.quote(model_id)
+            + " --api-key "
+            + shlex.quote(api_key or "local"),
+            flush=True,
+        )
+    if host in ("localhost", "127.0.0.1"):
+        print("  LAN disabled; use --host 0.0.0.0 to enable it.", flush=True)
+    print(
+        f"  LAN clients must reach TCP port {port}; allow it in your firewall if necessary.",
+        flush=True,
+    )
+    print(
+        "  Browser chat runs here; coding-agent file edits and commands run on the client PC.",
+        flush=True,
+    )
+    print("  Aider setup: https://aider.chat/docs/llms/openai-compat.html", flush=True)
+    print(
+        "  This endpoint implements Chat Completions (/v1/chat/completions), not /v1/responses.",
+        flush=True,
+    )
 
 
-def main():
+def _local_qwen_paths():
+    model_candidates = [
+        Path.home() / ".lmstudio/models/unsloth/Qwen3.8-27B-GGUF",
+        Path.home() / "Models/warp-nn/Qwen/Qwen3.8-27B-GGUF",
+        Path.home() / "Models/warp-nn/unsloth/Qwen3.8-27B-GGUF",
+    ]
+    cache = Path(os.environ.get("HF_HUB_CACHE", Path.home() / ".cache/huggingface/hub"))
+    snapshots = cache / "models--z-lab--Qwen3.8-27B-DFlash2/snapshots"
+    drafts = sorted(snapshots.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return next((p for p in model_candidates if p.is_dir()), None), next(
+        (p for p in drafts if p.is_dir()), None
+    )
+
+
+def main(argv=None, *, qwen_dflash=False):
     parser = argparse.ArgumentParser(description=__doc__)
+    default_model, default_draft = _local_qwen_paths() if qwen_dflash else (None, None)
     parser.add_argument(
         "model_dir",
         type=Path,
         help="Supported model checkpoint or directory",
+        **({"nargs": "?", "default": default_model} if qwen_dflash else {}),
     )
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default="0.0.0.0" if qwen_dflash else "127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
         "--model-id",
+        default="qwen3.8-27b" if qwen_dflash else None,
         help="Model name exposed by the API; defaults to the directory name",
     )
     parser.add_argument(
         "--api-key", help="Optional bearer token; omitted means no authentication"
     )
-    parser.add_argument("--max-new-tokens", type=int, default=4096)
-    parser.add_argument("--cache-capacity", type=int, default=4096)
+    parser.add_argument(
+        "--max-new-tokens", type=int, default=16384 if qwen_dflash else 4096
+    )
+    parser.add_argument("--cache-capacity", type=int, default=32768)
     parser.add_argument("--prefill-chunk-size", type=int, default=256)
     parser.add_argument(
         "--max-batch-size",
@@ -125,11 +184,34 @@ def main():
     )
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--top-p", type=float)
-    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--top-k", type=int)
     parser.add_argument("--presence-penalty", type=float)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--no-cublas", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--dflash-path",
+        type=Path,
+        default=default_draft,
+        help="DFlash assistant checkpoint directory",
+    )
+    args = parser.parse_args(argv)
+    if args.model_dir is None or not args.model_dir.is_dir():
+        parser.error("provide an existing model directory")
+    if qwen_dflash and args.dflash_path is None:
+        parser.error("provide --dflash-path /path/to/Qwen3.8-27B-DFlash2")
+    if args.dflash_path is not None and not args.dflash_path.is_dir():
+        parser.error("--dflash-path must be an existing directory")
+    if args.dflash_path is not None and args.max_batch_size != 1:
+        parser.error(
+            "DFlash currently requires --max-batch-size 1; requests are serialized"
+        )
+    if qwen_dflash and not args.api_key:
+        args.api_key = secrets.token_urlsafe(24)
+    print(
+        f"Loading {args.model_dir}"
+        + (f" with DFlash from {args.dflash_path}" if args.dflash_path else ""),
+        flush=True,
+    )
 
     tokenizer = create_tokenizer(args.model_dir)
     if args.yarn_factor is not None and (not args.yarn or args.yarn_factor < 1.0):
@@ -146,24 +228,25 @@ def main():
         prefill_chunk_size=args.prefill_chunk_size,
         use_cublas=not args.no_cublas,
         **({"rope_scaling": rope_scaling} if rope_scaling else {}),
+        **({"dflash_path": args.dflash_path} if args.dflash_path else {}),
     )
     model_id = args.model_id or args.model_dir.name
     thinking = (
         tokenizer.default_enable_thinking if args.thinking is None else args.thinking
     )
-    temperature = (
-        args.temperature if args.temperature is not None else (1.0 if thinking else 0.7)
-    )
-    top_p = args.top_p if args.top_p is not None else (0.95 if thinking else 0.8)
-    presence_penalty = (
-        args.presence_penalty
-        if args.presence_penalty is not None
-        else (0.0 if thinking else 1.5)
-    )
-    if temperature < 0.0 or not 0.0 < top_p <= 1.0 or args.top_k < 0:
-        parser.error("invalid sampling parameters")
-    if not -2.0 <= presence_penalty <= 2.0:
-        parser.error("--presence-penalty must be between -2 and 2")
+    from warp_nn.runtime.sampling import validate_sampling
+
+    defaults = tokenizer.sampling_defaults(thinking)
+    sampling = {
+        name: getattr(args, name) if getattr(args, name) is not None else value
+        for name, value in defaults.items()
+    }
+    temperature, top_p = sampling["temperature"], sampling["top_p"]
+    top_k, presence_penalty = sampling["top_k"], sampling["presence_penalty"]
+    try:
+        validate_sampling(temperature, top_k, top_p, presence_penalty)
+    except ValueError as error:
+        parser.error(str(error))
     if args.reasoning_effort and not thinking:
         parser.error("--reasoning-effort requires thinking mode")
     if args.reasoning_effort and not tokenizer.supports_reasoning_effort:
@@ -176,14 +259,24 @@ def main():
         thinking,
         temperature,
         top_p,
-        args.top_k,
+        top_k,
         presence_penalty,
         args.reasoning_effort,
         max_batch_size=args.max_batch_size,
         batch_wait_ms=args.batch_wait_ms,
+        use_dflash=args.dflash_path is not None,
     )
-    server = OpenAIHTTPServer((args.host, args.port), backend, args.api_key)
+    server = OpenAIHTTPServer(
+        (args.host, args.port),
+        backend,
+        args.api_key,
+        chat_html=Path(__file__).with_name("openai_chat.html").read_bytes(),
+    )
     _print_connection_info(server, model_id, args.host, args.api_key)
+    print(
+        f"  Acceleration: {'DFlash' if args.dflash_path else 'ordinary decoding'}; thinking={thinking}",
+        flush=True,
+    )
     print(
         "  Authentication: "
         + ("bearer token required" if args.api_key else "disabled"),

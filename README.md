@@ -26,6 +26,9 @@ pip install warp-nn
 
 ## Local coding agents
 
+For Qwen with DFlash, a browser chat UI and local/LAN coding-client connections, run
+`examples/qwen_dflash_server.py`; see the [server instructions](examples/openai_server.md).
+
 For local Qwen/Muse chat with sandboxed file and script tools, see the
 [coding-agent example](docs/coding-agent.md). The Qwen repetition diagnosis and
 validation are documented in [the investigation notes](docs/qwen-loop-investigation.md).

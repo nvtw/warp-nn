@@ -27,8 +27,8 @@ class _Tokenizer:
     def decode(self, token_ids, skip_special_tokens=False):
         return self.text if 1 in token_ids else ""
 
-    def parse_tool_calls(self, text):
-        return parse_qwen_tool_calls(text)
+    def parse_tool_calls(self, text, *, tools=None):
+        return parse_qwen_tool_calls(text, tools=tools)
 
 
 class _Runner:
@@ -403,3 +403,123 @@ def test_chat_completions_streams_structured_tool_call():
         "arguments": '{"path":"README.md"}',
     }
     assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_dflash_http_generation_discards_unconsumed_verified_cache():
+    from types import SimpleNamespace
+
+    class SpeculativeRunner(_CachingRunner):
+        dflash = SimpleNamespace(block_size=2)
+        speculative_calls = 0
+
+        def decode_dflash(self, token_id, *, sample=None):
+            self.speculative_calls += 1
+            return [0, 1], 1  # EOS followed by a committed but unconsumed token
+
+    runner = SpeculativeRunner()
+    backend = ChatCompletions(
+        "test", runner, _Tokenizer("Hi"), max_new_tokens=8, use_dflash=True
+    )
+    try:
+        response = backend.complete(
+            {"messages": [{"role": "user", "content": "hello"}]}
+        )
+        assert response["choices"][0]["message"]["content"] == "Hi"
+        assert runner.speculative_calls == 1
+        assert backend._cached_ids == []
+    finally:
+        backend.close()
+
+
+def test_browser_page_and_key_enforcement():
+    from urllib.error import HTTPError
+    import pytest
+
+    backend = ChatCompletions("test", _Runner(), _Tokenizer("Hi"))
+    server = OpenAIHTTPServer(
+        ("127.0.0.1", 0),
+        backend,
+        "test-secret",
+        chat_html=b"<!doctype html><title>Chat</title>",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_port}"
+        with urlopen(base) as response:
+            assert response.headers["Content-Type"] == "text/html; charset=utf-8"
+            assert b"<title>Chat</title>" in response.read()
+        data = json.dumps({"messages": [{"role": "user", "content": "hello"}]}).encode()
+        with pytest.raises(HTTPError) as error:
+            urlopen(
+                Request(
+                    base + "/v1/chat/completions",
+                    data=data,
+                    headers={"Content-Type": "application/json"},
+                )
+            )
+        assert error.value.code == 401
+        with urlopen(
+            Request(
+                base + "/v1/chat/completions",
+                data=data,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer test-secret",
+                },
+            )
+        ) as response:
+            assert json.load(response)["choices"][0]["message"]["content"] == "Hi"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_connection_banner_has_browser_api_and_agent_details(capsys, monkeypatch):
+    from types import SimpleNamespace
+    from examples import openai_server
+
+    monkeypatch.setattr(openai_server, "_lan_ipv4", lambda: "192.168.1.42")
+    openai_server._print_connection_info(
+        SimpleNamespace(server_port=8123), "qwen-test", "0.0.0.0", "test-key"
+    )
+    text = capsys.readouterr().out
+    assert "http://127.0.0.1:8123/" in text
+    assert "http://192.168.1.42:8123/v1" in text
+    assert "aider --model openai/qwen-test" in text
+    assert "--openai-api-key test-key" in text
+    assert "not /v1/responses" in text
+    openai_server._print_connection_info(
+        SimpleNamespace(server_port=8123), "test", "192.168.1.42", None
+    )
+    assert "127.0.0.1" not in capsys.readouterr().out
+
+
+def test_http_tool_call_preserves_schema_declared_strings():
+    text = "<tool_call><function=write_file><parameter=content>42</parameter></function></tool_call>"
+    backend = ChatCompletions("test", _Runner(), _Tokenizer(text))
+    try:
+        response = backend.complete(
+            {
+                "messages": [{"role": "user", "content": "write 42"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"content": {"type": "string"}},
+                            },
+                        },
+                    }
+                ],
+            }
+        )
+        arguments = response["choices"][0]["message"]["tool_calls"][0]["function"][
+            "arguments"
+        ]
+        assert json.loads(arguments)["content"] == "42"
+    finally:
+        backend.close()

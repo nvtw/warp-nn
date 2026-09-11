@@ -19,7 +19,7 @@ from warp_nn.runtime.chat import (
     ChatEncodingCache,
     Runner,
     Tokenizer,
-    generate_tokens,
+    TokenGeneration,
     is_eos_token,
     split_reasoning,
     split_tool_prefix,
@@ -161,7 +161,11 @@ class ChatCompletions:
         preserve_thinking: bool = True,
         max_batch_size: int = 1,
         batch_wait_ms: float = 2.0,
+        use_dflash: bool = False,
     ):
+        if use_dflash and max_batch_size != 1:
+            raise ValueError("DFlash currently requires max_batch_size=1")
+        self.use_dflash = use_dflash
         self.model = model
         self.runner = runner
         self.tokenizer = tokenizer
@@ -393,17 +397,18 @@ class ChatCompletions:
                 logits = self.runner.append(prompt_ids[len(cached_prefix) :])
             else:
                 logits = self.runner.prefill(prompt_ids)
-            for token_id in generate_tokens(
+            generation = TokenGeneration(
                 self.runner,
                 self.tokenizer,
-                prompt_ids,
+                logits,
                 request_max_tokens,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
                 presence_penalty=presence_penalty,
-                initial_logits=logits,
-            ):
+                use_dflash=self.use_dflash,
+            )
+            for token_id in generation:
                 if emit is not None and not response_started:
                     emit(
                         self._chunk(
@@ -427,7 +432,9 @@ class ChatCompletions:
                 if generated and is_eos_token(self.tokenizer, generated[-1])
                 else generated
             )
-            self._cached_ids = [*prompt_ids, *cached_completion]
+            self._cached_ids = (
+                [] if generation.pending else [*prompt_ids, *cached_completion]
+            )
             self._chat_encoder.extend_raw(generated)
         tail = decoder.decode(b"", final=True)
         if stream_filter:
@@ -440,7 +447,9 @@ class ChatCompletions:
             if stream_filter
             else split_reasoning(decoded, enable_thinking)
         )
-        text, tool_calls = self.tokenizer.parse_tool_calls(text)
+        text, tool_calls = self.tokenizer.parse_tool_calls(
+            text, **({"tools": tools} if tools else {})
+        )
         finish_reason = (
             "tool_calls"
             if tool_calls
@@ -596,9 +605,17 @@ class ChatCompletions:
 class OpenAIHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, backend: ChatCompletions, api_key: str | None = None):
+    def __init__(
+        self,
+        address,
+        backend: ChatCompletions,
+        api_key: str | None = None,
+        *,
+        chat_html: bytes | None = None,
+    ):
         self.backend = backend
         self.api_key = api_key
+        self.chat_html = chat_html
         super().__init__(address, OpenAIRequestHandler)
 
     def server_close(self):
@@ -614,7 +631,16 @@ class OpenAIRequestHandler(BaseHTTPRequestHandler):
         return self.server  # type: ignore[return-value]
 
     def do_GET(self):
-        if urlsplit(self.path).path == "/v1/models":
+        if urlsplit(self.path).path == "/" and self._server.chat_html is not None:
+            body = self._server.chat_html
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        elif urlsplit(self.path).path == "/v1/models":
             self._json(
                 200,
                 {

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Warp-NN Chat</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#151719;color:#e7e9ec}*{box-sizing:border-box}body{margin:0}header{border-bottom:1px solid #34383d;padding:18px 24px;display:flex;gap:16px;align-items:center;flex-wrap:wrap}h1{font-size:19px;margin:0}header span{color:#9ea6b1;font-size:13px}button,input,textarea{font:inherit;border:1px solid #454c55;border-radius:9px;background:#24282d;color:inherit;padding:10px}button{cursor:pointer}button:disabled{opacity:.5;cursor:default}main{max-width:920px;margin:auto;padding:20px 24px 190px}.message{margin:24px 0;padding:20px;border-radius:14px;background:#202429}.user{background:#293540;margin-left:12%}.role{font-size:12px;text-transform:uppercase;letter-spacing:.1em;color:#aab5c2;margin-bottom:10px}.body,details pre{white-space:pre-wrap;overflow-wrap:anywhere;font-family:ui-monospace,monospace;line-height:1.6;font-size:14px}details{color:#aab5c2;margin-bottom:12px}details pre{max-height:320px;overflow:auto}footer{position:fixed;bottom:0;width:100%;background:#151719;padding:14px 24px;border-top:1px solid #34383d}form{max-width:872px;margin:auto;display:flex;gap:10px;align-items:end}textarea{resize:vertical;min-height:70px;max-height:240px;flex:1}#status{max-width:872px;margin:8px auto 0;font-size:12px;color:#aab5c2}#key{width:260px}#empty{margin:12vh auto;text-align:center;color:#aab5c2}#empty h2{color:#e7e9ec;font-size:28px}
+</style>
+<header><h1>Warp-NN Chat</h1><span id="model">Connecting…</span><input id="key" type="password" placeholder="API key printed by the server" aria-label="API key" autocomplete="off"><button id="clear" type="button">New chat</button></header>
+<main id="chat"><div id="empty"><h2>What would you like to work on?</h2><p>Chat with the model running on your server.<br>Use a coding client for repository edits and command execution.</p></div></main>
+<footer><form id="form"><textarea id="prompt" placeholder="Message the model…" aria-label="Message" required></textarea><button id="send">Send</button><button id="stop" type="button" disabled>Stop</button></form><p id="status">Paste the server's API key above. Shift+Enter adds a line.</p></footer>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+let messages=[], model='', controller=null;
+function bubble(role){$('empty')?.remove();const box=document.createElement('section');box.className='message '+role;const title=document.createElement('div');title.className='role';title.textContent=role;const details=document.createElement('details'),summary=document.createElement('summary'),reason=document.createElement('pre'),body=document.createElement('div');summary.textContent='Thinking';details.append(summary,reason);details.hidden=true;body.className='body';box.append(title,details,body);$('chat').append(box);return {body,details,reason,box};}
+async function loadModel(){const response=await fetch('/v1/models');if(!response.ok)throw Error('Cannot discover model');model=(await response.json()).data[0].id;$('model').textContent=model;}
+loadModel().catch(error=>{$('status').textContent=error.message;});
+$('clear').onclick=()=>{if(controller)return;messages=[];$('chat').replaceChildren();$('status').textContent='New chat.';};
+$('stop').onclick=()=>controller?.abort();
+$('prompt').addEventListener('keydown',event=>{if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();if(!controller)$('form').requestSubmit();}});
+$('form').onsubmit=async event=>{
+ event.preventDefault();const text=$('prompt').value.trim();if(!text||controller)return;
+ if(!model){$('status').textContent='Model is not ready; reload this page.';return;}
+ const before=messages.length;bubble('user').body.textContent=text;messages.push({role:'user',content:text});$('prompt').value='';const answer=bubble('assistant');let content='',reasoning='',finished=false;
+ controller=new AbortController();$('send').disabled=true;$('clear').disabled=true;$('stop').disabled=false;$('status').textContent='Generating… The first request may compile kernels.';
+ try{
+  const response=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+$('key').value},body:JSON.stringify({model,messages,stream:true}),signal:controller.signal});
+  if(!response.ok){const error=await response.json();throw Error(error.error?.message||response.statusText);}
+  const reader=response.body.getReader(),decoder=new TextDecoder();let pending='';
+  function consume(frame){for(const line of frame.split('\n')){if(!line.startsWith('data:'))continue;const value=line.slice(5).trim();if(value==='[DONE]'){finished=true;continue;}const data=JSON.parse(value);const choice=data.choices?.[0];if(!choice)continue;content+=choice.delta?.content||'';reasoning+=choice.delta?.reasoning_content||'';answer.body.textContent=content;answer.reason.textContent=reasoning;answer.details.hidden=!reasoning;if(choice.finish_reason)$('status').textContent=choice.finish_reason==='length'?'Response limit reached. Start a new chat or request a shorter response.':'Ready.';}}
+  while(true){const {value,done}=await reader.read();pending+=decoder.decode(value,{stream:!done});let boundary;while((boundary=pending.indexOf('\n\n'))>=0){consume(pending.slice(0,boundary));pending=pending.slice(boundary+2);}window.scrollTo(0,document.body.scrollHeight);if(done)break;}
+  if(!finished)throw Error('Connection ended before completion.');
+  messages.push({role:'assistant',content,...(reasoning?{reasoning_content:reasoning}:{})});
+ }catch(error){messages.splice(before);$('status').textContent=error.name==='AbortError'?'Stopped; this exchange was not added to context.':error.message;if(!content)answer.body.textContent=error.name==='AbortError'?'Stopped.':'Request failed. Check the API key and server console.';}
+ finally{controller=null;$('send').disabled=false;$('clear').disabled=false;$('stop').disabled=true;$('prompt').focus();}
+};
+</script>
+</html>
