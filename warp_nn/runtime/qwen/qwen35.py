@@ -43,7 +43,6 @@ from warp_nn.runtime.kernels import (
     _prepare_gated_delta_kernel,
     _reorder_heads_kernel,
     _reorder_heads_decode_batch_kernel,
-    _reorder_interleaved_heads_kernel,
     _overlay_embedding_rows_kernel,
     _set_sequence_end,
     _sigmoid_gate_kernel,
@@ -1112,12 +1111,12 @@ class _Qwen35Plan:
                 layer["q_heads"],
                 layer["attention_gate"],
                 self.runner.head_size,
-                self.runner.gguf_layout,
+                False,  # Qwen GGUF preserves split-half Q/K channels.
             ],
             device=self.device,
         )
         for projected, output, interleaved in (
-            (layer["k_proj"], layer["k_heads"], self.runner.gguf_layout),
+            (layer["k_proj"], layer["k_heads"], False),
             (layer["v_proj"], layer["v_heads"], False),
         ):
             wp.launch(
@@ -1219,18 +1218,16 @@ class _Qwen35Plan:
                 layer["q"],
                 layer["attention_gate"],
                 self.runner.head_size,
-                self.runner.gguf_layout,
+                False,  # Qwen GGUF preserves split-half Q/K channels.
             ],
             device=self.device,
         )
-        for projected, output, interleaved in (
-            (layer["k_proj"], layer["k"], self.runner.gguf_layout),
-            (layer["v_proj"], layer["v"], False),
+        for projected, output in (
+            (layer["k_proj"], layer["k"]),
+            (layer["v_proj"], layer["v"]),
         ):
             wp.launch(
-                _reorder_interleaved_heads_kernel
-                if interleaved
-                else _reorder_heads_kernel,
+                _reorder_heads_kernel,
                 dim=(self.rows, self.runner.kv_heads, self.runner.head_size),
                 inputs=[
                     self.tensors[projected.outputs[0]],

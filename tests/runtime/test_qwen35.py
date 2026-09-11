@@ -871,3 +871,87 @@ def test_qwen35_mtp_rejection_rollback_matches_decode_and_replays(
     ]
     assert len(qkv_pointers) == len(set(qkv_pointers))
     assert 16 in verifier.graphs
+
+
+def _convert_tiny_qwen35_to_gguf(source, target):
+    """Apply the official converter's transforms; Q/K weights are NOT permuted."""
+    from tests.runtime.test_gguf import _write_gguf
+    from warp_nn.runtime.formats.safetensors import SafeTensorArchive
+    from warp_nn.runtime.qwen.qwen35 import _gguf_weight_map
+
+    config = json.loads((source / "config.json").read_text())["text_config"]
+    mapping = _gguf_weight_map(config)
+    tensors = []
+    for name, array in SafeTensorArchive(source).load("cpu").items():
+        values = array.numpy()
+        if name.endswith("norm.weight") and not name.endswith(
+            "linear_attn.norm.weight"
+        ):
+            values = values.astype(np.float32) + 1
+            kind = 0
+        elif name.endswith("A_log"):
+            values = -np.exp(values.astype(np.float32))
+            kind = 0
+        else:
+            kind = 0 if array.dtype == wp.float32 else 30
+            if kind == 30:
+                values = values.view(np.uint16)
+        if "conv1d" in name:
+            values = values.squeeze(1)
+        tensors.append((mapping[name], kind, values))
+    fields = {
+        "block_count": 2,
+        "full_attention_interval": 2,
+        "embedding_length": 8,
+        "feed_forward_length": 12,
+        "attention.head_count": 3,
+        "attention.head_count_kv": 1,
+        "attention.key_length": 4,
+        "ssm.state_size": 4,
+        "ssm.inner_size": 8,
+        "ssm.group_count": 1,
+        "ssm.conv_kernel": 3,
+        "context_length": 32,
+        "rope.dimension_count": 2,
+    }
+    metadata = [
+        ("general.architecture", 8, "qwen35"),
+        ("tokenizer.ggml.tokens", 9, (8, [str(i) for i in range(16)])),
+        ("qwen35.rope.dimension_sections", 9, (4, [1, 0, 0, 0])),
+        ("qwen35.rope.freq_base", 12, 10000.0),
+        ("qwen35.attention.layer_norm_rms_epsilon", 12, 1e-6),
+    ]
+    metadata += [("qwen35." + key, 4, value) for key, value in fields.items()]
+    target.mkdir()
+    _write_gguf(target / "model.gguf", tensors, metadata)
+
+
+@pytest.mark.parametrize("chunk_size", [2, 4])
+def test_qwen35_gguf_matches_safetensors_attention_layout(tmp_path, chunk_size):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA unavailable")
+    source, target = tmp_path / "native", tmp_path / "gguf"
+    _write_tiny_qwen35(source)
+    _convert_tiny_qwen35_to_gguf(source, target)
+    options = dict(
+        device="cuda:0",
+        cache_capacity=16,
+        prefill_chunk_size=chunk_size,
+        use_cublas=False,
+    )
+    native = Qwen35Runner(source, **options)
+    gguf = Qwen35Runner(target, **options)
+    prompt = [1, 7, 3, 9, 2]
+    np.testing.assert_allclose(
+        gguf.prefill(prompt).numpy().astype(np.float32),
+        native.prefill(prompt).numpy().astype(np.float32),
+        atol=1e-4,
+        rtol=1e-3,
+    )
+    for token in [4, 11, 6]:
+        np.testing.assert_allclose(
+            gguf.decode(token).numpy().astype(np.float32),
+            native.decode(token).numpy().astype(np.float32),
+            atol=1e-4,
+            rtol=1e-3,
+        )
