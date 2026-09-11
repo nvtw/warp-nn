@@ -54,10 +54,12 @@ from warp_nn.runtime.chat import (
     ChatEncodingCache,
     ChatSessionStore,
     is_eos_token,
-    sample_runner_token,
+    TokenGeneration,
+    ReasoningStream,
     split_tool_prefix,
 )
 from warp_nn.runtime.services.coding_tools import CodingTools
+from warp_nn.runtime.sampling import validate_sampling
 
 
 _REPETITION_NGRAM = 64
@@ -129,15 +131,28 @@ def _generate(
     use_dflash=False,
     use_mtp=False,
     hide_reasoning=False,
+    tools=None,
 ):
     generated = []
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     pending = ""
     tool_started = False
-    pending_tokens = []
+    stream = TokenGeneration(
+        runner,
+        tokenizer,
+        logits,
+        limit,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        presence_penalty=presence_penalty,
+        rng=rng,
+        use_dflash=use_dflash,
+        use_mtp=use_mtp,
+        cancelled=cancelled,
+    )
     seen_ngrams = {}
     repetitive = False
-    reasoning_tail = ""
     reasoning_complete = not hide_reasoning
     thinking_status = hide_reasoning and sys.stdout.isatty()
     if hide_reasoning:
@@ -145,22 +160,10 @@ def _generate(
     stream_filter = (
         tokenizer.stream_filter() if hasattr(tokenizer, "stream_filter") else None
     )
-    for _ in range(limit):
-        if cancelled and cancelled():
-            break
-        if pending_tokens:
-            token_id = pending_tokens.pop(0)
-        else:
-            token_id = sample_runner_token(
-                runner,
-                logits,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                presence_penalty=presence_penalty,
-                previous_tokens=generated,
-                rng=rng,
-            )
+    reasoning_filter = (
+        ReasoningStream() if hide_reasoning and stream_filter is None else None
+    )
+    for token_id in stream:
         generated.append(token_id)
         if is_eos_token(tokenizer, token_id):
             break
@@ -177,35 +180,15 @@ def _generate(
         )
         if stream_filter:
             text = stream_filter.feed(text)
+        if reasoning_filter:
+            text = reasoning_filter.feed(text)
         if not reasoning_complete:
-            if stream_filter is not None:
-                if text:
-                    reasoning_complete = True
-                    if thinking_status:
-                        print("\r\033[2K", end="", flush=True)
-                elif thinking_status and len(generated) % 32 == 0:
-                    print(
-                        f"\rThinking… {len(generated)} tokens",
-                        end="",
-                        flush=True,
-                    )
-            else:
-                reasoning_tail += text
-                _, marker, text = reasoning_tail.partition("</think>")
-                if not marker:
-                    reasoning_tail = reasoning_tail[-7:]
-                    text = ""
-                    if thinking_status and len(generated) % 32 == 0:
-                        print(
-                            f"\rThinking… {len(generated)} tokens",
-                            end="",
-                            flush=True,
-                        )
-                else:
-                    reasoning_complete = True
-                    if thinking_status:
-                        print("\r\033[2K", end="", flush=True)
-                    text = text.lstrip()
+            if text:
+                reasoning_complete = True
+                if thinking_status:
+                    print("\r\033[2K", end="", flush=True)
+            elif thinking_status and len(generated) % 32 == 0:
+                print(f"\rThinking… {len(generated)} tokens", end="", flush=True)
         if text:
             if tool_started:
                 pending += text
@@ -217,35 +200,13 @@ def _generate(
             else:
                 print(text, end="", flush=True)
         cached_ids.append(token_id)
-        if pending_tokens:
-            continue
-        remaining = limit - len(generated)
-        sample = None
-        if temperature > 0.0 and (use_dflash or use_mtp):
-
-            def sample(row_logits, accepted_drafts):
-                return sample_runner_token(
-                    runner,
-                    row_logits,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    presence_penalty=presence_penalty,
-                    previous_tokens=(*generated, *accepted_drafts),
-                    rng=rng,
-                )
-
-        if use_dflash and remaining >= runner.dflash.block_size:
-            pending_tokens.extend(runner.decode_dflash(token_id, sample=sample)[0])
-        elif use_mtp and remaining >= 3:
-            pending_tokens.extend(runner.decode_speculative(token_id, sample=sample)[0])
-        else:
-            logits = runner.decode(token_id)
-    if pending_tokens or repetitive:
+    if stream.pending or repetitive:
         cached_ids.clear()
     tail = decoder.decode(b"", final=True)
     if stream_filter:
         tail = stream_filter.feed(tail, final=True)
+    if reasoning_filter:
+        tail = reasoning_filter.feed(tail, final=True)
     if tool_started:
         pending += tail
     elif tool_marker:
@@ -255,7 +216,11 @@ def _generate(
         print(tail, end="", flush=True)
     response = tokenizer.decode(generated, skip_special_tokens=True)
     text, calls = (
-        tokenizer.parse_tool_calls(response) if tool_marker else (response, [])
+        tokenizer.parse_tool_calls(
+            response, **({"tools": tools} if tools is not None else {})
+        )
+        if tool_marker
+        else (response, [])
     )
     if pending and not calls:
         print(pending, end="", flush=True)
@@ -372,8 +337,8 @@ def _help(multimodal: bool, omni: bool, coding_tools: bool) -> None:
     print("  /quit (/exit)       save and close the chat")
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(argv=None, *, coding_agent=False):
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument(
         "model_dir",
         type=Path,
@@ -381,9 +346,15 @@ def main():
     )
     parser.add_argument("--system", help="Optional system message")
     parser.add_argument(
+        "--prompt", help="Run one request (including tool steps), then exit"
+    )
+    parser.add_argument(
         "--max-new-tokens",
         type=int,
         help="Optional response limit; defaults to the remaining KV-cache capacity",
+    )
+    parser.add_argument(
+        "--max-tool-rounds", type=int, default=16 if coding_agent else 8
     )
     parser.add_argument("--cache-capacity", type=int, default=1024)
     parser.add_argument("--prefill-chunk-size", type=int, default=256)
@@ -449,7 +420,8 @@ def main():
     parser.add_argument(
         "--trusted-folder",
         type=Path,
-        default=Path.cwd(),
+        default=None if coding_agent else Path.cwd(),
+        required=coding_agent,
         help="Root allowed for coding tools",
     )
     parser.add_argument(
@@ -457,31 +429,39 @@ def main():
         action="store_true",
         help="Allow shell commands without containment",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    args.coding_agent = args.coding_agent or coding_agent
+    if args.max_tool_rounds < 1:
+        parser.error("--max-tool-rounds must be positive")
+    if coding_agent:
+        from warp_nn.runtime.services.sandbox import is_sandbox_available
+
+        if args.unsafe_shell:
+            parser.error("the coding-agent example requires sandboxed execution")
+        if not is_sandbox_available():
+            parser.error(
+                "coding-agent execution requires Linux Landlock ABI >= 6 and libseccomp"
+            )
+    if args.coding_agent:
+        args.trusted_folder = args.trusted_folder.expanduser().resolve()
+        args.trusted_folder.mkdir(parents=True, exist_ok=True)
     multimodal = args.multimodal or args.vision_path is not None
     processor = create_multimodal_processor(args.model_dir) if multimodal else None
     tokenizer = processor.tokenizer if processor else create_tokenizer(args.model_dir)
     thinking = (
         tokenizer.default_enable_thinking if args.thinking is None else args.thinking
     )
-    temperature = (
-        args.temperature if args.temperature is not None else (1.0 if thinking else 0.7)
-    )
-    top_p = args.top_p if args.top_p is not None else (0.95 if thinking else 0.8)
-    top_k = (
-        args.top_k
-        if args.top_k is not None
-        else getattr(tokenizer, "default_top_k", 20)
-    )
-    presence_penalty = (
-        args.presence_penalty
-        if args.presence_penalty is not None
-        else (0.0 if thinking else 1.5)
-    )
-    if temperature < 0.0 or not 0.0 < top_p <= 1.0 or top_k < 0:
-        parser.error("invalid sampling parameters")
-    if not -2.0 <= presence_penalty <= 2.0:
-        parser.error("--presence-penalty must be between -2 and 2")
+    defaults = tokenizer.sampling_defaults(thinking)
+    sampling = {
+        name: getattr(args, name) if getattr(args, name) is not None else value
+        for name, value in defaults.items()
+    }
+    temperature, top_p = sampling["temperature"], sampling["top_p"]
+    top_k, presence_penalty = sampling["top_k"], sampling["presence_penalty"]
+    try:
+        validate_sampling(temperature, top_k, top_p, presence_penalty)
+    except ValueError as error:
+        parser.error(str(error))
     if args.max_new_tokens is not None and args.max_new_tokens < 1:
         parser.error("--max-new-tokens must be positive")
     if args.dflash_path is not None and multimodal:
@@ -521,7 +501,10 @@ def main():
     if args.coding_agent and system is None:
         system = (
             "You are a coding agent. Use tools only when a request requires inspecting or changing the trusted "
-            "workspace. Never use tools for conversation, general knowledge, translation, or creative writing."
+            "workspace. For coding tasks, write the requested files, run checks, and fix errors before finishing. "
+            "The shell has no network or graphical display. Give GUI programs a headless self-test for their logic; "
+            "do not try to connect to the host display. Use paths relative to the trusted folder. "
+            "Never use tools for conversation, general knowledge, translation, or creative writing."
         )
     messages = [] if system is None else [{"role": "system", "content": system}]
     session_store = ChatSessionStore(args.model_dir, args.chat_dir)
@@ -557,6 +540,10 @@ def main():
         "Enter /clear for a new conversation, /resume to reopen one, or /exit to quit."
     )
     print(f"Chats are saved automatically in {session_store.directory}.")
+    print(
+        f"Sampling: temperature={temperature:g}, top_p={top_p:g}, top_k={top_k}, "
+        f"presence_penalty={presence_penalty:g}; thinking={'on' if thinking else 'off'}."
+    )
     if processor:
         print(
             "Use /image PATH to queue an image, or /image PATH QUESTION to ask "
@@ -583,10 +570,11 @@ def main():
             print(
                 "Sandboxed shell unavailable on this host; command execution is disabled."
             )
+    prompts = iter([args.prompt]) if args.prompt is not None else None
     while True:
         try:
-            prompt = input("You: ").strip()
-        except (EOFError, KeyboardInterrupt):
+            prompt = (next(prompts) if prompts is not None else input("You: ")).strip()
+        except (EOFError, KeyboardInterrupt, StopIteration):
             print()
             break
         if not prompt:
@@ -689,7 +677,7 @@ def main():
         messages.append({"role": "user", "content": content})
         save_session()
         with _EscapeMonitor() as cancel:
-            for tool_round in range(8):
+            for tool_round in range(args.max_tool_rounds):
                 encode_options = {
                     "enable_thinking": thinking,
                     "tools": coding_tools.schemas if coding_tools else None,
@@ -750,6 +738,7 @@ def main():
                     use_dflash=args.dflash_path is not None,
                     use_mtp=args.mtp,
                     hide_reasoning=thinking,
+                    tools=coding_tools.schemas if coding_tools else None,
                 )
                 if processor is None:
                     chat_encoder.extend_raw(generated)
@@ -837,7 +826,7 @@ def main():
                 if cancel.cancelled.is_set():
                     break
                 if tool_round == 7:
-                    print("[Stopped after 8 tool rounds.]")
+                    print(f"[Stopped after {args.max_tool_rounds} tool rounds.]")
 
     saved_path = save_session()
     atexit.unregister(save_session)

@@ -540,9 +540,7 @@ def test_console_generation_reports_hidden_reasoning_progress(capsys, monkeypatc
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
     _generate(Runner(), Tokenizer(), 1, 40, 0.0, [], hide_reasoning=True)
 
-    assert capsys.readouterr().out == (
-        "Thinking…\rThinking… 32 tokens\r\033[2KDone"
-    )
+    assert capsys.readouterr().out == ("Thinking…\rThinking… 32 tokens\r\033[2KDone")
 
 
 def test_console_generation_stops_exact_repetition(capsys):
@@ -563,9 +561,7 @@ def test_console_generation_stops_exact_repetition(capsys):
             return bytes(token_ids).decode("latin1")
 
     cached_ids = []
-    generated, _, _ = _generate(
-        Runner(), Tokenizer(), 1, 300, 0.0, cached_ids
-    )
+    generated, _, _ = _generate(Runner(), Tokenizer(), 1, 300, 0.0, cached_ids)
 
     assert len(generated) == 191
     assert cached_ids == []
@@ -666,3 +662,95 @@ def test_interactive_image_message_keeps_all_attachments():
         {"type": "image", "image": "two.png"},
         {"type": "text", "text": "Compare them"},
     ]
+
+
+def test_qwen38_tools_preserve_effort_and_current_turn_reasoning(tmp_path):
+    path = tmp_path / "tokenizer.json"
+    _write_tokenizer(path)
+    (tmp_path / "chat_template.jinja").write_text("reasoning_effort <think>\\n")
+    tokenizer = Qwen3Tokenizer(path)
+    formatted = tokenizer.format_chat(
+        [
+            {"role": "system", "content": "Work carefully."},
+            {"role": "user", "content": "Previous question"},
+            {"role": "assistant", "content": "<think>old reasoning</think>Old answer"},
+            {"role": "user", "content": "Fix the program"},
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "Need to inspect the error",
+            },
+            {"role": "tool", "content": "NameError"},
+        ],
+        tools=[
+            {"type": "function", "function": {"name": "read_file", "parameters": {}}}
+        ],
+        preserve_thinking=False,
+        reasoning_effort="low",
+    )
+    assert "Reasoning effort is set to low." in formatted
+    assert "Work carefully." in formatted
+    assert "old reasoning" not in formatted
+    assert "<think>\nNeed to inspect the error\n</think>" in formatted
+    assert "<think>\n\n</think>\n\nAnswer" in tokenizer.format_chat(
+        [
+            {"role": "user", "content": "Question"},
+            {"role": "assistant", "content": "Answer"},
+        ]
+    )
+
+
+def test_official_model_sampling_defaults():
+    from warp_nn.runtime.muse.glimmer import MuseGlimmerTokenizer
+
+    qwen = object.__new__(Qwen3Tokenizer)
+    muse = object.__new__(MuseGlimmerTokenizer)
+    assert qwen.sampling_defaults(True) == dict(
+        temperature=1.0, top_p=0.95, top_k=20, presence_penalty=0.0
+    )
+    assert qwen.sampling_defaults(False) == dict(
+        temperature=0.7, top_p=0.8, top_k=20, presence_penalty=1.5
+    )
+    assert (
+        muse.sampling_defaults(True)
+        == muse.sampling_defaults(False)
+        == dict(temperature=1.0, top_p=0.95, top_k=64, presence_penalty=0.0)
+    )
+
+
+def test_qwen_parameter_tools_preserve_code_whitespace(tmp_path):
+    path = tmp_path / "tokenizer.json"
+    _write_tokenizer(path)
+    tokenizer = Qwen3Tokenizer(path)
+    arguments = {
+        "old_text": "    return 1\n",
+        "new_text": "    return 2\n\n",
+        "recursive": False,
+    }
+    formatted = tokenizer.format_chat(
+        [
+            {"role": "user", "content": "Edit"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "edit_file", "arguments": arguments}}
+                ],
+            },
+        ],
+        add_generation_prompt=False,
+    )
+    _, calls = parse_qwen_tool_calls(formatted)
+    assert calls[0]["arguments"] == arguments
+
+
+def test_qwen_tool_schema_keeps_json_looking_file_content_as_text():
+    from warp_nn.runtime.services.coding_tools import FILE_TOOL_SCHEMAS
+
+    for content in ("42", "true", "null", '"quoted"'):
+        text = (
+            "<tool_call><function=write_file><parameter=path>\nfile.txt\n</parameter>"
+        )
+        text += f"<parameter=content>\n{content}\n</parameter></function></tool_call>"
+        _, calls = parse_qwen_tool_calls(text, tools=FILE_TOOL_SCHEMAS)
+        assert calls[0]["arguments"] == {"path": "file.txt", "content": content}

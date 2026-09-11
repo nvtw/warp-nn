@@ -358,6 +358,10 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
         self.supports_reasoning_effort = True
         self.default_enable_thinking = True
 
+    def sampling_defaults(self, enable_thinking: bool) -> dict[str, float | int]:
+        """Muse's policy is independent of its requested reasoning strength."""
+        return {"temperature": 1.0, "top_p": 0.95, "top_k": 64, "presence_penalty": 0.0}
+
     @staticmethod
     def _reasoning_strength(enable_thinking: bool, reasoning_effort: str | None) -> str:
         if not enable_thinking:
@@ -533,7 +537,9 @@ class MuseGlimmerTokenizer(Qwen3Tokenizer):
         """Create a per-response ATEM channel filter for incremental output."""
         return _MuseStreamFilter()
 
-    def parse_tool_calls(self, text: str) -> tuple[str, list[dict[str, object]]]:
+    def parse_tool_calls(
+        self, text: str, *, tools=None
+    ) -> tuple[str, list[dict[str, object]]]:
         """Extract structured ATEM calls from Muse assistant text."""
         return parse_atem_tool_calls(text)
 

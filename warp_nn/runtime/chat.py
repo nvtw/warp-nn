@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterator, Mapping, Sequence
 from datetime import datetime, timezone
 import json
@@ -16,6 +17,12 @@ from typing import Any, Protocol
 import numpy as np
 
 from warp_nn.utils.paths import application_state_dir
+from warp_nn.runtime.sampling import (  # re-export the original public API
+    sample_candidates as sample_candidates,
+    sample_token as sample_token,
+    sample_runner_token as sample_runner_token,
+    validate_sampling,
+)
 
 
 _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -245,6 +252,33 @@ def split_tool_prefix(text: str, marker: str) -> tuple[str, str, bool]:
     return (text[:-keep], text[-keep:], False) if keep else (text, "", False)
 
 
+class ReasoningStream:
+    """Strip a Qwen reasoning prefix without buffering the whole response.
+
+    The prompt has already opened ``<think>``. This presentation-only decoder
+    never changes generated tokens or the model's KV/recurrent state.
+    """
+
+    def __init__(self):
+        self.complete = False
+        self._tail = ""
+        self._trim = True
+
+    def feed(self, text: str, *, final: bool = False) -> str:
+        if not self.complete:
+            self._tail += text
+            _, marker, text = self._tail.partition("</think>")
+            if not marker:
+                self._tail = "" if final else self._tail[-7:]
+                return ""
+            self._tail = ""
+            self.complete = True
+        if self._trim:
+            text = text.lstrip()
+            self._trim = not bool(text)
+        return text
+
+
 def split_reasoning(text: str, enable_thinking: bool) -> tuple[str, str | None]:
     """Separate a tagged thinking response into answer and reasoning text."""
     if not enable_thinking:
@@ -253,94 +287,90 @@ def split_reasoning(text: str, enable_thinking: bool) -> tuple[str, str | None]:
     return (answer.lstrip(), reasoning.strip()) if marker else ("", reasoning.strip())
 
 
-def sample_candidates(
-    values: np.ndarray,
-    candidates: np.ndarray,
-    temperature: float,
-    top_p: float,
-    rng: np.random.Generator,
-) -> int:
-    """Apply host probability policy to an already selected candidate set."""
-    values = np.asarray(values, dtype=np.float64) / temperature
-    candidates = np.asarray(candidates, dtype=np.int64)
-    probabilities = np.exp(values - np.max(values))
-    probabilities /= probabilities.sum()
-    if top_p < 1.0:
-        order = np.argsort(probabilities)[::-1]
-        keep = np.cumsum(probabilities[order]) - probabilities[order] < top_p
-        candidates = candidates[order[keep]]
-        probabilities = probabilities[order[keep]]
-        probabilities /= probabilities.sum()
-    return int(rng.choice(candidates, p=probabilities))
+class TokenGeneration:
+    """One sampling policy for ordinary, MTP, and DFlash token generation.
 
+    Runners own model state; this iterator owns only sampling history and pending
+    verified tokens. ``pending`` tells callers whether early stopping discarded
+    an already evaluated speculative suffix and requires invalidating their cache.
+    """
 
-def sample_token(
-    logits: Any,
-    temperature: float = 1.0,
-    top_k: int = 0,
-    top_p: float = 1.0,
-    presence_penalty: float = 0.0,
-    previous_tokens: Sequence[int] = (),
-    rng: np.random.Generator | None = None,
-) -> int:
-    """Sample one token from the last logits row on the host."""
-    values = logits.numpy() if hasattr(logits, "numpy") else np.asarray(logits)
-    values = (
-        np.asarray(values, dtype=np.float64).reshape(-1, values.shape[-1])[-1].copy()
-    )
-    if temperature <= 0.0:
-        return int(np.argmax(values))
-    if top_k < 0 or not 0.0 < top_p <= 1.0 or not -2.0 <= presence_penalty <= 2.0:
-        raise ValueError("invalid top_k, top_p, or presence_penalty")
-    if presence_penalty and previous_tokens:
-        seen = np.asarray(tuple(previous_tokens), dtype=np.int64)
-        seen = seen[(seen >= 0) & (seen < values.size)]
-        values[np.unique(seen)] -= presence_penalty
-    candidates = np.arange(values.size)
-    if 0 < top_k < values.size:
-        candidates = np.argpartition(values, -top_k)[-top_k:]
-        values = values[candidates]
-    return sample_candidates(
-        values, candidates, temperature, top_p, rng or np.random.default_rng()
-    )
-
-
-def sample_runner_token(
-    runner: Runner,
-    logits: Any,
-    temperature: float = 1.0,
-    top_k: int = 0,
-    top_p: float = 1.0,
-    presence_penalty: float = 0.0,
-    previous_tokens: Sequence[int] = (),
-    rng: np.random.Generator | None = None,
-) -> int:
-    """Sample through a runner's bounded device path when one is available."""
-    if temperature > 0.0 and (
-        top_k < 0 or not 0.0 < top_p <= 1.0 or not -2.0 <= presence_penalty <= 2.0
-    ):
-        raise ValueError("invalid top_k, top_p, or presence_penalty")
-    if temperature <= 0.0 or (top_k == 1 and presence_penalty == 0.0):
-        return runner.sample_greedy(logits)
-    read_top_k = getattr(runner, "read_top_k", None)
-    if callable(read_top_k) and presence_penalty == 0.0 and 1 < top_k <= 32:
-        values, candidates = read_top_k(logits, top_k)
-        return sample_candidates(
-            values,
-            candidates,
-            temperature,
-            top_p,
-            rng or np.random.default_rng(),
-        )
-    return sample_token(
+    def __init__(
+        self,
+        runner,
+        tokenizer,
         logits,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-        presence_penalty=presence_penalty,
-        previous_tokens=previous_tokens,
-        rng=rng,
-    )
+        limit,
+        *,
+        temperature=0.0,
+        top_k=0,
+        top_p=1.0,
+        presence_penalty=0.0,
+        rng=None,
+        use_dflash=False,
+        use_mtp=False,
+        cancelled=None,
+    ):
+        validate_sampling(temperature, top_k, top_p, presence_penalty)
+        if use_dflash and use_mtp:
+            raise ValueError("choose only one speculative decoder")
+        self.runner, self.tokenizer, self.logits = runner, tokenizer, logits
+        self.limit = limit
+        self.options = dict(
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            presence_penalty=presence_penalty,
+        )
+        self.rng = rng if rng is not None else np.random.default_rng()
+        self.use_dflash, self.use_mtp = use_dflash, use_mtp
+        self.cancelled = cancelled
+        self.generated = []
+        self.pending = deque()
+        self.finished = False
+
+    def _sample(self, logits, accepted=()):
+        return sample_runner_token(
+            self.runner,
+            logits,
+            **self.options,
+            previous_tokens=(*self.generated, *accepted)
+            if accepted
+            else self.generated,
+            rng=self.rng,
+        )
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if (
+            self.finished
+            or len(self.generated) >= self.limit
+            or (self.cancelled and self.cancelled())
+        ):
+            raise StopIteration
+        token = self.pending.popleft() if self.pending else self._sample(self.logits)
+        self.generated.append(token)
+        if is_eos_token(self.tokenizer, token):
+            self.finished = True
+            return token
+        if not self.pending:
+            remaining = self.limit - len(self.generated)
+            sample = (
+                self._sample
+                if self.options["temperature"] > 0 or self.options["presence_penalty"]
+                else None
+            )
+            if self.use_dflash and remaining >= self.runner.dflash.block_size:
+                self.pending.extend(self.runner.decode_dflash(token, sample=sample)[0])
+            elif self.use_mtp and remaining >= 3:
+                self.pending.extend(
+                    self.runner.decode_speculative(token, sample=sample)[0]
+                )
+            else:
+                self.logits = self.runner.decode(token)
+        return token
 
 
 def generate_tokens(
@@ -354,26 +384,22 @@ def generate_tokens(
     presence_penalty: float = 0.0,
     seed: int | None = None,
     initial_logits: Any | None = None,
+    *,
+    use_dflash: bool = False,
+    use_mtp: bool = False,
 ) -> Iterator[int]:
     """Generate tokens incrementally through the common stateful runner API."""
     logits = runner.prefill(prompt_ids) if initial_logits is None else initial_logits
-    generated = []
-    rng = np.random.default_rng(seed)
-    for _ in range(max_new_tokens):
-        token_id = sample_runner_token(
-            runner,
-            logits,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            presence_penalty=presence_penalty,
-            previous_tokens=generated,
-            rng=rng,
-        )
-        generated.append(token_id)
-        eos = is_eos_token(tokenizer, token_id)
-        next_logits = None if eos else runner.decode(token_id)
-        yield token_id
-        if eos:
-            break
-        logits = next_logits
+    yield from TokenGeneration(
+        runner,
+        tokenizer,
+        logits,
+        max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        presence_penalty=presence_penalty,
+        rng=np.random.default_rng(seed),
+        use_dflash=use_dflash,
+        use_mtp=use_mtp,
+    )

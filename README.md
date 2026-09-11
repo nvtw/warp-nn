@@ -24,6 +24,12 @@ Refer to the *Installation* section in docs for more details.
 pip install warp-nn
 ```
 
+## Local coding agents
+
+For local Qwen/Muse chat with sandboxed file and script tools, see the
+[coding-agent example](docs/coding-agent.md). The Qwen repetition diagnosis and
+validation are documented in [the investigation notes](docs/qwen-loop-investigation.md).
+
 ## Support
 
 Questions and discussions can be opened on [GitHub Discussions](https://github.com/NVIDIA/warp-nn/discussions).

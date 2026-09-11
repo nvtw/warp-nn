@@ -53,3 +53,33 @@ def test_coding_tools_use_available_sandbox(tmp_path, monkeypatch):
     )
     result = CodingTools(tmp_path).execute("run_command", {"command": "echo hello"})
     assert result == "Exit code: 0\nhello"
+
+
+def test_coding_tools_fallback_search_does_not_follow_external_symlinks(tmp_path):
+    outside = tmp_path / "private.txt"
+    outside.write_text("private-needle")
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "escape.txt").symlink_to(outside)
+    tools = CodingTools(root, shell="none")
+    tools._rg = None
+    assert tools.execute("search_files", {"query": "private-needle"}) == "(no matches)"
+    assert tools.execute("write_file", {"path": "escape.txt", "content": "bad"}).startswith("Error: path is outside")
+    assert outside.read_text() == "private-needle"
+
+
+def test_coding_example_requires_explicit_root_and_sandbox(tmp_path, monkeypatch):
+    import pytest
+    from examples.coding_agent import main
+
+    monkeypatch.setattr("examples.qwen_chat.create_tokenizer", lambda *args: pytest.fail("model loaded before validation"))
+    with pytest.raises(SystemExit) as error:
+        main(["unused-model"], coding_agent=True)
+    assert error.value.code == 2
+    with pytest.raises(SystemExit) as error:
+        main(["unused-model", "--trusted-folder", str(tmp_path), "--unsafe-shell"], coding_agent=True)
+    assert error.value.code == 2
+    monkeypatch.setattr("warp_nn.runtime.services.sandbox.is_sandbox_available", lambda: False)
+    with pytest.raises(SystemExit) as error:
+        main(["unused-model", "--trusted-folder", str(tmp_path)], coding_agent=True)
+    assert error.value.code == 2

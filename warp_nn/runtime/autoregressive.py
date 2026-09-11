@@ -516,9 +516,10 @@ class AutoregressiveRunner:
         token_stop = full_vocabulary if token_stop is None else token_stop
         if not 0 <= token_start < token_stop <= full_vocabulary:
             raise ValueError("top-k token interval is outside the vocabulary")
-        logits = logits.flatten()[token_start:token_stop].reshape(
-            (1, 1, token_stop - token_start)
-        )
+        row_offset = (logits.shape[1] - 1) * full_vocabulary
+        logits = logits.flatten()[
+            row_offset + token_start : row_offset + token_stop
+        ].reshape((1, 1, token_stop - token_start))
         vocabulary = token_stop - token_start
         if not 1 <= top_k <= 64:
             raise ValueError("top_k must be between 1 and 64")

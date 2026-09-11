@@ -955,3 +955,31 @@ def test_qwen35_gguf_matches_safetensors_attention_layout(tmp_path, chunk_size):
             atol=1e-4,
             rtol=1e-3,
         )
+
+
+def test_qwen35_gguf_batched_attention_matches_safetensors(tmp_path):
+    if not is_device_available("cuda:0"):
+        pytest.skip("CUDA unavailable")
+    source, target = tmp_path / "native", tmp_path / "gguf"
+    _write_tiny_qwen35(source)
+    _convert_tiny_qwen35_to_gguf(source, target)
+    batches = []
+    for path in [source, target]:
+        runner = Qwen35Runner(
+            path,
+            device="cuda:0",
+            cache_capacity=16,
+            prefill_chunk_size=4,
+            use_cublas=False,
+        )
+        batch = runner.create_batch_decoder(2)
+        batch.prefill(0, [1, 7, 3])
+        batch.prefill(1, [9, 2])
+        batches.append(batch)
+    for tokens in ([4, 11], [6, 3]):
+        np.testing.assert_allclose(
+            batches[0].decode(tokens).numpy().astype(np.float32),
+            batches[1].decode(tokens).numpy().astype(np.float32),
+            atol=1e-4,
+            rtol=1e-3,
+        )

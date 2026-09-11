@@ -518,6 +518,15 @@ class Qwen3Tokenizer:
             _BYTE_DECODER[character] for character in self._tokens[int(token_id)]
         )
 
+    def sampling_defaults(self, enable_thinking: bool) -> dict[str, float | int]:
+        """Qwen's published thinking/non-thinking sampling recommendations."""
+        return {
+            "temperature": 1.0 if enable_thinking else 0.7,
+            "top_p": 0.95 if enable_thinking else 0.8,
+            "top_k": 20,
+            "presence_penalty": 0.0 if enable_thinking else 1.5,
+        }
+
     def format_chat(
         self,
         messages: Sequence[Mapping[str, object]],
@@ -556,8 +565,6 @@ class Qwen3Tokenizer:
                 else _PARAMETER_TOOL_PROMPT
             ).format(tools=definitions)
             system = prompt
-            if reasoning_instruction:
-                system = reasoning_instruction + "\n\n" + system
             if messages and messages[0].get("role") in ("system", "developer"):
                 content = messages[0].get("content")
                 if not isinstance(content, str):
@@ -571,6 +578,8 @@ class Qwen3Tokenizer:
                         else prompt + "\n\n" + content.strip()
                     )
                 first = 1
+            if reasoning_instruction:
+                system = reasoning_instruction + "\n\n" + system
             formatted.append(f"<|im_start|>system\n{system}<|im_end|>\n")
         elif reasoning_instruction:
             system = reasoning_instruction
@@ -589,6 +598,17 @@ class Qwen3Tokenizer:
         ):
             formatted.append("<|im_start|>system\n<|im_end|>\n")
 
+        last_query = next(
+            (
+                i
+                for i in range(len(messages) - 1, -1, -1)
+                if messages[i].get("role") == "user"
+                and not str(messages[i].get("content", ""))
+                .strip()
+                .startswith("<tool_response>")
+            ),
+            len(messages),
+        )
         index = first
         while index < len(messages):
             message = messages[index]
@@ -621,14 +641,14 @@ class Qwen3Tokenizer:
             body = "" if content is None else content.strip()
             if role == "assistant":
                 reasoning = message.get("reasoning_content", message.get("reasoning"))
-                if (
-                    preserve_thinking
-                    and isinstance(reasoning, str)
-                    and reasoning.strip()
-                    and not body.startswith("<think>")
-                ):
-                    body = f"<think>\n{reasoning.strip()}\n</think>\n\n{body}"
-                elif not preserve_thinking and body.startswith("<think>"):
+                keep_reasoning = preserve_thinking or (
+                    self.supports_reasoning_effort and index > last_query
+                )
+                if keep_reasoning and not body.startswith("<think>"):
+                    reasoning = reasoning.strip() if isinstance(reasoning, str) else ""
+                    if reasoning or self.supports_reasoning_effort:
+                        body = f"<think>\n{reasoning}\n</think>\n\n{body}"
+                elif not keep_reasoning and body.startswith("<think>"):
                     body = re.sub(
                         r"^<think>.*?</think>\s*", "", body, count=1, flags=re.DOTALL
                     )
@@ -677,26 +697,37 @@ class Qwen3Tokenizer:
         """Format and encode a chat prompt."""
         return self.encode(self.format_chat(messages, **kwargs))
 
-    def parse_tool_calls(self, text: str) -> tuple[str, list[dict[str, object]]]:
+    def parse_tool_calls(
+        self, text: str, *, tools=None
+    ) -> tuple[str, list[dict[str, object]]]:
         """Extract structured function calls from Qwen assistant text."""
-        return parse_qwen_tool_calls(text)
+        return parse_qwen_tool_calls(text, tools=tools)
 
 
 def _format_tool_value(value: object) -> str:
-    if isinstance(value, (Mapping, list, tuple)):
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    return str(value)
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def parse_qwen_tool_calls(text: str) -> tuple[str, list[dict[str, object]]]:
+def parse_qwen_tool_calls(
+    text: str, *, tools=None
+) -> tuple[str, list[dict[str, object]]]:
     """Extract Qwen XML function calls and return remaining assistant text."""
+    string_parameters = {}
+    for tool in tools or ():
+        function = tool.get("function", tool)
+        properties = function.get("parameters", {}).get("properties", {})
+        string_parameters[function["name"]] = {
+            name
+            for name, schema in properties.items()
+            if schema.get("type") == "string"
+        }
     calls = []
     spans = []
     pattern = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
     function_pattern = re.compile(r"<function=([^>\n]+)>\s*(.*?)</function>", re.DOTALL)
-    parameter_pattern = re.compile(
-        r"<parameter=([^>\n]+)>\s*(.*?)\s*</parameter>", re.DOTALL
-    )
+    parameter_pattern = re.compile(r"<parameter=([^>\n]+)>(.*?)</parameter>", re.DOTALL)
     for match in pattern.finditer(text):
         body = match.group(1).strip()
         if body.startswith("{"):
@@ -717,12 +748,24 @@ def parse_qwen_tool_calls(text: str) -> tuple[str, list[dict[str, object]]]:
             continue
         arguments = {}
         for parameter in parameter_pattern.finditer(function.group(2)):
-            value = parameter.group(2).strip()
-            try:
-                value = json.loads(value)
-            except (json.JSONDecodeError, TypeError):
-                pass
-            arguments[parameter.group(1).strip()] = value
+            value = parameter.group(2)
+            # The template wraps each value in one newline. Preserve the
+            # value's own indentation and trailing newlines for exact file edits.
+            if value.startswith("\r\n"):
+                value = value[2:]
+            elif value.startswith("\n"):
+                value = value[1:]
+            if value.endswith("\r\n"):
+                value = value[:-2]
+            elif value.endswith("\n"):
+                value = value[:-1]
+            name = parameter.group(1).strip()
+            if name not in string_parameters.get(function.group(1).strip(), ()):
+                try:
+                    value = json.loads(value)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            arguments[name] = value
         calls.append({"name": function.group(1).strip(), "arguments": arguments})
         spans.append(match.span())
     for start, end in reversed(spans):

@@ -91,7 +91,7 @@ FILE_TOOL_SCHEMAS = (
 
 COMMAND_TOOL_SCHEMA = _schema(
     "run_command",
-    "Run a shell command with writes confined to the trusted folder.",
+    "Run a sandboxed shell command in the trusted folder, without network or host display access.",
     {
         "command": {"type": "string"},
         "timeout": {"type": "number", "minimum": 0.1, "maximum": 300},
@@ -130,7 +130,7 @@ class CodingTools:
             if method is None:
                 raise ValueError(f"unknown tool {name!r}")
             keywords = dict(arguments)
-            if name == "search_files":
+            if name in ("search_files", "run_command"):
                 keywords["_cancelled"] = cancelled
             return method(**keywords)[:_MAX_OUTPUT]
         except Exception as error:
@@ -158,7 +158,7 @@ class CodingTools:
                     if entry.is_dir(follow_symlinks=False):
                         if recursive and entry.name not in _SKIP_DIRECTORIES:
                             pending.append(Path(entry.path))
-                    else:
+                    elif entry.is_file(follow_symlinks=False):
                         yield Path(entry.path)
 
     def _read(self, path, line_start=1, line_end=None):
@@ -280,12 +280,14 @@ class CodingTools:
         path.write_text(content.replace(old_text, new_text), encoding="utf-8")
         return f"Edited {path.relative_to(self.root).as_posix()}"
 
-    def _command(self, command, timeout=30):
+    def _command(self, command, timeout=30, _cancelled=None):
         if not isinstance(command, str) or not command:
             raise ValueError("command must be a non-empty string")
         timeout = min(300.0, max(0.1, float(timeout)))
         if self.shell == "sandbox":
-            result = run_sandboxed(command, self.root, timeout)
+            result = run_sandboxed(
+                command, self.root, timeout, **({"cancelled": _cancelled} if _cancelled else {})
+            )
         else:
             result = subprocess.run(
                 command,

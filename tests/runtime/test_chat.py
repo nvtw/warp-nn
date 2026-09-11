@@ -147,3 +147,66 @@ def test_split_tool_prefix_preserves_partial_marker():
 def test_split_reasoning():
     assert split_reasoning("Reason\n</think>\n\nAnswer", True) == ("Answer", "Reason")
     assert split_reasoning("Answer", False) == ("Answer", None)
+
+
+@pytest.mark.parametrize("split", range(1, 9))
+def test_reasoning_stream_handles_split_terminators(split):
+    from warp_nn.runtime.chat import ReasoningStream
+
+    stream = ReasoningStream()
+    text = "private reasoning</think>\n\nAnswer"
+    actual = "".join(
+        stream.feed(text[i : i + split]) for i in range(0, len(text), split)
+    )
+    assert actual == "Answer"
+    assert stream.complete
+    assert stream.feed(" continues", final=True) == " continues"
+    assert ReasoningStream().feed("unfinished secret", final=True) == ""
+
+
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_speculative_generation_uses_identical_penalty_history(temperature):
+    from warp_nn.runtime.chat import TokenGeneration
+
+    class Runner:
+        class dflash:
+            block_size = 3
+
+        def __init__(self):
+            self.position = 0
+
+        def logits(self):
+            return np.array([[0, 4, 3.5, 3]], dtype=np.float32)
+
+        def decode(self, token):
+            self.position += 1
+            return self.logits()
+
+        def decode_dflash(self, token, sample=None):
+            assert sample is not None
+            logits = self.decode(token)
+            accepted = []
+            for draft in [2, 1]:
+                prediction = sample(logits, accepted)
+                if prediction != draft:
+                    return [*accepted, prediction], len(accepted)
+                accepted.append(draft)
+                logits = self.decode(draft)
+            return [*accepted, sample(logits, accepted)], len(accepted)
+
+    results = []
+    for speculative in [False, True]:
+        runner = Runner()
+        generation = TokenGeneration(
+            runner,
+            _Tokenizer(),
+            runner.logits(),
+            10,
+            temperature=temperature,
+            top_k=1,
+            presence_penalty=2,
+            use_dflash=speculative,
+        )
+        results.append(list(generation))
+        assert runner.position == 2  # EOS was sampled but not committed.
+    assert results == [[1, 2, 3], [1, 2, 3]]
