@@ -1,25 +1,32 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Small workspace tool set for local coding agents."""
+"""Small coding-tool facade; untrusted filesystem operations run in isolation."""
 
 from __future__ import annotations
 
-import fnmatch
-import os
+import atexit
+import json
+import math
 import shutil
+from pathlib import Path
 import subprocess
+import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
-from pathlib import Path
+import uuid
 
-from warp_nn.runtime.services.sandbox import is_sandbox_available, run_sandboxed
+from warp_nn.runtime.services import workspace_files
+from warp_nn.runtime.services.sandbox import (
+    SandboxLimits,
+    is_sandbox_available,
+    run_sandboxed,
+    _PYTHON_EXECUTABLE,
+)
 
-
-_SKIP_DIRECTORIES = {".git", ".hg", ".svn", ".venv", "__pycache__", "node_modules"}
-_MAX_OUTPUT = 64 * 1024
-_SEARCH_TIMEOUT = 30.0
+_WORKER_SOURCE = Path(workspace_files.__file__).read_text(encoding="utf-8")
+_RG_PATH = shutil.which("rg")
+_RG_PATH = str(Path(_RG_PATH).resolve()) if _RG_PATH else None
 
 
 def _schema(name, description, properties, required=()):
@@ -40,6 +47,12 @@ def _schema(name, description, properties, required=()):
 
 FILE_TOOL_SCHEMAS = (
     _schema(
+        "set_executable",
+        "Make a compiled workspace artifact or script executable safely. Use this if a compiled program reports Permission denied; chmod is blocked.",
+        {"path": {"type": "string"}},
+        ("path",),
+    ),
+    _schema(
         "read_file",
         "Read numbered lines from a UTF-8 text file in the trusted folder.",
         {
@@ -51,41 +64,62 @@ FILE_TOOL_SCHEMAS = (
     ),
     _schema(
         "list_files",
-        "List files in the trusted folder.",
+        "List files deterministically. Use offset to retrieve subsequent pages.",
         {
             "path": {"type": "string", "default": "."},
             "pattern": {"type": "string", "default": "*"},
             "recursive": {"type": "boolean", "default": True},
             "max_results": {"type": "integer", "minimum": 1, "maximum": 1000},
+            "offset": {"type": "integer", "minimum": 0},
         },
     ),
     _schema(
         "search_files",
-        "Find a literal string in trusted-folder text files.",
+        "Search text files, optionally using regex and surrounding lines. Use offset for more results.",
         {
             "query": {"type": "string"},
             "path": {"type": "string", "default": "."},
             "pattern": {"type": "string", "default": "*"},
             "case_sensitive": {"type": "boolean", "default": False},
+            "regex": {"type": "boolean", "default": False},
+            "context_lines": {"type": "integer", "minimum": 0, "maximum": 5},
             "max_results": {"type": "integer", "minimum": 1, "maximum": 1000},
+            "offset": {"type": "integer", "minimum": 0},
         },
         ("query",),
     ),
     _schema(
         "write_file",
         "Create or replace a UTF-8 text file in the trusted folder.",
-        {"path": {"type": "string"}, "content": {"type": "string"}},
+        {
+            "path": {"type": "string"},
+            "content": {"type": "string"},
+            "expected_sha256": {"type": "string"},
+        },
         ("path", "content"),
     ),
     _schema(
         "edit_file",
-        "Replace one exact text occurrence in a trusted-folder file.",
+        "Atomically apply one exact replacement or an edits array. All edits must match once; otherwise nothing changes. Use the SHA256 from read_file to reject stale edits.",
         {
             "path": {"type": "string"},
             "old_text": {"type": "string"},
             "new_text": {"type": "string"},
+            "expected_sha256": {"type": "string"},
+            "edits": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "old_text": {"type": "string"},
+                        "new_text": {"type": "string"},
+                    },
+                    "required": ["old_text", "new_text"],
+                    "additionalProperties": False,
+                },
+            },
         },
-        ("path", "old_text", "new_text"),
+        ("path",),
     ),
 )
 
@@ -94,209 +128,292 @@ COMMAND_TOOL_SCHEMA = _schema(
     "Run a sandboxed shell command in the trusted folder, without network or host display access.",
     {
         "command": {"type": "string"},
-        "timeout": {"type": "number", "minimum": 0.1, "maximum": 300},
+        "timeout": {"type": "number", "minimum": 0.1, "maximum": 3600},
+        "wait_seconds": {"type": "number", "minimum": 0, "maximum": 10},
     },
     ("command",),
 )
 
 
-class CodingTools:
-    """Execute coding tools within one trusted folder."""
+PROGRESS_TOOL_SCHEMA = _schema(
+    "save_progress",
+    "Save a concise durable checkpoint: task, constraints, discoveries, changed files, tests and next steps. Update before a long sequence of tools.",
+    {"summary": {"type": "string"}},
+    ("summary",),
+)
 
-    def __init__(self, root: str | Path, shell: str = "sandbox"):
+JOB_TOOL_SCHEMAS = (
+    _schema(
+        "poll_command",
+        "Wait briefly for a command job and retrieve its status and output.",
+        {
+            "job_id": {"type": "string"},
+            "wait_seconds": {"type": "number", "minimum": 0, "maximum": 10},
+        },
+        ("job_id",),
+    ),
+    _schema(
+        "read_command_log",
+        "Read a retained command log by byte offset, or tail its last bytes.",
+        {
+            "job_id": {"type": "string"},
+            "offset": {"type": "integer", "minimum": 0},
+            "max_bytes": {"type": "integer", "minimum": 1, "maximum": 32768},
+            "tail": {"type": "boolean"},
+        },
+        ("job_id",),
+    ),
+    _schema(
+        "cancel_command",
+        "Stop a running command and all of its children.",
+        {"job_id": {"type": "string"}},
+        ("job_id",),
+    ),
+)
+
+
+class CodingTools:
+    """One workspace, one concurrent command, bounded retained job logs.
+
+    The dedicated coding example supplies a disposable workspace. Direct callers
+    must supply a dedicated directory, never the runtime installation or home.
+    shell='none' is an explicit file-only mode, not a sandbox fallback.
+    """
+
+    def __init__(
+        self, root, shell="sandbox", *, limits=None, state_dir=None, read_only=()
+    ):
         if shell not in ("sandbox", "unsafe", "none"):
             raise ValueError("shell must be 'sandbox', 'unsafe', or 'none'")
         self.root = Path(root).resolve()
         self.shell = shell
-        self.shell_available = shell == "unsafe" or (shell == "sandbox" and is_sandbox_available())
-        self.schemas = FILE_TOOL_SCHEMAS + ((COMMAND_TOOL_SCHEMA,) if self.shell_available else ())
-        self._rg = shutil.which("rg")
+        self.limits = limits or SandboxLimits()
+        self.read_only = tuple(
+            str(Path(path).resolve(strict=True)) for path in read_only
+        )
+        self.shell_available = shell == "unsafe" or (
+            shell == "sandbox" and is_sandbox_available()
+        )
+        self.schemas = (
+            FILE_TOOL_SCHEMAS
+            + (PROGRESS_TOOL_SCHEMA,)
+            + (
+                (COMMAND_TOOL_SCHEMA,) + JOB_TOOL_SCHEMAS
+                if self.shell_available
+                else ()
+            )
+        )
+        self.state_dir = (
+            Path(state_dir)
+            if state_dir
+            else Path(tempfile.mkdtemp(prefix="warp-nn-agent-logs-"))
+        )
+        self.state_dir = self.state_dir.resolve()
+        if self.state_dir.is_relative_to(self.root):
+            raise ValueError("tool state must be outside the writable workspace")
+        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._rg = _RG_PATH
+        if self._rg and (
+            Path(self._rg).is_relative_to(self.root)
+            or not Path(self._rg).is_relative_to(Path("/usr"))
+        ):
+            self._rg = None
+        self.jobs = {}
+        atexit.register(self.close)
 
-    def execute(
-        self, name: str, arguments: Mapping[str, object], cancelled: Callable[[], bool] | None = None
-    ) -> str:
-        """Run a named tool and return a bounded text result."""
-        methods = {
-            "read_file": self._read,
-            "list_files": self._list,
-            "search_files": self._search,
-            "write_file": self._write,
-            "edit_file": self._edit,
-        }
-        if self.shell_available:
-            methods["run_command"] = self._command
+    @property
+    def checkpoint(self):
+        path = self.state_dir / "progress.txt"
+        return path.read_text() if path.exists() else ""
+
+    def close(self):
+        for job in self.jobs.values():
+            job["cancel"].set()
+        for job in self.jobs.values():
+            job["thread"].join(timeout=5)
+        atexit.unregister(self.close)
+
+    def execute(self, name, arguments, cancelled=None):
         try:
-            method = methods.get(name)
-            if method is None:
+            if cancelled and cancelled():
+                return (
+                    "Error: search cancelled"
+                    if name == "search_files"
+                    else "Error: tool cancelled"
+                )
+            if name == "save_progress":
+                summary = arguments.get("summary")
+                if not isinstance(summary, str) or len(summary) > 12000:
+                    raise ValueError(
+                        "summary must be a string of at most 12000 characters"
+                    )
+                (self.state_dir / "progress.txt").write_text(summary)
+                return "Progress checkpoint saved."
+            if name in ("write_file", "edit_file", "set_executable") and any(
+                job["thread"].is_alive() for job in self.jobs.values()
+            ):
+                raise ValueError(
+                    "a command is still running; poll or cancel it before editing files"
+                )
+            if name in {schema["function"]["name"] for schema in FILE_TOOL_SCHEMAS}:
+                if self.shell == "sandbox":
+                    if not is_sandbox_available():
+                        raise RuntimeError(
+                            "sandbox unavailable; file tools fail closed"
+                        )
+                    request = json.dumps(
+                        {"name": name, "arguments": dict(arguments), "rg": self._rg}
+                    )
+                    if len(request) > 8 * 1024**2:
+                        raise ValueError("tool request too large")
+                    result = run_sandboxed(
+                        [_PYTHON_EXECUTABLE, "-I", "-S", "-c", _WORKER_SOURCE],
+                        self.root,
+                        30,
+                        cancelled=cancelled,
+                        input_text=request,
+                        limits=self.limits,
+                        read_only=self.read_only,
+                    )
+                    if result.returncode:
+                        return f"Error: file worker exited {result.returncode}\n{result.stdout}"
+                    return result.stdout.rstrip()
+                return getattr(workspace_files.WorkspaceFiles(self.root), name)(
+                    **arguments
+                )
+            if not self.shell_available:
                 raise ValueError(f"unknown tool {name!r}")
-            keywords = dict(arguments)
-            if name in ("search_files", "run_command"):
-                keywords["_cancelled"] = cancelled
-            return method(**keywords)[:_MAX_OUTPUT]
+            methods = {
+                "run_command": self._command,
+                "poll_command": self._poll,
+                "read_command_log": self._read_log,
+                "cancel_command": self._cancel,
+            }
+            if name not in methods:
+                raise ValueError(f"unknown tool {name!r}")
+            return methods[name](**arguments, _cancelled=cancelled)
         except Exception as error:
             return f"Error: {error}"
 
-    def _path(self, value: object) -> Path:
-        if not isinstance(value, str):
-            raise ValueError("path must be a string")
-        path = (self.root / value).resolve()
-        try:
-            path.relative_to(self.root)
-        except ValueError as error:
-            raise ValueError("path is outside the trusted folder") from error
-        return path
+    @staticmethod
+    def _duration(value, maximum):
+        value = float(value)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("duration must be finite and non-negative")
+        return min(maximum, value)
 
-    def _walk(self, path: Path, recursive: bool = True) -> Iterator[Path]:
-        pending = [path]
-        while pending:
-            current = pending.pop()
-            if current.is_file():
-                yield current
-                continue
-            with os.scandir(current) as entries:
-                for entry in entries:
-                    if entry.is_dir(follow_symlinks=False):
-                        if recursive and entry.name not in _SKIP_DIRECTORIES:
-                            pending.append(Path(entry.path))
-                    elif entry.is_file(follow_symlinks=False):
-                        yield Path(entry.path)
-
-    def _read(self, path, line_start=1, line_end=None):
-        path = self._path(path)
-        start = max(1, int(line_start))
-        end = start + 999 if line_end is None else min(int(line_end), start + 999)
-        if end < start:
-            raise ValueError("line_end must not precede line_start")
-        output = []
-        with path.open("r", encoding="utf-8", errors="replace") as stream:
-            for number, line in enumerate(stream, 1):
-                if number > end:
-                    break
-                if number >= start:
-                    output.append(f"{number:>6} | {line}")
-        return "".join(output) or "(no matching lines)"
-
-    def _list(self, path=".", pattern="*", recursive=True, max_results=200):
-        path = self._path(path)
-        limit = min(1000, max(1, int(max_results)))
-        items = []
-        for item in self._walk(path, bool(recursive)):
-            relative = item.relative_to(self.root).as_posix()
-            if fnmatch.fnmatch(relative, str(pattern)) or fnmatch.fnmatch(item.name, str(pattern)):
-                items.append(relative + ("/" if item.is_dir() else ""))
-                if len(items) >= limit:
-                    break
-        return "\n".join(sorted(items)) or "(no matches)"
-
-    def _search(self, query, path=".", pattern="*", case_sensitive=False, max_results=100, _cancelled=None):
-        if not isinstance(query, str) or not query:
-            raise ValueError("query must be a non-empty string")
-        path = self._path(path)
-        limit = min(1000, max(1, int(max_results)))
-        if self._rg:
-            return self._search_rg(query, path, str(pattern), bool(case_sensitive), limit, _cancelled)
-        needle = query if case_sensitive else query.casefold()
-        matches = []
-        deadline = time.monotonic() + _SEARCH_TIMEOUT
-        for file in self._walk(path):
-            if _cancelled and _cancelled():
-                raise RuntimeError("search cancelled")
-            if time.monotonic() >= deadline:
-                raise RuntimeError("search timed out")
-            relative = file.relative_to(self.root).as_posix()
-            if not (fnmatch.fnmatch(relative, str(pattern)) or fnmatch.fnmatch(file.name, str(pattern))):
-                continue
-            try:
-                with file.open("r", encoding="utf-8") as stream:
-                    for number, line in enumerate(stream, 1):
-                        candidate = line if case_sensitive else line.casefold()
-                        if needle in candidate:
-                            matches.append(f"{relative}:{number}:{line.rstrip()}")
-                            if len(matches) >= limit:
-                                return "\n".join(matches)
-            except (OSError, UnicodeError):
-                continue
-        return "\n".join(matches) or "(no matches)"
-
-    def _search_rg(self, query: str, path: Path, pattern: str, case_sensitive: bool, limit: int, cancelled):
-        command = [self._rg, "--line-number", "--no-heading", "--color=never", "--fixed-strings", "--glob", pattern]
-        if not case_sensitive:
-            command.append("--ignore-case")
-        command.extend(["--", query, str(path)])
-        process = subprocess.Popen(command, cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        done = threading.Event()
-        stopped = threading.Event()
-        timed_out = threading.Event()
-
-        def watch():
-            deadline = time.monotonic() + _SEARCH_TIMEOUT
-            while not done.wait(0.05):
-                if cancelled and cancelled():
-                    stopped.set()
-                    process.terminate()
-                    return
-                if time.monotonic() >= deadline:
-                    timed_out.set()
-                    process.terminate()
-                    return
-
-        watcher = threading.Thread(target=watch, daemon=True)
-        watcher.start()
-        lines = []
-        try:
-            for line in process.stdout:
-                lines.append(line.rstrip())
-                if len(lines) >= limit:
-                    process.terminate()
-                    break
-        finally:
-            done.set()
-            process.wait()
-            watcher.join()
-        if stopped.is_set():
-            raise RuntimeError("search cancelled")
-        if timed_out.is_set():
-            raise RuntimeError("search timed out")
-        if not lines and process.returncode not in (0, 1):
-            raise RuntimeError(process.stderr.read().strip() or "rg failed")
-        return "\n".join(lines) or "(no matches)"
-
-    def _write(self, path, content):
-        path = self._path(path)
-        if not isinstance(content, str):
-            raise ValueError("content must be a string")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-        return f"Wrote {len(content)} characters to {path.relative_to(self.root).as_posix()}"
-
-    def _edit(self, path, old_text, new_text):
-        path = self._path(path)
-        if not isinstance(old_text, str) or not old_text or not isinstance(new_text, str):
-            raise ValueError("old_text must be non-empty and new_text must be a string")
-        content = path.read_text(encoding="utf-8")
-        count = content.count(old_text)
-        if count != 1:
-            raise ValueError(f"old_text occurs {count} times; expected exactly once")
-        path.write_text(content.replace(old_text, new_text), encoding="utf-8")
-        return f"Edited {path.relative_to(self.root).as_posix()}"
-
-    def _command(self, command, timeout=30, _cancelled=None):
+    def _command(self, command, timeout=300, wait_seconds=2, _cancelled=None):
         if not isinstance(command, str) or not command:
             raise ValueError("command must be a non-empty string")
-        timeout = min(300.0, max(0.1, float(timeout)))
-        if self.shell == "sandbox":
-            result = run_sandboxed(
-                command, self.root, timeout, **({"cancelled": _cancelled} if _cancelled else {})
+        timeout = self._duration(timeout, 3600)
+        wait_seconds = self._duration(wait_seconds, 10)
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        if any(job["thread"].is_alive() for job in self.jobs.values()):
+            raise ValueError("a command is still running; poll or cancel it first")
+        if len(self.jobs) >= 64:
+            raise ValueError("session job limit reached (64); start another session")
+        job_id = uuid.uuid4().hex[:12]
+        log = self.state_dir / (job_id + ".log")
+        job = {"cancel": threading.Event(), "result": None, "log": log}
+
+        metadata = self.state_dir / (job_id + ".json")
+        metadata.write_text(
+            json.dumps(
+                {
+                    "command": command,
+                    "result": "Interrupted before completion; inspect the retained log and rerun checks.",
+                }
             )
-        else:
-            result = subprocess.run(
-                command,
-                cwd=self.root,
-                shell=True,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=timeout,
-            )
-        output = (result.stdout + result.stderr).strip()
-        return f"Exit code: {result.returncode}\n{output}".rstrip()
+        )
+
+        def run():
+            try:
+                if self.shell == "sandbox":
+                    result = run_sandboxed(
+                        command,
+                        self.root,
+                        timeout,
+                        cancelled=lambda: job["cancel"].is_set()
+                        or bool(_cancelled and _cancelled()),
+                        log_path=log,
+                        limits=self.limits,
+                        read_only=self.read_only,
+                    )
+                else:
+                    # Explicit legacy opt-out; never used by the coding example.
+                    result = subprocess.run(
+                        command,
+                        cwd=self.root,
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                    )
+                    log.write_text(
+                        (result.stdout + result.stderr)[: self.limits.log_bytes]
+                    )
+                job["result"] = (
+                    f"Exit code: {result.returncode}\n{(result.stdout + result.stderr).strip()}"
+                )
+            except Exception as error:
+                job["result"] = f"Error: {error}"
+            finally:
+                metadata.write_text(
+                    json.dumps({"command": command, "result": job["result"]})
+                )
+
+        job["thread"] = threading.Thread(target=run, daemon=True)
+        self.jobs[job_id] = job
+        job["thread"].start()
+        return self._poll(job_id, wait_seconds, _cancelled)
+
+    def _job(self, job_id):
+        if job_id in self.jobs:
+            return self.jobs[job_id]
+        if (
+            not isinstance(job_id, str)
+            or len(job_id) != 12
+            or any(c not in "0123456789abcdef" for c in job_id)
+        ):
+            raise ValueError("unknown job_id")
+        metadata = self.state_dir / (job_id + ".json")
+        if not metadata.is_file():
+            raise ValueError("unknown job_id")
+        return {
+            "result": json.loads(metadata.read_text())["result"],
+            "log": self.state_dir / (job_id + ".log"),
+            "cancel": threading.Event(),
+            "thread": threading.Thread(),
+        }
+
+    def _poll(self, job_id, wait_seconds=2, _cancelled=None):
+        job = self._job(job_id)
+        deadline = time.monotonic() + self._duration(wait_seconds, 10)
+        while job["thread"].is_alive() and time.monotonic() < deadline:
+            if _cancelled and _cancelled():
+                job["cancel"].set()
+                break
+            job["thread"].join(timeout=0.05)
+        if job["thread"].is_alive():
+            return f"Running job: {job_id}. Use poll_command or read_command_log."
+        return f"{job['result']}\nJob: {job_id}; log retained for read_command_log."
+
+    def _read_log(self, job_id, offset=0, max_bytes=16384, tail=False, _cancelled=None):
+        job = self._job(job_id)
+        count = min(32768, max(1, int(max_bytes)))
+        if not job["log"].exists():
+            return "(no log output yet)"
+        with job["log"].open("rb") as stream:
+            size = stream.seek(0, 2)
+            offset = max(0, size - count) if tail else max(0, int(offset))
+            stream.seek(offset)
+            data = stream.read(count)
+        return (
+            f"Bytes {offset}..{offset + len(data)} of {size}; next offset={offset + len(data)}\n"
+            + data.decode(errors="replace")
+        )
+
+    def _cancel(self, job_id, _cancelled=None):
+        self._job(job_id)["cancel"].set()
+        return self._poll(job_id, 2)

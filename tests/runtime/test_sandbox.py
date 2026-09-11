@@ -93,8 +93,12 @@ def test_sandbox_does_not_inherit_secrets_or_fds(tmp_path, monkeypatch):
 
 
 def test_sandbox_output_timeout_and_cancel_are_bounded(tmp_path):
-    result = run_python(tmp_path, "while True: print('x'*8192)")
-    assert "output limit exceeded" in result.stdout
+    result = run_python(
+        tmp_path, "print('x'*100000); open('finished', 'w').write('yes')"
+    )
+    assert result.returncode == 0
+    assert (tmp_path / "finished").read_text() == "yes"
+    assert "Display truncated" in result.stdout
     assert len(result.stdout) < 66000
     start = time.monotonic()
     result = run_python(tmp_path, "import time; time.sleep(60)", timeout=0.3)
@@ -123,3 +127,8 @@ def test_sandbox_executes_python_file_and_returns_runtime_errors(tmp_path):
     result = run_sandboxed("python3 program.py", tmp_path, 5)
     assert result.returncode == 0, result.stdout
     assert result.stdout.strip() == "42"
+
+
+def test_sandbox_preserves_failure_in_output_pipeline(tmp_path):
+    result = run_sandboxed("false | cat", tmp_path, 5)
+    assert result.returncode == 1, result.stdout

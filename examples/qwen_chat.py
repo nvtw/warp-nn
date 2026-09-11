@@ -41,6 +41,7 @@ import os
 import shlex
 import sys
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -353,10 +354,8 @@ def main(argv=None, *, coding_agent=False):
         type=int,
         help="Optional response limit; defaults to the remaining KV-cache capacity",
     )
-    parser.add_argument(
-        "--max-tool-rounds", type=int, default=16 if coding_agent else 8
-    )
-    parser.add_argument("--cache-capacity", type=int, default=1024)
+    parser.add_argument("--max-tool-rounds", type=int)
+    parser.add_argument("--cache-capacity", type=int)
     parser.add_argument("--prefill-chunk-size", type=int, default=256)
     speculation = parser.add_mutually_exclusive_group()
     speculation.add_argument(
@@ -421,7 +420,7 @@ def main(argv=None, *, coding_agent=False):
         "--trusted-folder",
         type=Path,
         default=None if coding_agent else Path.cwd(),
-        required=coding_agent,
+        required=False,
         help="Root allowed for coding tools",
     )
     parser.add_argument(
@@ -429,22 +428,84 @@ def main(argv=None, *, coding_agent=False):
         action="store_true",
         help="Allow shell commands without containment",
     )
+    parser.add_argument(
+        "--resume-workspace",
+        type=Path,
+        help="Resume a retained coding-agent session directory",
+    )
+    parser.add_argument(
+        "--workspace-exclude",
+        action="append",
+        default=[],
+        help="Exclude a relative glob from the disposable copy (repeatable)",
+    )
+    parser.add_argument(
+        "--sandbox-read-only",
+        action="append",
+        type=Path,
+        default=[],
+        help="Expose a trusted dependency directory read-only (repeatable)",
+    )
+    parser.add_argument("--sandbox-memory-gib", type=int, default=8)
+    parser.add_argument("--sandbox-workspace-gib", type=int, default=2)
     args = parser.parse_args(argv)
     args.coding_agent = args.coding_agent or coding_agent
+    if args.max_tool_rounds is None:
+        args.max_tool_rounds = 64 if args.coding_agent else 8
+    if args.cache_capacity is None:
+        args.cache_capacity = 32768 if args.coding_agent else 1024
+    workspace_session = None
+    if args.sandbox_memory_gib < 1 or args.sandbox_workspace_gib < 1:
+        parser.error("sandbox memory and workspace budgets must be positive")
+    if args.resume_workspace and not args.coding_agent:
+        parser.error("--resume-workspace requires coding tools")
     if args.max_tool_rounds < 1:
         parser.error("--max-tool-rounds must be positive")
-    if coding_agent:
+    if coding_agent and args.trusted_folder is None and args.resume_workspace is None:
+        parser.error("provide --trusted-folder or --resume-workspace")
+    if coding_agent and args.unsafe_shell:
+        parser.error("the coding-agent example requires sandboxed execution")
+    if args.coding_agent and not args.unsafe_shell:
         from warp_nn.runtime.services.sandbox import is_sandbox_available
 
-        if args.unsafe_shell:
-            parser.error("the coding-agent example requires sandboxed execution")
         if not is_sandbox_available():
             parser.error(
-                "coding-agent execution requires Linux Landlock ABI >= 6 and libseccomp"
+                "coding-agent execution requires Linux Landlock ABI >= 6, libseccomp and Bash"
             )
+    try:
+        args.sandbox_read_only = [
+            path.expanduser().resolve(strict=True) for path in args.sandbox_read_only
+        ]
+    except OSError as error:
+        parser.error(str(error))
     if args.coding_agent:
-        args.trusted_folder = args.trusted_folder.expanduser().resolve()
-        args.trusted_folder.mkdir(parents=True, exist_ok=True)
+        args.trusted_folder = (
+            (args.trusted_folder or args.resume_workspace / "workspace")
+            .expanduser()
+            .resolve()
+        )
+        if not args.resume_workspace:
+            args.trusted_folder.mkdir(parents=True, exist_ok=True)
+        if not args.unsafe_shell or args.resume_workspace:
+            from warp_nn.runtime.services.workspace_session import WorkspaceSession
+
+            try:
+                workspace_session = (
+                    WorkspaceSession(args.resume_workspace)
+                    if args.resume_workspace
+                    else WorkspaceSession.create(
+                        args.trusted_folder,
+                        exclude=args.workspace_exclude,
+                        max_bytes=args.sandbox_workspace_gib * 1024**3,
+                    )
+                )
+            except (OSError, ValueError) as error:
+                parser.error(str(error))
+            args.trusted_folder = workspace_session.root
+            print(f"Disposable workspace: {workspace_session.root}")
+            print(
+                f"Session retained in {workspace_session.directory}; original repository is unchanged."
+            )
     multimodal = args.multimodal or args.vision_path is not None
     processor = create_multimodal_processor(args.model_dir) if multimodal else None
     tokenizer = processor.tokenizer if processor else create_tokenizer(args.model_dir)
@@ -504,7 +565,22 @@ def main(argv=None, *, coding_agent=False):
             "workspace. For coding tasks, write the requested files, run checks, and fix errors before finishing. "
             "The shell has no network or graphical display. Give GUI programs a headless self-test for their logic; "
             "do not try to connect to the host display. Use paths relative to the trusted folder. "
-            "Never use tools for conversation, general knowledge, translation, or creative writing."
+            "Never use tools for conversation, general knowledge, translation, or creative writing. "
+            "For repository tasks, use search and numbered reads instead of reading whole trees. "
+            "Use save_progress to record constraints, discoveries, changed files, test results and next steps. "
+            "Long commands return job IDs: poll them and inspect retained logs before declaring success. "
+            "Do not recreate credentials or hooks. Finish with a concise account of changes and validation."
+        )
+    if workspace_session:
+        system = (
+            (system or "")
+            + " Work is in a disposable copy; Git metadata, common credential files and dependency directories are excluded."
+        )
+    if args.coding_agent and args.sandbox_read_only:
+        system = (
+            (system or "")
+            + "\nRead-only dependency paths available to commands: "
+            + ", ".join(str(p.resolve()) for p in args.sandbox_read_only)
         )
     messages = [] if system is None else [{"role": "system", "content": system}]
     session_store = ChatSessionStore(args.model_dir, args.chat_dir)
@@ -532,9 +608,34 @@ def main(argv=None, *, coding_agent=False):
     if args.unsafe_shell and not args.coding_agent:
         parser.error("--unsafe-shell requires --tools")
     shell = "unsafe" if args.unsafe_shell else "sandbox"
+    from warp_nn.runtime.services.sandbox import SandboxLimits
+
     coding_tools = (
-        CodingTools(args.trusted_folder, shell=shell) if args.coding_agent else None
+        CodingTools(
+            args.trusted_folder,
+            shell=shell,
+            limits=SandboxLimits(
+                memory_bytes=args.sandbox_memory_gib * 1024**3,
+                workspace_bytes=args.sandbox_workspace_gib * 1024**3,
+            ),
+            read_only=args.sandbox_read_only,
+            state_dir=workspace_session.directory / "logs"
+            if workspace_session
+            else None,
+        )
+        if args.coding_agent
+        else None
     )
+
+    if args.resume_workspace and coding_tools and coding_tools.checkpoint:
+        messages.append(
+            {
+                "role": "user",
+                "content": "Progress from the prior workspace session:\n"
+                + coding_tools.checkpoint,
+                "_agent_compaction": True,
+            }
+        )
 
     print(
         "Enter /clear for a new conversation, /resume to reopen one, or /exit to quit."
@@ -693,6 +794,38 @@ def main(argv=None, *, coding_agent=False):
                     if multimodal_prompt
                     else chat_encoder.encode_chat(messages, **encode_options)
                 )
+                if (
+                    coding_tools
+                    and processor is None
+                    and len(token_ids) > args.cache_capacity * 0.6
+                ):
+                    from warp_nn.runtime.services.agent_context import compact_messages
+
+                    def encode(items):
+                        return tokenizer.encode_chat(items, **encode_options)
+
+                    compacted = compact_messages(
+                        messages,
+                        encode,
+                        int(args.cache_capacity * 0.45),
+                        coding_tools.checkpoint,
+                    )
+                    if compacted is not None:
+                        archive = (
+                            coding_tools.state_dir / f"context-{time.time_ns()}.json"
+                        )
+                        archive.write_text(
+                            json.dumps(messages, ensure_ascii=False, default=str)
+                        )
+                        messages[:] = compacted
+                        cached_ids.clear()
+                        cached_media_count = 0
+                        chat_encoder.reset()
+                        token_ids = chat_encoder.encode_chat(messages, **encode_options)
+                        save_session()
+                        print(
+                            f"[Context compacted; full history retained in {archive}.]"
+                        )
                 if len(token_ids) >= args.cache_capacity:
                     if tool_round == 0:
                         messages.pop()
@@ -825,9 +958,17 @@ def main(argv=None, *, coding_agent=False):
                     save_session()
                 if cancel.cancelled.is_set():
                     break
-                if tool_round == 7:
+                if tool_round == args.max_tool_rounds - 1:
                     print(f"[Stopped after {args.max_tool_rounds} tool rounds.]")
 
+    if coding_tools:
+        coding_tools.close()
+    if workspace_session:
+        patch_path = workspace_session.review()
+        print(
+            f"Review changes in {patch_path} and {workspace_session.directory / 'changes.txt'}."
+        )
+        workspace_session.close()
     saved_path = save_session()
     atexit.unregister(save_session)
     if saved_path is not None:

@@ -15,12 +15,13 @@ An unattended request can create, test, and repair files::
 
     python examples/coding_agent.py /path/to/Qwen3.8-27B-GGUF --trusted-folder ./agent-workspace --cache-capacity 16384 --prompt 'Write minesweeper.py with a tkinter GUI and a --self-test mode that tests its game logic without opening a window. Run its self-test and fix any errors.'
 
-The sandbox requires Linux Landlock ABI >= 6 and libseccomp. It permits file
-contents from the workspace and system runtime, writes within the workspace,
-and no network or host display. It applies time, output, and per-process resource
-limits; these are not aggregate container/cgroup quotas. Unsupported hosts fail
-closed. Use a dedicated folder containing only files the agent may change.
-See docs/coding-agent.md for the security boundary and validation details.
+The example works in a retained disposable repository copy. It prints the session
+path and a review patch; the original repository is never modified. Use
+--resume-workspace SESSION to continue. File tools and commands share a Linux
+Landlock/seccomp sandbox. Long commands expose job IDs and retained logs. Progress
+checkpoints and automatic context compaction support longer tasks. Resource
+monitoring is best effort, not a VM or strict cgroup quota.
+See docs/coding-agent.md for tools, dependencies, limits and review instructions.
 """
 
 if __package__:
