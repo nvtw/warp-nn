@@ -64,6 +64,7 @@ qwen-image21 = [
   "diffusers @ git+https://github.com/huggingface/diffusers.git@51a454be9a43854939d2ef2d231565f46a41e366",
   "transformers>=5.17.0",
   "torch>=2.5.0",
+  "torchvision",
   "accelerate",
   "pillow",
 ]
