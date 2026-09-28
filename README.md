@@ -33,6 +33,26 @@ For local Qwen/Muse chat with sandboxed file and script tools, see the
 [coding-agent example](docs/coding-agent.md). The Qwen repetition diagnosis and
 validation are documented in [the investigation notes](docs/qwen-loop-investigation.md).
 
+## FLUX.2 Klein image generation
+
+The [FLUX.2 Klein example](examples/flux2_klein.py) runs the Apache-2.0 4B
+model with native Warp inference and four denoising steps. Download its
+self-contained Diffusers bundle without the duplicate transformer checkpoint:
+
+```bash
+HF_HUB_DISABLE_XET=1 HF_HUB_DOWNLOAD_TIMEOUT=60 \
+  hf download black-forest-labs/FLUX.2-klein-4B \
+  --exclude 'flux-2-klein-4b.safetensors' --exclude '*.jpg' \
+  --local-dir ~/Models/warp-nn/black-forest-labs/FLUX.2-klein-4B
+.venv/bin/python examples/flux2_klein.py \
+  ~/Models/warp-nn/black-forest-labs/FLUX.2-klein-4B \
+  --prompt "A red fox in a snowy forest, photographic" \
+  --output fox.png
+```
+
+The example uses the bundled Qwen3 text encoder, FLUX transformer, and VAE;
+PyTorch, Diffusers, and Transformers are not inference dependencies.
+
 ## Support
 
 Questions and discussions can be opened on [GitHub Discussions](https://github.com/NVIDIA/warp-nn/discussions).

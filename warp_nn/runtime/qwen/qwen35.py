@@ -1354,6 +1354,7 @@ class _Qwen35Plan:
                     self.runner.cache_capacity,
                     self.runner.head_size**-0.5,
                     0,
+                    2147483647,
                 ],
                 block_dim=layer["attention_block"],
                 device=self.device,

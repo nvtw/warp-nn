@@ -176,6 +176,7 @@ class _Qwen3EncoderPlan:
     def __init__(self, runner: Qwen3Encoder, sequence: int):
         self.runner = weakref.proxy(runner)
         self.sequence = sequence
+        self.key_limit = sequence
         self.device = runner.device
         self.dtype = runner.dtype
         self.input_ids = wp.empty((1, sequence), dtype=wp.int64, device=self.device)
@@ -389,11 +390,12 @@ class _Qwen3EncoderPlan:
             device=self.device,
         )
 
-    def execute(self) -> wp.array:
+    def execute(self, capture_layers: tuple[int, ...] = ()) -> wp.array:
         self._stage_embeddings()
         self._execute(self.first_norm)
         rotary = _rotary_embedding_kernel_for_dtype(self.dtype)
-        for layer in self.layers:
+        captured = {}
+        for index, layer in enumerate(self.layers, 1):
             for name in ("q", "k", "v"):
                 self._execute(layer[name])
             for name, target, heads in (
@@ -453,6 +455,7 @@ class _Qwen3EncoderPlan:
                     self.sequence,
                     self.runner.head_dim**-0.5,
                     int(getattr(self.runner, "sliding_window", 0)),
+                    self.key_limit,
                 ],
                 block_dim=self.attention_block,
                 device=self.device,
@@ -467,6 +470,18 @@ class _Qwen3EncoderPlan:
                 "next_norm",
             ):
                 self._execute(layer[name])
+            if index in capture_layers:
+                snapshot = wp.empty(
+                    (1, self.sequence, self.runner.hidden_size),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                wp.copy(
+                    snapshot, self.tensors[f"hidden.{index}"].reshape(snapshot.shape)
+                )
+                captured[index] = snapshot
+            if capture_layers and index == capture_layers[-1]:
+                return tuple(captured[number] for number in capture_layers)
         return self.output
 
     def run(self) -> wp.array:
@@ -507,9 +522,15 @@ class QwenEncoder:
         device=None,
         use_cublas: bool = True,
         tokenizer_path: str | Path | None = None,
+        last_layer: int | None = None,
     ):
         path = Path(path)
         self.config = self.config_loader(path)
+        if last_layer is not None:
+            last_layer = int(last_layer)
+            if not 1 <= last_layer <= int(self.config["num_hidden_layers"]):
+                raise ValueError("Qwen last_layer must lie within the backbone")
+            self.config = {**self.config, "num_hidden_layers": last_layer}
         self.device = parse_device(device)
         self.dtype = dtype
         if dtype not in (wp.float16, wp.bfloat16):
@@ -592,8 +613,36 @@ class QwenEncoder:
             raise ValueError("Qwen token ID is outside the vocabulary")
         plan = self._plan(values.size)
         plan.input_ids.assign(values[None, :])
+        plan.key_limit = plan.sequence
         plan.run()
         return plan.output if final_normalize else plan.pre_norm_output
+
+    def encode_intermediate_ids(
+        self,
+        token_ids: Sequence[int],
+        layers: Sequence[int],
+        *,
+        valid_tokens: int | None = None,
+    ) -> tuple[wp.array, ...]:
+        """Return pre-final-norm hidden states after selected Qwen layers."""
+        selected = tuple(sorted(set(int(layer) for layer in layers)))
+        if not selected or selected[0] < 1 or selected[-1] > self.layers:
+            raise ValueError("intermediate Qwen layers must lie within the backbone")
+        values = np.asarray(token_ids, dtype=np.int64)
+        if values.ndim != 1 or values.size == 0:
+            raise ValueError(
+                "Qwen token IDs must be a nonempty one-dimensional sequence"
+            )
+        if values.min() < 0 or values.max() >= int(self.config["vocab_size"]):
+            raise ValueError("Qwen token ID is outside the vocabulary")
+        plan = self._plan(values.size)
+        plan.input_ids.assign(values[None, :])
+        if valid_tokens is None:
+            valid_tokens = plan.sequence
+        if not 1 <= int(valid_tokens) <= plan.sequence:
+            raise ValueError("valid_tokens must lie within the Qwen sequence")
+        plan.key_limit = int(valid_tokens)
+        return plan.execute(selected)
 
     def encode(self, text: str, *, max_tokens: int = 256) -> wp.array:
         """Tokenize and return the full causal caption hidden-state sequence."""

@@ -227,6 +227,7 @@ class _CausalAttention:
                 self.length,
                 self.width**-0.5,
                 0,
+                self.length,
             ],
             block_dim=self.block,
             device=self.q.device,

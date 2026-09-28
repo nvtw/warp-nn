@@ -1116,6 +1116,7 @@ class _MusePlan:
                     cache_capacity,
                     self.runner.head_dim**-0.5,
                     window,
+                    2147483647,
                 ],
                 block_dim=layer["attention_block"],
                 device=self.device,

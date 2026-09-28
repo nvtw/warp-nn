@@ -159,6 +159,7 @@ class _Qwen3CausalPlan(_Qwen3EncoderPlan):
                     runner.cache_capacity,
                     runner.head_dim**-0.5,
                     0,
+                    2147483647,
                 ],
                 block_dim=self.attention_block,
                 device=self.device,

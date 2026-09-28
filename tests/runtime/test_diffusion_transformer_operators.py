@@ -160,4 +160,26 @@ def test_adaptive_rope_joint_attention_and_sinusoidal_plans():
     expected_angles = float(rounded) * 1000.0 * frequencies
     expected = np.concatenate((np.cos(expected_angles), np.sin(expected_angles)))[None]
     np.testing.assert_allclose(quantized, expected, rtol=0.01, atol=0.005)
+    scaled_quantized = (
+        SinusoidalEmbeddingPlan(
+            timesteps,
+            6,
+            dtype=wp.bfloat16,
+            scale=1000.0,
+            frequency_shift=0.0,
+            flip_sin_cos=True,
+            quantize_input=True,
+            quantize_scaled=True,
+        )
+        .execute()
+        .numpy()
+    )
+    rounded_scaled = wp.array(
+        [float(rounded) * 1000.0], dtype=wp.bfloat16, device="cuda:0"
+    ).numpy()[0]
+    scaled_angles = float(rounded_scaled) * frequencies
+    scaled_expected = np.concatenate((np.cos(scaled_angles), np.sin(scaled_angles)))[
+        None
+    ]
+    np.testing.assert_allclose(scaled_quantized, scaled_expected, rtol=0.01, atol=0.005)
     np.testing.assert_allclose(actual, expected_unquantized, rtol=0.01, atol=0.005)

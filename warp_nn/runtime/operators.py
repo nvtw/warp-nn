@@ -9,6 +9,7 @@ from typing import Any, Iterable
 from collections.abc import Mapping
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 import math
 
 import numpy as np
@@ -3108,6 +3109,150 @@ class OverlapTileBlendPlan:
         return self.canvas
 
 
+@lru_cache(maxsize=None)
+def _spatial_group_norm_kernels(dtype):
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def partial(
+        x: wp.array4d(dtype=DTYPE),
+        sums: wp.array3d(dtype=wp.float32),
+        squares: wp.array3d(dtype=wp.float32),
+        groups: int,
+    ):
+        batch, group, chunk = wp.tid()
+        channels_per_group = x.shape[3] // groups
+        total = x.shape[1] * x.shape[2] * channels_per_group
+        acc = wp.float32(0.0)
+        acc2 = wp.float32(0.0)
+        for offset in range(256):
+            flat = chunk * 256 + offset
+            if flat < total:
+                pixel = flat // channels_per_group
+                channel = group * channels_per_group + flat % channels_per_group
+                row = pixel // x.shape[2]
+                column = pixel % x.shape[2]
+                value = wp.float32(DTYPE(x[batch, row, column, channel]))
+                acc += value
+                acc2 += value * value
+        sums[batch, group, chunk] = acc
+        squares[batch, group, chunk] = acc2
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def finish(
+        sums: wp.array3d(dtype=wp.float32),
+        squares: wp.array3d(dtype=wp.float32),
+        mean: wp.array2d(dtype=wp.float32),
+        inv_std: wp.array2d(dtype=wp.float32),
+        count: int,
+        epsilon: float,
+    ):
+        batch, group = wp.tid()
+        total = wp.float32(0.0)
+        total2 = wp.float32(0.0)
+        for chunk in range(sums.shape[2]):
+            total += sums[batch, group, chunk]
+            total2 += squares[batch, group, chunk]
+        m = total / wp.float32(count)
+        variance = wp.max(total2 / wp.float32(count) - m * m, 0.0)
+        mean[batch, group] = m
+        inv_std[batch, group] = 1.0 / wp.sqrt(variance + epsilon)
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def normalize(
+        x: wp.array4d(dtype=DTYPE),
+        weight: wp.array1d(dtype=DTYPE),
+        bias: wp.array1d(dtype=DTYPE),
+        mean: wp.array2d(dtype=wp.float32),
+        inv_std: wp.array2d(dtype=wp.float32),
+        y: wp.array4d(dtype=DTYPE),
+        groups: int,
+        silu: bool,
+    ):
+        batch, row, column, channel = wp.tid()
+        group = channel // (x.shape[3] // groups)
+        value = (
+            wp.float32(x[batch, row, column, channel]) - mean[batch, group]
+        ) * inv_std[batch, group]
+        value = value * wp.float32(weight[channel]) + wp.float32(bias[channel])
+        if silu:
+            value = value / (1.0 + wp.exp(-value))
+        y[batch, row, column, channel] = DTYPE(value)
+
+    return partial, finish, normalize
+
+
+class SpatialGroupNormPlan:
+    """Spatial GroupNorm on NHWC tensors with optional fused SiLU."""
+
+    def __init__(self, x, weight, bias, *, groups=32, epsilon=1.0e-6, silu=False):
+        groups = int(groups)
+        if groups <= 0 or not math.isfinite(epsilon) or epsilon <= 0.0:
+            raise ValueError("spatial GroupNorm requires positive groups and epsilon")
+        if (
+            x.ndim != 4
+            or x.dtype not in (wp.float16, wp.bfloat16, wp.float32)
+            or x.shape[3] % groups
+            or weight.shape != (x.shape[3],)
+            or bias.shape != weight.shape
+        ):
+            raise ValueError("spatial GroupNorm geometry is incompatible")
+        if any(
+            item.dtype != x.dtype or item.device != x.device for item in (weight, bias)
+        ):
+            raise ValueError("spatial GroupNorm tensors must share dtype and device")
+        self.input, self.weight, self.bias = x, weight, bias
+        self.groups, self.epsilon, self.silu = int(groups), float(epsilon), bool(silu)
+        count = x.shape[1] * x.shape[2] * (x.shape[3] // groups)
+        chunks = (count + 255) // 256
+        self.sums = wp.empty(
+            (x.shape[0], groups, chunks), dtype=wp.float32, device=x.device
+        )
+        self.squares = wp.empty_like(self.sums)
+        self.mean = wp.empty((x.shape[0], groups), dtype=wp.float32, device=x.device)
+        self.inv_std = wp.empty_like(self.mean)
+        self.output = wp.empty_like(x)
+        self.count = count
+
+    def execute(self):
+        partial, finish, normalize = _spatial_group_norm_kernels(self.input.dtype)
+        wp.launch(
+            partial,
+            dim=self.sums.shape,
+            inputs=[self.input, self.sums, self.squares, self.groups],
+            device=self.input.device,
+        )
+        wp.launch(
+            finish,
+            dim=self.mean.shape,
+            inputs=[
+                self.sums,
+                self.squares,
+                self.mean,
+                self.inv_std,
+                self.count,
+                self.epsilon,
+            ],
+            device=self.input.device,
+        )
+        wp.launch(
+            normalize,
+            dim=self.output.shape,
+            inputs=[
+                self.input,
+                self.weight,
+                self.bias,
+                self.mean,
+                self.inv_std,
+                self.output,
+                self.groups,
+                self.silu,
+            ],
+            device=self.input.device,
+        )
+        return self.output
+
+
 class SpatialRMSNormPlan:
     """Graph-safe channels-last spatial RMSNorm with optional fused SiLU."""
 
@@ -3655,6 +3800,74 @@ class Snake1dPlan:
         return self.output
 
 
+class LinearPlan:
+    """Fixed-shape bias-free dense projection through the shared GEMM planner."""
+
+    def __init__(self, x, weight, *, cublas=None):
+        if x.ndim < 2 or weight.ndim != 2 or x.shape[-1] != weight.shape[1]:
+            raise ValueError("linear projection geometry is incompatible")
+        if weight.dtype != x.dtype or weight.device != x.device:
+            raise ValueError("linear projection tensors must share dtype and device")
+        rows = int(np.prod(x.shape[:-1]))
+        self.input = x
+        self._tensors = {"x": x.reshape((rows, x.shape[-1])), "weight": weight}
+        self._shapes = {name: value.shape for name, value in self._tensors.items()}
+        self._operation = Operation("Linear", ["x", "weight"], ["projected"])
+        plan_linear(
+            self._operation, self._tensors, self._shapes, x.device, cublas=cublas
+        )
+        self.output = self._tensors["projected"].reshape(
+            (*x.shape[:-1], weight.shape[0])
+        )
+
+    def execute(self):
+        execute_operations(
+            (self._operation,), self._tensors, self._shapes, self.input.device
+        )
+        return self.output
+
+
+@lru_cache(maxsize=None)
+def _fused_swiglu_kernel(dtype):
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def fused_swiglu(x: wp.array3d(dtype=DTYPE), y: wp.array3d(dtype=DTYPE)):
+        batch, token, channel = wp.tid()
+        gate = wp.float32(x[batch, token, channel])
+        value = wp.float32(x[batch, token, channel + y.shape[2]])
+        y[batch, token, channel] = DTYPE((gate / (1.0 + wp.exp(-gate))) * value)
+
+    return fused_swiglu
+
+
+class FusedSwiGLUPlan:
+    """Apply SwiGLU to a gate/value pair concatenated along the last axis."""
+
+    def __init__(self, x):
+        if (
+            x.ndim != 3
+            or x.shape[2] % 2
+            or x.dtype not in (wp.float16, wp.bfloat16, wp.float32)
+        ):
+            raise ValueError(
+                "fused SwiGLU requires a rank-three even-width float tensor"
+            )
+        self.input = x
+        self.output = wp.empty(
+            (*x.shape[:2], x.shape[2] // 2), dtype=x.dtype, device=x.device
+        )
+
+    def execute(self):
+        wp.launch(
+            _fused_swiglu_kernel(self.input.dtype),
+            dim=self.output.shape,
+            inputs=[self.input, self.output],
+            device=self.input.device,
+        )
+        return self.output
+
+
 class BiasedLinearPlan:
     """Fixed-buffer dense projection with fused bias and optional activation."""
 
@@ -3759,6 +3972,50 @@ class RMSNormPlan:
         return self.output
 
 
+class ActivationBufferPool:
+    """Reuse fixed-shape activation storage across sequential inference blocks."""
+
+    def __init__(self):
+        self.buffers = {}
+
+    def bind(self, name, allocated):
+        output = self.buffers.setdefault(name, allocated)
+        if (
+            output.shape != allocated.shape
+            or output.dtype != allocated.dtype
+            or output.device != allocated.device
+        ):
+            raise ValueError(f"activation buffer '{name}' has incompatible geometry")
+        return output
+
+
+def warp_to_numpy_float32(value):
+    """Convert a Warp float array, including BF16, to a NumPy FP32 array."""
+    host = value.numpy()
+    if value.dtype == wp.bfloat16:
+        bits = host.view(np.uint16).astype(np.uint32) << 16
+        return bits.view(np.float32)
+    return host.astype(np.float32, copy=False)
+
+
+def reuse_plan_output(plan, pool, name):
+    """Bind a plan's output to shared storage before constructing its consumer."""
+    original = plan.output
+    plan.output = pool.bind(name, plan.output)
+    if isinstance(plan, Conv2dPlan) and plan._use_mma and plan._mma_output is original:
+        plan._mma_output = plan.output
+    elif isinstance(plan, LinearPlan):
+        plan._tensors["projected"] = plan.output.reshape(
+            plan._tensors["projected"].shape
+        )
+    elif isinstance(plan, RMSNormPlan):
+        plan._tensors["normalized"] = plan.output
+        plan._operation.attrs["_output_2d"] = plan.output.reshape(
+            plan._operation.attrs["_output_2d"].shape
+        )
+    return plan.output
+
+
 class AdaptiveLayerNormPlan:
     """Affine-free LayerNorm followed by batch-broadcast shift and scale."""
 
@@ -3851,6 +4108,7 @@ class SinusoidalEmbeddingPlan:
         frequency_shift=1.0,
         flip_sin_cos=False,
         quantize_input=False,
+        quantize_scaled=False,
     ):
         if values.ndim != 1 or values.dtype != wp.float32:
             raise TypeError("sinusoidal embedding values must be a rank-one FP32 array")
@@ -3862,6 +4120,7 @@ class SinusoidalEmbeddingPlan:
         self.frequency_shift = float(frequency_shift)
         self.flip_sin_cos = bool(flip_sin_cos)
         self.quantize_input = bool(quantize_input)
+        self.quantize_scaled = bool(quantize_scaled)
         self.output = wp.empty(
             (values.shape[0], int(width)), dtype=dtype, device=values.device
         )
@@ -3878,6 +4137,7 @@ class SinusoidalEmbeddingPlan:
                 wp.float32(self.frequency_shift),
                 self.flip_sin_cos,
                 self.quantize_input,
+                self.quantize_scaled,
             ],
             device=self.values.device,
         )
@@ -3938,11 +4198,15 @@ class RotaryCachePlan:
             raise ValueError("rotary input must have an even head width")
         if cosine.shape != (x.shape[2], x.shape[3] // 2) or sine.shape != cosine.shape:
             raise ValueError("rotary cache geometry is incompatible")
-        if any(
-            value.dtype != x.dtype or value.device != x.device
-            for value in (cosine, sine)
+        if (
+            cosine.dtype not in (x.dtype, wp.float32)
+            or sine.dtype != cosine.dtype
+            or cosine.device != x.device
+            or sine.device != x.device
         ):
-            raise ValueError("rotary tensors must share dtype and device")
+            raise ValueError(
+                "rotary caches must share a device and use input or FP32 dtype"
+            )
         self.input, self.cosine, self.sine = x, cosine, sine
         self.output = wp.empty_like(x)
 
@@ -4062,7 +4326,7 @@ class SequenceSlicePlan:
 
 def multi_axis_rotary_cache_values(coordinates, axes, theta=10000.0):
     """Build adjacent-pair RoPE caches for explicit multi-axis coordinates."""
-    coordinates = np.asarray(coordinates, dtype=np.float32)
+    coordinates = np.asarray(coordinates, dtype=np.float64)
     axes = tuple(int(value) for value in axes)
     if coordinates.ndim != 2 or coordinates.shape[1] != len(axes):
         raise ValueError("rotary coordinates must have one column per axis")
@@ -4073,7 +4337,7 @@ def multi_axis_rotary_cache_values(coordinates, axes, theta=10000.0):
     angles = []
     for index, width in enumerate(axes):
         inverse = 1.0 / np.power(
-            theta, np.arange(0, width, 2, dtype=np.float32) / width
+            theta, np.arange(0, width, 2, dtype=np.float64) / width
         )
         angles.append(coordinates[:, index : index + 1] * inverse[None])
     values = np.concatenate(angles, axis=1)

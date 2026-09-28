@@ -1177,6 +1177,7 @@ def _sinusoidal_embedding_kernel(
     frequency_shift: wp.float32,
     flip_sin_cos: bool,
     quantize_input: bool,
+    quantize_scaled: bool,
 ):
     """Create a graph-safe diffusion-style sinusoidal embedding."""
     batch, column = wp.tid()
@@ -1193,7 +1194,10 @@ def _sinusoidal_embedding_kernel(
         value = values[batch]
         if quantize_input:
             value = wp.float32(output.dtype(value))
-        angle = value * scale * frequency
+        scaled = value * scale
+        if quantize_scaled:
+            scaled = wp.float32(output.dtype(scaled))
+        angle = scaled * frequency
         use_cos = (column >= half) != flip_sin_cos
         output[batch, column] = output.dtype(
             wp.cos(angle) if use_cos else wp.sin(angle)
@@ -3682,6 +3686,7 @@ def _create_gqa_attention_kernel(head_size: int, dtype: type):
         total_length: int,
         scale: float,
         window: int,
+        key_limit: int,
     ):
         """Apply causal GQA with an optional circular sliding window."""
         index = wp.tid()
@@ -3695,6 +3700,7 @@ def _create_gqa_attention_kernel(head_size: int, dtype: type):
             + query_token
             + 2
         )
+        valid_keys = wp.min(valid_keys, key_limit)
         first_key = wp.max(0, valid_keys - window) if window > 0 else 0
         query_row = (batch * query_heads + head) * sequence_length + query_token
         query_values = wp.tile_load(query[query_row], shape=(head_size,))
