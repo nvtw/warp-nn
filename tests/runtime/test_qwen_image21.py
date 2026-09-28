@@ -143,3 +143,55 @@ def test_pipeline_uses_cached_local_reference_and_preserves_rgba(tmp_path, monke
     pipeline.generate("edit", image=[object()])
     assert calls["generate"]["width"] is None
     assert calls["generate"]["height"] is None
+
+
+def test_example_reuses_pipeline_for_multiple_outputs(tmp_path, monkeypatch):
+    import examples.qwen_image21 as example
+
+    bundle = QwenImage21Bundle.inspect(_bundle(tmp_path / "model"))
+    monkeypatch.setattr(
+        example.QwenImage21Bundle, "inspect", lambda *args, **kwargs: bundle
+    )
+    loaded = []
+    seeds = []
+
+    class Image:
+        mode = "RGBA"
+
+        def save(self, path):
+            path.write_bytes(b"png")
+
+    class Pipeline:
+        def __init__(self, *args, **kwargs):
+            loaded.append(1)
+
+        def generate(self, prompt, **kwargs):
+            seeds.append(kwargs["seed"])
+            return Image()
+
+    monkeypatch.setattr(example, "QwenImage21Pipeline", Pipeline)
+    output = tmp_path / "out.png"
+    assert (
+        example.main(
+            [
+                str(bundle.root),
+                "--prompt",
+                "a bird",
+                "--width",
+                "512",
+                "--height",
+                "512",
+                "--repeat",
+                "2",
+                "--seed",
+                "5",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert loaded == [1]
+    assert seeds == [5, 6]
+    assert (tmp_path / "out-000.png").read_bytes() == b"png"
+    assert (tmp_path / "out-001.png").read_bytes() == b"png"

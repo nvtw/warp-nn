@@ -18,7 +18,9 @@ from .runner import QwenImage21Bundle
 class QwenImage21Pipeline:
     """Load a local 2.1 checkpoint and keep its weights resident across calls."""
 
-    def __init__(self, bundle: QwenImage21Bundle | str | Path, *, device="cuda"):
+    def __init__(
+        self, bundle: QwenImage21Bundle | str | Path, *, device="cuda", compile=False
+    ):
         self.bundle = (
             bundle
             if isinstance(bundle, QwenImage21Bundle)
@@ -38,6 +40,15 @@ class QwenImage21Pipeline:
         self._pipeline = DiffusersQwenImage21Pipeline.from_pretrained(
             str(self.bundle.root), dtype=torch.bfloat16, local_files_only=True
         ).to(self.device)
+        if compile:
+            from diffusers.models.transformers.transformer_qwenimage21 import (
+                QwenImage21FlexAttnProcessor,
+            )
+
+            self._pipeline.transformer.set_attn_processor(
+                QwenImage21FlexAttnProcessor()
+            )
+            self._pipeline.transformer.compile()
         self._pipeline.set_progress_bar_config(disable=True)
 
     def generate(
