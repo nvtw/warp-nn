@@ -2864,7 +2864,7 @@ class Conv2dPlan:
             and self.dilation == (1, 1)
             and x.dtype in (wp.float16, wp.bfloat16)
             and in_channels % 16 == 0
-            and out_channels % 32 == 0
+            and out_channels >= 32
         ):
             tile_m = 16
             top, _, left, _ = self.padding
@@ -2890,8 +2890,25 @@ class Conv2dPlan:
                     + (last_y - first_y)
                     * (self._interior_x_begin + output_x - self._interior_x_end)
                 )
-                self._packed_weight = wp.empty(
-                    (kernel_y, kernel_x, out_channels, in_channels),
+                padded_channels = ((out_channels + 31) // 32) * 32
+                self._mma_output = (
+                    self.output
+                    if padded_channels == out_channels
+                    else wp.empty(
+                        (x.shape[0], output_y, output_x, padded_channels),
+                        dtype=x.dtype,
+                        device=x.device,
+                    )
+                )
+                self._mma_bias = (
+                    self.bias
+                    if padded_channels == out_channels
+                    else wp.zeros(padded_channels, dtype=x.dtype, device=x.device)
+                )
+                if padded_channels != out_channels and self._use_bias:
+                    wp.copy(self._mma_bias, self.bias, count=out_channels)
+                self._packed_weight = wp.zeros(
+                    (kernel_y, kernel_x, padded_channels, in_channels),
                     dtype=x.dtype,
                     device=x.device,
                 )
@@ -2899,6 +2916,7 @@ class Conv2dPlan:
                     self._pack_kernel,
                     self._mma_kernel,
                     self._boundary_kernel,
+                    self._crop_kernel,
                 ) = _conv2d_mma_kernels(x.dtype, kernel_y, kernel_x, tile_m, 32)
                 wp.launch(
                     self._pack_kernel,
@@ -2919,13 +2937,13 @@ class Conv2dPlan:
                 dim=(
                     self._x_tiles,
                     self._interior_y_end - self._interior_y_begin,
-                    self.output.shape[0] * (self.output.shape[3] // 32),
+                    self._mma_output.shape[0] * (self._mma_output.shape[3] // 32),
                 ),
                 inputs=[
                     self.input,
                     self._packed_weight,
-                    self.bias,
-                    self.output,
+                    self._mma_bias,
+                    self._mma_output,
                     self._first_x_tile,
                     self._interior_y_begin,
                     self.padding[0],
@@ -2946,8 +2964,8 @@ class Conv2dPlan:
                     inputs=[
                         self.input,
                         self._packed_weight,
-                        self.bias,
-                        self.output,
+                        self._mma_bias,
+                        self._mma_output,
                         self._interior_x_begin,
                         self._interior_x_end,
                         self._interior_y_begin,
@@ -2956,6 +2974,13 @@ class Conv2dPlan:
                         self.padding[2],
                         self._use_bias,
                     ],
+                    device=self.input.device,
+                )
+            if self._mma_output is not self.output:
+                wp.launch(
+                    self._crop_kernel,
+                    dim=self.output.shape,
+                    inputs=[self._mma_output, self.output],
                     device=self.input.device,
                 )
             return self.output

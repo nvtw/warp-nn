@@ -40,7 +40,9 @@ from ...utils.device import parse_device
 def qwen_encoder_weight_names(config: dict) -> tuple[str, ...]:
     """Return weights used by a supported Qwen language backbone."""
     names = ["model.embed_tokens.weight", "model.norm.weight"]
-    qk_norm = bool(config.get("qk_norm", config.get("model_type") == "qwen3"))
+    qk_norm = bool(
+        config.get("qk_norm", config.get("model_type") in ("qwen3", "qwen3_vl"))
+    )
     attention_bias = bool(config.get("attention_bias", False))
     for index in range(int(config["num_hidden_layers"])):
         prefix = f"model.layers.{index}."
@@ -85,6 +87,8 @@ def load_qwen_encoder_config(path: str | Path) -> dict:
     # backbone already handled below.
     if config.get("model_type") == "qwen2_5_vl_text":
         config["model_type"] = "qwen2_5_vl"
+    elif config.get("model_type") == "qwen3_vl_text":
+        config["model_type"] = "qwen3_vl"
     required = (
         "hidden_size",
         "intermediate_size",
@@ -97,8 +101,10 @@ def load_qwen_encoder_config(path: str | Path) -> dict:
     missing = [name for name in required if name not in config]
     if missing:
         raise ValueError(f"Qwen encoder config is missing {missing}")
-    if config.get("model_type") not in ("qwen3", "qwen2_5_vl"):
-        raise ValueError("Qwen encoder requires Qwen3 or Qwen2.5-VL text config")
+    if config.get("model_type") not in ("qwen3", "qwen2_5_vl", "qwen3_vl"):
+        raise ValueError(
+            "Qwen encoder requires Qwen3, Qwen3-VL, or Qwen2.5-VL text config"
+        )
     layers = int(config["num_hidden_layers"])
     layer_types = config.get("layer_types", ["full_attention"] * layers)
     if len(layer_types) != layers or set(layer_types) != {"full_attention"}:
@@ -126,10 +132,10 @@ def load_qwen_encoder_config(path: str | Path) -> dict:
     rope_scaling = config.get("rope_scaling")
     if rope_scaling not in (None, {}):
         rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
-        if (
-            config.get("model_type") != "qwen2_5_vl"
-            or rope_type not in ("default", "mrope")
-            or "mrope_section" not in rope_scaling
+        if not (
+            config.get("model_type") in ("qwen2_5_vl", "qwen3_vl")
+            and rope_type in ("default", "mrope")
+            and "mrope_section" in rope_scaling
         ):
             raise ValueError("Qwen encoder requires default or text-only M-RoPE")
     return config
@@ -352,6 +358,9 @@ class _Qwen3EncoderPlan:
         self.output = self.tensors[normalized].reshape(
             (1, self.sequence, self.runner.hidden_size)
         )
+        self.pre_norm_output = self.tensors[hidden].reshape(
+            (1, self.sequence, self.runner.hidden_size)
+        )
 
     def _execute(self, operation: Operation) -> None:
         execute_operations(
@@ -512,7 +521,9 @@ class QwenEncoder:
         self.head_dim = int(self.config["head_dim"])
         self.epsilon = float(self.config.get("rms_norm_eps", 1.0e-6))
         self.qk_norm = bool(
-            self.config.get("qk_norm", self.config.get("model_type") == "qwen3")
+            self.config.get(
+                "qk_norm", self.config.get("model_type") in ("qwen3", "qwen3_vl")
+            )
         )
         self.attention_bias = bool(self.config.get("attention_bias", False))
         archive = SafeTensorArchive(path)
@@ -525,6 +536,14 @@ class QwenEncoder:
                 archive, {name: name.removeprefix("model.") for name in names}
             )
             missing = set()
+        if missing and self.config.get("model_type") == "qwen3_vl":
+            mapping = {
+                name: name.replace("model.", "model.language_model.", 1)
+                for name in names
+            }
+            if all(source in archive.names for source in mapping.values()):
+                archive = MappedWeightArchive(archive, mapping)
+                missing = set()
         if missing:
             raise ValueError(
                 f"Qwen encoder checkpoint is missing {sorted(missing)[:5]}"
@@ -560,7 +579,9 @@ class QwenEncoder:
             plan = self._plans[sequence] = _Qwen3EncoderPlan(self, sequence)
         return plan
 
-    def encode_ids(self, token_ids: Sequence[int]) -> wp.array:
+    def encode_ids(
+        self, token_ids: Sequence[int], *, final_normalize: bool = True
+    ) -> wp.array:
         """Return ``[1, sequence, hidden]`` final hidden states."""
         values = np.asarray(token_ids, dtype=np.int64)
         if values.ndim != 1:
@@ -571,7 +592,8 @@ class QwenEncoder:
             raise ValueError("Qwen token ID is outside the vocabulary")
         plan = self._plan(values.size)
         plan.input_ids.assign(values[None, :])
-        return plan.run()
+        plan.run()
+        return plan.output if final_normalize else plan.pre_norm_output
 
     def encode(self, text: str, *, max_tokens: int = 256) -> wp.array:
         """Tokenize and return the full causal caption hidden-state sequence."""

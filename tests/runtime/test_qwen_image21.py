@@ -2,9 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import numpy as np
 import pytest
 
-from warp_nn.runtime.qwen_image import QwenImage21Bundle
+from warp_nn.runtime.qwen.encoder import load_qwen_encoder_config
+from warp_nn.runtime.qwen_image import (
+    QwenImage21Bundle,
+    QwenImageVAEConfig,
+    qwen_image_21_vae_decoder_weight_specs,
+    qwen_image_to_rgba8,
+)
 
 
 def _bundle(tmp_path):
@@ -96,3 +103,51 @@ def test_bundle_rejects_old_model_and_wrong_geometry(tmp_path):
     (root / "vae/config.json").write_text(json.dumps(config))
     with pytest.raises(ValueError, match="geometry"):
         QwenImage21Bundle.inspect(root)
+
+
+def test_qwen3_vl_text_config_and_rgba_output(tmp_path):
+    config = {
+        "text_config": {
+            "model_type": "qwen3_vl_text",
+            "hidden_size": 4096,
+            "intermediate_size": 12288,
+            "num_hidden_layers": 36,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "vocab_size": 151936,
+            "max_position_embeddings": 262144,
+            "rope_scaling": {
+                "rope_type": "default",
+                "mrope_interleaved": True,
+                "mrope_section": [24, 20, 20],
+            },
+        }
+    }
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    assert load_qwen_encoder_config(path)["model_type"] == "qwen3_vl"
+    rgba = qwen_image_to_rgba8(
+        np.array([[[[-1.0]], [[0.0]], [[1.0]], [[0.5]]]], dtype=np.float32)
+    )
+    np.testing.assert_array_equal(rgba[0, 0], [0, 128, 255, 191])
+
+
+def test_qwen_image21_vae_decoder_selects_single_frame_rgba_weights():
+    config = QwenImageVAEConfig(
+        base_dim=96,
+        dimension_multipliers=(1, 2, 4, 8, 8),
+        residual_blocks=2,
+        latent_channels=64,
+        temporal_downsample=(False, True, True, True),
+        latent_mean=(0.0,) * 64,
+        latent_std=(1.0,) * 64,
+    )
+    specs = qwen_image_21_vae_decoder_weight_specs(config)
+    names = {spec.name for spec in specs}
+    assert len(names) == 128
+    assert "decoder.up_blocks.0.upsampler.time_conv.weight" not in names
+    assert "decoder.up_blocks.0.upsampler.resample.1.weight" in names
+    assert next(
+        spec for spec in specs if spec.name == "decoder.conv_out.weight"
+    ).source_shape == (4, 144, 3, 3)

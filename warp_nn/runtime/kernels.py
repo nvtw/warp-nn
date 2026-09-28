@@ -5607,9 +5607,17 @@ def _conv2d_mma_kernels(
                             )
         output[batch, row, column, out_channel] = DTYPE(total)
 
-    for kernel in (pack_weight, interior, boundary):
+    @wp.kernel(enable_backward=False, module="unique")
+    def crop_channels(
+        padded: wp.array4d(dtype=DTYPE),
+        output: wp.array4d(dtype=DTYPE),
+    ):
+        batch, row, column, channel = wp.tid()
+        output[batch, row, column, channel] = DTYPE(padded[batch, row, column, channel])
+
+    for kernel in (pack_weight, interior, boundary, crop_channels):
         kernel.module.options["enable_backward"] = False
-    return pack_weight, interior, boundary
+    return pack_weight, interior, boundary, crop_channels
 
 
 @lru_cache(maxsize=None)

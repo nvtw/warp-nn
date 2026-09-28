@@ -4,6 +4,7 @@
 """Exact fixed-shape still-image execution for the Qwen-Image-2512 VAE."""
 
 from pathlib import Path
+from functools import lru_cache
 
 import warp as wp
 
@@ -23,8 +24,49 @@ from .runner import QwenImageVAEConfig
 from .vae import (
     _qwen_image_vae_decoder_weight_specs,
     load_qwen_image_2512_vae_decoder_weights,
+    prepare_qwen_image_vae_decoder_weights,
     qwen_image_2512_vae_decoder_weight_specs,
+    qwen_image_21_vae_decoder_weight_specs,
 )
+
+
+@lru_cache(maxsize=None)
+def _dup_upsample_kernel(dtype):
+    DTYPE = dtype
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def duplicate(
+        source: wp.array4d(dtype=DTYPE),
+        output: wp.array4d(dtype=DTYPE),
+        repeats: int,
+    ):
+        batch, y, x, channel = wp.tid()
+        original = (channel * 4 + (y % 2) * 2 + (x % 2)) // repeats
+        output[batch, y, x, channel] = source[batch, y // 2, x // 2, original]
+
+    return duplicate
+
+
+class _ResidualUpsampleShortcut:
+    def __init__(self, source, channels):
+        if channels * 4 % source.shape[3]:
+            raise ValueError("VAE shortcut channels are incompatible")
+        self.source = source
+        self.repeats = channels * 4 // source.shape[3]
+        self.output = wp.empty(
+            (source.shape[0], source.shape[1] * 2, source.shape[2] * 2, channels),
+            dtype=source.dtype,
+            device=source.device,
+        )
+
+    def execute(self):
+        wp.launch(
+            _dup_upsample_kernel(self.source.dtype),
+            dim=self.output.shape,
+            inputs=[self.source, self.output, self.repeats],
+            device=self.source.device,
+        )
+        return self.output
 
 
 class _ResidualBlockPlan:
@@ -102,7 +144,9 @@ class _MidBlockPlan:
 
 
 class _UpBlockPlan:
-    def __init__(self, x, weights, prefix, residual_blocks, *, upsample):
+    def __init__(
+        self, x, weights, prefix, residual_blocks, *, upsample, residual_upsample=False
+    ):
         self.residuals = []
         output = x
         for index in range(residual_blocks + 1):
@@ -110,11 +154,14 @@ class _UpBlockPlan:
             self.residuals.append(residual)
             output = residual.output
         self.upsample = NearestUpsample2dPlan(output, 2) if upsample else None
+        up_prefix = (
+            f"{prefix}.upsampler" if residual_upsample else f"{prefix}.upsamplers.0"
+        )
         self.upsample_conv = (
             Conv2dPlan(
                 self.upsample.output,
-                weights[f"{prefix}.upsamplers.0.resample.1.weight"],
-                weights[f"{prefix}.upsamplers.0.resample.1.bias"],
+                weights[f"{up_prefix}.resample.1.weight"],
+                weights[f"{up_prefix}.resample.1.bias"],
                 padding=1,
                 tensor_cores=True,
             )
@@ -124,23 +171,50 @@ class _UpBlockPlan:
         self.output = (
             self.upsample_conv.output if self.upsample_conv is not None else output
         )
+        self.shortcut = (
+            _ResidualUpsampleShortcut(x, self.output.shape[3])
+            if upsample and residual_upsample
+            else None
+        )
+        self.shortcut_add = (
+            ResidualAddPlan(self.output, self.shortcut.output)
+            if self.shortcut is not None
+            else None
+        )
+        if self.shortcut_add is not None:
+            self.output = self.shortcut_add.output
 
     def execute(self):
         for residual in self.residuals:
             residual.execute()
         if self.upsample is not None:
             self.upsample.execute()
-            return self.upsample_conv.execute()
+            self.upsample_conv.execute()
+            if self.shortcut is not None:
+                self.shortcut.execute()
+                return self.shortcut_add.execute()
+            return self.output
         return self.output
 
 
 class _QwenImageVAEDecoderPlan:
     """Generic fixed-shape plan used by the strict public decoder and tests."""
 
-    def __init__(self, config, weights, latent_height, latent_width, *, batch_size=1):
+    def __init__(
+        self,
+        config,
+        weights,
+        latent_height,
+        latent_width,
+        *,
+        batch_size=1,
+        specs=None,
+        residual_upsample=False,
+        output_channels=3,
+    ):
         if min(int(batch_size), int(latent_height), int(latent_width)) <= 0:
             raise ValueError("Qwen-Image VAE decode geometry must be positive")
-        specs = _qwen_image_vae_decoder_weight_specs(config)
+        specs = _qwen_image_vae_decoder_weight_specs(config) if specs is None else specs
         missing = [spec.name for spec in specs if spec.name not in weights]
         if missing:
             raise KeyError(f"missing prepared Qwen-Image VAE weights: {missing}")
@@ -201,6 +275,7 @@ class _QwenImageVAEDecoderPlan:
                 f"decoder.up_blocks.{index}",
                 config.residual_blocks,
                 upsample=index < stages - 1,
+                residual_upsample=residual_upsample,
             )
             self.up_blocks.append(block)
             output = block.output
@@ -222,7 +297,7 @@ class _QwenImageVAEDecoderPlan:
         sample_height = latent_height * config.spatial_scale_factor
         sample_width = latent_width * config.spatial_scale_factor
         packed_output = self.clamp.output.reshape(
-            (batch_size, sample_height * sample_width, 3)
+            (batch_size, sample_height * sample_width, output_channels)
         )
         self.unpack_output = SpatialPatchUnpackPlan(
             packed_output, sample_height, sample_width, 1
@@ -348,3 +423,45 @@ class QwenImage2512VAEDecoder(_QwenImageVAEDecoderPlan):
             batch_size=batch_size,
             **options,
         )
+
+
+class QwenImage21VAEDecoder(_QwenImageVAEDecoderPlan):
+    """Exact native single-frame RGBA decoder for Qwen-Image-2.1."""
+
+    approximate = False
+    mode = "exact_untiled"
+
+    def __init__(self, config, weights, latent_height, latent_width, *, batch_size=1):
+        super().__init__(
+            config,
+            weights,
+            latent_height,
+            latent_width,
+            batch_size=batch_size,
+            specs=qwen_image_21_vae_decoder_weight_specs(config),
+            residual_upsample=True,
+            output_channels=4,
+        )
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        path,
+        latent_height,
+        latent_width,
+        *,
+        batch_size=1,
+        device=None,
+        dtype=wp.bfloat16,
+    ):
+        path = Path(path)
+        directory = path if path.is_dir() else path.parent
+        config = QwenImageVAEConfig.load(directory / "config.json")
+        checkpoint = (
+            directory / "diffusion_pytorch_model.safetensors" if path.is_dir() else path
+        )
+        specs = qwen_image_21_vae_decoder_weight_specs(config)
+        weights = prepare_qwen_image_vae_decoder_weights(
+            SafeTensorArchive(checkpoint), specs, device, dtype
+        )
+        return cls(config, weights, latent_height, latent_width, batch_size=batch_size)

@@ -70,13 +70,14 @@ def test_conv2d_cpu_matches_reference(stride, padding):
     np.testing.assert_allclose(plan.execute().numpy(), expected, atol=2.0e-6)
 
 
-def test_conv2d_tensor_core_matches_reference_and_captures():
+@pytest.mark.parametrize("out_channels", [32, 48])
+def test_conv2d_tensor_core_matches_reference_and_captures(out_channels):
     if not is_device_available("cuda:0"):
         pytest.skip("CUDA is unavailable")
     rng = np.random.default_rng(912)
     x = rng.normal(0.0, 0.08, size=(1, 8, 48, 16)).astype(np.float32)
-    weight = rng.normal(0.0, 0.08, size=(32, 16, 3, 3)).astype(np.float32)
-    bias = rng.normal(0.0, 0.02, size=32).astype(np.float32)
+    weight = rng.normal(0.0, 0.08, size=(out_channels, 16, 3, 3)).astype(np.float32)
+    bias = rng.normal(0.0, 0.02, size=out_channels).astype(np.float32)
     plan = Conv2dPlan(
         wp.array(x, dtype=wp.bfloat16, device="cuda:0"),
         wp.array(weight, dtype=wp.bfloat16, device="cuda:0"),

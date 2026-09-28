@@ -17,7 +17,7 @@ from typing import Iterable
 import warp as wp
 
 
-from ..weights import extract_temporal_conv2d_weight
+from ..weights import cast_weight, extract_temporal_conv2d_weight
 from .runner import QwenImageVAEConfig
 
 
@@ -64,27 +64,63 @@ def _conv2d(specs, prefix, in_channels, out_channels, kernel=1):
     _vector(specs, f"{prefix}.bias", out_channels)
 
 
-def _residual(specs, prefix, in_channels, out_channels):
+def _residual(specs, prefix, in_channels, out_channels, *, still_conv=_causal_conv):
     _vector(specs, f"{prefix}.norm1.gamma", in_channels, source_rank=4)
-    _causal_conv(specs, f"{prefix}.conv1", in_channels, out_channels)
+    still_conv(specs, f"{prefix}.conv1", in_channels, out_channels)
     _vector(specs, f"{prefix}.norm2.gamma", out_channels, source_rank=4)
-    _causal_conv(specs, f"{prefix}.conv2", out_channels, out_channels)
+    still_conv(specs, f"{prefix}.conv2", out_channels, out_channels)
     if in_channels != out_channels:
-        _causal_conv(
+        still_conv(
             specs,
             f"{prefix}.conv_shortcut",
             in_channels,
             out_channels,
-            kernel=(1, 1, 1),
+            kernel=(1, 1, 1) if still_conv is _causal_conv else 1,
         )
 
 
-def _mid_block(specs, prefix, channels):
-    _residual(specs, f"{prefix}.resnets.0", channels, channels)
+def _mid_block(specs, prefix, channels, *, still_conv=_causal_conv):
+    _residual(specs, f"{prefix}.resnets.0", channels, channels, still_conv=still_conv)
     _vector(specs, f"{prefix}.attentions.0.norm.gamma", channels, source_rank=3)
     _conv2d(specs, f"{prefix}.attentions.0.to_qkv", channels, 3 * channels)
     _conv2d(specs, f"{prefix}.attentions.0.proj", channels, channels)
-    _residual(specs, f"{prefix}.resnets.1", channels, channels)
+    _residual(specs, f"{prefix}.resnets.1", channels, channels, still_conv=still_conv)
+
+
+def qwen_image_21_vae_decoder_weight_specs(config: QwenImageVAEConfig):
+    """Selected tensors for the released 2.1 single-frame RGBA decoder."""
+    actual = (
+        config.base_dim,
+        config.dimension_multipliers,
+        config.residual_blocks,
+        config.latent_channels,
+        config.temporal_downsample,
+    )
+    if actual != (96, (1, 2, 4, 8, 8), 2, 64, (False, True, True, True)):
+        raise ValueError("unsupported Qwen-Image-2.1 VAE decoder geometry")
+    specs = []
+
+    def conv(selected, prefix, inp, out, kernel=3):
+        _conv2d(selected, prefix, inp, out, kernel=kernel)
+
+    conv(specs, "post_quant_conv", 64, 64, kernel=1)
+    conv(specs, "decoder.conv_in", 64, 1152)
+    _mid_block(specs, "decoder.mid_block", 1152, still_conv=conv)
+    dimensions = (1152, 1152, 1152, 576, 288, 144)
+    for block, (inp, out) in enumerate(zip(dimensions[:-1], dimensions[1:])):
+        for residual in range(config.residual_blocks + 1):
+            _residual(
+                specs,
+                f"decoder.up_blocks.{block}.resnets.{residual}",
+                inp if residual == 0 else out,
+                out,
+                still_conv=conv,
+            )
+        if block < 4:
+            conv(specs, f"decoder.up_blocks.{block}.upsampler.resample.1", out, out)
+    _vector(specs, "decoder.norm_out.gamma", 144, source_rank=4)
+    conv(specs, "decoder.conv_out", 144, 4)
+    return tuple(specs)
 
 
 def _qwen_image_vae_decoder_weight_specs(
@@ -155,6 +191,7 @@ def prepare_qwen_image_vae_decoder_weights(
     archive,
     specs: Iterable[QwenImageVAEWeightSpec],
     device=None,
+    dtype=None,
 ) -> dict[str, object]:
     """Validate and prepare selected decoder tensors without rank-five arrays."""
 
@@ -185,7 +222,9 @@ def prepare_qwen_image_vae_decoder_weights(
                 wp.synchronize_stream(wp.get_stream(source.device))
         else:
             prepared = source.reshape(spec.prepared_shape)
-        output[spec.name] = prepared
+        output[spec.name] = (
+            cast_weight(prepared, dtype) if dtype is not None else prepared
+        )
     return output
 
 

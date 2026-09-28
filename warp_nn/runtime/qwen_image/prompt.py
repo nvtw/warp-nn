@@ -97,3 +97,56 @@ class QwenImagePromptEncoder:
         elif plan.input.ptr != hidden.ptr:
             raise RuntimeError("Qwen prompt encoder changed a cached plan buffer")
         return plan.execute()
+
+
+class QwenImage21PromptEncoder:
+    """Text-only Qwen3-VL prompt path for Qwen-Image-2.1."""
+
+    _system = "Comprehend and analyze the provided prompt."
+
+    def __init__(self, encoder: QwenEncoder):
+        if encoder.config.get("model_type") != "qwen3_vl":
+            raise ValueError("Qwen-Image-2.1 requires the Qwen3-VL text backbone")
+        self.encoder = encoder
+        self._slices = {}
+        self._prefix = f"<|im_start|>system\n{self._system}<|im_end|>\n"
+        self._drop = len(encoder.tokenizer.encode(self._prefix))
+
+    @classmethod
+    def from_pretrained(cls, path, *, dtype=wp.bfloat16, device=None, use_cublas=True):
+        root = Path(path)
+        return cls(
+            QwenEncoder(
+                root / "text_encoder",
+                dtype=dtype,
+                device=device,
+                use_cublas=use_cublas,
+                tokenizer_path=root / "processor",
+            )
+        )
+
+    def encode(self, prompt: str, *, max_sequence_length=512):
+        if not isinstance(prompt, str):
+            raise TypeError("Qwen-Image-2.1 prompt must be a string")
+        if not 1 <= int(max_sequence_length) <= 1024:
+            raise ValueError("Qwen-Image-2.1 prompt length must be between 1 and 1024")
+        wrapped = (
+            self._prefix
+            + f"<|im_start|>user\n{prompt or ' '}<|im_end|>\n"
+            + "<|im_start|>assistant\n"
+        )
+        ids = self.encoder.tokenizer.encode(wrapped)[
+            : self._drop + int(max_sequence_length)
+        ]
+        length = len(ids) - self._drop
+        if length <= 0:
+            raise ValueError("Qwen-Image-2.1 prompt produced no retained tokens")
+        hidden = self.encoder.encode_ids(ids, final_normalize=False)
+        plan = self._slices.get(len(ids))
+        if plan is None:
+            plan = self._slices[len(ids)] = SequenceSlicePlan(
+                hidden, self._drop, length
+            )
+        elif plan.input.ptr != hidden.ptr:
+            raise RuntimeError("Qwen-Image-2.1 encoder changed a cached plan buffer")
+        return plan.execute()

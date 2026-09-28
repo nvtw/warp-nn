@@ -15,10 +15,12 @@ from .mmdit import (
     qwen_image_mmdit_workspace_bytes,
     qwen_image_rotary_coordinates,
 )
+from .dit21 import QwenImage21DiTPlan, load_qwen_image_21_transformer_weights
 from .prompt import (
     QWEN_IMAGE_PREFIX_TOKENS,
     QWEN_IMAGE_SYSTEM_PROMPT,
     QwenImagePromptEncoder,
+    QwenImage21PromptEncoder,
     format_qwen_image_prompt,
     tokenize_qwen_image_prompt,
 )
@@ -27,6 +29,7 @@ from .pipeline import (
     qwen_image_batch_to_rgb8,
     qwen_image_to_rgb8,
 )
+from .pipeline21 import QwenImage21Pipeline, qwen_image_to_rgba8
 from .runner import (
     QWEN_IMAGE_21_RESOLUTIONS,
     QWEN_IMAGE_2512_RESOLUTIONS,
@@ -42,20 +45,25 @@ from .vae import (
     load_qwen_image_2512_vae_decoder_weights,
     prepare_qwen_image_vae_decoder_weights,
     qwen_image_2512_vae_decoder_weight_specs,
+    qwen_image_21_vae_decoder_weight_specs,
 )
-from .vae_decoder import QwenImage2512VAEDecoder
+from .vae_decoder import QwenImage21VAEDecoder, QwenImage2512VAEDecoder
 from .vae_tiling import QwenImage2512VAETiledDecoder, QwenImageVAETilingConfig
 
 __all__ = [
     "QWEN_IMAGE_PREFIX_TOKENS",
     "QWEN_IMAGE_SYSTEM_PROMPT",
     "QwenImagePromptEncoder",
+    "QwenImage21PromptEncoder",
     "format_qwen_image_prompt",
     "tokenize_qwen_image_prompt",
     "FlowMatchEulerConfig",
     "QWEN_IMAGE_2512_RESOLUTIONS",
     "QWEN_IMAGE_21_RESOLUTIONS",
     "QwenImage21Bundle",
+    "QwenImage21DiTPlan",
+    "QwenImage21Pipeline",
+    "QwenImage21VAEDecoder",
     "QwenImage2512VAEDecoder",
     "QwenImage2512Bundle",
     "QwenImage2512Pipeline",
@@ -69,6 +77,7 @@ __all__ = [
     "TensorMetadataArchive",
     "QwenImageVAEWeightSpec",
     "load_qwen_image_2512_vae_decoder_weights",
+    "load_qwen_image_21_transformer_weights",
     "QwenImageVAETilingConfig",
     "load_qwen_image_transformer_weights",
     "prepare_qwen_image_vae_decoder_weights",
@@ -76,5 +85,7 @@ __all__ = [
     "qwen_image_rotary_coordinates",
     "qwen_image_batch_to_rgb8",
     "qwen_image_to_rgb8",
+    "qwen_image_to_rgba8",
     "qwen_image_2512_vae_decoder_weight_specs",
+    "qwen_image_21_vae_decoder_weight_specs",
 ]

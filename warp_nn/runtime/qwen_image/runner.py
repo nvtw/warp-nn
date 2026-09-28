@@ -162,7 +162,10 @@ class QwenImageVAEConfig:
             ),
             "Qwen-Image VAE",
         )
-        if data["_class_name"] != "AutoencoderKLQwenImage":
+        if data["_class_name"] not in (
+            "AutoencoderKLQwenImage",
+            "AutoencoderKLQwenImage21",
+        ):
             raise ValueError("unsupported Qwen-Image VAE architecture")
         if not isinstance(data["dim_mult"], list) or not isinstance(
             data["temperal_downsample"], list
@@ -385,7 +388,7 @@ class QwenImage2512Bundle:
 
 @dataclass(frozen=True)
 class QwenImage21Bundle:
-    """Inspect official 2.1 metadata; Warp-native inference is not implemented."""
+    """Inspect the official 2.1 bundle before native inference."""
 
     root: Path
     transformer_index: SafeTensorIndex
