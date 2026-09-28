@@ -385,7 +385,7 @@ class QwenImage2512Bundle:
 
 @dataclass(frozen=True)
 class QwenImage21Bundle:
-    """Inspect the official 2.1 bundle before invoking its upstream pipeline."""
+    """Inspect official 2.1 metadata; Warp-native inference is not implemented."""
 
     root: Path
     transformer_index: SafeTensorIndex
