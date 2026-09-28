@@ -46,14 +46,18 @@ class QwenImage21Pipeline:
         *,
         image=None,
         negative_prompt: str | None = None,
-        width: int = 2048,
-        height: int = 2048,
+        width: int | None = None,
+        height: int | None = None,
         steps: int = 40,
         true_cfg_scale: float = 1.0,
         seed: int = 0,
     ):
         """Return one PIL image; its alpha channel is retained when present."""
-        self.bundle.latent_geometry(width, height)
+        if image is None:
+            width = 2048 if width is None else width
+            height = 2048 if height is None else height
+        if width is not None and height is not None:
+            self.bundle.latent_geometry(width, height)
         if steps <= 0:
             raise ValueError("steps must be positive")
         if true_cfg_scale <= 0:

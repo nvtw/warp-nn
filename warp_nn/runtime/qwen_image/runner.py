@@ -402,8 +402,9 @@ class QwenImage21Bundle:
     def latent_geometry(self, width: int, height: int) -> tuple[int, int, int]:
         width = _positive_int(width, "width")
         height = _positive_int(height, "height")
-        if width % 16 or height % 16:
-            raise ValueError("Qwen-Image-2.1 dimensions must be divisible by 16")
+        # The VAE downsamples by 16 and the processor groups latent tokens 2x2.
+        if width % 32 or height % 32:
+            raise ValueError("Qwen-Image-2.1 dimensions must be divisible by 32")
         return width // 16, height // 16, width * height // 256
 
     @classmethod

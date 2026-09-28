@@ -34,7 +34,7 @@ def main(argv=None):
         help="condition image; repeat for up to ten images",
     )
     parser.add_argument("--negative-prompt", default=None)
-    parser.add_argument("--preset", choices=QWEN_IMAGE_21_RESOLUTIONS, default="1:1")
+    parser.add_argument("--preset", choices=QWEN_IMAGE_21_RESOLUTIONS)
     parser.add_argument("--width", type=int)
     parser.add_argument("--height", type=int)
     parser.add_argument("--steps", type=int, default=40)
@@ -48,11 +48,21 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     bundle = QwenImage21Bundle.inspect(args.model, require_weights=not args.check)
-    preset_width, preset_height = QWEN_IMAGE_21_RESOLUTIONS[args.preset]
-    width = args.width or preset_width
-    height = args.height or preset_height
-    latent_width, latent_height, tokens = bundle.latent_geometry(width, height)
+    preset_width, preset_height = QWEN_IMAGE_21_RESOLUTIONS[args.preset or "1:1"]
+    width = (
+        args.width
+        if args.width is not None
+        else (None if args.image and not args.preset else preset_width)
+    )
+    height = (
+        args.height
+        if args.height is not None
+        else (None if args.image and not args.preset else preset_height)
+    )
     if args.check:
+        latent_width, latent_height, tokens = bundle.latent_geometry(
+            width or preset_width, height or preset_height
+        )
         print(
             json.dumps(
                 {
@@ -60,7 +70,7 @@ def main(argv=None):
                     "resolution": [width, height],
                     "latent": [latent_width, latent_height],
                     "image_tokens": tokens,
-                    "checkpoint_bytes": sum(
+                    "indexed_transformer_and_text_bytes": sum(
                         index.total_size or 0
                         for index in (
                             bundle.transformer_index,
@@ -77,6 +87,8 @@ def main(argv=None):
         parser.error("--prompt is required for generation")
     if args.image and len(args.image) > 10:
         parser.error("at most ten --image inputs are supported")
+    if width is not None and height is not None:
+        bundle.latent_geometry(width, height)
     images = None
     if args.image:
         from PIL import Image
@@ -88,8 +100,11 @@ def main(argv=None):
     print(f"Loading Qwen-Image-2.1 on {args.device}...", flush=True)
     started = time.perf_counter()
     pipeline = QwenImage21Pipeline(bundle, device=args.device)
+    size = (
+        f"{width}x{height}" if width and height else "the condition image aspect ratio"
+    )
     print(
-        f"Ready in {time.perf_counter() - started:.1f}s; generating {width}x{height}...",
+        f"Ready in {time.perf_counter() - started:.1f}s; generating {size}...",
         flush=True,
     )
     started = time.perf_counter()

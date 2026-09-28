@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -80,7 +81,7 @@ def test_bundle_geometry_and_missing_weights(tmp_path):
     assert len(bundle.missing_weight_files()) == 3
     with pytest.raises(FileNotFoundError, match="missing 3 weight file"):
         QwenImage21Bundle.inspect(root, require_weights=True)
-    with pytest.raises(ValueError, match="divisible by 16"):
+    with pytest.raises(ValueError, match="divisible by 32"):
         bundle.latent_geometry(1025, 1024)
 
 
@@ -106,8 +107,6 @@ def test_pipeline_uses_cached_local_reference_and_preserves_rgba(tmp_path, monke
     for missing in bundle.missing_weight_files():
         missing.touch()
 
-    import diffusers
-
     calls = {}
     image = object()
 
@@ -128,7 +127,9 @@ def test_pipeline_uses_cached_local_reference_and_preserves_rgba(tmp_path, monke
             calls["generate"] = kwargs
             return SimpleNamespace(images=[image])
 
-    monkeypatch.setattr(diffusers, "QwenImage21Pipeline", Reference)
+    monkeypatch.setitem(
+        sys.modules, "diffusers", SimpleNamespace(QwenImage21Pipeline=Reference)
+    )
     pipeline = QwenImage21Pipeline(bundle, device="cpu")
     assert (
         pipeline.generate("a glass bird", width=512, height=512, steps=3, seed=42)
@@ -139,3 +140,6 @@ def test_pipeline_uses_cached_local_reference_and_preserves_rgba(tmp_path, monke
     assert calls["generate"]["use_kv_cache"] is True
     assert calls["generate"]["true_cfg_scale"] == 1.0
     assert calls["generate"]["generator"].initial_seed() == 42
+    pipeline.generate("edit", image=[object()])
+    assert calls["generate"]["width"] is None
+    assert calls["generate"]["height"] is None
