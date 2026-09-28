@@ -27,9 +27,12 @@ from .pipeline import (
     qwen_image_batch_to_rgb8,
     qwen_image_to_rgb8,
 )
+from .pipeline21 import QwenImage21Pipeline
 from .runner import (
+    QWEN_IMAGE_21_RESOLUTIONS,
     QWEN_IMAGE_2512_RESOLUTIONS,
     FlowMatchEulerConfig,
+    QwenImage21Bundle,
     QwenImage2512Bundle,
     QwenImageTransformerConfig,
     QwenImageVAEConfig,
@@ -52,6 +55,9 @@ __all__ = [
     "tokenize_qwen_image_prompt",
     "FlowMatchEulerConfig",
     "QWEN_IMAGE_2512_RESOLUTIONS",
+    "QWEN_IMAGE_21_RESOLUTIONS",
+    "QwenImage21Bundle",
+    "QwenImage21Pipeline",
     "QwenImage2512VAEDecoder",
     "QwenImage2512Bundle",
     "QwenImage2512Pipeline",

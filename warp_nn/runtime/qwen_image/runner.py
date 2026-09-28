@@ -30,6 +30,16 @@ QWEN_IMAGE_2512_RESOLUTIONS = {
     "2:3": (1056, 1584),
 }
 
+QWEN_IMAGE_21_RESOLUTIONS = {
+    "1:1": (2048, 2048),
+    "4:3": (2400, 1792),
+    "3:4": (1792, 2400),
+    "3:2": (2528, 1696),
+    "2:3": (1696, 2528),
+    "16:9": (2752, 1536),
+    "9:16": (1536, 2752),
+}
+
 
 def _read_json(path: Path) -> dict:
     try:
@@ -370,4 +380,74 @@ class QwenImage2512Bundle:
         )
         if require_weights:
             bundle.require_weight_files()
+        return bundle
+
+
+@dataclass(frozen=True)
+class QwenImage21Bundle:
+    """Inspect the official 2.1 bundle before invoking its upstream pipeline."""
+
+    root: Path
+    transformer_index: SafeTensorIndex
+    text_encoder_index: SafeTensorIndex
+
+    def missing_weight_files(self) -> tuple[Path, ...]:
+        vae = self.root / "vae" / "diffusion_pytorch_model.safetensors"
+        return (
+            *self.transformer_index.missing_shards(),
+            *self.text_encoder_index.missing_shards(),
+            *((vae,) if not vae.is_file() else ()),
+        )
+
+    def latent_geometry(self, width: int, height: int) -> tuple[int, int, int]:
+        width = _positive_int(width, "width")
+        height = _positive_int(height, "height")
+        if width % 16 or height % 16:
+            raise ValueError("Qwen-Image-2.1 dimensions must be divisible by 16")
+        return width // 16, height // 16, width * height // 256
+
+    @classmethod
+    def inspect(cls, path: str | Path, *, require_weights=False) -> QwenImage21Bundle:
+        root = Path(path)
+        index = _read_json(root / "model_index.json")
+        expected = {
+            "processor": ["transformers", "Qwen3VLProcessor"],
+            "text_encoder": ["transformers", "Qwen3VLForConditionalGeneration"],
+            "transformer": ["diffusers", "QwenImage21Transformer2DModel"],
+            "vae": ["diffusers", "AutoencoderKLQwenImage21"],
+            "scheduler": ["diffusers", "FlowMatchEulerDiscreteScheduler"],
+        }
+        if index.get("_class_name") != "QwenImage21Pipeline" or any(
+            index.get(key) != value for key, value in expected.items()
+        ):
+            raise ValueError("bundle is not an official Qwen-Image-2.1 pipeline")
+        transformer = _read_json(root / "transformer" / "config.json")
+        vae = _read_json(root / "vae" / "config.json")
+        text = _read_json(root / "text_encoder" / "config.json")
+        if (
+            transformer.get("in_channels") != 64
+            or transformer.get("out_channels") != 64
+            or transformer.get("patch_size") != 1
+            or transformer.get("context_in_dim")
+            != text.get("text_config", {}).get("hidden_size")
+            or vae.get("z_dim") != 64
+            or vae.get("scale_factor_spatial") != 16
+        ):
+            raise ValueError("unsupported Qwen-Image-2.1 model geometry")
+        FlowMatchEulerConfig.load(root / "scheduler" / "scheduler_config.json")
+        bundle = cls(
+            root,
+            read_safetensors_index(
+                root / "transformer" / "diffusion_pytorch_model.safetensors.index.json"
+            ),
+            read_safetensors_index(
+                root / "text_encoder" / "model.safetensors.index.json"
+            ),
+        )
+        if require_weights:
+            missing = bundle.missing_weight_files()
+            if missing:
+                raise FileNotFoundError(
+                    f"Qwen-Image-2.1 bundle is missing {len(missing)} weight file(s): {missing[0]}"
+                )
         return bundle
