@@ -1,12 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generate or edit images with a local Qwen-Image-2.1 checkpoint.
+r"""Generate or edit images with a local Qwen-Image-2.1 checkpoint.
 
 Install the optional runtime with ``uv pip install -e '.[qwen-image21]'``.
 Download the checkpoint with::
 
     hf download Qwen/Qwen-Image-2.1 --local-dir ~/Models/warp-nn/Qwen/Qwen-Image-2.1
+
+Then run::
+
+    python examples/qwen_image21.py ~/Models/warp-nn/Qwen/Qwen-Image-2.1 \
+        --prompt "A glass bird on a wooden table" --output bird.png
+
+Use ``--image input.png`` for editing. ``--repeat 3`` keeps the model resident
+and reports warm image throughput; ``--compile`` may help repeated generations.
 """
 
 from __future__ import annotations
