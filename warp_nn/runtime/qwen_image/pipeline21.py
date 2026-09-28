@@ -41,13 +41,6 @@ class QwenImage21Pipeline:
             str(self.bundle.root), dtype=torch.bfloat16, local_files_only=True
         ).to(self.device)
         if compile:
-            from diffusers.models.transformers.transformer_qwenimage21 import (
-                QwenImage21FlexAttnProcessor,
-            )
-
-            self._pipeline.transformer.set_attn_processor(
-                QwenImage21FlexAttnProcessor()
-            )
             self._pipeline.transformer.compile()
         self._pipeline.set_progress_bar_config(disable=True)
 

@@ -47,7 +47,7 @@ def main(argv=None):
     parser.add_argument(
         "--compile",
         action="store_true",
-        help="compile the transformer's fast block attention (slow first run)",
+        help="compile the transformer (slow first run; useful with --repeat)",
     )
     parser.add_argument("--output", type=Path, default=Path("qwen-image21.png"))
     parser.add_argument(

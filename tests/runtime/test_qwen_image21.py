@@ -111,6 +111,11 @@ def test_pipeline_uses_cached_local_reference_and_preserves_rgba(tmp_path, monke
     image = object()
 
     class Reference:
+        def __init__(self):
+            self.transformer = SimpleNamespace(
+                compile=lambda: calls.setdefault("compiled", True)
+            )
+
         @classmethod
         def from_pretrained(cls, path, **kwargs):
             calls["load"] = (path, kwargs)
@@ -143,6 +148,8 @@ def test_pipeline_uses_cached_local_reference_and_preserves_rgba(tmp_path, monke
     pipeline.generate("edit", image=[object()])
     assert calls["generate"]["width"] is None
     assert calls["generate"]["height"] is None
+    QwenImage21Pipeline(bundle, device="cpu", compile=True)
+    assert calls["compiled"] is True
 
 
 def test_example_reuses_pipeline_for_multiple_outputs(tmp_path, monkeypatch):
